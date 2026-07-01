@@ -1,0 +1,55 @@
+package types
+
+// CreateVMRequest is the payload accepted by POST /v1/vms.
+type CreateVMRequest struct {
+	Template string `json:"template"`
+	VCPUs    int64  `json:"vcpus,omitempty"`
+	MemMB    int64  `json:"mem_mb,omitempty"`
+
+	// NoNetwork skips the TAP device/IP allocation entirely, giving the VM
+	// zero network path to the host. Sandboxed/ephemeral workloads (the
+	// main use case in PROJECT.md) often shouldn't need one at all — the
+	// intended channel for those is vsock, not SSH over a TAP link. Network
+	// stays on by default so existing callers keep working unchanged.
+	NoNetwork bool `json:"no_network,omitempty"`
+}
+
+// VMResponse is the JSON representation of a VM returned by the API.
+type VMResponse struct {
+	ID        string  `json:"id"`
+	Template  string  `json:"template"`
+	State     VMState `json:"state"`
+	PID       int     `json:"pid,omitempty"`
+	GuestIP   string  `json:"guest_ip,omitempty"`
+	HostIP    string  `json:"host_ip,omitempty"`
+	TapDevice string  `json:"tap_device,omitempty"`
+	LogPath   string  `json:"log_path,omitempty"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// ExecRequest is the payload accepted by POST /v1/vms/{id}/exec.
+type ExecRequest struct {
+	Cmd string `json:"cmd"`
+}
+
+// ExecResponse is the combined stdout+stderr and exit code of a command run
+// inside a VM via the vsock exec channel (see internal/vsock).
+type ExecResponse struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// NewVMResponse builds the API DTO from an internal VM record.
+func NewVMResponse(vm *VM) VMResponse {
+	return VMResponse{
+		ID:        vm.Config.ID,
+		Template:  vm.Config.TemplateName,
+		State:     vm.State,
+		PID:       vm.PID,
+		GuestIP:   vm.Config.GuestIP,
+		HostIP:    vm.Config.HostIP,
+		TapDevice: vm.Config.TapDevice,
+		LogPath:   vm.LogPath,
+		CreatedAt: vm.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+}

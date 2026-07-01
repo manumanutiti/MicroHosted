@@ -1,0 +1,32 @@
+# Binarios compilados
+build/
+*.ext4
+vmlinux*
+
+# Imágenes — descargar con scripts/
+images/kernels/
+images/rootfs/
+images/instances/
+
+# Clave SSH del proyecto — generada localmente por scripts/prepare-image.sh,
+# nunca se commitea (es una clave privada)
+images/keys/
+
+# Sockets de Firecracker (generados en runtime)
+*.socket
+/srv/jailer/
+
+# Estado persistente (SQLite) — generado en runtime
+images/microhosted.db
+*.db
+*.db-wal
+*.db-shm
+
+# Go
+*.test
+vendor/
+
+# Editor
+.vscode/
+.idea/
+*.swp

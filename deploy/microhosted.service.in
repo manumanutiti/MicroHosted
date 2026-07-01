@@ -1,0 +1,46 @@
+# Plantilla de unit systemd para microhosted.
+# scripts/install-service.sh sustituye los @PLACEHOLDERS@ y la instala en
+# /etc/systemd/system/microhosted.service — no editar el resultado a mano,
+# volver a correr el instalador.
+[Unit]
+Description=MicroHosted — orquestador de microVMs Firecracker+Jailer
+Documentation=file://@WORKDIR@/PROJECT.md
+After=network.target
+
+# Sin /dev/kvm no hay nada que orquestar: fallar claro en el arranque del
+# servicio en vez de más tarde con un error oscuro de Firecracker.
+AssertPathExists=/dev/kvm
+
+[Service]
+Type=simple
+
+# El daemon lanza Firecracker vía Jailer (chroot, cgroups v2, tap devices,
+# /dev/kvm): necesita root. Las unidades de sistema ya corren como root.
+ExecStart=@BINARY@ --addr @ADDR@ --catalog @WORKDIR@/images/catalog.json --instances-dir @WORKDIR@/images/instances --db @WORKDIR@/images/microhosted.db
+WorkingDirectory=@WORKDIR@
+
+# CLAVE para que las microVMs sobrevivan a un reinicio del daemon: systemd
+# señala SOLO al proceso principal (el orquestador), nunca a los procesos
+# Firecracker hijos. Así `systemctl restart microhosted` reinicia el daemon y
+# las VMs siguen vivas; al arrancar, Manager.Reconcile las readopta por PID.
+# (Este es exactamente el caso que un Ctrl-C en primer plano rompía, porque la
+# señal iba a todo el grupo de procesos de la terminal.)
+KillMode=process
+
+# Jailer crea y gestiona un cgroup por VM; delegar el subárbol de cgroup al
+# servicio evita que choque con la gestión de systemd.
+Delegate=yes
+
+# Si el daemon se cae, reiniciarlo: reconcile readopta las VMs que sigan vivas.
+Restart=on-failure
+RestartSec=2
+
+# El apagado ordenado del daemon (srv.Shutdown) espera hasta 10s; dar margen.
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=microhosted
+
+[Install]
+WantedBy=multi-user.target
