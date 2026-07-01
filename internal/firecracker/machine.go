@@ -15,6 +15,15 @@ import (
 
 const defaultKernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
 
+// defaultNameservers are handed to every networked guest via the SDK's
+// IPConfiguration.Nameservers (see BuildConfig). Public resolvers, not the
+// host's own — the host's resolver (e.g. systemd-resolved's 127.0.0.53 stub)
+// would be unreachable anyway, since guest→host is dropped by design (see
+// docs/networking.md). These only resolve anything on a network with
+// egress:true; on a no-egress network DNS queries just time out the same way
+// any other WAN traffic does, which is correct.
+var defaultNameservers = []string{"1.1.1.1", "8.8.8.8"}
+
 // VsockDevicePath is where Firecracker creates the vsock UDS, relative to
 // its own (chrooted) view of the filesystem. internal/vsock connects to it
 // from the host by joining this with jailer.WorkspaceRoot(id) — the SDK
@@ -75,18 +84,47 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 		// The SDK configures this statically inside the guest at boot
 		// (no DHCP, no in-guest agent needed) — same pattern as Firecracker's
 		// own getting-started network guide.
+		// Mask must be the network's real prefix, not a fixed /30: with the wrong
+		// prefix the guest miscomputes its subnet (e.g. treats a same-network
+		// peer as its broadcast address) and unicast between VMs breaks.
+		prefix := vm.PrefixLen
+		if prefix == 0 {
+			prefix = 24
+		}
 		cfg.NetworkInterfaces = fc.NetworkInterfaces{{
 			StaticConfiguration: &fc.StaticNetworkConfiguration{
 				HostDevName: vm.TapDevice,
+				// A unique, stable MAC per VM. Without it Firecracker leaves the
+				// guest to pick one, and on a shared bridge two VMs can collide
+				// on the same MAC — the bridge then can't tell them apart and
+				// L2/ARP between them fails ("Destination Host Unreachable").
+				// Derived from the guest IP (locally-administered 02: prefix),
+				// so it's deterministic across reboots and never duplicated
+				// within a subnet.
+				MacAddress: deriveMAC(guestIP),
 				IPConfiguration: &fc.IPConfiguration{
-					IPAddr:  net.IPNet{IP: guestIP, Mask: net.CIDRMask(30, 32)},
-					Gateway: gatewayIP,
+					IPAddr:      net.IPNet{IP: guestIP, Mask: net.CIDRMask(prefix, 32)},
+					Gateway:     gatewayIP,
+					Nameservers: defaultNameservers,
 				},
 			},
 		}}
 	}
 
 	return cfg, nil
+}
+
+// deriveMAC builds a locally-administered, unicast MAC from an IPv4 address:
+// 02:00 + the four IP octets (e.g. 172.16.1.2 -> 02:00:ac:10:01:02). Unique
+// per address within a deployment and stable across reboots. Falls back to a
+// fixed local MAC if ip isn't a valid IPv4 (shouldn't happen — the caller only
+// reaches here with a TAP configured).
+func deriveMAC(ip net.IP) string {
+	v4 := ip.To4()
+	if v4 == nil {
+		return "02:00:00:00:00:01"
+	}
+	return fmt.Sprintf("02:00:%02x:%02x:%02x:%02x", v4[0], v4[1], v4[2], v4[3])
 }
 
 // Launch starts a new Firecracker microVM through Jailer (cfg.JailerCfg must

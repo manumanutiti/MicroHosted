@@ -53,7 +53,15 @@ func main() {
 		CgroupVersion: *cgroupVersion,
 	}
 
-	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st)
+	// Networks come up before VMs: recreate bridges wiped by a host reboot,
+	// ensure the default network exists, and install the nftables ruleset —
+	// so VMs adopted just below can re-reserve their IPs on live networks.
+	netmgr := network.NewManager(st)
+	if err := netmgr.Reconcile(); err != nil {
+		log.Fatalf("reconciliando redes: %v", err)
+	}
+
+	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)
 
 	// Recover state from a previous run before serving: adopt VMs still
 	// running, sweep those that died while we were down. This also tells us
@@ -71,7 +79,7 @@ func main() {
 		log.Fatalf("limpiando tap devices huérfanos: %v", err)
 	}
 
-	srv := api.NewServer(mgr, *addr)
+	srv := api.NewServer(mgr, netmgr, *addr)
 
 	go func() {
 		log.Printf("microhosted escuchando en %s", *addr)

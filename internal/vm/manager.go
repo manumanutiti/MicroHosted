@@ -43,7 +43,7 @@ type running struct {
 type Manager struct {
 	catalog      *storage.Catalog
 	jailerCfg    jailer.Defaults
-	alloc        *network.Allocator
+	netmgr       *network.Manager
 	instancesDir string
 	store        *store.Store
 
@@ -53,13 +53,14 @@ type Manager struct {
 }
 
 // NewManager wires a Manager to its template catalog, jailer defaults, the
-// directory where per-VM rootfs clones and console logs are stored, and the
-// store that persists VM records across daemon restarts.
-func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDir string, st *store.Store) *Manager {
+// directory where per-VM rootfs clones and console logs are stored, the network
+// manager it attaches VMs through, and the store that persists VM records
+// across daemon restarts.
+func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDir string, st *store.Store, netmgr *network.Manager) *Manager {
 	return &Manager{
 		catalog:      catalog,
 		jailerCfg:    jailerCfg,
-		alloc:        network.NewAllocator(),
+		netmgr:       netmgr,
 		instancesDir: instancesDir,
 		store:        st,
 		vms:          make(map[string]*types.VM),
@@ -93,16 +94,14 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 
 			if tap := rec.Config.TapDevice; tap != "" {
 				keepTaps[tap] = true
-				if err := m.alloc.Reserve(id, rec.Config.HostIP); err != nil {
-					log.Printf("reconcile: reserving IP block for %s: %v", id, err)
-				}
+				m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
 			}
 			log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
 			continue
 		}
 
 		// Dead while we were down — sweep whatever it left behind and forget it.
-		m.cleanupNetwork(rec.Config.TapDevice, id)
+		m.cleanupNetwork(rec.Config.NetworkName, rec.Config.TapDevice, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
 		_ = removeIfExists(rec.LogPath)
@@ -144,27 +143,35 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 
 	// Network is opt-out, not mandatory: sandboxed/ephemeral workloads often
 	// shouldn't have any path to the host at all (see NoNetwork's doc comment).
-	var tapName, guestIP, hostIP, gatewayIP string
+	// When on, the VM joins a segmented network (the default one if unspecified):
+	// its TAP is enslaved to that network's bridge and it gets an IP from the
+	// network's subnet — VMs share L2 within a network, isolated across networks.
+	var tapName, networkName, bridge, guestIP, gatewayIP string
+	var prefixLen int
 	if !req.NoNetwork {
-		block, err := m.alloc.Allocate(id)
+		networkName = req.Network
+		if networkName == "" {
+			networkName = network.DefaultNetworkName
+		}
+		ip, gw, br, prefix, err := m.netmgr.AttachVM(networkName, id)
 		if err != nil {
 			_ = storage.DeleteClone(m.instancesDir, id)
-			return nil, fmt.Errorf("allocating network block: %w", err)
+			return nil, fmt.Errorf("attaching to network %q: %w", networkName, err)
 		}
 
 		tapName = "tap" + id
-		if err := network.CreateTap(tapName, block.HostIP, block.PrefixLen); err != nil {
-			m.alloc.Release(id)
+		if err := network.CreateTapEnslaved(tapName, br); err != nil {
+			m.netmgr.DetachVM(networkName, id)
 			_ = storage.DeleteClone(m.instancesDir, id)
 			return nil, fmt.Errorf("creating tap device: %w", err)
 		}
-		guestIP, hostIP, gatewayIP = block.GuestIP, block.HostIP, block.GatewayIP
+		guestIP, gatewayIP, bridge, prefixLen = ip, gw, br, prefix
 	}
 
 	logPath := filepath.Join(m.instancesDir, id+".log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		m.cleanupNetwork(tapName, id)
+		m.cleanupNetwork(networkName, tapName, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		return nil, fmt.Errorf("opening console log %s: %w", logPath, err)
 	}
@@ -176,10 +183,12 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		Rootfs:       rootfsPath,
 		VCPUs:        vcpus,
 		MemMB:        memMB,
+		NetworkName:  networkName,
+		Bridge:       bridge,
 		TapDevice:    tapName,
 		GuestIP:      guestIP,
-		HostIP:       hostIP,
 		GatewayIP:    gatewayIP,
+		PrefixLen:    prefixLen,
 	}
 
 	// stdout/stderr point at the VM's own log file, never at the daemon's
@@ -188,7 +197,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	fcCfg, err := firecracker.BuildConfig(vmCfg, jcfg)
 	if err != nil {
 		_ = logFile.Close()
-		m.cleanupNetwork(tapName, id)
+		m.cleanupNetwork(networkName, tapName, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		return nil, err
 	}
@@ -201,7 +210,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	machine, err := firecracker.Launch(context.Background(), fcCfg)
 	if err != nil {
 		_ = logFile.Close()
-		m.cleanupNetwork(tapName, id)
+		m.cleanupNetwork(networkName, tapName, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		return nil, fmt.Errorf("launching VM: %w", err)
 	}
@@ -267,7 +276,7 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	// fails to stop cleanly must still have its tap/IP/clone/jail dir released,
 	// or the leak compounds on every crash. Errors are collected, not returned
 	// early, so one failed step never skips the rest.
-	m.cleanupNetwork(record.Config.TapDevice, id)
+	m.cleanupNetwork(record.Config.NetworkName, record.Config.TapDevice, id)
 	cloneErr := storage.DeleteClone(m.instancesDir, id)
 	// Jailer never removes its own per-VM directory; without this the chroot
 	// (rootfs/kernel hardlinks, api socket, cgroup leftovers) accumulates under
@@ -298,6 +307,44 @@ func wrapErr(format, id string, err error) error {
 		return nil
 	}
 	return fmt.Errorf(format+": %w", id, err)
+}
+
+// DestroyAll destroys every VM currently tracked. Each VM is destroyed
+// independently — one failing (e.g. a stuck stop) doesn't stop the rest from
+// being cleaned up, so a partial batch still makes maximum progress instead of
+// aborting on the first error. Returns the IDs destroyed and a per-ID error for
+// any that failed.
+func (m *Manager) DestroyAll(ctx context.Context) (deleted []string, failed map[string]error) {
+	return m.destroyMatching(ctx, func(*types.VM) bool { return true })
+}
+
+// DestroyByNetwork destroys every VM attached to the named network — the
+// bulk-cleanup step before deleting the network itself, which otherwise
+// refuses while any VM is still attached (see network.Manager.Delete). Same
+// independent-failure semantics as DestroyAll.
+func (m *Manager) DestroyByNetwork(ctx context.Context, networkName string) (deleted []string, failed map[string]error) {
+	return m.destroyMatching(ctx, func(v *types.VM) bool { return v.Config.NetworkName == networkName })
+}
+
+func (m *Manager) destroyMatching(ctx context.Context, match func(*types.VM) bool) (deleted []string, failed map[string]error) {
+	m.mu.Lock()
+	var ids []string
+	for id, v := range m.vms {
+		if match(v) {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+
+	failed = make(map[string]error)
+	for _, id := range ids {
+		if err := m.Destroy(ctx, id); err != nil {
+			failed[id] = err
+			continue
+		}
+		deleted = append(deleted, id)
+	}
+	return deleted, failed
 }
 
 // Exec runs cmd inside a VM over its vsock channel — no SSH key, no IP, no
@@ -337,11 +384,13 @@ func (m *Manager) Templates() []types.Template {
 	return m.catalog.List()
 }
 
-func (m *Manager) cleanupNetwork(tapName, vmID string) {
+func (m *Manager) cleanupNetwork(networkName, tapName, vmID string) {
 	if tapName != "" {
 		_ = network.DeleteTap(tapName)
 	}
-	m.alloc.Release(vmID)
+	if networkName != "" {
+		m.netmgr.DetachVM(networkName, vmID)
+	}
 }
 
 // processAlive reports whether pid is a live Firecracker process for vmID. The

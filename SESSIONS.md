@@ -120,10 +120,14 @@ para agentes de IA** — y dos decisiones de arquitectura fijadas con el usuario
 **persistencia SQLite** desde ya. Detalle completo del plan por fases en
 `PROJECT.md`. Estado por fases:
 
-- **Fase 0 — Fundamento (EN CURSO)**: limpieza total en `Destroy` (chroot de
-  Jailer incluido — hecho), persistencia SQLite + reconciliación por PID
-  (hecho, unit-tested), despliegue systemd (hecho — ver abajo), y límites
-  cgroup por VM (pendiente, necesita la ruta real del cgroup en el host).
+- **Fase 0 — Fundamento (CERRADA, validada en hardware)**: limpieza total en
+  `Destroy` (chroot de Jailer incluido), persistencia SQLite + reconciliación
+  por PID, despliegue systemd (ver abajo). Validado end-to-end en el host:
+  crear VM → `systemctl restart` → misma PID readoptada → `exec` devuelve
+  `root`. Los límites cgroup se reencuadraron a Fase 4 (multi-tenencia): el
+  guest ya está contenido por KVM+Jailer, así que el cgroup aporta política de
+  overcommit, no aislamiento anti-malicioso (eso lo dan KVM/Jailer + la red de
+  Fase 1).
 
   **Despliegue systemd (hecho)**: `deploy/microhosted.service.in` +
   `scripts/install-service.sh` + targets `make install-service` /
@@ -145,8 +149,56 @@ para agentes de IA** — y dos decisiones de arquitectura fijadas con el usuario
   `firecracker.BuildConfig` fija `ForwardSignals: []os.Signal{}` (slice vacío,
   no nil) para desactivar el reenvío — la vida de la VM es del Manager, solo
   la termina un Destroy explícito.
-- **Fase 1 — Red segmentada**: `Network` + CRUD, bridge por red, IPAM por-red,
-  `nftables` (drop guest→host, drop cross-segment, NAT condicional).
+- **Fase 1 — Red segmentada (CERRADA, validada en hardware 2026-07-02)**:
+  reemplaza el `/30` punto-a-punto por redes con nombre (bridge por red, TAP
+  enslavado, IPAM por-red, nftables).
+  Diseño completo en `docs/networking.md`. Hecho hasta ahora (compila + tests):
+  - Modelo `types.Network` + `network` en `CreateVMRequest`/`VMConfig`/`VMResponse`.
+  - Persistencia: tabla `networks` (name UNIQUE) + `SaveNetwork`/`DeleteNetwork`/
+    `ListNetworks` en `store`.
+  - IPAM por-red: `network.Subnet` (`ParseSubnet`/`Allocate`/`Reserve`/`Release`,
+    reserva .1 como gateway), con tests. Bug cazado por el test: el atajo de
+    marca de agua (`next`) se saltaba IPs liberadas por debajo; ahora escanea
+    el rango entero.
+  - Primitivas de data plane: `CreateBridge`/`DeleteBridge`/`BridgeExists` +
+    `CreateTapEnslaved` (TAP sin IP, enslavado al bridge).
+  - `network.ApplyNftables`: ruleset declarativo (re-render entero + `nft -f -`
+    atómico) — drop guest→host (salvo established, para SSH host→guest),
+    drop cross-segment por pares, egress NAT condicional. Con test del render.
+  - `network.Manager`: CRUD de redes, pool de `/24` desde `172.16.0.0/12`,
+    attach/detach VM, reconcile de bridges al arrancar + red `default` auto.
+  - `vm.Manager` **movido del `/30` a bridges**: `AttachVM` + `CreateTapEnslaved`
+    en create, `DetachVM` en destroy/reconcile. Modelo `/30` retirado
+    (`alloc.go`/`CreateTap` borrados).
+  - Endpoints `/v1/networks` (POST/GET/GET{name}/DELETE) + `network` en el
+    create de VM. `setup-host.sh` instala `nftables`.
+  - Egress: `EnsureIPForward` (ip_forward=1) + `EnsureDockerForwarding`
+    (coexistencia con Docker vía `DOCKER-USER`, ver `docs/networking.md` →
+    "Egress y coexistencia con el firewall del host"). Best-effort: si fallan,
+    warning y el daemon sigue vivo; la tabla `inet microhosted` es autoritativa.
+  - **Validada en hardware**: 4 bugs cazados y arreglados en el proceso (máscara
+    `/30` → broadcast; sin MAC → colisión en bridge; ip_forward; Docker FORWARD
+    drop). inter-VM OK, aislamiento entre redes OK, guest↛host OK, egress
+    false/true OK sobre host con Docker. Ver `docs/networking.md`.
+  - **Bug #5, encontrado después de cerrar la fase**: DNS no resolvía
+    (`ping 8.8.8.8` OK, `ping google.com` fallaba). Dos causas, ninguna de
+    firewall: (a) nunca pasábamos `Nameservers` al SDK — arreglado con
+    `defaultNameservers = [1.1.1.1, 8.8.8.8]` en `firecracker.BuildConfig`;
+    (b) aunque el kernel los vuelca en `/proc/net/pnp`, el guest no lee de ahí
+    salvo que `/etc/resolv.conf` sea symlink a ese archivo — arreglado en
+    `prepare-image.sh` (paso incondicional, no ligado a `--no-ssh`/`--no-vsock`).
+    A diferencia del bug de Docker, este es de la IMAGEN, no del host — mismo
+    fix en cualquier host. Documentado a fondo en `docs/networking.md` → "DNS
+    en el guest". Requiere: volver a correr `prepare-image.sh` sobre la
+    plantilla dorada + crear una VM NUEVA (las clonadas antes no cambian).
+
+  **Bulk delete (a petición del usuario)**: `DELETE /v1/vms` (borra todas las
+  VMs) y `DELETE /v1/networks/{name}/vms` (borra las VMs de una red — paso
+  previo a poder borrar esa red, que hoy rechaza si tiene VMs conectadas).
+  `vm.Manager.destroyMatching` es el helper compartido: destruye cada VM de
+  forma independiente (un fallo no frena a las demás) y devuelve
+  `(deleted []string, failed map[string]error)`. Respuesta siempre 200
+  (`BulkDeleteResponse{deleted, failed}`) — no es todo-o-nada.
 - **Fase 2 — Volúmenes**: `Volume` + CRUD, attach como drive extra; muestra RO +
   salida writable para artefactos.
 - **Fase 3 — Completar CRUD**: Update (inyectar archivo/playbook) + Read estilo

@@ -36,6 +36,65 @@ Fuente: `images/catalog.json`, cargado una vez al arrancar el daemon
 
 ---
 
+## Redes
+
+Segmentos L2 con nombre (bridge + subred + política nftables). Detalle del
+modelo en `docs/networking.md`. Al arrancar existe siempre una red `default`
+(`172.16.0.0/24`, sin salida a internet).
+
+### `POST /v1/networks` — crear
+
+**Body** (`CreateNetworkRequest`):
+
+| campo    | tipo   | requerido | descripción                                                        |
+|----------|--------|-----------|---------------------------------------------------------------------|
+| `name`   | string | sí        | nombre único de la red                                             |
+| `subnet` | string | no        | CIDR (p.ej. `10.10.0.0/24`); si se omite, se asigna un `/24` libre |
+| `egress` | bool   | no        | si `true`, la subred sale a internet vía NAT; `false` por defecto  |
+
+```bash
+curl -X POST localhost:8080/v1/networks -d '{"name":"lab"}'
+curl -X POST localhost:8080/v1/networks -d '{"name":"build","egress":true}'
+```
+
+**Respuesta 201** (`NetworkResponse`) · **400** si falta `name` · **500** si el
+nombre ya existe, la subred es inválida o falla la creación del bridge.
+
+### `GET /v1/networks` · `GET /v1/networks/{name}`
+
+Lista todas las redes / detalle de una. **Forma de `NetworkResponse`:**
+
+| campo        | descripción                                             |
+|--------------|----------------------------------------------------------|
+| `name`       | nombre de la red                                        |
+| `bridge`     | bridge Linux que la respalda (`mhbr<id>`)               |
+| `subnet`     | CIDR de la red                                          |
+| `gateway`    | IP del host en el bridge (la `.1`, ruta de los guests)  |
+| `egress`     | si tiene salida a internet                              |
+| `created_at` | timestamp RFC3339                                       |
+
+### `DELETE /v1/networks/{name}`
+
+```bash
+curl -X DELETE localhost:8080/v1/networks/lab
+```
+
+**Respuesta 204** · **404** si no existe · **409** si aún tiene VMs conectadas
+(destrúyelas primero, con el endpoint de abajo).
+
+### `DELETE /v1/networks/{name}/vms` — borrar todas las VMs de una red
+
+Paso previo típico a `DELETE /v1/networks/{name}` cuando aún tiene VMs.
+
+```bash
+curl -X DELETE localhost:8080/v1/networks/lab/vms
+```
+
+**Respuesta 200** (`BulkDeleteResponse`, ver forma más abajo) · **404** si la
+red no existe.
+
+---
+
 ## VMs
 
 ### `POST /v1/vms` — crear
@@ -47,10 +106,12 @@ Fuente: `images/catalog.json`, cargado una vez al arrancar el daemon
 | `template`    | string | sí        | nombre de una plantilla del catálogo                                        |
 | `vcpus`       | int    | no        | overridea el `vcpus` de la plantilla                                        |
 | `mem_mb`      | int    | no        | overridea el `mem_mb` de la plantilla                                       |
+| `network`     | string | no        | red segmentada a la que conectar la VM (ver `## Redes`); vacío = `default`  |
 | `no_network`  | bool   | no        | si `true`, no crea TAP/IP — la VM solo es accesible por vsock (`/exec`)     |
 
 ```bash
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu"}'
+curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","network":"lab"}'
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true}'
 ```
 
@@ -93,9 +154,9 @@ curl localhost:8080/v1/vms/a1b2c3d4
 | `template`    | nombre de la plantilla de la que se clonó                                   |
 | `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (hoy solo se usa `running`) |
 | `pid`         | PID del proceso Firecracker (jailed)                                        |
-| `guest_ip`    | IP del guest (vacío si `no_network`)                                        |
-| `host_ip`     | IP del host en el enlace punto a punto (vacío si `no_network`)              |
-| `tap_device`  | nombre del TAP (vacío si `no_network`)                                      |
+| `network`     | nombre de la red segmentada a la que está conectada (vacío si `no_network`) |
+| `guest_ip`    | IP del guest en la subred de su red (vacío si `no_network`)                 |
+| `tap_device`  | nombre del TAP, enslavado al bridge de la red (vacío si `no_network`)       |
 | `log_path`    | archivo con la consola serie + logs de Jailer/Firecracker de esta VM        |
 | `created_at`  | timestamp RFC3339                                                            |
 
@@ -113,10 +174,35 @@ curl -X DELETE localhost:8080/v1/vms/a1b2c3d4
 **Respuesta 204** · **404** si no existe o si falla al parar/limpiar (el
 detalle del error queda en el body).
 
-Para a la máquina (`firecracker.Stop`: ACPI graceful + SIGTERM de respaldo),
-borra el TAP device, libera el bloque de IP, y borra el clon del rootfs
-(`images/instances/<id>.ext4` y `.log`). Pendiente de auditar que no queden
-huérfanos en todos los casos de fallo parcial — ver `SESSIONS.md`.
+Para a la máquina (`firecracker.Stop`: ACPI graceful + SIGTERM de respaldo, o
+señal por PID si es una VM adoptada tras un reinicio), borra el TAP, libera la
+IP en su red, borra el clon del rootfs + `.log`, el directorio de chroot de
+Jailer y el registro persistido. La limpieza acumula errores (`errors.Join`):
+un fallo en un paso no salta los demás.
+
+---
+
+### `DELETE /v1/vms` — borrar todas las VMs
+
+Resetea el entorno (útil entre tandas de pruebas) sin ir una a una.
+
+```bash
+curl -X DELETE localhost:8080/v1/vms
+```
+
+**Respuesta 200** siempre — destruir muchas VMs independientes no es
+todo-o-nada; el resultado va en el body, no en el código HTTP.
+
+**Forma de `BulkDeleteResponse`** (también la usa `DELETE /v1/networks/{name}/vms`):
+
+| campo     | descripción                                                        |
+|-----------|----------------------------------------------------------------------|
+| `deleted` | array de IDs destruidos con éxito                                   |
+| `failed`  | objeto `{id: mensaje de error}` — solo presente si algo falló       |
+
+```json
+{"deleted": ["a1b2c3d4", "e5f6a7b8"], "failed": {"c9d0e1f2": "vm not found"}}
+```
 
 ---
 

@@ -20,11 +20,20 @@ type VMConfig struct {
 	VCPUs        int64
 	MemMB        int64
 
-	// Red
-	TapDevice string
-	GuestIP   string
-	HostIP    string
-	GatewayIP string
+	// Red. En el modelo segmentado (Fase 1) el TAP se enslava al bridge de la
+	// red; GuestIP sale del IPAM de la red y GatewayIP es el gateway del bridge.
+	// HostIP queda del modelo /30 anterior y ya no se usa en redes segmentadas.
+	NetworkName string
+	Bridge      string
+	TapDevice   string
+	GuestIP     string
+	HostIP      string
+	GatewayIP   string
+	// PrefixLen is the guest's subnet prefix (the network's, e.g. 24). It must
+	// match the network so the guest computes the right broadcast/route; a
+	// wrong value (the old hardcoded /30) makes same-subnet peers look like
+	// broadcast and unicast between VMs fails.
+	PrefixLen int
 }
 
 type VM struct {

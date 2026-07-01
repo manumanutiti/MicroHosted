@@ -33,12 +33,24 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("opening sqlite at %s: %w", path, err)
 	}
 
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS vms (
-		id   TEXT PRIMARY KEY,
-		data TEXT NOT NULL
-	)`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("creating schema: %w", err)
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS vms (
+			id   TEXT PRIMARY KEY,
+			data TEXT NOT NULL
+		)`,
+		// name is UNIQUE so the DB itself enforces one network per name — the
+		// manager relies on this instead of a racy check-then-insert.
+		`CREATE TABLE IF NOT EXISTS networks (
+			id   TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			data TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range schema {
+		if _, err := db.Exec(stmt); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("creating schema: %w", err)
+		}
 	}
 
 	return &Store{db: db}, nil
@@ -97,4 +109,54 @@ func (s *Store) ListVMs() ([]*types.VM, error) {
 		vms = append(vms, &vm)
 	}
 	return vms, rows.Err()
+}
+
+// SaveNetwork upserts a network record. The UNIQUE constraint on name means a
+// second network with the same name but a different id fails here rather than
+// silently duplicating.
+func (s *Store) SaveNetwork(n *types.Network) error {
+	data, err := json.Marshal(n)
+	if err != nil {
+		return fmt.Errorf("marshaling network %s: %w", n.Name, err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO networks (id, name, data) VALUES (?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET name = excluded.name, data = excluded.data`,
+		n.ID, n.Name, string(data),
+	); err != nil {
+		return fmt.Errorf("saving network %s: %w", n.Name, err)
+	}
+	return nil
+}
+
+// DeleteNetwork removes a network record by id. Idempotent.
+func (s *Store) DeleteNetwork(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM networks WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting network %s: %w", id, err)
+	}
+	return nil
+}
+
+// ListNetworks returns every persisted network record, for reconciliation at
+// startup (recreating bridges + rules).
+func (s *Store) ListNetworks() ([]*types.Network, error) {
+	rows, err := s.db.Query(`SELECT data FROM networks`)
+	if err != nil {
+		return nil, fmt.Errorf("querying networks: %w", err)
+	}
+	defer rows.Close()
+
+	var nets []*types.Network
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scanning network row: %w", err)
+		}
+		var n types.Network
+		if err := json.Unmarshal([]byte(data), &n); err != nil {
+			return nil, fmt.Errorf("unmarshaling network row: %w", err)
+		}
+		nets = append(nets, &n)
+	}
+	return nets, rows.Err()
 }

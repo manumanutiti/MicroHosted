@@ -48,6 +48,16 @@ if ! command -v ip &>/dev/null; then
 fi
 echo "  iproute2: OK"
 
+echo "==> Verificando nftables (nft)..."
+if ! command -v nft &>/dev/null; then
+  echo "  Instalando nftables..."
+  sudo apt-get install -y nftables
+fi
+# El daemon lo necesita al arrancar: aplica la política de red segmentada
+# (drop guest→host, aislamiento entre redes, NAT de egress) en la tabla propia
+# 'inet microhosted'. Sin nft, la reconciliación de redes falla al arrancar.
+echo "  nftables: OK"
+
 echo "==> Creando directorio de trabajo de Jailer..."
 sudo mkdir -p /srv/jailer
 sudo chown root:root /srv/jailer

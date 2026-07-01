@@ -39,28 +39,6 @@ func SweepOrphans(keep map[string]bool) error {
 	return nil
 }
 
-// CreateTap creates a TAP device and assigns it a host-side IP within a
-// point-to-point /30 block, matching the layout in docs/architecture.md.
-// Requires CAP_NET_ADMIN — the daemon already needs to run as root to drive
-// Jailer, so this rides along on that same privilege.
-func CreateTap(name, hostIP string, prefixLen int) error {
-	steps := [][]string{
-		{"ip", "tuntap", "add", name, "mode", "tap"},
-		{"ip", "addr", "add", fmt.Sprintf("%s/%d", hostIP, prefixLen), "dev", name},
-		{"ip", "link", "set", name, "up"},
-	}
-
-	for _, args := range steps {
-		cmd := exec.Command(args[0], args[1:]...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			_ = DeleteTap(name) // best-effort rollback of whatever step(s) already succeeded
-			return fmt.Errorf("running %v: %w (%s)", args, err, out)
-		}
-	}
-
-	return nil
-}
-
 // DeleteTap removes a TAP device. Safe to call even if it doesn't exist.
 func DeleteTap(name string) error {
 	cmd := exec.Command("ip", "link", "del", name)

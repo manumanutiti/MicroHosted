@@ -6,6 +6,11 @@ type CreateVMRequest struct {
 	VCPUs    int64  `json:"vcpus,omitempty"`
 	MemMB    int64  `json:"mem_mb,omitempty"`
 
+	// Network is the name of the segmented network to attach the VM to (see
+	// docs/networking.md). Empty means the built-in "default" network. Ignored
+	// when NoNetwork is set.
+	Network string `json:"network,omitempty"`
+
 	// NoNetwork skips the TAP device/IP allocation entirely, giving the VM
 	// zero network path to the host. Sandboxed/ephemeral workloads (the
 	// main use case in PROJECT.md) often shouldn't need one at all — the
@@ -20,11 +25,22 @@ type VMResponse struct {
 	Template  string  `json:"template"`
 	State     VMState `json:"state"`
 	PID       int     `json:"pid,omitempty"`
+	Network   string  `json:"network,omitempty"`
 	GuestIP   string  `json:"guest_ip,omitempty"`
 	HostIP    string  `json:"host_ip,omitempty"`
 	TapDevice string  `json:"tap_device,omitempty"`
 	LogPath   string  `json:"log_path,omitempty"`
 	CreatedAt string  `json:"created_at"`
+}
+
+// BulkDeleteResponse is returned by bulk-delete endpoints (DELETE /v1/vms,
+// DELETE /v1/networks/{name}/vms). Individual VM failures don't abort the
+// batch — each VM is destroyed independently, so partial success is the
+// normal case, not an error condition; the caller inspects Failed to see
+// what, if anything, needs a retry.
+type BulkDeleteResponse struct {
+	Deleted []string          `json:"deleted"`
+	Failed  map[string]string `json:"failed,omitempty"`
 }
 
 // ExecRequest is the payload accepted by POST /v1/vms/{id}/exec.
@@ -46,6 +62,7 @@ func NewVMResponse(vm *VM) VMResponse {
 		Template:  vm.Config.TemplateName,
 		State:     vm.State,
 		PID:       vm.PID,
+		Network:   vm.Config.NetworkName,
 		GuestIP:   vm.Config.GuestIP,
 		HostIP:    vm.Config.HostIP,
 		TapDevice: vm.Config.TapDevice,

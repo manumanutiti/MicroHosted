@@ -59,6 +59,24 @@ trap cleanup EXIT
 echo "==> Montando ${ROOTFS}..."
 sudo mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
+# DNS: la IP/gateway/nameservers que pasamos por firecracker-go-sdk
+# (IPConfiguration) no llegan al guest como config de red normal — el kernel
+# los escribe en /proc/net/pnp (mecanismo heredado de nfsroot/netboot; ver el
+# comentario de IPConfiguration en el SDK). Para que el guest los use,
+# /etc/resolv.conf tiene que ser un symlink a /proc/net/pnp. Muchas imágenes
+# (systemd-resolved, netplan, cloud-init) lo dejan como archivo normal o
+# symlink a su propio stub — sin este paso, `ping`/`curl` a una IP funcionan
+# pero resolver nombres (google.com) falla con "Temporary failure in name
+# resolution" aunque la VM tenga egress e internet real. Siempre se hace,
+# independientemente de --no-ssh/--no-vsock: es funcionalidad de red básica,
+# no parte del acceso.
+echo "==> Configurando DNS del guest (/etc/resolv.conf -> /proc/net/pnp)..."
+if [[ -e "$MOUNT_DIR/etc/resolv.conf" && ! -L "$MOUNT_DIR/etc/resolv.conf" ]]; then
+  sudo mv "$MOUNT_DIR/etc/resolv.conf" "$MOUNT_DIR/etc/resolv.conf.microhosted-orig"
+fi
+sudo ln -sf /proc/net/pnp "$MOUNT_DIR/etc/resolv.conf"
+echo "    OK: resolución DNS lista (usa los nameservers que microhosted asigna a cada VM)."
+
 if [[ "$DO_VSOCK" -eq 1 ]]; then
   if [[ ! -x "$MOUNT_DIR/usr/bin/socat" ]]; then
     echo "ERROR: esta imagen no tiene socat instalado (necesario para el canal vsock)."
