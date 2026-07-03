@@ -2,9 +2,10 @@
   {
     "name": "base-ubuntu",
     "description": "Ubuntu 22.04 (rootfs oficial de Firecracker CI)",
-    "kernel_path": "images/kernels/vmlinux-6.1.102",
-    "rootfs_path": "images/rootfs/ubuntu-22.04.ext4",
+    "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
+    "rootfs_path": "/var/lib/microhosted/store/rootfs/ubuntu-22.04.ext4",
     "vcpus": 1,
-    "mem_mb": 128
+    "mem_mb": 128,
+    "disk_mb": 1024
   }
 ]

@@ -253,6 +253,42 @@ host. Endurecer para malware da gratis el aislamiento que el caso IA también
 quiere. (Cuotas de GPU para IA y un agente de prueba tipo ONNX quedan aparcados
 para más adelante — primero el core.)
 
+### Refinamiento del posicionamiento (2026-07-02)
+
+El encuadre madura de "dos casos de uso" a un **posicionamiento único**:
+**plataforma de sandboxing de seguridad AUTOHOSTED**. Separar en dos capas:
+
+- **El motor** (ciclo de vida de microVMs + aislamiento + snapshots): general y
+  neutral, agnóstico al caso de uso. La calidad se mide en correctitud y
+  garantías.
+- **El producto**: una **librería curada de imágenes desechables** para distintos
+  usos defensivos (detonación de malware, honeypots/deception, bancos DFIR,
+  rangos blue-team, labs/CTF; el sandbox de agentes IA es un segundo acto sobre
+  el mismo motor).
+
+Claves estratégicas:
+- **Foso = soberanía del dato.** El autohosted es el eje donde los sandboxes
+  cloud (ANY.RUN, Joe Sandbox, e2b) no pueden competir por estructura: no mandas
+  la muestra/el dato a un tercero. Para banca/defensa/sanidad/air-gap es un "no"
+  rotundo, no una preferencia.
+- **Incumbente a desplazar = CAPEv2/Cuckoo** (sandbox de malware self-hosted
+  clásico, QEMU pesado, doloroso de operar). Ángulo: el sucesor moderno en
+  microVMs Firecracker, API-first, que sí se instala.
+- **Disciplina: motor general, primer workflow afilado.** "Biblioteca para
+  distintos usos" es la promesa, no el lanzamiento. Se lanza con UN workflow
+  hondo (detonación: muestra → VM aislada sin egress → corre → captura artefactos
+  → reset a limpio) y se expande desde ahí. Amplitud = promesa; profundidad-de-uno
+  = prueba.
+- **Consecuencias**: el catálogo/sistema de imágenes sube a activo de primera
+  clase (templates versionadas, manifests, builds reproducibles, firma) — enlaza
+  con las imágenes ultra-optimizadas pendientes (Alpine/Rocky). **Snapshots** son
+  lo más estratégico (reset-a-limpio, bifurcar en el punto de infección), por
+  encima de multi-host/HA. **Modelo de amenaza escrito + tests adversariales**
+  pasa a ser argumento de venta, no higiene.
+- **Orden**: control plane, colas, HA y multi-host son etapas posteriores; su
+  orden lo dicta un caso de uso que tira, no una checklist de escalar. Siguiente:
+  soak test (robustez en operación) → snapshots → workflow vertical de detonación.
+
 ### Decisiones de arquitectura fijadas
 - **Red segmentada por nombre** (no el `/30` punto-a-punto actual, donde el host
   es gateway de todas las VMs y dos VMs no pueden verse). Bridge por red nombrada;
@@ -278,10 +314,17 @@ para más adelante — primero el core.)
 - `nftables`: drop guest→host, drop cross-segment, NAT condicional.
 - `NoNetwork` sigue válido para el sandbox más hermético.
 
-**Fase 2 — Volúmenes**
-- Entidad `Volume` (nombre, tamaño, ext4 persistente que sobrevive al destroy)
-  + CRUD `/v1/volumes`; attach como drive extra (Firecracker `Drives`).
-- Ciber: muestra montada read-only + volumen de salida writable para artefactos.
+**Fase 2 — Almacenamiento**
+- *(hecho, validado en hardware 2026-07-02)* **Tamaño de disco configurable**
+  (`disk_mb` en template/request; el clon se agranda con `resize2fs`) + **store
+  copy-on-write** (loopback btrfs, agnóstico al host, provisionado por
+  `setup-host.sh`). Todo lo que Jailer clona/hardlinka (golden, kernel, chroot)
+  vive en el mismo btrfs por invariante — reflink y hardlink no cruzan FS. Ver
+  `SESSIONS.md` (Fase 2 parte 1) y `docs/layers.md` L3.
+- *(pendiente)* Entidad `Volume` (nombre, tamaño, ext4 persistente que sobrevive
+  al destroy) + CRUD `/v1/volumes`; attach como drive extra (Firecracker
+  `Drives`). Ciber: muestra montada read-only + volumen de salida writable para
+  artefactos.
 
 **Fase 3 — Completar el CRUD**
 - Update: inyectar archivo/playbook a un disco (vía vsock si viva, montando el

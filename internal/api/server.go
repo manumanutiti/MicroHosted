@@ -138,6 +138,27 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 		writeJSON(w, http.StatusOK, bulkDeleteResponse(mgr.DestroyAll(r.Context())))
 	})
 
+	// Stop powers a VM off but keeps its disk and IP (see vm.Manager.Stop) —
+	// as opposed to DELETE /v1/vms/{id}, which erases everything. Start below
+	// brings it back at the same address.
+	mux.HandleFunc("POST /v1/vms/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		record, err := mgr.Stop(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+	})
+
+	mux.HandleFunc("POST /v1/vms/{id}/start", func(w http.ResponseWriter, r *http.Request) {
+		record, err := mgr.Start(r.Context(), r.PathValue("id"))
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+	})
+
 	mux.HandleFunc("POST /v1/vms/{id}/exec", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ExecRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -175,6 +196,20 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// writeVMOpError maps a vm.Manager lifecycle error to an HTTP status: an
+// unknown VM is 404, an operation invalid for the VM's current state (stop on
+// a stopped VM, start on a running one) is 409 Conflict, anything else is 500.
+func writeVMOpError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, vm.ErrVMNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, vm.ErrVMState):
+		writeError(w, http.StatusConflict, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 // bulkDeleteResponse converts a vm.Manager bulk-destroy result (IDs + a

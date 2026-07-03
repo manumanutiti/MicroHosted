@@ -6,6 +6,12 @@ type CreateVMRequest struct {
 	VCPUs    int64  `json:"vcpus,omitempty"`
 	MemMB    int64  `json:"mem_mb,omitempty"`
 
+	// DiskMB overrides the template's default disk size (in MiB) for this VM.
+	// Only ever grows the disk past the golden image — a value smaller than the
+	// image (or 0, meaning "use the template default") is ignored. See
+	// types.Template.DiskMB and storage.CloneRootfs.
+	DiskMB int64 `json:"disk_mb,omitempty"`
+
 	// Network is the name of the segmented network to attach the VM to (see
 	// docs/networking.md). Empty means the built-in "default" network. Ignored
 	// when NoNetwork is set.

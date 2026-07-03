@@ -19,6 +19,10 @@ type VMConfig struct {
 	Rootfs       string
 	VCPUs        int64
 	MemMB        int64
+	// DiskMB is the size the clone was grown to at Create time. Recorded for
+	// visibility (List/Get) and so a future resize path can tell what a VM
+	// already has; the actual growth happens once, in storage.CloneRootfs.
+	DiskMB int64
 
 	// Red. En el modelo segmentado (Fase 1) el TAP se enslava al bridge de la
 	// red; GuestIP sale del IPAM de la red y GatewayIP es el gateway del bridge.

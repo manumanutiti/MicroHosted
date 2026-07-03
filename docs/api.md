@@ -4,7 +4,7 @@ Servida por `internal/api` (`cmd/microhosted`, flag `--addr`, por defecto
 `:8080`). Todos los cuerpos son JSON. No hay autenticación todavía — pensada
 para correr detrás de un panel/backend propio, no expuesta directamente.
 
-Estado: cubre create/read/delete + exec. El CRUD completo (incluyendo
+Estado: cubre create/read/delete + stop/start + exec. El CRUD completo (incluyendo
 "update" y matices de create/delete) está en marcha — ver `SESSIONS.md`,
 sección "Próxima sesión".
 
@@ -106,6 +106,7 @@ red no existe.
 | `template`    | string | sí        | nombre de una plantilla del catálogo                                        |
 | `vcpus`       | int    | no        | overridea el `vcpus` de la plantilla                                        |
 | `mem_mb`      | int    | no        | overridea el `mem_mb` de la plantilla                                       |
+| `disk_mb`     | int    | no        | overridea el `disk_mb` de la plantilla; solo agranda (nunca encoge)        |
 | `network`     | string | no        | red segmentada a la que conectar la VM (ver `## Redes`); vacío = `default`  |
 | `no_network`  | bool   | no        | si `true`, no crea TAP/IP — la VM solo es accesible por vsock (`/exec`)     |
 
@@ -120,8 +121,13 @@ o el JSON es inválido · **500** si falla el clonado/red/arranque (el mensaje
 de error incluye en qué paso falló).
 
 Cada `POST` clona el rootfs de la plantilla desde cero
-(`internal/storage.CloneRootfs`, copy-on-write vía `cp --reflink=auto`) — hoy
-no hay forma de re-arrancar sobre un disco ya modificado de una VM anterior;
+(`internal/storage.CloneRootfs`, copy-on-write vía `cp --reflink=auto`) y lo
+agranda a `disk_mb` con `resize2fs` para que el guest tenga espacio libre (un
+rootfs dorado va casi lleno; sin esto un `apt install` se queda sin espacio).
+El CoW solo es real sobre un FS con reflink (btrfs / XFS-reflink); en ext4
+normal `cp` cae a copia completa y cada VM ocupa el disco entero — el daemon
+avisa de esto al arrancar y `scripts/setup-host.sh` provisiona un store CoW.
+Hoy no hay forma de re-arrancar sobre un disco ya modificado de una VM anterior;
 eso es parte del trabajo pendiente (ver `SESSIONS.md`).
 
 ---
@@ -152,7 +158,7 @@ curl localhost:8080/v1/vms/a1b2c3d4
 |---------------|------------------------------------------------------------------------------|
 | `id`          | ID corto (8 hex) de la VM                                                    |
 | `template`    | nombre de la plantilla de la que se clonó                                   |
-| `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (hoy solo se usa `running`) |
+| `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (se usan `running` y `stopped`) |
 | `pid`         | PID del proceso Firecracker (jailed)                                        |
 | `network`     | nombre de la red segmentada a la que está conectada (vacío si `no_network`) |
 | `guest_ip`    | IP del guest en la subred de su red (vacío si `no_network`)                 |
@@ -179,6 +185,40 @@ señal por PID si es una VM adoptada tras un reinicio), borra el TAP, libera la
 IP en su red, borra el clon del rootfs + `.log`, el directorio de chroot de
 Jailer y el registro persistido. La limpieza acumula errores (`errors.Join`):
 un fallo en un paso no salta los demás.
+
+**Destruir (`DELETE`) vs. apagar (`stop`)**: `DELETE` borra *todo*, incluido el
+ext4 de la microVM (el disco). Si solo quieres liberar CPU/RAM y conservar el
+disco, usa `stop` (abajo).
+
+---
+
+### `POST /v1/vms/{id}/stop` — apagar (poweroff, conserva el disco)
+
+```bash
+curl -X POST localhost:8080/v1/vms/a1b2c3d4/stop
+```
+
+**Respuesta 200** con el `VMResponse` (ahora `state: "stopped"`, `pid` omitido) ·
+**404** si no existe · **409** si ya estaba parada.
+
+Apaga el proceso Firecracker (libera CPU/RAM) y suelta el TAP y el directorio de
+chroot de Jailer, pero **conserva el clon del rootfs** (el disco, con todo lo que
+el guest haya escrito) y **mantiene la IP reservada** en su red. Sobrevive a un
+reinicio del daemon: `Reconcile` no la barre, la deja parada y re-reserva su IP.
+No se puede hacer `exec` sobre una VM parada (**409**).
+
+### `POST /v1/vms/{id}/start` — arrancar una VM parada
+
+```bash
+curl -X POST localhost:8080/v1/vms/a1b2c3d4/start
+```
+
+**Respuesta 200** con el `VMResponse` (`state: "running"`, nuevo `pid`) ·
+**404** si no existe · **409** si no está parada.
+
+Recrea el TAP (que se soltó al parar) y relanza Firecracker sobre el **mismo**
+ext4 y la **misma** IP que tenía. El bridge de la red sigue en pie (parar no lo
+toca), así que arranca en frío con el disco y el direccionamiento intactos.
 
 ---
 

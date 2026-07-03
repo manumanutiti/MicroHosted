@@ -24,6 +24,14 @@ import (
 	"microhosted/pkg/types"
 )
 
+// Lifecycle errors the API layer maps to HTTP status codes: ErrVMNotFound → 404,
+// ErrVMState → 409 (an operation invalid for the VM's current state, e.g. Stop
+// on a stopped VM or Start on a running one).
+var (
+	ErrVMNotFound = errors.New("vm not found")
+	ErrVMState    = errors.New("vm in incompatible state")
+)
+
 // running couples a live Machine with the log file its console/Jailer
 // output was redirected to, so Destroy can close the file handle cleanly.
 type running struct {
@@ -86,6 +94,24 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 
 	for _, rec := range records {
 		id := rec.Config.ID
+
+		// A VM stopped on purpose (poweroff — disk kept, IP reserved) has no
+		// live process by design, so it must NOT be swept like a crashed one.
+		// Keep it tracked as stopped and re-reserve its IP so a freshly created
+		// VM can't grab the address it will reclaim on Start. It has no TAP
+		// (Stop released it), so there's nothing to add to keepTaps.
+		if rec.State == types.VMStateStopped {
+			m.mu.Lock()
+			m.vms[id] = rec
+			m.run[id] = &running{}
+			m.mu.Unlock()
+			if rec.Config.GuestIP != "" {
+				m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+			}
+			log.Printf("reconcile: kept stopped vm %s", id)
+			continue
+		}
+
 		if processAlive(rec.PID, id) {
 			m.mu.Lock()
 			m.vms[id] = rec
@@ -131,12 +157,16 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if memMB == 0 {
 		memMB = tpl.MemMB
 	}
+	diskMB := req.DiskMB
+	if diskMB == 0 {
+		diskMB = tpl.DiskMB
+	}
 
 	// Kept short (8 hex chars) because it's reused as part of the tap
 	// device name, which Linux caps at 15 characters (IFNAMSIZ).
 	id := uuid.NewString()[:8]
 
-	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID, diskMB)
 	if err != nil {
 		return nil, fmt.Errorf("cloning rootfs: %w", err)
 	}
@@ -168,14 +198,6 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		guestIP, gatewayIP, bridge, prefixLen = ip, gw, br, prefix
 	}
 
-	logPath := filepath.Join(m.instancesDir, id+".log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		m.cleanupNetwork(networkName, tapName, id)
-		_ = storage.DeleteClone(m.instancesDir, id)
-		return nil, fmt.Errorf("opening console log %s: %w", logPath, err)
-	}
-
 	vmCfg := types.VMConfig{
 		ID:           id,
 		TemplateName: tpl.Name,
@@ -183,6 +205,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		Rootfs:       rootfsPath,
 		VCPUs:        vcpus,
 		MemMB:        memMB,
+		DiskMB:       diskMB,
 		NetworkName:  networkName,
 		Bridge:       bridge,
 		TapDevice:    tapName,
@@ -191,50 +214,23 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		PrefixLen:    prefixLen,
 	}
 
-	// stdout/stderr point at the VM's own log file, never at the daemon's
-	// terminal — see the comment on jailer.Build for why.
-	jcfg := jailer.Build(id, tpl.KernelPath, m.jailerCfg, logFile, logFile)
-	fcCfg, err := firecracker.BuildConfig(vmCfg, jcfg)
-	if err != nil {
-		_ = logFile.Close()
+	record := &types.VM{
+		Config:    vmCfg,
+		LogPath:   filepath.Join(m.instancesDir, id+".log"),
+		CreatedAt: time.Now(),
+	}
+
+	// boot opens the console log and launches Firecracker, filling in the
+	// runtime fields. Any failure here rolls back the network attachment and
+	// rootfs clone this Create made (boot cleans up only the log it opened).
+	if err := m.boot(record); err != nil {
 		m.cleanupNetwork(networkName, tapName, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		return nil, err
 	}
 
-	// Deliberately not `ctx`: the SDK ties the Firecracker process's lifetime
-	// to whatever context it's launched with (exec.CommandContext under the
-	// hood). ctx here is request-scoped and dies the moment this HTTP call
-	// returns, which would kill the VM right after it finished booting. The
-	// VM's lifetime is the manager's, not any single API request's.
-	machine, err := firecracker.Launch(context.Background(), fcCfg)
-	if err != nil {
-		_ = logFile.Close()
-		m.cleanupNetwork(networkName, tapName, id)
-		_ = storage.DeleteClone(m.instancesDir, id)
-		return nil, fmt.Errorf("launching VM: %w", err)
-	}
-
-	pid, _ := machine.PID()
-
-	record := &types.VM{
-		Config: vmCfg,
-		State:  types.VMStateRunning,
-		PID:    pid,
-		// machine.Cfg.SocketPath (not fcCfg.SocketPath) because Jailer
-		// rewrites it to the absolute path inside the chroot once launched.
-		SocketPath: machine.Cfg.SocketPath,
-		LogPath:    logPath,
-		// Unlike SocketPath, the SDK does NOT rewrite VsockDevice.Path into
-		// the chroot for us — build the host-side path ourselves using the
-		// same convention jailer.WorkspaceRoot encodes.
-		VsockPath: filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath),
-		CreatedAt: time.Now(),
-	}
-
 	m.mu.Lock()
 	m.vms[id] = record
-	m.run[id] = &running{machine: machine, logFile: logFile}
 	m.mu.Unlock()
 
 	// Persist last, once the VM is fully up and tracked. A record we can't
@@ -246,6 +242,59 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	}
 
 	return record, nil
+}
+
+// boot opens the VM's console log and launches Firecracker+Jailer for the
+// already-populated record (rootfs cloned, network attached). On success it
+// fills in the runtime fields — PID, socket path, vsock path, running state —
+// and tracks the live handle in m.run. On failure it closes only the log file
+// it opened; rolling back the clone/network is the caller's job, since boot
+// can't know whether they should survive (Start reuses them, Create undoes
+// them). Shared by Create (first boot) and Start (boot from a stopped VM).
+func (m *Manager) boot(record *types.VM) error {
+	id := record.Config.ID
+
+	logFile, err := os.OpenFile(record.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening console log %s: %w", record.LogPath, err)
+	}
+
+	// stdout/stderr point at the VM's own log file, never at the daemon's
+	// terminal — see the comment on jailer.Build for why.
+	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, logFile, logFile)
+	fcCfg, err := firecracker.BuildConfig(record.Config, jcfg)
+	if err != nil {
+		_ = logFile.Close()
+		return err
+	}
+
+	// Deliberately not a request context: the SDK ties the Firecracker
+	// process's lifetime to whatever context it's launched with
+	// (exec.CommandContext under the hood). A request-scoped ctx dies the
+	// moment the HTTP call returns, which would kill the VM right after it
+	// booted. The VM's lifetime is the manager's, not any single request's.
+	machine, err := firecracker.Launch(context.Background(), fcCfg)
+	if err != nil {
+		_ = logFile.Close()
+		return fmt.Errorf("launching VM: %w", err)
+	}
+
+	pid, _ := machine.PID()
+	record.PID = pid
+	// machine.Cfg.SocketPath (not fcCfg.SocketPath) because Jailer rewrites it
+	// to the absolute path inside the chroot once launched.
+	record.SocketPath = machine.Cfg.SocketPath
+	// Unlike SocketPath, the SDK does NOT rewrite VsockDevice.Path into the
+	// chroot for us — build the host-side path ourselves using the same
+	// convention jailer.WorkspaceRoot encodes.
+	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
+	record.State = types.VMStateRunning
+
+	m.mu.Lock()
+	m.run[id] = &running{machine: machine, logFile: logFile}
+	m.mu.Unlock()
+
+	return nil
 }
 
 // Destroy stops the machine and releases every resource associated with it.
@@ -298,6 +347,103 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 		wrapErr("removing console log for vm %s", id, logErr),
 		wrapErr("removing vm record %s", id, storeErr),
 	)
+}
+
+// Stop powers a VM off but keeps it around. It halts the Firecracker process
+// (freeing its CPU/RAM) and releases the host-side TAP device and jail dir, but
+// deliberately preserves the rootfs clone (the disk, with everything the guest
+// wrote — e.g. a file it touched) and the VM's IP reservation. Start later
+// brings the same VM back at the same address, disk intact. This is the whole
+// difference from Destroy, which additionally erases the disk and frees the IP.
+func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
+	m.mu.Lock()
+	record, ok := m.vms[id]
+	r := m.run[id]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	if record.State == types.VMStateStopped {
+		return nil, fmt.Errorf("%w: vm %s is already stopped", ErrVMState, id)
+	}
+
+	var stopErr error
+	switch {
+	case r != nil && r.machine != nil:
+		// Normal path: we own a live SDK handle from this daemon's lifetime.
+		stopErr = firecracker.Stop(ctx, r.machine)
+	case record.PID > 0:
+		// Adopted VM (recovered after a restart): no SDK handle to drive a
+		// graceful shutdown — signal the process directly.
+		stopErr = stopByPID(record.PID)
+	}
+	if r != nil && r.logFile != nil {
+		_ = r.logFile.Close()
+	}
+
+	// Release only what a powered-off VM doesn't need: the TAP device and the
+	// jail dir. Removing the jail dir is safe for the data — the rootfs clone
+	// under instancesDir is a separate hardlink to the same inode, so the disk
+	// survives. Deliberately NOT DetachVM (that would release the IP) and NOT
+	// DeleteClone (that would erase the disk) — those belong to Destroy.
+	if record.Config.TapDevice != "" {
+		_ = network.DeleteTap(record.Config.TapDevice)
+	}
+	jailErr := jailer.RemoveInstanceDir(m.jailerCfg, id)
+
+	m.mu.Lock()
+	record.State = types.VMStateStopped
+	record.PID = 0 // no live process; also keeps Destroy from signalling a dead pid
+	record.SocketPath = ""
+	record.VsockPath = ""
+	m.run[id] = &running{} // drop the (now closed) SDK handle + log file
+	m.mu.Unlock()
+
+	storeErr := m.store.SaveVM(record)
+
+	return record, errors.Join(
+		wrapErr("stopping vm %s", id, stopErr),
+		wrapErr("removing jail dir for vm %s", id, jailErr),
+		wrapErr("persisting stopped vm %s", id, storeErr),
+	)
+}
+
+// Start boots a stopped VM back up. Stop kept its rootfs clone and IP
+// reservation, so it returns at the same address with the same disk; all Start
+// rebuilds is the TAP device (released at Stop) and the Firecracker process.
+// The network's bridge is still up — Stop never touched it.
+func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
+	m.mu.Lock()
+	record, ok := m.vms[id]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	if record.State != types.VMStateStopped {
+		return nil, fmt.Errorf("%w: vm %s is not stopped (state %s)", ErrVMState, id, record.State)
+	}
+
+	// Recreate the TAP and re-enslave it to its network's bridge. No AttachVM:
+	// the IP is still reserved from before, so we reuse record.Config.GuestIP.
+	if record.Config.TapDevice != "" {
+		if err := network.CreateTapEnslaved(record.Config.TapDevice, record.Config.Bridge); err != nil {
+			return nil, fmt.Errorf("recreating tap for vm %s: %w", id, err)
+		}
+	}
+
+	if err := m.boot(record); err != nil {
+		if record.Config.TapDevice != "" {
+			_ = network.DeleteTap(record.Config.TapDevice)
+		}
+		return nil, err
+	}
+
+	if err := m.store.SaveVM(record); err != nil {
+		_ = m.Destroy(context.Background(), id)
+		return nil, fmt.Errorf("persisting restarted vm %s: %w", id, err)
+	}
+
+	return record, nil
 }
 
 // wrapErr annotates err with a formatted context prefix, or returns nil if
@@ -355,6 +501,9 @@ func (m *Manager) Exec(id, cmd string) (string, int, error) {
 	m.mu.Unlock()
 	if !ok {
 		return "", 0, fmt.Errorf("vm %q not found", id)
+	}
+	if record.State != types.VMStateRunning {
+		return "", 0, fmt.Errorf("%w: vm %s is not running (state %s)", ErrVMState, id, record.State)
 	}
 
 	return vsock.Exec(record.VsockPath, cmd)

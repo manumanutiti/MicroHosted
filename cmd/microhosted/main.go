@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -23,15 +24,36 @@ func main() {
 
 	addr := flag.String("addr", ":8080", "dirección donde escucha la API HTTP")
 	catalogPath := flag.String("catalog", "images/catalog.json", "ruta al catálogo de plantillas (JSON)")
-	instancesDir := flag.String("instances-dir", "images/instances", "directorio donde se clonan los rootfs por VM")
+	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "store de discos (btrfs CoW): clones, goldens, kernels y chroot del Jailer. Fuera del repo a propósito: son datos de runtime de root, no fuentes")
 	dbPath := flag.String("db", "images/microhosted.db", "ruta a la base de datos SQLite de estado")
-	chrootBase := flag.String("chroot-base", def.ChrootBaseDir, "directorio base de chroot de Jailer")
+	chrootBase := flag.String("chroot-base", "", "directorio base de chroot de Jailer (por defecto <instances-dir>/jailer)")
 	jailerBinary := flag.String("jailer-binary", def.JailerBinary, "ruta al binario jailer")
 	execFile := flag.String("exec-file", def.ExecFile, "ruta al binario firecracker")
 	uid := flag.Int("jailer-uid", def.UID, "uid con el que Jailer ejecuta firecracker")
 	gid := flag.Int("jailer-gid", def.GID, "gid con el que Jailer ejecuta firecracker")
 	cgroupVersion := flag.String("cgroup-version", def.CgroupVersion, "versión de cgroup que usa Jailer (autodetectada; solo forzarla si hace falta)")
 	flag.Parse()
+
+	// El chroot del Jailer DEBE vivir en el mismo filesystem que los clones de
+	// rootfs: Jailer hardlinka el rootfs (y el kernel) dentro del chroot, y un
+	// hardlink no cruza dispositivos (EXDEV). Con el store CoW los clones están
+	// en un btrfs aparte, así que el chroot deriva por defecto de --instances-dir
+	// (queda como <instances-dir>/jailer, mismo FS) en vez del histórico
+	// /srv/jailer, que estaría en otro filesystem y rompería el arranque. El
+	// kernel del catálogo debe estar en ese mismo FS por la misma razón (ver
+	// scripts/setup-host.sh, que lo deja en <instances-dir>/kernels).
+	// Resolvemos a rutas absolutas para que los hardlinks no dependan del cwd.
+	absInstances, err := filepath.Abs(*instancesDir)
+	if err != nil {
+		log.Fatalf("resolviendo instances-dir %s: %v", *instancesDir, err)
+	}
+	*instancesDir = absInstances
+	if *chrootBase == "" {
+		*chrootBase = filepath.Join(absInstances, "jailer")
+	}
+	if err := os.MkdirAll(*chrootBase, 0o755); err != nil {
+		log.Fatalf("creando chroot base %s: %v", *chrootBase, err)
+	}
 
 	catalog, err := storage.LoadCatalog(*catalogPath)
 	if err != nil {
@@ -59,6 +81,20 @@ func main() {
 	netmgr := network.NewManager(st)
 	if err := netmgr.Reconcile(); err != nil {
 		log.Fatalf("reconciliando redes: %v", err)
+	}
+
+	// Warn loudly, once, if the instances store can't do copy-on-write clones.
+	// On such a filesystem (plain ext4) every VM is a FULL copy of its rootfs,
+	// so a handful of 1GB VMs fills the disk fast — provision a CoW store with
+	// scripts/setup-host.sh. Just a warning, not fatal: full-copy clones still
+	// work, they just don't scale.
+	if err := os.MkdirAll(*instancesDir, 0o755); err != nil {
+		log.Fatalf("creando directorio de instancias %s: %v", *instancesDir, err)
+	}
+	if !storage.SupportsReflink(*instancesDir) {
+		log.Printf("AVISO: el store de instancias %s NO soporta copy-on-write (reflink): "+
+			"cada VM será una COPIA COMPLETA de su rootfs y el disco se llenará rápido. "+
+			"Provisiona un store CoW con scripts/setup-host.sh.", *instancesDir)
 	}
 
 	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)

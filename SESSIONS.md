@@ -199,13 +199,134 @@ para agentes de IA** — y dos decisiones de arquitectura fijadas con el usuario
   forma independiente (un fallo no frena a las demás) y devuelve
   `(deleted []string, failed map[string]error)`. Respuesta siempre 200
   (`BulkDeleteResponse{deleted, failed}`) — no es todo-o-nada.
-- **Fase 2 — Volúmenes**: `Volume` + CRUD, attach como drive extra; muestra RO +
-  salida writable para artefactos.
+- **Fase 2 — Almacenamiento (EN CURSO)**: tamaño de disco configurable + store
+  copy-on-write (hecho y validado, ver bloque abajo); volúmenes extra (`Volume`
+  + CRUD, muestra RO + salida writable para artefactos) pendientes.
 - **Fase 3 — Completar CRUD**: Update (inyectar archivo/playbook) + Read estilo
   `docker ps`.
 - **Fase 4 — Endurecimiento + prueba de resistencia**.
 
 `docs/api.md` se mantiene al día según se añaden/cambian endpoints.
+
+---
+
+## Fase 2 (parte 1) — Tamaño de disco + store copy-on-write (2026-07-02, validada en hardware)
+
+Disparador real: dentro de una microVM, `apt update`/`install` fallaba con
+`No space left on device` y dejaba `/var/lib/dpkg/status` corrupto. Causa: el
+rootfs dorado es un ext4 de tamaño fijo casi lleno, y el clon lo copiaba tal
+cual — cada VM nacía sin espacio libre.
+
+**Tamaño de disco configurable.** Nuevo campo `disk_mb` en `types.Template`,
+`CreateVMRequest` y `VMConfig`. `storage.CloneRootfs` recibe `diskMB` y, tras
+clonar, agranda el clon con `truncate` + `e2fsck -fy` + `resize2fs` (offline,
+sin nada dentro del guest: los goldens son ext4 sobre el dispositivo entero, sin
+tabla de particiones, así que un resize offline basta). Solo crece, nunca encoge.
+`base-ubuntu` → `disk_mb: 1024`. Tests: `TestCloneRootfsGrows` (mkfs.ext4 real →
+grow → asserta tamaño) + `TestCloneRootfsNeverShrinks`.
+
+**Store copy-on-write, agnóstico al host.** El host es ext4 **sin reflink**
+(comprobado), así que `cp --reflink=auto` caía a copia completa: cada VM = copia
+entera del rootfs → con imágenes de 1GB el disco se llena en un instante. Arreglo
+en `scripts/setup-host.sh`: si el directorio de instancias no está ya sobre un FS
+con reflink, provisiona un **loopback btrfs** (fichero sparse + `mkfs.btrfs` +
+mount + fstab; btrfs va en el kernel de cualquier Ubuntu, sin reparticionar).
+Guardrail en el daemon: `storage.SupportsReflink` sondea reflink real al arrancar
+y suelta un AVISO visible si el store no es CoW (nunca duplicar en silencio).
+
+**Bug #6 — reflink no cruza filesystems.** Con el store btrfs montado, los clones
+seguían costando 300MB completos. Los goldens vivían en `images/rootfs` (ext4 del
+host) y los clones en `images/instances` (btrfs): `cp --reflink` entre FS
+distintos = copia completa. Arreglo: los goldens viven en el MISMO btrfs, en
+`images/instances/rootfs/`; el catálogo apunta ahí. Verificado con
+`btrfs filesystem du -s`: clon reflink = **0 B Exclusive** / 300MiB shared; clon
+completo de plataforma (reflink + grow 1GB + resize2fs) = **236 KiB Exclusive**.
+Cada VM cuesta sus deltas, no 1GB. (Nota: el `df` de btrfs NO sirve para medir
+CoW — salta por asignación de chunks de metadata; usar `btrfs fi du`.)
+
+**Bug #7 — hardlink no cruza filesystems (`invalid cross-device link`).** El
+primer create tras el cambio falló al arrancar: `NaiveChrootStrategy` del SDK
+**hardlinka rootfs Y kernel** dentro del chroot, y el chroot (`/srv/jailer`) +
+el kernel (`images/kernels`) estaban en el ext4 del host mientras el clon estaba
+en el btrfs → EXDEV. No es solo eficiencia: Stop/Start depende de que clon y
+rootfs del chroot sean el MISMO inodo (hardlink). Arreglo — todo lo que Jailer
+hardlinka/clona comparte el FS del store: (a) `cmd/microhosted/main.go` **deriva
+`--chroot-base` de `--instances-dir`** por defecto (`<instances>/jailer`, mismo
+FS) en vez del histórico `/srv/jailer`, resuelve a ruta absoluta y crea el dir;
+(b) kernel movido a `images/instances/kernels/` y catálogo repuntado; (c) golden
+ya en `images/instances/rootfs/`; (d) `setup-host.sh` crea
+`<instances>/{rootfs,kernels,jailer}` en el store con la nota del invariante
+"hardlink/reflink = mismo FS". Layout final del store (un solo btrfs):
+`images/instances/{rootfs/, kernels/, jailer/, <id>.ext4}`. Ver `docs/layers.md`
+(L3) y `docs/architecture.md`.
+
+**VALIDADO en hardware**: tras `make install-service`, crear una VM `base-ubuntu`
+en una red con egress arranca, tiene espacio (`apt install` funciona) y el clon
+es CoW. El usuario confirmó "todo funciona".
+
+Esto fue un cambio **estructural**, no un parche: se cazaron dos invariantes
+latentes (reflink y hardlink exigen mismo FS) que habrían roto en CUALQUIER host
+donde el store del disco no coincidiera con el FS de jailer/kernel, y se
+**codificaron** (el chroot deriva del store; el daemon avisa si no hay CoW). Más
+correcto y más resistente a mala configuración; falta probar la robustez en
+operación (soak test con muchas VMs + reinicios).
+
+**Bug #8 — store dentro del repo rompía el tooling.** El store estaba montado en
+`images/instances` (dentro del repo), así que los jail dirs de Jailer (propiedad
+de root) vivían en el árbol de fuentes: `go build ./...` fallaba con
+`permission denied` mientras hubiera una VM viva (Go recorre el chroot de root).
+Smell real: datos de runtime no van en el código. Arreglo: el store se movió a
+**`/var/lib/microhosted/store`** (absoluto, fuera del repo; el fichero btrfs ya
+estaba en `/var/lib/microhosted/instances.btrfs`, solo mal montado). Cambios:
+default de `--instances-dir` + unit + catálogo (`rootfs_path`/`kernel_path`
+absolutos) → nuevo path; `setup-host.sh` con bloque de **migración** (`losetup -j`
++ `findmnt` detectan el btrfs montado en otro sitio, lo desmontan, limpian fstab
+y remontan — sin copiar datos, es el mismo subvolumen). Gotcha operativo al
+migrar: `KillMode=process` hace que las VMs sobrevivan al stop del servicio, así
+que el `umount` da "target is busy" hasta matar los `firecracker` huérfanos
+(`sudo pkill -9 -f '/firecracker --id'`). Validado: tras migrar, `go build ./...`
+limpio y crear VM funciona.
+
+**Estado: Fase 2 parte 1 CERRADA y validada en hardware.** El usuario confirmó
+"ahora funciona todo". Siguiente: soak test (robustez en operación) o volúmenes
+extra (Fase 2 parte 2). Ver `docs/layers.md` para el mapa completo por capas.
+
+---
+
+## Matices de la idea de producto (2026-07-02)
+
+Afinado con el usuario tras cerrar el store CoW (detalle en `PROJECT.md` →
+"Dirección refinada"). El encuadre pasa de "dos casos de uso" a un
+**posicionamiento**: **plataforma de sandboxing de seguridad autohosted**, con un
+**motor neutral** (ciclo de vida + aislamiento + snapshots) y una **librería
+curada de imágenes desechables** para distintos usos defensivos (detonación de
+malware, honeypots, bancos DFIR, rangos blue-team, y — segundo acto, mismo motor
+— sandbox de agentes IA).
+
+- **El foso es la soberanía del dato.** El autohosted es lo que los sandboxes
+  cloud (ANY.RUN, Joe, e2b) no pueden igualar por estructura: no mandas la
+  muestra/el dato a un tercero. Para banca/defensa/sanidad/air-gap eso es un "no"
+  rotundo, no una preferencia.
+- **Incumbente a desplazar: CAPEv2/Cuckoo** (el sandbox de malware self-hosted
+  clásico, QEMU pesado y doloroso de operar). Ángulo: el sucesor moderno en
+  microVMs Firecracker, API-first, que sí se instala.
+- **Disciplina clave: motor general, primer workflow afilado.** "Biblioteca para
+  distintos usos" es la promesa/superficie, no el lanzamiento. Se lanza con UN
+  workflow hondo (detonación: muestra → VM aislada sin egress → corre → captura
+  artefactos → reset a limpio), no con la biblioteca entera. Amplitud = promesa;
+  profundidad-de-uno = prueba.
+- **Consecuencias de roadmap**: el sistema de imágenes/catálogo sube a activo de
+  primera clase (templates versionadas, manifests, builds reproducibles,
+  imágenes firmadas) — conecta con las imágenes ultra-optimizadas (Alpine/Rocky)
+  pendientes. **Snapshots** siguen siendo lo más estratégico (reset-a-limpio,
+  bifurcar en el punto de infección) — más que el multi-host/HA. El **modelo de
+  amenaza escrito + tests adversariales** deja de ser opcional: en defensivo,
+  "aquí está el modelo de amenaza y los tests que lo verifican" ES el argumento
+  de venta.
+- **Orden**: control plane / colas / HA / multi-host son etapas posteriores, y
+  su orden lo dicta un usuario/caso que tira, no una checklist genérica de
+  escalar. Primero: soak test (robustez en operación) → snapshots → workflow
+  vertical de detonación.
 
 ---
 
