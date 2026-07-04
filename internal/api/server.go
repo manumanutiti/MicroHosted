@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 
@@ -159,6 +160,111 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
 	})
 
+	// Snapshot: freeze a running VM's memory+disk as a restorable point in
+	// time (the VM is paused sub-second and resumed). The snapshot is an
+	// independent entity — it survives its source VM being destroyed.
+	// Verb-style route (like stop/start/fork/restore/exec): the created
+	// resource lives at /v1/snapshots/{id}, this is the action that makes it.
+	mux.HandleFunc("POST /v1/vms/{id}/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		var req types.CreateSnapshotRequest
+		// Body is optional (name only) — an empty body is a valid request.
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		snap, err := mgr.Snapshot(r.Context(), r.PathValue("id"), req.Name)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, types.NewSnapshotResponse(snap))
+	})
+
+	mux.HandleFunc("GET /v1/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		snaps := mgr.Snapshots()
+		resp := make([]types.SnapshotResponse, 0, len(snaps))
+		for _, s := range snaps {
+			resp = append(resp, types.NewSnapshotResponse(s))
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("GET /v1/snapshots/{id}", func(w http.ResponseWriter, r *http.Request) {
+		snap, ok := mgr.GetSnapshot(r.PathValue("id"))
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("snapshot %q not found", r.PathValue("id")))
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewSnapshotResponse(snap))
+	})
+
+	mux.HandleFunc("DELETE /v1/snapshots/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := mgr.DeleteSnapshot(r.PathValue("id")); err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Fork: create a NEW VM from a snapshot — the guest resumes mid-execution
+	// where the snapshot froze it. Default mode rejoins the origin network at
+	// the snapshot's IP (409 if taken); quarantine=true gives the fork a TAP
+	// connected to nothing (vsock-only access, N simultaneous forks allowed).
+	// Same verb, body and response as POST /v1/vms/{id}/fork below — the only
+	// difference is what you fork from.
+	mux.HandleFunc("POST /v1/snapshots/{id}/fork", func(w http.ResponseWriter, r *http.Request) {
+		var req types.ForkVMRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		record, err := mgr.Fork(r.Context(), r.PathValue("id"), req.Quarantine)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, types.NewVMResponse(record))
+	})
+
+	// Direct fork: clone a RUNNING VM in one call, no user-managed snapshot —
+	// the manager takes an ephemeral snapshot, forks from it and deletes it.
+	// Same body and network semantics as forking a snapshot; since the source
+	// VM stays alive holding its IP, quarantine=true is the usual mode here.
+	mux.HandleFunc("POST /v1/vms/{id}/fork", func(w http.ResponseWriter, r *http.Request) {
+		var req types.ForkVMRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		record, err := mgr.ForkVM(r.Context(), r.PathValue("id"), req.Quarantine)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, types.NewVMResponse(record))
+	})
+
+	// Restore: rewind THIS VM, in place, to one of its own snapshots — same
+	// ID, IP and TAP, only memory+disk are rewound. The reset-to-clean
+	// primitive between samples.
+	mux.HandleFunc("POST /v1/vms/{id}/restore", func(w http.ResponseWriter, r *http.Request) {
+		var req types.RestoreVMRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Snapshot == "" {
+			writeError(w, http.StatusBadRequest, errors.New("snapshot is required"))
+			return
+		}
+		record, err := mgr.Restore(r.Context(), r.PathValue("id"), req.Snapshot)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+	})
+
 	mux.HandleFunc("POST /v1/vms/{id}/exec", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ExecRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -199,13 +305,15 @@ func writeError(w http.ResponseWriter, status int, err error) {
 }
 
 // writeVMOpError maps a vm.Manager lifecycle error to an HTTP status: an
-// unknown VM is 404, an operation invalid for the VM's current state (stop on
-// a stopped VM, start on a running one) is 409 Conflict, anything else is 500.
+// unknown VM or snapshot is 404, an operation invalid for the VM's current
+// state (stop on a stopped VM, start on a running one) or colliding with
+// current resources (forking onto a taken address) is 409 Conflict, anything
+// else is 500.
 func writeVMOpError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, vm.ErrVMNotFound):
+	case errors.Is(err, vm.ErrVMNotFound), errors.Is(err, vm.ErrSnapshotNotFound):
 		writeError(w, http.StatusNotFound, err)
-	case errors.Is(err, vm.ErrVMState):
+	case errors.Is(err, vm.ErrVMState), errors.Is(err, vm.ErrConflict):
 		writeError(w, http.StatusConflict, err)
 	default:
 		writeError(w, http.StatusInternalServerError, err)

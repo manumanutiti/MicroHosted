@@ -45,6 +45,10 @@ func Open(path string) (*Store, error) {
 			name TEXT NOT NULL UNIQUE,
 			data TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			id   TEXT PRIMARY KEY,
+			data TEXT NOT NULL
+		)`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
@@ -109,6 +113,55 @@ func (s *Store) ListVMs() ([]*types.VM, error) {
 		vms = append(vms, &vm)
 	}
 	return vms, rows.Err()
+}
+
+// SaveSnapshot upserts a snapshot record.
+func (s *Store) SaveSnapshot(snap *types.Snapshot) error {
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("marshaling snapshot %s: %w", snap.ID, err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO snapshots (id, data) VALUES (?, ?)
+		 ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
+		snap.ID, string(data),
+	); err != nil {
+		return fmt.Errorf("saving snapshot %s: %w", snap.ID, err)
+	}
+	return nil
+}
+
+// DeleteSnapshot removes a snapshot record. Idempotent.
+func (s *Store) DeleteSnapshot(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM snapshots WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting snapshot %s: %w", id, err)
+	}
+	return nil
+}
+
+// ListSnapshots returns every persisted snapshot record, loaded once at
+// startup — snapshots are inert files plus this row, so unlike VMs there is
+// no liveness to reconcile against.
+func (s *Store) ListSnapshots() ([]*types.Snapshot, error) {
+	rows, err := s.db.Query(`SELECT data FROM snapshots`)
+	if err != nil {
+		return nil, fmt.Errorf("querying snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var snaps []*types.Snapshot
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scanning snapshot row: %w", err)
+		}
+		var snap types.Snapshot
+		if err := json.Unmarshal([]byte(data), &snap); err != nil {
+			return nil, fmt.Errorf("unmarshaling snapshot row: %w", err)
+		}
+		snaps = append(snaps, &snap)
+	}
+	return snaps, rows.Err()
 }
 
 // SaveNetwork upserts a network record. The UNIQUE constraint on name means a

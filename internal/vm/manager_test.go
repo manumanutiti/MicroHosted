@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -69,5 +71,90 @@ func TestReconcileSweepsDeadRunningVM(t *testing.T) {
 
 	if _, ok := m.Get("cafebabe"); ok {
 		t.Fatal("dead running VM was kept; it must be swept")
+	}
+}
+
+// Guards the error contract of the snapshot/fork/restore surface — the paths
+// that don't need a live Firecracker to be exercised.
+func TestSnapshotErrorPaths(t *testing.T) {
+	m := newTestManager(t)
+
+	if _, err := m.Snapshot(context.Background(), "nope", ""); !errors.Is(err, ErrVMNotFound) {
+		t.Errorf("Snapshot of unknown vm: err = %v, want ErrVMNotFound", err)
+	}
+
+	// A stopped VM has no live Firecracker process to pause and snapshot.
+	stopped := &types.VM{
+		Config: types.VMConfig{ID: "deadbeef"},
+		State:  types.VMStateStopped,
+	}
+	m.Reconcile([]*types.VM{stopped})
+	if _, err := m.Snapshot(context.Background(), "deadbeef", ""); !errors.Is(err, ErrVMState) {
+		t.Errorf("Snapshot of stopped vm: err = %v, want ErrVMState", err)
+	}
+}
+
+// Direct fork rides on Snapshot, so it inherits its preconditions: the source
+// VM must exist and be running (there's no memory to freeze otherwise).
+func TestForkVMErrorPaths(t *testing.T) {
+	m := newTestManager(t)
+
+	if _, err := m.ForkVM(context.Background(), "nope", true); !errors.Is(err, ErrVMNotFound) {
+		t.Errorf("ForkVM of unknown vm: err = %v, want ErrVMNotFound", err)
+	}
+
+	stopped := &types.VM{
+		Config: types.VMConfig{ID: "deadbeef"},
+		State:  types.VMStateStopped,
+	}
+	m.Reconcile([]*types.VM{stopped})
+	if _, err := m.ForkVM(context.Background(), "deadbeef", true); !errors.Is(err, ErrVMState) {
+		t.Errorf("ForkVM of stopped vm: err = %v, want ErrVMState", err)
+	}
+}
+
+func TestForkUnknownSnapshot(t *testing.T) {
+	m := newTestManager(t)
+	if _, err := m.Fork(context.Background(), "nope", false); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Errorf("Fork of unknown snapshot: err = %v, want ErrSnapshotNotFound", err)
+	}
+}
+
+// In-place restore is restricted to the VM's own snapshots: the guest identity
+// (IP, MAC, drive name) frozen in another VM's snapshot would silently replace
+// this VM's. That cross-VM operation is Fork, and Restore must refuse it.
+func TestRestoreRejectsForeignSnapshot(t *testing.T) {
+	m := newTestManager(t)
+
+	vm := &types.VM{Config: types.VMConfig{ID: "deadbeef"}, State: types.VMStateStopped}
+	m.Reconcile([]*types.VM{vm})
+
+	snapDir := t.TempDir() // exists, so LoadSnapshots keeps it
+	m.LoadSnapshots([]*types.Snapshot{{ID: "snap1234", SourceVMID: "otro-vm1", Dir: snapDir}})
+
+	if _, err := m.Restore(context.Background(), "deadbeef", "snap1234"); !errors.Is(err, ErrConflict) {
+		t.Errorf("Restore with foreign snapshot: err = %v, want ErrConflict", err)
+	}
+	if _, err := m.Restore(context.Background(), "deadbeef", "nope"); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Errorf("Restore with unknown snapshot: err = %v, want ErrSnapshotNotFound", err)
+	}
+}
+
+// A snapshot whose directory was removed out-of-band can only produce failing
+// restores — LoadSnapshots must drop it (and its record) instead of indexing it.
+func TestLoadSnapshotsDropsMissingDir(t *testing.T) {
+	m := newTestManager(t)
+
+	alive := t.TempDir()
+	m.LoadSnapshots([]*types.Snapshot{
+		{ID: "kept1234", SourceVMID: "a", Dir: alive},
+		{ID: "gone1234", SourceVMID: "a", Dir: filepath.Join(alive, "does-not-exist")},
+	})
+
+	if _, ok := m.GetSnapshot("kept1234"); !ok {
+		t.Error("snapshot with existing dir was dropped")
+	}
+	if _, ok := m.GetSnapshot("gone1234"); ok {
+		t.Error("snapshot with missing dir was kept")
 	}
 }

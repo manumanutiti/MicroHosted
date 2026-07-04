@@ -24,12 +24,16 @@ import (
 	"microhosted/pkg/types"
 )
 
-// Lifecycle errors the API layer maps to HTTP status codes: ErrVMNotFound → 404,
-// ErrVMState → 409 (an operation invalid for the VM's current state, e.g. Stop
-// on a stopped VM or Start on a running one).
+// Lifecycle errors the API layer maps to HTTP status codes: ErrVMNotFound /
+// ErrSnapshotNotFound → 404, ErrVMState → 409 (an operation invalid for the
+// VM's current state, e.g. Stop on a stopped VM or Start on a running one),
+// ErrConflict → 409 (the operation is valid but collides with current
+// resources, e.g. forking onto a network where the snapshot's IP is taken).
 var (
-	ErrVMNotFound = errors.New("vm not found")
-	ErrVMState    = errors.New("vm in incompatible state")
+	ErrVMNotFound       = errors.New("vm not found")
+	ErrVMState          = errors.New("vm in incompatible state")
+	ErrSnapshotNotFound = errors.New("snapshot not found")
+	ErrConflict         = errors.New("conflicting resources")
 )
 
 // running couples a live Machine with the log file its console/Jailer
@@ -54,10 +58,16 @@ type Manager struct {
 	netmgr       *network.Manager
 	instancesDir string
 	store        *store.Store
+	// netOverridesOK: the host's firecracker binary accepts network_overrides
+	// in snapshot load (>= 1.12). Without it a snapshot can only be restored
+	// onto a TAP with the exact name recorded in its vmstate, which constrains
+	// what Fork can do (see there). Probed once at construction.
+	netOverridesOK bool
 
-	mu  sync.Mutex
-	vms map[string]*types.VM
-	run map[string]*running
+	mu    sync.Mutex
+	vms   map[string]*types.VM
+	run   map[string]*running
+	snaps map[string]*types.Snapshot
 }
 
 // NewManager wires a Manager to its template catalog, jailer defaults, the
@@ -66,13 +76,32 @@ type Manager struct {
 // across daemon restarts.
 func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDir string, st *store.Store, netmgr *network.Manager) *Manager {
 	return &Manager{
-		catalog:      catalog,
-		jailerCfg:    jailerCfg,
-		netmgr:       netmgr,
-		instancesDir: instancesDir,
-		store:        st,
-		vms:          make(map[string]*types.VM),
-		run:          make(map[string]*running),
+		catalog:        catalog,
+		jailerCfg:      jailerCfg,
+		netmgr:         netmgr,
+		instancesDir:   instancesDir,
+		store:          st,
+		netOverridesOK: firecracker.SupportsNetworkOverrides(jailerCfg.ExecFile),
+		vms:            make(map[string]*types.VM),
+		run:            make(map[string]*running),
+		snaps:          make(map[string]*types.Snapshot),
+	}
+}
+
+// LoadSnapshots seeds the manager's snapshot index from persisted records at
+// startup. Unlike VMs there's no liveness to reconcile — a snapshot is inert
+// files plus this record — but one whose directory vanished (operator deleted
+// it by hand) is dropped rather than offered for restores that can only fail.
+func (m *Manager) LoadSnapshots(records []*types.Snapshot) {
+	for _, snap := range records {
+		if _, err := os.Stat(snap.Dir); err != nil {
+			log.Printf("reconcile: dropping snapshot %s: dir %s missing", snap.ID, snap.Dir)
+			_ = m.store.DeleteSnapshot(snap.ID)
+			continue
+		}
+		m.mu.Lock()
+		m.snaps[snap.ID] = snap
+		m.mu.Unlock()
 	}
 }
 
@@ -105,7 +134,9 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 			m.vms[id] = rec
 			m.run[id] = &running{}
 			m.mu.Unlock()
-			if rec.Config.GuestIP != "" {
+			// Quarantined forks hold no reservation: their GuestIP is only
+			// what the restored guest believes it has, not an IPAM lease.
+			if rec.Config.GuestIP != "" && rec.Config.NetworkName != "" {
 				m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
 			}
 			log.Printf("reconcile: kept stopped vm %s", id)
@@ -120,7 +151,11 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 
 			if tap := rec.Config.TapDevice; tap != "" {
 				keepTaps[tap] = true
-				m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+				// See the stopped branch: a quarantined fork's TAP is live and
+				// must be kept, but there is no network to re-reserve on.
+				if rec.Config.NetworkName != "" {
+					m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+				}
 			}
 			log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
 			continue
@@ -223,8 +258,12 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	// boot opens the console log and launches Firecracker, filling in the
 	// runtime fields. Any failure here rolls back the network attachment and
 	// rootfs clone this Create made (boot cleans up only the log it opened).
+	// The jail dir too: the SDK stops the VMM on a failed start but never
+	// removes Jailer's directory, and a leftover would break a retried launch
+	// under the same ID and leak disk otherwise.
 	if err := m.boot(record); err != nil {
 		m.cleanupNetwork(networkName, tapName, id)
+		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		return nil, err
 	}
@@ -425,8 +464,11 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 
 	// Recreate the TAP and re-enslave it to its network's bridge. No AttachVM:
 	// the IP is still reserved from before, so we reuse record.Config.GuestIP.
+	// A quarantined fork gets its bridge-less TAP back instead — starting it
+	// cold must not quietly connect it to a network its whole point is to be
+	// off of.
 	if record.Config.TapDevice != "" {
-		if err := network.CreateTapEnslaved(record.Config.TapDevice, record.Config.Bridge); err != nil {
+		if err := recreateTap(record.Config); err != nil {
 			return nil, fmt.Errorf("recreating tap for vm %s: %w", id, err)
 		}
 	}
@@ -444,6 +486,479 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	}
 
 	return record, nil
+}
+
+// recreateTap rebuilds a VM's TAP device according to its config: enslaved to
+// its network's bridge, or deliberately bridge-less for a quarantined fork.
+func recreateTap(cfg types.VMConfig) error {
+	if cfg.Quarantine {
+		return network.CreateTapQuarantined(cfg.TapDevice)
+	}
+	return network.CreateTapEnslaved(cfg.TapDevice, cfg.Bridge)
+}
+
+// Snapshot captures a running VM's full state — guest memory, device state,
+// and a copy-on-write clone of its disk — as a restorable point in time. The
+// VM is paused for the duration (memory and disk must be captured at the same
+// instant to be mutually consistent) and resumed before returning; the pause
+// is not a state transition the API surfaces, just a sub-second freeze.
+//
+// Works on adopted VMs too (no SDK handle after a daemon restart): all three
+// steps speak to Firecracker's API socket directly.
+func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snapshot, error) {
+	m.mu.Lock()
+	record, ok := m.vms[vmID]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, vmID)
+	}
+	if record.State != types.VMStateRunning {
+		return nil, fmt.Errorf("%w: vm %s is not running (state %s)", ErrVMState, vmID, record.State)
+	}
+
+	sid := uuid.NewString()[:8]
+	dir, err := storage.CreateSnapshotDir(m.instancesDir, sid)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(step string, err error) (*types.Snapshot, error) {
+		_ = storage.DeleteSnapshotDir(m.instancesDir, sid)
+		return nil, fmt.Errorf("%s for vm %s: %w", step, vmID, err)
+	}
+
+	socket := record.SocketPath
+	if err := firecracker.PauseVM(ctx, socket); err != nil {
+		return fail("pausing vm", err)
+	}
+	// From here on the VM must be resumed no matter what fails — a VM left
+	// frozen because its snapshot failed would be strictly worse than no
+	// snapshot. Background context: the resume must happen even if the
+	// request's ctx is already dead.
+	paused := true
+	defer func() {
+		if paused {
+			if err := firecracker.ResumeVM(context.Background(), socket); err != nil {
+				log.Printf("snapshot: resuming vm %s after failure: %v", vmID, err)
+			}
+		}
+	}()
+
+	// Chroot-relative paths: Firecracker writes these inside its jail, and the
+	// daemon then moves them (same-FS rename, free) into the snapshot dir.
+	stateBase := "snap_" + sid + ".vmstate"
+	memBase := "snap_" + sid + ".mem"
+	if err := firecracker.SnapshotCreate(ctx, socket, "/"+stateBase, "/"+memBase); err != nil {
+		return fail("creating snapshot", err)
+	}
+
+	ws := jailer.WorkspaceRoot(m.jailerCfg, vmID)
+	if err := os.Rename(filepath.Join(ws, stateBase), filepath.Join(dir, storage.SnapshotStateFile)); err != nil {
+		return fail("collecting vmstate", err)
+	}
+	if err := os.Rename(filepath.Join(ws, memBase), filepath.Join(dir, storage.SnapshotMemFile)); err != nil {
+		return fail("collecting memory file", err)
+	}
+
+	// Disk capture happens while still paused, so it matches the memory image
+	// exactly. Reflink: instant and shares blocks, no matter the disk size.
+	if err := storage.ReflinkFile(record.Config.Rootfs, filepath.Join(dir, storage.SnapshotDiskFile)); err != nil {
+		return fail("capturing disk", err)
+	}
+
+	paused = false
+	if err := firecracker.ResumeVM(ctx, socket); err != nil {
+		// The snapshot itself is complete and usable; what failed is bringing
+		// the SOURCE back. Keep the snapshot, surface the resume failure.
+		return nil, fmt.Errorf("snapshot %s created, but resuming vm %s failed: %w", sid, vmID, err)
+	}
+
+	snap := &types.Snapshot{
+		ID:           sid,
+		Name:         name,
+		SourceVMID:   vmID,
+		TemplateName: record.Config.TemplateName,
+		VCPUs:        record.Config.VCPUs,
+		MemMB:        record.Config.MemMB,
+		DiskMB:       record.Config.DiskMB,
+		NetworkName:  record.Config.NetworkName,
+		GuestIP:      record.Config.GuestIP,
+		GatewayIP:    record.Config.GatewayIP,
+		PrefixLen:    record.Config.PrefixLen,
+		HadNetwork:   record.Config.TapDevice != "",
+		TapDevice:    record.Config.TapDevice,
+		DriveBase:    filepath.Base(record.Config.Rootfs),
+		Dir:          dir,
+		CreatedAt:    time.Now(),
+	}
+
+	if err := m.store.SaveSnapshot(snap); err != nil {
+		_ = storage.DeleteSnapshotDir(m.instancesDir, sid)
+		return nil, fmt.Errorf("persisting snapshot %s: %w", sid, err)
+	}
+	m.mu.Lock()
+	m.snaps[sid] = snap
+	m.mu.Unlock()
+
+	return snap, nil
+}
+
+// Fork creates a brand-new VM from a snapshot: fresh ID, its own CoW disk
+// stamped from the snapshot's, and the snapshot's memory restored — the guest
+// resumes mid-execution exactly where the snapshot froze it.
+//
+// The guest's network identity (IP, MAC) is baked into that memory and cannot
+// be changed at restore time, which forces the two modes:
+//
+//   - default: the fork rejoins the snapshot's origin network at the
+//     snapshot's IP — valid only while that address is free (origin VM
+//     destroyed, or never on that network since). This is "reset to clean /
+//     resume from a known state as a real VM".
+//   - quarantine: the fork's TAP is enslaved to nothing; the guest wakes up
+//     believing it's networked while every packet dies on the host. Reachable
+//     via vsock exec only. Any number of quarantined forks of one snapshot
+//     can run simultaneously.
+func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*types.VM, error) {
+	m.mu.Lock()
+	snap, ok := m.snaps[snapID]
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, snapID)
+	}
+
+	id := uuid.NewString()[:8]
+
+	rootfs, err := storage.CloneFromSnapshot(snap.Dir, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Kernel is irrelevant to the restore itself (the guest's kernel lives in
+	// the snapshotted memory) but is recorded so a later Stop+Start — a cold
+	// boot of the fork's disk — still knows what to boot. A template deleted
+	// from the catalog since the snapshot just leaves it blank.
+	var kernel string
+	if m.catalog != nil {
+		if tpl, err := m.catalog.Get(snap.TemplateName); err == nil {
+			kernel = tpl.KernelPath
+		}
+	}
+
+	vmCfg := types.VMConfig{
+		ID:           id,
+		TemplateName: snap.TemplateName,
+		Kernel:       kernel,
+		Rootfs:       rootfs,
+		VCPUs:        snap.VCPUs,
+		MemMB:        snap.MemMB,
+		DiskMB:       snap.DiskMB,
+		RestoredFrom: snapID,
+	}
+
+	if snap.HadNetwork {
+		// TAP naming is constrained by the host's Firecracker: before 1.12
+		// there is no network_overrides, so a snapshot can ONLY be restored
+		// onto a TAP named exactly what its vmstate recorded. On such hosts
+		// the fork takes the original name if it's free (origin destroyed or
+		// stopped) and refuses otherwise — the honest limit, with the upgrade
+		// path spelled out. On >= 1.12 every fork gets its own name and the
+		// restore handler emits the override.
+		tap := "tap" + id
+		if !m.netOverridesOK {
+			snapTap := snapshotTapName(snap)
+			if network.TapExists(snapTap) {
+				_ = storage.DeleteClone(m.instancesDir, id)
+				return nil, fmt.Errorf("%w: this host's firecracker predates network_overrides (needs >= 1.12), so the fork must reuse the snapshot's TAP %q, which is in use — destroy/stop the VM holding it, or upgrade firecracker (scripts/install-fc.sh) for simultaneous forks", ErrConflict, snapTap)
+			}
+			tap = snapTap
+		}
+		if quarantine {
+			if err := network.CreateTapQuarantined(tap); err != nil {
+				_ = storage.DeleteClone(m.instancesDir, id)
+				return nil, fmt.Errorf("creating quarantined tap: %w", err)
+			}
+			// GuestIP/gateway are what the restored guest BELIEVES it has —
+			// kept for visibility. NetworkName stays empty: no reservation.
+			vmCfg.TapDevice = tap
+			vmCfg.GuestIP = snap.GuestIP
+			vmCfg.GatewayIP = snap.GatewayIP
+			vmCfg.PrefixLen = snap.PrefixLen
+			vmCfg.Quarantine = true
+		} else {
+			gateway, bridge, prefix, err := m.netmgr.ClaimVM(snap.NetworkName, id, snap.GuestIP)
+			if err != nil {
+				_ = storage.DeleteClone(m.instancesDir, id)
+				return nil, fmt.Errorf("%w: fork needs the snapshot's address on network %q (%s): %v — destroy the VM holding it, or fork with quarantine=true", ErrConflict, snap.NetworkName, snap.GuestIP, err)
+			}
+			if err := network.CreateTapEnslaved(tap, bridge); err != nil {
+				m.netmgr.DetachVM(snap.NetworkName, id)
+				_ = storage.DeleteClone(m.instancesDir, id)
+				return nil, fmt.Errorf("creating tap device: %w", err)
+			}
+			vmCfg.NetworkName = snap.NetworkName
+			vmCfg.Bridge = bridge
+			vmCfg.TapDevice = tap
+			vmCfg.GuestIP = snap.GuestIP
+			vmCfg.GatewayIP = gateway
+			vmCfg.PrefixLen = prefix
+		}
+	}
+
+	record := &types.VM{
+		Config:    vmCfg,
+		LogPath:   filepath.Join(m.instancesDir, id+".log"),
+		CreatedAt: time.Now(),
+	}
+
+	if err := m.bootFromSnapshot(record, snap); err != nil {
+		m.cleanupNetwork(vmCfg.NetworkName, vmCfg.TapDevice, id)
+		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
+		_ = storage.DeleteClone(m.instancesDir, id)
+		return nil, err
+	}
+
+	m.mu.Lock()
+	m.vms[id] = record
+	m.mu.Unlock()
+
+	// Persist last, same contract as Create: a fork we can't persist is
+	// rolled back rather than left running-but-unknown.
+	if err := m.store.SaveVM(record); err != nil {
+		_ = m.Destroy(context.Background(), id)
+		return nil, fmt.Errorf("persisting vm record %s: %w", id, err)
+	}
+
+	return record, nil
+}
+
+// ForkVM forks a RUNNING VM directly, without the caller managing a snapshot:
+// it takes an ephemeral snapshot (the source VM is paused sub-second and
+// resumed, exactly like Snapshot), forks a new VM from it, and deletes the
+// snapshot. Deleting it under a live fork is safe by design — the fork's disk
+// is a private reflink copy and its chroot hardlinks the mem/vmstate inodes
+// (see DeleteSnapshot).
+//
+// This is the one-call path for "give me a copy of this machine as it is right
+// now". The network constraints are Fork's: the source VM keeps its IP, so a
+// non-quarantine fork of a live VM always collides with it — direct forks are
+// therefore mostly useful with quarantine=true (or on a VM with no network).
+// Callers who want to keep the frozen point for later restores should use
+// Snapshot + Fork instead.
+func (m *Manager) ForkVM(ctx context.Context, vmID string, quarantine bool) (*types.VM, error) {
+	snap, err := m.Snapshot(ctx, vmID, "fork-ephemeral")
+	if err != nil {
+		return nil, err
+	}
+
+	record, forkErr := m.Fork(ctx, snap.ID, quarantine)
+
+	// The ephemeral snapshot goes away whether the fork worked or not; a
+	// deletion failure is a leak to log, not a reason to fail a good fork.
+	if err := m.DeleteSnapshot(snap.ID); err != nil {
+		log.Printf("forkvm: deleting ephemeral snapshot %s: %v", snap.ID, err)
+	}
+
+	return record, forkErr
+}
+
+// Restore rolls a VM back, in place, to a snapshot previously taken FROM THAT
+// VM: same ID, same network identity, same TAP — only the disk and memory are
+// rewound. This is the "reset to clean between samples" primitive: detonate,
+// restore, detonate the next sample on a pristine machine in milliseconds.
+//
+// Restricted to the VM's own snapshots because the guest's identity (IP, MAC,
+// in-chroot drive name) is frozen inside the snapshot — restoring another
+// VM's snapshot here would silently swap the machine's identity; that
+// operation is Fork, which handles the collisions honestly.
+func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, error) {
+	m.mu.Lock()
+	record, okVM := m.vms[vmID]
+	snap, okSnap := m.snaps[snapID]
+	r := m.run[vmID]
+	m.mu.Unlock()
+	if !okVM {
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, vmID)
+	}
+	if !okSnap {
+		return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, snapID)
+	}
+	if snap.SourceVMID != vmID {
+		return nil, fmt.Errorf("%w: snapshot %s was taken from vm %s, not %s — use fork to create a new vm from it", ErrConflict, snapID, snap.SourceVMID, vmID)
+	}
+	if record.State != types.VMStateRunning && record.State != types.VMStateStopped {
+		return nil, fmt.Errorf("%w: vm %s is %s", ErrVMState, vmID, record.State)
+	}
+
+	// Tear down the current incarnation the way Stop does — process, jail dir,
+	// TAP — but keep the IP reservation and VM record: the restored guest is
+	// the same machine at the same address.
+	if record.State == types.VMStateRunning {
+		var stopErr error
+		switch {
+		case r != nil && r.machine != nil:
+			stopErr = firecracker.Stop(ctx, r.machine)
+		case record.PID > 0:
+			stopErr = stopByPID(record.PID)
+		}
+		if stopErr != nil {
+			return nil, fmt.Errorf("stopping vm %s before restore: %w", vmID, stopErr)
+		}
+		if r != nil && r.logFile != nil {
+			_ = r.logFile.Close()
+		}
+		if record.Config.TapDevice != "" {
+			_ = network.DeleteTap(record.Config.TapDevice)
+		}
+		if err := jailer.RemoveInstanceDir(m.jailerCfg, vmID); err != nil {
+			return nil, fmt.Errorf("removing jail dir for vm %s: %w", vmID, err)
+		}
+		m.mu.Lock()
+		record.State = types.VMStateStopped
+		record.PID = 0
+		record.SocketPath = ""
+		record.VsockPath = ""
+		m.run[vmID] = &running{}
+		m.mu.Unlock()
+	}
+
+	// Rewind the disk: drop the current clone, stamp a fresh one from the
+	// snapshot. Same filename, so the vmstate's recorded drive path matches.
+	if err := storage.DeleteClone(m.instancesDir, vmID); err != nil {
+		return nil, err
+	}
+	rootfs, err := storage.CloneFromSnapshot(snap.Dir, vmID, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	if err != nil {
+		return nil, err
+	}
+	record.Config.Rootfs = rootfs
+
+	if record.Config.TapDevice != "" {
+		if err := recreateTap(record.Config); err != nil {
+			return nil, fmt.Errorf("recreating tap for vm %s: %w", vmID, err)
+		}
+	}
+
+	if err := m.bootFromSnapshot(record, snap); err != nil {
+		if record.Config.TapDevice != "" {
+			_ = network.DeleteTap(record.Config.TapDevice)
+		}
+		// Remove the jail dir so a retried restore doesn't trip over the
+		// files this attempt linked into the chroot. Disk is already rewound;
+		// the VM stays stopped with a clean disk — a retryable state, not a
+		// leak.
+		_ = jailer.RemoveInstanceDir(m.jailerCfg, vmID)
+		_ = m.store.SaveVM(record)
+		return nil, err
+	}
+	record.Config.RestoredFrom = snapID
+
+	if err := m.store.SaveVM(record); err != nil {
+		_ = m.Destroy(context.Background(), vmID)
+		return nil, fmt.Errorf("persisting restored vm %s: %w", vmID, err)
+	}
+
+	return record, nil
+}
+
+// bootFromSnapshot is boot()'s sibling for restores: same log file and jailer
+// plumbing, but the Firecracker process is brought up via snapshot load —
+// no kernel boot, the guest resumes where the snapshot froze it.
+func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error {
+	id := record.Config.ID
+
+	logFile, err := os.OpenFile(record.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("opening console log %s: %w", record.LogPath, err)
+	}
+
+	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, logFile, logFile)
+	fcCfg := firecracker.BuildRestoreConfig(id, record.Config.Rootfs, jcfg)
+
+	spec := firecracker.RestoreSpec{
+		StatePath:   filepath.Join(snap.Dir, storage.SnapshotStateFile),
+		MemPath:     filepath.Join(snap.Dir, storage.SnapshotMemFile),
+		DiskPath:    record.Config.Rootfs,
+		DriveBase:   snap.DriveBase,
+		ChrootDir:   jailer.WorkspaceRoot(m.jailerCfg, id),
+		TapDevice:   record.Config.TapDevice,
+		SnapshotTap: snapshotTapName(snap),
+	}
+
+	// Background context for the same reason as boot(): the SDK ties the
+	// Firecracker process's lifetime to this context.
+	machine, err := firecracker.LaunchFromSnapshot(context.Background(), fcCfg, spec)
+	if err != nil {
+		_ = logFile.Close()
+		return fmt.Errorf("restoring VM from snapshot %s: %w", snap.ID, err)
+	}
+
+	pid, _ := machine.PID()
+	record.PID = pid
+	record.SocketPath = machine.Cfg.SocketPath
+	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
+	record.State = types.VMStateRunning
+
+	m.mu.Lock()
+	m.run[id] = &running{machine: machine, logFile: logFile}
+	m.mu.Unlock()
+
+	return nil
+}
+
+// snapshotTapName returns the TAP name recorded in a snapshot's vmstate,
+// deriving it from the source VM's ID for records persisted before the
+// TapDevice field existed (the daemon has always named TAPs "tap<vm-id>").
+func snapshotTapName(snap *types.Snapshot) string {
+	if snap.TapDevice != "" {
+		return snap.TapDevice
+	}
+	if !snap.HadNetwork {
+		return ""
+	}
+	return "tap" + snap.SourceVMID
+}
+
+// GetSnapshot returns a single snapshot by ID.
+func (m *Manager) GetSnapshot(id string) (*types.Snapshot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.snaps[id]
+	return s, ok
+}
+
+// Snapshots returns every snapshot currently tracked.
+func (m *Manager) Snapshots() []*types.Snapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	list := make([]*types.Snapshot, 0, len(m.snaps))
+	for _, s := range m.snaps {
+		list = append(list, s)
+	}
+	return list
+}
+
+// DeleteSnapshot removes a snapshot's files and record. Safe while VMs
+// restored from it are running: their disks are private reflink copies and
+// their chroots hold their own hardlinks to the mem/vmstate inodes, so
+// nothing they depend on disappears with the snapshot directory.
+func (m *Manager) DeleteSnapshot(id string) error {
+	m.mu.Lock()
+	_, ok := m.snaps[id]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrSnapshotNotFound, id)
+	}
+
+	dirErr := storage.DeleteSnapshotDir(m.instancesDir, id)
+	storeErr := m.store.DeleteSnapshot(id)
+
+	m.mu.Lock()
+	delete(m.snaps, id)
+	m.mu.Unlock()
+
+	return errors.Join(
+		wrapErr("removing snapshot dir %s", id, dirErr),
+		wrapErr("removing snapshot record %s", id, storeErr),
+	)
 }
 
 // wrapErr annotates err with a formatted context prefix, or returns nil if

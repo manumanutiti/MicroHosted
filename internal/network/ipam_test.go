@@ -92,3 +92,45 @@ func TestParseSubnetRejects(t *testing.T) {
 		}
 	}
 }
+
+// ReserveExclusive is the fork path: the snapshot's IP either is free or the
+// fork must not join the network. Unlike Reserve (adopt-on-restart), a taken
+// address must be an error, never a silent double-booking.
+func TestSubnetReserveExclusiveRejectsTakenAddress(t *testing.T) {
+	s, err := ParseSubnet("172.16.0.0/24")
+	if err != nil {
+		t.Fatalf("ParseSubnet: %v", err)
+	}
+
+	ip, err := s.Allocate("origin-vm")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+
+	if err := s.ReserveExclusive("fork-vm", ip); err == nil {
+		t.Fatalf("ReserveExclusive(%s) succeeded while origin-vm holds it", ip)
+	}
+
+	// Once the origin releases the address, the fork can claim it...
+	s.Release("origin-vm")
+	if err := s.ReserveExclusive("fork-vm", ip); err != nil {
+		t.Fatalf("ReserveExclusive after release: %v", err)
+	}
+	// ...and a second fork can't.
+	if err := s.ReserveExclusive("fork-vm-2", ip); err == nil {
+		t.Fatal("second ReserveExclusive on same address must fail")
+	}
+}
+
+func TestSubnetReserveExclusiveRejectsOutsideSubnet(t *testing.T) {
+	s, err := ParseSubnet("172.16.0.0/24")
+	if err != nil {
+		t.Fatalf("ParseSubnet: %v", err)
+	}
+	if err := s.ReserveExclusive("vm", "10.0.0.5"); err == nil {
+		t.Fatal("ReserveExclusive outside the subnet must fail")
+	}
+	if err := s.ReserveExclusive("vm", "not-an-ip"); err == nil {
+		t.Fatal("ReserveExclusive with a bogus IP must fail")
+	}
+}

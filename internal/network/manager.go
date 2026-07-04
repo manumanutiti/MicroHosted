@@ -210,6 +210,26 @@ func (m *Manager) ReserveVM(networkName, vmID, ip string) {
 	mn.vms[vmID] = true
 }
 
+// ClaimVM attaches vmID to the named network at one specific address — the
+// fork-from-snapshot path, where the guest's IP is frozen inside the restored
+// memory and can't be reallocated. Unlike ReserveVM (adopt-on-restart, which
+// tolerates re-registering because the address was already this VM's), this
+// fails if the address is held by anyone else, so a fork can never collide
+// with its origin VM on the same bridge.
+func (m *Manager) ClaimVM(networkName, vmID, ip string) (gateway, bridge string, prefixLen int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mn, ok := m.nets[networkName]
+	if !ok {
+		return "", "", 0, fmt.Errorf("network %q not found", networkName)
+	}
+	if err := mn.subnet.ReserveExclusive(vmID, ip); err != nil {
+		return "", "", 0, err
+	}
+	mn.vms[vmID] = true
+	return mn.net.Gateway, mn.net.Bridge, mn.subnet.Prefix(), nil
+}
+
 // DetachVM releases vmID's IP back to its network's pool.
 func (m *Manager) DetachVM(networkName, vmID string) {
 	m.mu.Lock()

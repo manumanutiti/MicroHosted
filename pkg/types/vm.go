@@ -38,6 +38,20 @@ type VMConfig struct {
 	// wrong value (the old hardcoded /30) makes same-subnet peers look like
 	// broadcast and unicast between VMs fails.
 	PrefixLen int
+
+	// Quarantine marks a VM forked from a snapshot with its TAP deliberately
+	// enslaved to no bridge: the guest believes it has GuestIP (frozen in the
+	// restored memory) but its packets go nowhere. NetworkName is empty for
+	// such a VM — it holds no IP reservation on any network — yet GuestIP is
+	// kept populated as the address the guest *thinks* it has. Reconcile and
+	// cleanup must not touch IPAM for it, only the TAP.
+	Quarantine bool
+
+	// RestoredFrom is the snapshot ID this VM was forked/restored from, empty
+	// for VMs booted from a template. Lineage only — deleting the snapshot
+	// later doesn't affect a VM already restored from it (the restore took
+	// reflink copies / extra hardlinks, never a live dependency).
+	RestoredFrom string
 }
 
 type VM struct {

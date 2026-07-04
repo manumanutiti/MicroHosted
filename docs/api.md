@@ -8,6 +8,17 @@ Estado: cubre create/read/delete + stop/start + exec. El CRUD completo (incluyen
 "update" y matices de create/delete) está en marcha — ver `SESSIONS.md`,
 sección "Próxima sesión".
 
+**Convención de rutas** (toda la API sigue esta regla):
+
+- **Recursos = sustantivos con CRUD puro**: `POST/GET /v1/<recurso>` y
+  `GET/DELETE /v1/<recurso>/{id}` — `vms`, `snapshots`, `networks`, `templates`.
+- **Acciones = verbos**: `POST /v1/<recurso>/{id}/<verbo>` — `stop`, `start`,
+  `snapshot`, `fork`, `restore`, `exec`. El mismo verbo significa lo mismo
+  cuelgue de donde cuelgue (p. ej. `fork` existe en `/vms/{id}` y en
+  `/snapshots/{id}` con el mismo body y la misma respuesta; solo cambia el
+  origen). Lo que una acción crea vive después en su colección: `snapshot`
+  crea en `/v1/snapshots`, `fork` crea en `/v1/vms`.
+
 ---
 
 ## Plantillas (catálogo)
@@ -243,6 +254,140 @@ todo-o-nada; el resultado va en el body, no en el código HTTP.
 ```json
 {"deleted": ["a1b2c3d4", "e5f6a7b8"], "failed": {"c9d0e1f2": "vm not found"}}
 ```
+
+---
+
+## Snapshots y bifurcación
+
+Un snapshot congela una VM **en marcha** como punto restaurable: memoria del
+guest + estado de dispositivos (vmstate/mem de Firecracker) + un clon
+copy-on-write de su disco, capturado todo en el mismo instante (la VM se pausa
+<1s y se reanuda sola). El snapshot es una entidad independiente: **sobrevive
+a que su VM de origen se pare o destruya** — ese es el punto: "detonar y
+volver a limpio" exige que el estado limpio viva más que lo que pase después.
+
+Dos formas de volver a un snapshot:
+
+- **Restore in-place** (`POST /v1/vms/{id}/restore`): rebobina ESA VM — mismo
+  ID, misma IP, mismo TAP; solo memoria y disco vuelven atrás. El primitivo
+  "reset a limpio entre muestras".
+- **Fork** (`POST /v1/snapshots/{id}/fork`): crea una VM **nueva** desde el
+  snapshot — el guest despierta a mitad de ejecución justo donde se congeló.
+
+Y un atajo que no requiere gestionar snapshots:
+
+- **Fork directo** (`POST /v1/vms/{id}/fork`): bifurca una VM **en marcha** en
+  una sola llamada — el daemon toma un snapshot efímero, forkea desde él y lo
+  borra. Para "dame una copia de esta máquina tal y como está ahora".
+
+**La identidad de red va congelada en la memoria.** El guest restaurado cree
+tener la IP/MAC del momento del snapshot y eso no se puede cambiar al
+restaurar. De ahí los dos modos de fork:
+
+| modo | qué hace | cuándo |
+|---|---|---|
+| normal (por defecto) | el fork se une a la red de origen con la IP del snapshot; **409** si esa IP está ocupada (p. ej. la VM original sigue viva) | recuperar un estado conocido como VM plena |
+| `quarantine: true` | TAP creado pero enslavado a **nada**: el guest cree tener red pero cada paquete muere en el host; solo accesible por vsock (`/exec`) | bifurcar el punto de infección y examinarlo sin que hable con nadie; permite **N forks simultáneos** del mismo snapshot |
+
+### `POST /v1/vms/{id}/snapshot` — crear snapshot
+
+**Body** (opcional): `{"name": "clean"}` — etiqueta libre.
+
+```bash
+curl -X POST localhost:8080/v1/vms/a1b2c3d4/snapshot -d '{"name":"clean"}'
+```
+
+**Respuesta 201** (`SnapshotResponse`) · **404** si la VM no existe · **409**
+si no está en marcha (solo se puede snapshotear una VM `running`).
+
+**Forma de `SnapshotResponse`:**
+
+| campo | descripción |
+|---|---|
+| `id` | ID corto del snapshot |
+| `name` | etiqueta opcional |
+| `source_vm` | VM de la que se tomó |
+| `template` | plantilla de la VM de origen |
+| `vcpus` / `mem_mb` / `disk_mb` | forma de la máquina congelada (fija: la restauración vuelve exactamente así) |
+| `network` / `guest_ip` | identidad de red congelada en la memoria del guest |
+| `created_at` | timestamp RFC3339 |
+
+### `GET /v1/snapshots` · `GET /v1/snapshots/{id}` · `DELETE /v1/snapshots/{id}`
+
+Listado, detalle y borrado. Borrar un snapshot es seguro aunque haya VMs
+restauradas desde él corriendo (tienen copias/hardlinks propios). **204** al
+borrar · **404** si no existe.
+
+### `POST /v1/snapshots/{id}/fork` — bifurcar (fork)
+
+**Body** (`ForkVMRequest`, opcional): `{"quarantine": true}`.
+
+```bash
+# Fork normal: exige la IP del snapshot libre en su red de origen
+curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork
+
+# Fork en cuarentena: sin red real, solo vsock
+curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork -d '{"quarantine":true}'
+```
+
+**Respuesta 201** (`VMResponse`; los forks llevan `restored_from` y, en su
+caso, `quarantine: true`; en cuarentena `guest_ip` es la IP que el guest
+*cree* tener, no una reserva real) · **404** si el snapshot no existe ·
+**409** si la IP del snapshot está ocupada en la red de origen (destruye la
+VM que la tiene o usa `quarantine`).
+
+**Requisito de versión para forks simultáneos**: `network_overrides` (remapear
+la NIC congelada a otro TAP) existe desde **Firecracker v1.12.0**. Con un FC
+anterior (el daemon lo detecta solo), el fork reutiliza el nombre de TAP
+original del snapshot — funciona si la VM de origen está destruida o parada,
+pero **con la original (u otro fork) corriendo cualquier fork da 409**,
+incluido `quarantine`, indicando que hay que actualizar
+(`scripts/install-fc.sh`). Al actualizar FC, los snapshots existentes deben
+recrearse (su formato va ligado a la versión).
+
+### `POST /v1/vms/{id}/fork` — fork directo de una VM en marcha
+
+**Body** (`ForkVMRequest`, opcional): `{"quarantine": true}` — el mismo que el
+fork desde snapshot.
+
+```bash
+# Copia en cuarentena de una VM viva, en una llamada
+curl -X POST localhost:8080/v1/vms/a1b2c3d4/fork -d '{"quarantine":true}'
+```
+
+Equivale a snapshot → fork → borrar el snapshot, sin que el snapshot efímero
+quede registrado. La VM de origen solo se pausa <1s (igual que al snapshotear)
+y sigue corriendo. Si quieres conservar el punto congelado para restores
+posteriores, usa el flujo explícito (`/snapshots` + fork).
+
+**Semántica de red**: la de fork, con una consecuencia práctica — la VM de
+origen sigue viva ocupando su IP, así que el fork directo **sin** `quarantine`
+siempre da 409 en una VM con red (la IP congelada está en uso por definición).
+El modo natural de este endpoint es `quarantine: true` (o VMs `no_network`).
+
+**Respuesta 201** (`VMResponse`, como el fork normal) · **404** VM inexistente
+· **409** VM no `running`, o el conflicto de red/TAP correspondiente (en FC
+< 1.12 el TAP original está siempre en uso por la propia VM de origen, así que
+este endpoint requiere en la práctica **Firecracker ≥ 1.12**).
+
+### `POST /v1/vms/{id}/restore` — rebobinar in-place
+
+**Body** (`RestoreVMRequest`): `{"snapshot": "f00dcafe"}`. Solo acepta
+snapshots tomados **de esa misma VM** (para restaurar el snapshot de otra VM
+está el fork, que gestiona las colisiones de identidad honestamente).
+
+```bash
+curl -X POST localhost:8080/v1/vms/a1b2c3d4/restore -d '{"snapshot":"f00dcafe"}'
+```
+
+Vale sobre una VM `running` (se para primero) o `stopped`. **Respuesta 200**
+(`VMResponse`, `state: "running"`) · **404** VM o snapshot inexistentes ·
+**409** si el snapshot es de otra VM o la VM está en un estado incompatible.
+
+**Nota (reloj del guest)**: tras cualquier restauración el reloj del guest
+sigue en la hora del snapshot; para análisis donde importe el timestamp,
+resincroniza vía `/exec` (p. ej. `date -s` o chrony). Es el comportamiento
+documentado de Firecracker.
 
 ---
 

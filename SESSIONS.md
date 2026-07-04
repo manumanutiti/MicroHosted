@@ -346,11 +346,93 @@ malware, honeypots, bancos DFIR, rangos blue-team, y — segundo acto, mismo mot
 
 ---
 
-## Sesión 6 — Snapshot/restore (pendiente)
+## Sesión 6 — Snapshot/restore + bifurcación (implementada 2026-07-03, VALIDADA EN HARDWARE 2026-07-04)
 
-**Objetivo**: arranque desde snapshot < 200ms.
+**Objetivo**: arranque desde snapshot < 200ms + bifurcar (fork) desde un punto congelado.
 
-**Estado**: pendiente
+**Estado**: VALIDADA end-to-end contra KVM real. Medido (VM 128MB, endpoint
+HTTP completo): **snapshot 271ms · restore in-place 109ms · fork 113ms** — el
+criterio de <200ms de la sesión se cumple con margen. Batería completa
+superada: rebobinado real de memoria+disco (contador en memoria reanuda en el
+valor congelado, no en 0 ni en el sucio; fichero rebobinado), fork despierta
+con la IP del snapshot reclamada y respondiendo, cuarentena aislada de verdad
+(guest cree tener red, no alcanza ni al gateway, vsock OK), 409s honestos,
+persistencia tras restart del daemon (snapshot sobre VM adoptada incluida, con
+mismo PID), borrado de snapshot con fork vivo inocuo, y cero fugas al final
+(TAPs/clones/jail dirs/snapshots).
+
+**Bug real cazado EN la validación**: asumí `network_overrides` desde FC v1.8;
+en realidad es de **v1.12.0** y el host tiene 1.10.1 → el primer restore dio
+400. Arreglo (validado): el daemon sondea la versión del binario al arrancar;
+el restore in-place nunca envía override (recrea el TAP con su nombre
+original); el fork en FC <1.12 reutiliza el nombre de TAP original si está
+libre y si no da 409 explicando la actualización; en FC ≥1.12 cada fork lleva
+TAP propio + override. El fallo de restore dejó la VM `stopped` con disco
+rebobinado y reintentable — el camino de fallo diseñado funcionó tal cual.
+Pendiente opcional del host: `sudo ./scripts/install-fc.sh v1.16.1` para forks
+simultáneos (recrear snapshots después: su formato va ligado a la versión).
+
+**Qué hay**:
+- `POST /v1/vms/{id}/snapshot` — pausa (<1s) → vmstate+mem → reflink del disco
+  en pausa (consistencia memoria↔disco) → resume. Los artefactos van a
+  `<store>/snapshots/<sid>/`. Funciona también sobre VMs adoptadas tras un
+  reinicio (llamadas crudas al socket UDS, sin handle del SDK).
+- `POST /v1/vms/{id}/restore` — rebobinado in-place (mismo ID/IP/TAP): el
+  primitivo "reset a limpio entre muestras". Solo snapshots de esa misma VM.
+- `POST /v1/snapshots/{id}/fork` — fork a VM nueva. Dos modos por la identidad
+  de red congelada en la memoria: normal (reclama la IP del snapshot en la red
+  de origen, reserva estricta, 409 si ocupada) y `quarantine` (TAP sin bridge,
+  solo vsock, N forks simultáneos).
+- CRUD de snapshots (`GET/DELETE /v1/snapshots[/{id}]`), persistidos en SQLite
+  y re-indexados al arrancar; un snapshot sobrevive al destroy de su VM.
+
+**Decisiones técnicas** (detalle en `docs/architecture.md`):
+- El SDK v1.0.0 no conoce `network_overrides` (imprescindible para que el fork
+  use su propio TAP; Firecracker ≥1.8 lo soporta, tenemos 1.10.1) → el load se
+  hace con una llamada cruda `PUT /snapshot/load` enganchada como handler
+  propio en el pipeline del SDK (`LaunchFromSnapshot`), manteniendo Jailer y
+  la gestión de proceso del SDK.
+- El invariante "todo en el mismo btrfs" paga de nuevo: mover el snapshot fuera
+  del chroot es un `rename`, capturar/estampar discos son reflinks, y montar el
+  chroot del restore son hardlinks.
+- El mem se restaura con backend File (mapeo copy-on-write): N restores
+  comparten el mismo fichero de memoria sin copiarlo ni escribirlo.
+- Borrar un snapshot con forks vivos es seguro (tienen inodos/copias propios).
+
+**Refinado post-validación (2026-07-04)** — dos asperezas de la validación,
+resueltas:
+- `scripts/install-fc.sh` instalaba v1.10.1 por defecto (el usuario lo corrió
+  esperando la nueva y obtuvo la vieja). Ahora sin argumentos resuelve e
+  instala la **última release** (siguiendo el redirect de
+  `releases/latest`, sin depender de la API de GitHub), y al terminar
+  recuerda: reiniciar el daemon (la capacidad `network_overrides` se sondea
+  al arrancar) y recrear los snapshots (formato ligado a versión).
+- **Fork directo** `POST /v1/vms/{id}/fork` (body `{"quarantine":true}`
+  opcional): bifurcar una VM viva ya no exige gestionar un snapshot —
+  `vm.Manager.ForkVM` compone snapshot efímero → `Fork` → `DeleteSnapshot`
+  (borrar bajo un fork vivo ya estaba validado como seguro: disco reflink +
+  hardlinks propios). Sin `quarantine` sigue dando 409 con la origen viva
+  (su IP congelada está en uso por definición) — el modo natural del
+  endpoint es cuarentena. En FC <1.12 requiere en la práctica actualizar
+  (la origen ocupa el TAP original). PENDIENTE de validar en hardware con
+  FC ≥ 1.12.
+- **Rutas unificadas** (a petición del usuario — convivían dos estilos):
+  regla única "sustantivo = recurso CRUD, verbo = acción
+  (`POST /v1/<recurso>/{id}/<verbo>`)", documentada al inicio de
+  `docs/api.md`. Renombres (ruptura limpia, sin alias — API pre-release):
+  `POST /v1/vms/{id}/snapshots` → `/v1/vms/{id}/snapshot` y
+  `POST /v1/snapshots/{id}/vms` → `/v1/snapshots/{id}/fork` (mismo verbo y
+  body que el fork directo `/v1/vms/{id}/fork`; solo cambia el origen).
+
+**Batería de validación ejecutada (2026-07-04, todas OK)**:
+1. VM + estado (fichero en disco, contador vivo en memoria) → snapshot 271ms; la VM siguió corriendo.
+2. estado ensuciado → `restore` in-place 109ms → fichero rebobinado, contador reanudó en el valor congelado y siguió, misma IP respondiendo.
+3. original viva → fork normal Y quarantine dan 409 (límite FC 1.10.1, mensaje con la solución).
+4. original destruida → fork normal 113ms → IP del snapshot reclamada en `default`, ping OK, estado congelado presente.
+5. fork parado (libera TAP) → fork `quarantine` → eth0 UP con la IP "fantasma", ni el gateway alcanzable, vsock OK.
+6. restart del daemon → cuarentena adoptada (mismo PID), parada conservada, snapshot listado; snapshot sobre la VM adoptada OK.
+7. `DELETE` del snapshot con su fork corriendo → 204 y el fork siguió vivo.
+8. limpieza → cero huérfanos (taps, clones, jail dirs, snapshots).
 
 ---
 

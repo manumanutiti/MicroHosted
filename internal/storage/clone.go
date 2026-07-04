@@ -42,12 +42,8 @@ func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid 
 
 	dst := filepath.Join(instancesDir, vmID+".ext4")
 
-	cmd := exec.Command("cp", "--reflink=auto", tpl.RootfsPath, dst)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(dst) // partial output from the failed cp, if any
-		if copyErr := copyFile(tpl.RootfsPath, dst); copyErr != nil {
-			return "", fmt.Errorf("cloning rootfs for %s: cp failed (%s), fallback copy failed: %w", vmID, out, copyErr)
-		}
+	if err := ReflinkFile(tpl.RootfsPath, dst); err != nil {
+		return "", fmt.Errorf("cloning rootfs for %s: %w", vmID, err)
 	}
 
 	if err := growRootfs(dst, diskMB); err != nil {

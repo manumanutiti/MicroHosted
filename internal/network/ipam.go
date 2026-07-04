@@ -112,6 +112,33 @@ func (s *Subnet) Reserve(vmID, ipStr string) error {
 	return nil
 }
 
+// ReserveExclusive claims a specific IP for vmID, failing if the address is
+// already held. This is the fork-from-snapshot path: the restored guest wakes
+// up with the snapshot's IP frozen in its memory, so either that exact address
+// is free on the network or the fork must not join it at all. Silently
+// double-booking (what Reserve does, deliberately, for adopt-on-restart where
+// the address was already ours) would put two VMs with the same IP *and* the
+// same derived MAC on one bridge.
+func (s *Subnet) ReserveExclusive(vmID, ipStr string) error {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return fmt.Errorf("claiming %q for %s: invalid IPv4", ipStr, vmID)
+	}
+	v := binary.BigEndian.Uint32(ip)
+	if v <= s.base || v >= s.bcast {
+		return fmt.Errorf("claiming %q for %s: outside subnet", ipStr, vmID)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taken[v] {
+		return fmt.Errorf("address %s is already in use on this network", ipStr)
+	}
+	s.taken[v] = true
+	s.used[vmID] = v
+	return nil
+}
+
 // Release frees the address held by vmID.
 func (s *Subnet) Release(vmID string) {
 	s.mu.Lock()

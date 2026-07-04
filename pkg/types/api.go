@@ -36,7 +36,12 @@ type VMResponse struct {
 	HostIP    string  `json:"host_ip,omitempty"`
 	TapDevice string  `json:"tap_device,omitempty"`
 	LogPath   string  `json:"log_path,omitempty"`
-	CreatedAt string  `json:"created_at"`
+	// Quarantine: forked from a snapshot with its TAP on no bridge — guest_ip
+	// is the address the guest believes it has, not a live reservation.
+	Quarantine bool `json:"quarantine,omitempty"`
+	// RestoredFrom is the snapshot this VM was forked/restored from, if any.
+	RestoredFrom string `json:"restored_from,omitempty"`
+	CreatedAt    string `json:"created_at"`
 }
 
 // BulkDeleteResponse is returned by bulk-delete endpoints (DELETE /v1/vms,
@@ -64,15 +69,17 @@ type ExecResponse struct {
 // NewVMResponse builds the API DTO from an internal VM record.
 func NewVMResponse(vm *VM) VMResponse {
 	return VMResponse{
-		ID:        vm.Config.ID,
-		Template:  vm.Config.TemplateName,
-		State:     vm.State,
-		PID:       vm.PID,
-		Network:   vm.Config.NetworkName,
-		GuestIP:   vm.Config.GuestIP,
-		HostIP:    vm.Config.HostIP,
-		TapDevice: vm.Config.TapDevice,
-		LogPath:   vm.LogPath,
-		CreatedAt: vm.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		ID:           vm.Config.ID,
+		Template:     vm.Config.TemplateName,
+		State:        vm.State,
+		PID:          vm.PID,
+		Network:      vm.Config.NetworkName,
+		GuestIP:      vm.Config.GuestIP,
+		HostIP:       vm.Config.HostIP,
+		TapDevice:    vm.Config.TapDevice,
+		LogPath:      vm.LogPath,
+		Quarantine:   vm.Config.Quarantine,
+		RestoredFrom: vm.Config.RestoredFrom,
+		CreatedAt:    vm.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 }

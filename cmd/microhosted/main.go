@@ -109,6 +109,14 @@ func main() {
 	}
 	keepTaps := mgr.Reconcile(records)
 
+	// Snapshots are inert (files + record, no liveness): just re-index them,
+	// dropping any whose files were removed out-of-band.
+	snaps, err := st.ListSnapshots()
+	if err != nil {
+		log.Fatalf("cargando snapshots persistidos: %v", err)
+	}
+	mgr.LoadSnapshots(snaps)
+
 	// Remove tap devices left by an uncleanly-terminated previous run, except
 	// those belonging to VMs we just adopted — see network.SweepOrphans.
 	if err := network.SweepOrphans(keepTaps); err != nil {

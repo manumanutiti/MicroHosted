@@ -137,3 +137,53 @@ func TestStatePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("record did not survive reopen: %+v", got)
 	}
 }
+
+func TestSnapshotRoundTrip(t *testing.T) {
+	st := openTemp(t)
+	want := &types.Snapshot{
+		ID:           "snap1234",
+		Name:         "clean",
+		SourceVMID:   "abc12345",
+		TemplateName: "ubuntu-22.04",
+		VCPUs:        2,
+		MemMB:        512,
+		DiskMB:       2048,
+		NetworkName:  "default",
+		GuestIP:      "172.16.0.14",
+		GatewayIP:    "172.16.0.1",
+		PrefixLen:    24,
+		HadNetwork:   true,
+		DriveBase:    "abc12345.ext4",
+		Dir:          "/var/lib/microhosted/store/snapshots/snap1234",
+		CreatedAt:    time.Now().Truncate(time.Second),
+	}
+
+	if err := st.SaveSnapshot(want); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	got, err := st.ListSnapshots()
+	if err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d snapshots, want 1", len(got))
+	}
+	if *got[0] != *want {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got[0], want)
+	}
+
+	if err := st.DeleteSnapshot("snap1234"); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	got, err = st.ListSnapshots()
+	if err != nil {
+		t.Fatalf("ListSnapshots after delete: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d snapshots after delete, want 0", len(got))
+	}
+	// Idempotent, same contract as DeleteVM.
+	if err := st.DeleteSnapshot("snap1234"); err != nil {
+		t.Fatalf("DeleteSnapshot (absent): %v", err)
+	}
+}

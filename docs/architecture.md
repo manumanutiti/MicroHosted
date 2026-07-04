@@ -76,6 +76,11 @@ bajo el store:
 │       ├── firecracker.socket   # socket de la API REST
 │       ├── vmlinux              # hard link al kernel del store
 │       └── <id>.ext4            # hard link al clon (MISMO inodo → Stop conserva disco)
+├── snapshots/                # snapshots (memoria+estado+disco congelados)
+│   └── <snap-id>/
+│       ├── vmstate              # estado de dispositivos/vCPUs (Firecracker)
+│       ├── mem                  # memoria del guest (los restores la mapean CoW)
+│       └── disk.ext4            # reflink del disco tomado con la VM pausada
 └── <id>.ext4                 # clon de la VM (reflink del golden, agrandado)
 ```
 
@@ -83,6 +88,48 @@ Jailer hace chroot a `root/` antes de ejecutar Firecracker; el proceso resultant
 no ve nada fuera de ese directorio. El `--chroot-base` del daemon **deriva de
 `--instances-dir`** (`<instances>/jailer`) precisamente para garantizar el mismo
 FS. Ver `docs/layers.md` (L3) para el detalle.
+
+## Snapshots y bifurcación
+
+**Crear** (`vm.Manager.Snapshot`): pausa la VM (`PATCH /vm`), le pide a
+Firecracker un snapshot Full (`PUT /snapshot/create` — el proceso está
+chrooteado, así que escribe vmstate+mem dentro de su propio chroot), el daemon
+los mueve con `os.Rename` (mismo FS ⇒ gratis) a `snapshots/<sid>/`, reflinka el
+disco **aún en pausa** (memoria y disco quedan mutuamente consistentes) y
+reanuda. Estas llamadas van directas al socket UDS (`internal/firecracker/rawapi.go`),
+no por el SDK: así funcionan igual sobre VMs adoptadas tras un reinicio del
+daemon (sin handle del SDK) y dan acceso a campos que el SDK v1.0.0 no conoce.
+
+**Restaurar/bifurcar** (`vm.Manager.Fork` / `Restore`): se lanza un Firecracker
+nuevo vía Jailer **sin boot** — se sustituye el pipeline de arranque del SDK por
+StartVMM + un handler propio (`internal/firecracker.LaunchFromSnapshot`) que
+hardlinka vmstate/mem/disco al chroot recién creado y hace `PUT /snapshot/load`
+con `resume_vm`. El mem se mapea copy-on-write: N VMs pueden restaurar del
+mismo snapshot a la vez sin copiarlo.
+
+**TAP y versión de Firecracker**: el vmstate recuerda el nombre del TAP
+original, y `network_overrides` (el campo de `/snapshot/load` que permite
+remapear la NIC a otro TAP) **solo existe desde Firecracker v1.12.0**. El
+daemon sondea la versión del binario al arrancar
+(`firecracker.SupportsNetworkOverrides`) y adapta la estrategia:
+- **Restore in-place**: recrea el TAP con su nombre original → nunca necesita
+  override → funciona en cualquier versión.
+- **Fork en FC ≥1.12**: TAP propio (`tap<nuevo-id>`) + override. Sin
+  restricciones.
+- **Fork en FC <1.12**: reutiliza el nombre de TAP original del snapshot si
+  está libre (original destruida/parada); si está ocupado → 409 explicando que
+  los forks simultáneos requieren actualizar Firecracker. Ojo al actualizar:
+  el formato de snapshot va ligado a la versión de FC — los snapshots
+  existentes hay que recrearlos.
+
+Medido en hardware (2026-07-04, host FC 1.10.1): snapshot 271ms, restore
+in-place 109ms, fork 113ms (endpoint completo, VM de 128MB).
+
+**Identidad congelada**: la IP/MAC del guest viven en la memoria snapshoteada y
+no se pueden cambiar al restaurar. Por eso el fork tiene dos modos: unirse a la
+red de origen reclamando la IP exacta del snapshot (reserva estricta,
+`ClaimVM` — 409 si está ocupada), o `quarantine` (TAP sin bridge: el guest cree
+tener red, todo muere en el host, acceso solo por vsock — N forks simultáneos).
 
 ## Decisiones de diseño
 

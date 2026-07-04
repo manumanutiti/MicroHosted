@@ -47,6 +47,34 @@ func DeleteBridge(name string) error {
 	return nil
 }
 
+// TapExists reports whether a TAP device with this name is present on the
+// host — used by fork-from-snapshot on Firecracker < 1.12 to know whether the
+// snapshot's original TAP name (the only name such a host can restore onto)
+// is free to take.
+func TapExists(name string) bool {
+	return exec.Command("ip", "link", "show", "dev", name).Run() == nil
+}
+
+// CreateTapQuarantined creates a TAP device enslaved to nothing, up but going
+// nowhere. Firecracker refuses to restore a snapshot that had a network device
+// unless a host TAP backs it, and a quarantined fork wants exactly that: the
+// guest wakes up believing it still has its network (IP/MAC frozen in the
+// restored memory) while every frame it emits dies at a TAP with no bridge —
+// no path to the host, other VMs, or the internet. vsock exec still works.
+func CreateTapQuarantined(tap string) error {
+	steps := [][]string{
+		{"ip", "tuntap", "add", tap, "mode", "tap"},
+		{"ip", "link", "set", tap, "up"},
+	}
+	for _, args := range steps {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			_ = DeleteTap(tap) // best-effort rollback
+			return fmt.Errorf("running %v: %w (%s)", args, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
 // CreateTapEnslaved creates a TAP device and enslaves it to bridge, bringing it
 // up. Unlike the old CreateTap, the TAP carries no IP of its own: guests get
 // their address from the network's subnet and reach the host/gateway through
