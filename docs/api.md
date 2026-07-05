@@ -60,19 +60,30 @@ modelo en `docs/networking.md`. Al arrancar existe siempre una red `default`
 
 **Body** (`CreateNetworkRequest`):
 
-| campo    | tipo   | requerido | descripción                                                        |
-|----------|--------|-----------|---------------------------------------------------------------------|
-| `name`   | string | sí        | nombre único de la red                                             |
-| `subnet` | string | no        | CIDR (p.ej. `10.10.0.0/24`); si se omite, se asigna un `/24` libre |
-| `egress` | bool   | no        | si `true`, la subred sale a internet vía NAT; `false` por defecto  |
+| campo            | tipo   | requerido | descripción                                                        |
+|------------------|--------|-----------|---------------------------------------------------------------------|
+| `name`           | string | sí        | nombre único de la red                                             |
+| `subnet`         | string | no        | CIDR (p.ej. `10.10.0.0/24`); si se omite, se asigna un `/24` libre |
+| `egress`         | bool   | no        | si `true`, la subred sale a internet vía NAT; `false` por defecto  |
+| `allowed_egress` | array  | no        | egress de grano fino: solo estos flujos salen a la WAN; requiere `egress` a `false`. Ver `docs/networking.md` |
+| `intra`          | bool   | no        | si `true`, las VMs de la red se ven entre sí (L2); `false` por defecto: cada TAP es un puerto aislado del bridge |
+
+Cada elemento de `allowed_egress` es `{"ip", "protocol", "port"}`: `ip` IPv4 o
+CIDR IPv4 canónico, `protocol` ∈ `tcp`/`udp`/`icmp` (minúsculas), `port`
+obligatorio para tcp/udp y prohibido para icmp.
 
 ```bash
 curl -X POST localhost:8080/v1/networks -d '{"name":"lab"}'
 curl -X POST localhost:8080/v1/networks -d '{"name":"build","egress":true}'
+curl -X POST localhost:8080/v1/networks -d '{"name":"iot","allowed_egress":[
+  {"ip":"203.0.113.7","protocol":"tcp","port":8883},
+  {"ip":"203.0.113.7","protocol":"icmp"}]}'
 ```
 
-**Respuesta 201** (`NetworkResponse`) · **400** si falta `name` · **500** si el
-nombre ya existe, la subred es inválida o falla la creación del bridge.
+**Respuesta 201** (`NetworkResponse`) · **400** si falta `name`, si una regla
+de `allowed_egress` es inválida, o si se combinan `egress: true` y
+`allowed_egress` · **500** si el nombre ya existe, la subred es inválida o
+falla la creación del bridge.
 
 ### `GET /v1/networks` · `GET /v1/networks/{name}`
 
@@ -85,7 +96,46 @@ Lista todas las redes / detalle de una. **Forma de `NetworkResponse`:**
 | `subnet`     | CIDR de la red                                          |
 | `gateway`    | IP del host en el bridge (la `.1`, ruta de los guests)  |
 | `egress`     | si tiene salida a internet                              |
+| `allowed_egress` | reglas de egress fino, si las hay (omitido si vacío) |
+| `intra`      | si las VMs de la red pueden verse entre sí              |
 | `created_at` | timestamp RFC3339                                       |
+
+### `PUT /v1/networks/{name}/egress` — actualizar la política de egress en caliente
+
+Reemplaza la política de egress **entera** (no hace merge) sin tocar las VMs
+conectadas. Mismos campos y validación que en la creación: `egress` (bool) y
+`allowed_egress` (array), mutuamente exclusivos.
+
+```bash
+curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{"allowed_egress":[
+  {"ip":"192.168.0.15","protocol":"icmp"},
+  {"ip":"192.168.0.15","protocol":"tcp","port":6565}]}'
+
+# quitar todo el egress: body vacío
+curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{}'
+```
+
+Los flujos abiertos bajo la política anterior se cortan inmediatamente al
+endurecer (ver `docs/networking.md`, "Update en caliente").
+
+**Respuesta 200** (`NetworkResponse` actualizado) · **400** si una regla es
+inválida o se combinan `egress: true` y `allowed_egress` · **404** si la red
+no existe.
+
+### `PUT /v1/networks/{name}/intra` — conectividad VM↔VM en caliente
+
+Activa o desactiva el tráfico entre las VMs de la red sin recrearla: persiste
+el flag y re-aplica el aislamiento de puerto a todos los TAPs vivos de la red.
+Las VMs paradas lo cogen al arrancar.
+
+```bash
+curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":true}'
+curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":false}'
+```
+
+**Respuesta 200** (`NetworkResponse` actualizado) · **400** body inválido ·
+**404** si la red no existe · **500** si el flag se guardó pero algún TAP vivo
+no convergió (el mensaje dice cuáles — re-lanza el PUT).
 
 ### `DELETE /v1/networks/{name}`
 

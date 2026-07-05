@@ -40,6 +40,16 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 			writeError(w, http.StatusBadRequest, errors.New("name is required"))
 			return
 		}
+		// Bad egress rules are the caller's fault (400), so vet them here;
+		// Create re-checks as defense in depth but reports 500.
+		if req.Egress && len(req.AllowedEgress) > 0 {
+			writeError(w, http.StatusBadRequest, errors.New("egress and allowed_egress are mutually exclusive"))
+			return
+		}
+		if err := network.ValidateEgressRules(req.AllowedEgress); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		n, err := netmgr.Create(req)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -61,6 +71,61 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 		n, ok := netmgr.Get(r.PathValue("name"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("network %q not found", r.PathValue("name")))
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
+	})
+
+	// Live egress-policy update: replaces the network's whole egress policy
+	// atomically without touching attached VMs. Old flows are cut immediately
+	// (the forward chain matches statelessly — see internal/network).
+	mux.HandleFunc("PUT /v1/networks/{name}/egress", func(w http.ResponseWriter, r *http.Request) {
+		var req types.UpdateNetworkEgressRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Egress && len(req.AllowedEgress) > 0 {
+			writeError(w, http.StatusBadRequest, errors.New("egress and allowed_egress are mutually exclusive"))
+			return
+		}
+		if err := network.ValidateEgressRules(req.AllowedEgress); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, ok := netmgr.Get(r.PathValue("name")); !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("network %q not found", r.PathValue("name")))
+			return
+		}
+		n, err := netmgr.UpdateEgress(r.PathValue("name"), req)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
+	})
+
+	// Live intra toggle: flips VM↔VM reachability. The flag is persisted
+	// first, then every live TAP on the network converges (bridge-port
+	// isolation). If any tap fails to converge we say so loudly — after a
+	// tightening, a stale-reachable tap is a hole, not a detail.
+	mux.HandleFunc("PUT /v1/networks/{name}/intra", func(w http.ResponseWriter, r *http.Request) {
+		var req types.UpdateNetworkIntraRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, ok := netmgr.Get(r.PathValue("name")); !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("network %q not found", r.PathValue("name")))
+			return
+		}
+		n, err := netmgr.UpdateIntra(r.PathValue("name"), req.Intra)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err := mgr.SyncTapIsolation(n.Name, !req.Intra); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("intra flag saved, but not all live taps converged: %w", err))
 			return
 		}
 		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))

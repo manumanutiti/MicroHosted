@@ -47,6 +47,21 @@ func DeleteBridge(name string) error {
 	return nil
 }
 
+// SetTapIsolation (re)applies the isolated-port flag on a live, enslaved TAP.
+// Reconcile calls it for every adopted VM so a TAP created under an older
+// policy (daemon upgrade, network flag changed while the daemon was down)
+// converges to the network's CURRENT intra setting without restarting the VM.
+func SetTapIsolation(tap string, isolated bool) error {
+	state := "on"
+	if !isolated {
+		state = "off"
+	}
+	if out, err := exec.Command("bridge", "link", "set", "dev", tap, "isolated", state).CombinedOutput(); err != nil {
+		return fmt.Errorf("setting isolation %s on %s: %w (%s)", state, tap, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // TapExists reports whether a TAP device with this name is present on the
 // host — used by fork-from-snapshot on Firecracker < 1.12 to know whether the
 // snapshot's original TAP name (the only name such a host can restore onto)
@@ -78,12 +93,25 @@ func CreateTapQuarantined(tap string) error {
 // CreateTapEnslaved creates a TAP device and enslaves it to bridge, bringing it
 // up. Unlike the old CreateTap, the TAP carries no IP of its own: guests get
 // their address from the network's subnet and reach the host/gateway through
-// the bridge, and VMs on the same bridge see each other at L2.
-func CreateTapEnslaved(tap, bridge string) error {
+// the bridge.
+//
+// isolated is the deny-by-default for VM↔VM traffic: an isolated bridge port
+// (kernel feature, `bridge link set ... isolated on`) exchanges no frames with
+// other isolated ports, only with the bridge itself — so the guest still
+// reaches its gateway (and whatever the egress policy allows) but never a
+// sibling VM. Same-bridge traffic never traverses nftables (it's pure L2
+// switching), so this is the layer where intra-network isolation must happen;
+// a forward-chain rule could not do it.
+func CreateTapEnslaved(tap, bridge string, isolated bool) error {
 	steps := [][]string{
 		{"ip", "tuntap", "add", tap, "mode", "tap"},
 		{"ip", "link", "set", tap, "master", bridge},
 		{"ip", "link", "set", tap, "up"},
+	}
+	if isolated {
+		// After master: the flag lives on the bridge port, which only exists
+		// once the TAP is enslaved.
+		steps = append(steps, []string{"bridge", "link", "set", "dev", tap, "isolated", "on"})
 	}
 	for _, args := range steps {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {

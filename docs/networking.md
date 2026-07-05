@@ -12,13 +12,20 @@ Una **Network** es un segmento L2 con nombre:
   chars de `IFNAMSIZ`),
 - una **subred** (CIDR, p.ej. `172.16.0.0/24`),
 - un **gateway** = IP del host en el bridge (`.1` de la subred),
-- un flag **egress** (salida a internet sí/no).
+- un flag **egress** (salida a internet sí/no) y opcionalmente **allowed_egress**
+  (egress de grano fino),
+- un flag **intra** (conectividad VM↔VM dentro de la red; **off por defecto**).
 
 Cada VM que entra a una red recibe un **TAP enslavado a ese bridge** (el TAP no
 lleva IP; la IP de gateway vive en el bridge) y una **IP de la subred** de la
 red (IPAM por-red). El gateway del guest es el del bridge.
 
-- VMs en la **misma** red → conectividad L2 directa (el bridge).
+- VMs en la **misma** red → **aisladas por defecto** (deny-by-default): cada
+  TAP se enslava como *isolated bridge port* del kernel, que no intercambia
+  tramas con otros puertos aislados pero sí con el bridge (el gateway). Solo
+  con `intra: true` la red es un segmento L2 clásico donde las VMs se ven.
+  Esto se hace a nivel L2 a propósito: el tráfico same-bridge **no pasa por
+  nftables** (es switching puro), una regla de forward no podría cortarlo.
 - VMs en redes **distintas** → aisladas (bridges separados + regla nftables que
   descarta el tráfico cruzado).
 - `no_network: true` sigue válido: VM sin TAP, sin IP, solo vsock. El sandbox
@@ -29,13 +36,69 @@ red (IPAM por-red). El gateway del guest es el del bridge.
 - **guest → host**: DROP. La VM no puede alcanzar servicios del host (solo su
   gateway, y solo para enrutar si hay egress).
 - **cross-segment**: DROP. El tráfico de la subred A hacia la subred B se
-  descarta.
+  descarta. Implementado como UNA regla agregada sobre sets (`@mhbridges` +
+  exención `@mhsame` para el tráfico intra-bridge bajo br_netfilter), no una
+  regla por par de bridges: el ruleset se mantiene O(N) con N redes, clave
+  para la topología red-por-VM.
 - **egress**:
   - `egress: true`  → `MASQUERADE` de la subred por la interfaz de salida por
     defecto + FORWARD permitido hacia la WAN.
   - `egress: false` → sin NAT y FORWARD hacia la WAN descartado. **Default**,
     por seguridad (malware-safe): una muestra no llama a casa salvo que se pida
     explícitamente.
+  - `egress: false` + **`allowed_egress`** → egress de grano fino: solo los
+    flujos listados (IP/CIDR destino + protocolo + puerto) se aceptan en
+    `forward` **antes** del drop hacia la WAN, y la subred se enmascara para
+    que esos flujos tengan NAT. Todo lo demás sigue cayendo en el drop. Caso
+    típico IoT: un parser que solo puede hablar con su broker MQTT
+    (`203.0.113.7:8883/tcp`) y nada más.
+
+## Egress de grano fino (`allowed_egress`)
+
+Cada regla es `{ip, protocol, port}`: `ip` es una IPv4 o CIDR IPv4 **en forma
+canónica**, `protocol` ∈ {`tcp`, `udp`, `icmp`} (minúsculas), y `port`
+(1–65535) es obligatorio para tcp/udp y prohibido para icmp. Es **mutuamente
+exclusivo** con `egress: true` (que ya lo permite todo).
+
+La validación (`ValidateEgressRules`) es una frontera de seguridad, no una
+comodidad: los campos se interpolan tal cual en el script `nft -f`, así que
+cualquier cosa que no sea estrictamente IPv4 canónica + protocolo conocido +
+puerto numérico se rechaza en `POST /v1/networks` — si no, sería inyección de
+ruleset.
+
+En el `forward` chain el orden por red restringida es: accepts de
+`allowed_egress` → drop hacia la WAN. En `postrouting`, la subred restringida
+se enmascara entera — es seguro porque postrouting solo ve paquetes que el
+`forward` chain ya aceptó.
+
+### Update en caliente de intra (`PUT /v1/networks/{name}/intra`)
+
+El flag `intra` también se puede cambiar en vivo: se persiste y luego
+`vm.Manager.SyncTapIsolation` recorre los TAPs vivos de la red re-aplicando
+`bridge link set ... isolated on/off`. El reparto de responsabilidades es
+deliberado: el flag vive en el manager de red, pero los nombres de TAP
+pertenecen a las VMs (un fork en Firecracker < 1.12 puede reutilizar el TAP
+del snapshot, así que `tap<id>` no es una convención fiable) — por eso el
+recorrido lo hace el manager de VMs. Si algún TAP no converge al endurecer,
+el endpoint devuelve 500 nombrándolo: un TAP que conserva alcanzabilidad
+antigua es un agujero, no un detalle de log.
+
+### Update en caliente de egress (`PUT /v1/networks/{name}/egress`)
+
+La política de egress de una red viva se puede **reemplazar** sin tocar las
+VMs conectadas: bridge, subred e IPs no cambian, solo se re-renderiza el
+ruleset (que ya es declarativo y atómico). El body reemplaza la política
+entera, no hace merge.
+
+Decisión de diseño clave: el chain `forward` matchea **sin estado** — no tiene
+el `ct state established,related accept` que sí tiene `input`. Cada paquete de
+un flujo iniciado por un guest re-evalúa la política en cada pasada, así que
+al endurecer las reglas los flujos abiertos bajo la política anterior mueren
+en el siguiente paquete: una entrada conntrack obsoleta no puede colarse por
+un accept de established, y no hace falta el binario `conntrack(8)` para
+flushear nada. Las respuestas (tráfico de vuelta desde la WAN) no las toca
+ningún drop (todos van scoped por `iifname` de bridge), pasan por policy
+accept.
 
 ## Egress y coexistencia con el firewall del host (LEER — origen de bugs sutiles)
 

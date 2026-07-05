@@ -191,6 +191,12 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 				// must be kept, but there is no network to re-reserve on.
 				if rec.Config.NetworkName != "" {
 					m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+					// The TAP predates this daemon run — converge it to the
+					// network's current intra policy (best-effort: a failure
+					// leaves stale reachability, not a broken VM).
+					if err := network.SetTapIsolation(tap, !m.netmgr.Intra(rec.Config.NetworkName)); err != nil {
+						log.Printf("reconcile: vm %s: %v", id, err)
+					}
 				}
 			}
 			log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
@@ -493,7 +499,9 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	// shouldn't have any path to the host at all (see NoNetwork's doc comment).
 	// When on, the VM joins a segmented network (the default one if unspecified):
 	// its TAP is enslaved to that network's bridge and it gets an IP from the
-	// network's subnet — VMs share L2 within a network, isolated across networks.
+	// network's subnet. Isolated across networks always; within a network VMs
+	// see each other only if the network opted in (intra) — otherwise the TAP
+	// is an isolated bridge port.
 	var tapName, networkName, bridge, guestIP, gatewayIP string
 	var prefixLen int
 	if !req.NoNetwork {
@@ -508,7 +516,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		}
 
 		tapName = "tap" + id
-		if err := network.CreateTapEnslaved(tapName, br); err != nil {
+		if err := network.CreateTapEnslaved(tapName, br, !m.netmgr.Intra(networkName)); err != nil {
 			m.netmgr.DetachVM(networkName, id)
 			_ = storage.DeleteClone(m.instancesDir, id)
 			return nil, fmt.Errorf("creating tap device: %w", err)
@@ -834,7 +842,7 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	// cold must not quietly connect it to a network its whole point is to be
 	// off of.
 	if record.Config.TapDevice != "" {
-		if err := recreateTap(record.Config); err != nil {
+		if err := m.recreateTap(record.Config); err != nil {
 			return nil, fmt.Errorf("recreating tap for vm %s: %w", id, err)
 		}
 	}
@@ -874,13 +882,41 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	return record, nil
 }
 
+// SyncTapIsolation re-applies the isolated-port flag to every live TAP on the
+// named network — the enforcement half of a hot intra toggle (the flag itself
+// is persisted by network.Manager.UpdateIntra). Stopped VMs have no TAP and
+// pick the current flag up at Start; quarantined forks carry no network name
+// and are never touched. Partial failure returns an error naming what's left
+// unconverged — on a tightening, a tap that kept its old reachability is a
+// security hole the caller must surface, not a footnote for the log.
+func (m *Manager) SyncTapIsolation(networkName string, isolated bool) error {
+	m.mu.Lock()
+	var taps []string
+	for _, rec := range m.vms {
+		if rec.Config.NetworkName == networkName && rec.Config.TapDevice != "" && rec.State != types.VMStateStopped {
+			taps = append(taps, rec.Config.TapDevice)
+		}
+	}
+	m.mu.Unlock()
+
+	var errs []error
+	for _, tap := range taps {
+		if err := network.SetTapIsolation(tap, isolated); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // recreateTap rebuilds a VM's TAP device according to its config: enslaved to
 // its network's bridge, or deliberately bridge-less for a quarantined fork.
-func recreateTap(cfg types.VMConfig) error {
+// Isolation is re-derived from the network's CURRENT intra flag, not a stored
+// copy, so a restarted VM always lands on the network's present policy.
+func (m *Manager) recreateTap(cfg types.VMConfig) error {
 	if cfg.Quarantine {
 		return network.CreateTapQuarantined(cfg.TapDevice)
 	}
-	return network.CreateTapEnslaved(cfg.TapDevice, cfg.Bridge)
+	return network.CreateTapEnslaved(cfg.TapDevice, cfg.Bridge, !m.netmgr.Intra(cfg.NetworkName))
 }
 
 // Snapshot captures a running VM's full state — guest memory, device state,
@@ -1078,7 +1114,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 				_ = storage.DeleteClone(m.instancesDir, id)
 				return nil, fmt.Errorf("%w: fork needs the snapshot's address on network %q (%s): %v — destroy the VM holding it, or fork with quarantine=true", ErrConflict, snap.NetworkName, snap.GuestIP, err)
 			}
-			if err := network.CreateTapEnslaved(tap, bridge); err != nil {
+			if err := network.CreateTapEnslaved(tap, bridge, !m.netmgr.Intra(snap.NetworkName)); err != nil {
 				m.netmgr.DetachVM(snap.NetworkName, id)
 				_ = storage.DeleteClone(m.instancesDir, id)
 				return nil, fmt.Errorf("creating tap device: %w", err)
@@ -1231,7 +1267,7 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	record.Config.Rootfs = rootfs
 
 	if record.Config.TapDevice != "" {
-		if err := recreateTap(record.Config); err != nil {
+		if err := m.recreateTap(record.Config); err != nil {
 			return nil, fmt.Errorf("recreating tap for vm %s: %w", vmID, err)
 		}
 	}

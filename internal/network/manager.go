@@ -94,6 +94,12 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 	if req.Name == "" {
 		return nil, fmt.Errorf("network name is required")
 	}
+	if req.Egress && len(req.AllowedEgress) > 0 {
+		return nil, fmt.Errorf("egress and allowed_egress are mutually exclusive: allowed_egress restricts a network whose egress is otherwise blocked")
+	}
+	if err := ValidateEgressRules(req.AllowedEgress); err != nil {
+		return nil, err
+	}
 
 	m.mu.Lock()
 	if _, exists := m.nets[req.Name]; exists {
@@ -118,13 +124,15 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 
 	id := uuid.NewString()[:8]
 	n := &types.Network{
-		ID:        id,
-		Name:      req.Name,
-		Bridge:    "mhbr" + id,
-		Subnet:    cidr,
-		Gateway:   subnet.Gateway(),
-		Egress:    req.Egress,
-		CreatedAt: time.Now(),
+		ID:            id,
+		Name:          req.Name,
+		Bridge:        "mhbr" + id,
+		Subnet:        cidr,
+		Gateway:       subnet.Gateway(),
+		Egress:        req.Egress,
+		AllowedEgress: req.AllowedEgress,
+		Intra:         req.Intra,
+		CreatedAt:     time.Now(),
 	}
 
 	if err := CreateBridge(n.Bridge, subnet.GatewayCIDR()); err != nil {
@@ -144,6 +152,67 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 		return nil, err
 	}
 	return n, nil
+}
+
+// UpdateEgress replaces a live network's egress policy and reinstalls the
+// nftables ruleset. The point is firewall changes without touching attached
+// VMs: bridge, subnet and allocated IPs are untouched, only the rules change.
+// New flows obey the new policy immediately; flows established under the old
+// policy are cut on the next packet too, because the forward chain matches
+// statelessly (see renderNftables).
+func (m *Manager) UpdateEgress(name string, req types.UpdateNetworkEgressRequest) (*types.Network, error) {
+	if req.Egress && len(req.AllowedEgress) > 0 {
+		return nil, fmt.Errorf("egress and allowed_egress are mutually exclusive: allowed_egress restricts a network whose egress is otherwise blocked")
+	}
+	if err := ValidateEgressRules(req.AllowedEgress); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	mn, ok := m.nets[name]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("network %q not found", name)
+	}
+	// Copy-on-write: persist the updated record before swapping it in, so a
+	// store failure leaves both memory and disk on the old policy.
+	updated := *mn.net
+	updated.Egress = req.Egress
+	updated.AllowedEgress = req.AllowedEgress
+	if err := m.store.SaveNetwork(&updated); err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persisting network %s: %w", name, err)
+	}
+	mn.net = &updated
+	m.mu.Unlock()
+
+	if err := m.applyRules(); err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// UpdateIntra flips a live network's VM↔VM policy. Persist-first copy-on-write
+// like UpdateEgress; no nftables re-render (intra isn't in the ruleset — it's
+// bridge-port isolation). The caller must then converge the network's LIVE
+// taps via vm.Manager.SyncTapIsolation: tap devices belong to VMs, which this
+// manager doesn't track by name. New taps pick the flag up on their own.
+func (m *Manager) UpdateIntra(name string, intra bool) (*types.Network, error) {
+	m.mu.Lock()
+	mn, ok := m.nets[name]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("network %q not found", name)
+	}
+	updated := *mn.net
+	updated.Intra = intra
+	if err := m.store.SaveNetwork(&updated); err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persisting network %s: %w", name, err)
+	}
+	mn.net = &updated
+	m.mu.Unlock()
+	return &updated, nil
 }
 
 // Delete removes a network. It refuses while any VM is still attached — the
@@ -240,6 +309,16 @@ func (m *Manager) DetachVM(networkName, vmID string) {
 	}
 }
 
+// Intra reports whether the named network allows VM↔VM traffic — the flag the
+// TAP-creation paths turn into bridge-port isolation. Unknown network → false,
+// the most restrictive answer (the attach itself will fail anyway).
+func (m *Manager) Intra(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mn, ok := m.nets[name]
+	return ok && mn.net.Intra
+}
+
 // Get returns a network by name.
 func (m *Manager) Get(name string) (*types.Network, bool) {
 	m.mu.Lock()
@@ -271,7 +350,9 @@ func (m *Manager) applyRules() error {
 	anyEgress := false
 	for _, mn := range m.nets {
 		snapshot = append(snapshot, *mn.net)
-		if mn.net.Egress {
+		// Restricted networks (AllowedEgress) need forwarding + NAT plumbing
+		// just like full-egress ones; only the ruleset differs.
+		if mn.net.Egress || len(mn.net.AllowedEgress) > 0 {
 			anyEgress = true
 		}
 	}
