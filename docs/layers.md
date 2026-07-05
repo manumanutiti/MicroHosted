@@ -182,6 +182,14 @@ The top. What actually happens on `POST /v1/vms`.
   one). `stop`/`start` power it off and back on keeping its disk and IP;
   `delete` frees everything.
 
+**Data in and out.** Beyond a VM's own disk, the platform has a **data plane**
+(see `docs/volumes.md`): persistent **volumes** (ext4 disks that outlive VMs,
+attached read-only for a sample or writable for artifacts) and file transfer
+that adapts to the VM's state — over **vsock** while running (even with no
+network), or **offline via `debugfs`** while stopped. The one rule mirrors L2's:
+the host **never mounts a guest filesystem** — `debugfs` reads/writes the ext4
+in userspace, so a malicious image can't reach the host kernel's fs parser.
+
 ---
 
 ## One-line summary

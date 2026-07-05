@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 
 	"microhosted/internal/network"
 	"microhosted/internal/vm"
@@ -80,6 +81,89 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			return
 		}
 		writeJSON(w, http.StatusOK, bulkDeleteResponse(mgr.DestroyByNetwork(r.Context(), name)))
+	})
+
+	// Volumes: persistent ext4 disks that outlive VMs — the data plane. A sample
+	// attached read-only, or a writable disk that collects a detonation's
+	// artifacts and can be read back after the VM is gone.
+	mux.HandleFunc("POST /v1/volumes", func(w http.ResponseWriter, r *http.Request) {
+		var req types.CreateVolumeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Name == "" {
+			writeError(w, http.StatusBadRequest, errors.New("name is required"))
+			return
+		}
+		if req.SizeMB <= 0 {
+			writeError(w, http.StatusBadRequest, errors.New("size_mb must be positive"))
+			return
+		}
+		vol, err := mgr.CreateVolume(req)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, types.NewVolumeResponse(vol))
+	})
+
+	mux.HandleFunc("GET /v1/volumes", func(w http.ResponseWriter, r *http.Request) {
+		vols := mgr.Volumes()
+		resp := make([]types.VolumeResponse, 0, len(vols))
+		for _, v := range vols {
+			resp = append(resp, types.NewVolumeResponse(v))
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("GET /v1/volumes/{id}", func(w http.ResponseWriter, r *http.Request) {
+		vol, ok := mgr.GetVolume(r.PathValue("id"))
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("volume %q not found", r.PathValue("id")))
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewVolumeResponse(vol))
+	})
+
+	mux.HandleFunc("DELETE /v1/volumes/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := mgr.DeleteVolume(r.PathValue("id")); err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Offline I/O on a DETACHED volume, host-side via debugfs (never mounting the
+	// guest fs on the host). Inject a sample before attaching it; extract results
+	// after the VM that wrote them is gone. Refused while the volume is attached —
+	// use the VM's live channel then (see /v1/vms/{id}/files).
+	mux.HandleFunc("PUT /v1/volumes/{id}/files", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+			return
+		}
+		defer r.Body.Close()
+		if err := mgr.InjectToVolume(r.PathValue("id"), path, r.Body); err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("GET /v1/volumes/{id}/files", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+			return
+		}
+		rc, size, err := mgr.ExtractFromVolumeStream(r.PathValue("id"), path)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		streamFile(w, rc, size)
 	})
 
 	mux.HandleFunc("POST /v1/vms", func(w http.ResponseWriter, r *http.Request) {
@@ -284,7 +368,53 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 		writeJSON(w, http.StatusOK, types.ExecResponse{Output: output, ExitCode: exitCode})
 	})
 
+	// File transfer to/from a VM. Transparent over the VM's state: running →
+	// streamed over vsock (works even with no network), stopped → read/written
+	// offline with debugfs straight on the disk. The bulk data channel and the
+	// post-mortem artifact path in one endpoint.
+	mux.HandleFunc("PUT /v1/vms/{id}/files", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+			return
+		}
+		// Stream the body straight through: no io.ReadAll, so a multi-GB upload
+		// costs a fixed buffer, not its size. r.ContentLength (-1 when unknown,
+		// e.g. chunked) is passed on; the manager stages to disk to learn the
+		// length only when the vsock path needs it and it wasn't given.
+		if err := mgr.PutFile(r.PathValue("id"), path, r.Body, r.ContentLength); err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("GET /v1/vms/{id}/files", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+			return
+		}
+		rc, size, err := mgr.GetFileStream(r.PathValue("id"), path)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		streamFile(w, rc, size)
+	})
+
 	return &http.Server{Addr: addr, Handler: logRequests(mux)}
+}
+
+// streamFile copies an extracted file to the response in constant memory,
+// advertising its length so clients get a real Content-Length rather than a
+// chunked stream of unknown size. rc is always closed.
+func streamFile(w http.ResponseWriter, rc io.ReadCloser, size int64) {
+	defer rc.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc)
 }
 
 func logRequests(next http.Handler) http.Handler {

@@ -120,11 +120,16 @@ red no existe.
 | `disk_mb`     | int    | no        | overridea el `disk_mb` de la plantilla; solo agranda (nunca encoge)        |
 | `network`     | string | no        | red segmentada a la que conectar la VM (ver `## Redes`); vacío = `default`  |
 | `no_network`  | bool   | no        | si `true`, no crea TAP/IP — la VM solo es accesible por vsock (`/exec`)     |
+| `volumes`     | array  | no        | volúmenes a adjuntar al arrancar (ver `## Volúmenes`); cada uno `{name, read_only?, guest_path?}` |
 
 ```bash
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu"}'
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","network":"lab"}'
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true}'
+# muestra montada de solo lectura + volumen de salida escribible
+curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true,
+  "volumes":[{"name":"muestra","read_only":true,"guest_path":"/mnt/sample"},
+             {"name":"salida"}]}'
 ```
 
 **Respuesta 201** (`VMResponse`, ver más abajo) · **400** si falta `template`
@@ -421,10 +426,144 @@ responde.
 
 ---
 
+## Volúmenes
+
+Discos ext4 persistentes que viven aparte de las VMs y sobreviven a su
+destrucción — el plano de datos: una muestra montada de solo lectura, o un
+disco escribible que recoge artefactos y se lee después. Detalle completo (canal
+vsock vs `debugfs`, streaming, seguridad) en `docs/volumes.md`.
+
+**Regla de seguridad**: el host **nunca monta** el filesystem del guest;
+todo el I/O host-side va por `debugfs` (espacio de usuario, sin `mount`).
+
+### `POST /v1/volumes` — crear
+
+**Body** (`CreateVolumeRequest`):
+
+| campo     | tipo   | requerido | descripción                          |
+|-----------|--------|-----------|----------------------------------------|
+| `name`    | string | sí        | nombre único del volumen              |
+| `size_mb` | int    | sí        | tamaño del ext4 en MiB (fijo al crear) |
+
+```bash
+curl -X POST localhost:8080/v1/volumes -d '{"name":"muestra","size_mb":64}'
+curl -X POST localhost:8080/v1/volumes -d '{"name":"dataset","size_mb":8192}'
+```
+
+**Respuesta 201** (`VolumeResponse`) · **400** si falta `name`/`size_mb` ≤ 0 ·
+**409** si ya existe un volumen con ese nombre.
+
+### `GET /v1/volumes` · `GET /v1/volumes/{id}`
+
+Lista todos / detalle de uno. **Forma de `VolumeResponse`:**
+
+| campo         | descripción                                             |
+|---------------|----------------------------------------------------------|
+| `id`          | id del volumen                                          |
+| `name`        | nombre                                                  |
+| `size_mb`     | tamaño en MiB                                           |
+| `attached_to` | id de la VM que lo tiene adjunto, o ausente si libre    |
+| `created_at`  | timestamp RFC3339                                       |
+
+### `DELETE /v1/volumes/{id}`
+
+```bash
+curl -X DELETE localhost:8080/v1/volumes/VOLID
+```
+
+**Respuesta 204** · **404** si no existe · **409** si está adjunto a una VM
+(destruye esa VM primero — el volumen persiste al destruirla).
+
+### Adjuntar un volumen a una VM
+
+**No hay endpoint de "attach"**: Firecracker no permite enchufar un disco a una
+VM ya arrancada (no hay hot-plug). Un volumen se adjunta **al crear la VM**, en
+el campo `volumes[]` de `POST /v1/vms`. Cada elemento:
+
+| campo        | tipo   | requerido | descripción                                                        |
+|--------------|--------|-----------|---------------------------------------------------------------------|
+| `name`       | string | sí        | nombre de un volumen existente (creado con `POST /v1/volumes`)      |
+| `read_only`  | bool   | no        | adjuntar como dispositivo de solo lectura (una muestra que el guest no debe alterar) |
+| `guest_path` | string | no        | dónde montarlo dentro del guest; por defecto `/vol/<name>`          |
+
+Tras arrancar, el daemon monta cada volumen en su `guest_path` por vsock (con
+`-o ro` si es `read_only`). Firecracker los expone como `/dev/vdb`, `/dev/vdc`…
+en el orden del array.
+
+```bash
+# 1) crear el volumen
+curl -X POST localhost:8080/v1/volumes -d '{"name":"salida","size_mb":512}'
+
+# 2) (opcional) prellenarlo offline sin arrancar nada
+curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/muestra.bin" --data-binary @muestra.bin
+
+# 3) crear la VM con el volumen adjunto
+curl -X POST localhost:8080/v1/vms -d '{
+  "template":"base-ubuntu","no_network":true,
+  "volumes":[{"name":"salida","guest_path":"/mnt/out"}]}'
+```
+
+Un volumen está adjunto **a lo sumo a una VM a la vez** — adjuntarlo a una
+segunda mientras la primera lo tiene da **409**. Al destruir la VM el volumen se
+suelta (queda libre) pero **no se borra**. Si necesitas escribir en un volumen
+ya adjunto a una VM viva, hazlo por el canal de la VM
+(`PUT /v1/vms/{id}/files`, más abajo), no por el endpoint offline del volumen.
+
+### `PUT`/`GET /v1/volumes/{id}/files?path=…` — meter/sacar datos offline
+
+Escribe o lee un fichero dentro del volumen **sin arrancar ninguna VM**, con
+`debugfs` (sin montar). Es la vía para **preparar** un volumen: lo llenas y
+luego lo adjuntas al crear la VM. En streaming — memoria constante sea cual sea
+el tamaño (un dataset de varios GB no carga la RAM del host).
+
+Solo válido con el volumen **libre** (`attached_to` vacío): escribir por debajo
+de un guest que lo tiene montado lo corrompería.
+
+```bash
+# meter una muestra en el volumen (el cuerpo es el fichero crudo)
+curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/muestra.bin" --data-binary @muestra.bin
+# sacar un artefacto
+curl "localhost:8080/v1/volumes/VOLID/files?path=/salida/resultado.txt" -o resultado.txt
+```
+
+**Respuesta 204** (PUT) / **200** con el fichero (GET) · **400** si falta
+`path` o no es una ruta absoluta válida · **404** si el volumen o el fichero no
+existe · **409** si el volumen está adjunto a una VM.
+
+> **Datos grandes**: Firecracker no tiene hot-plug de discos, así que no se
+> adjunta un volumen a una VM ya arrancada. El modelo es **preparar y adjuntar**:
+> creas el volumen del tamaño que necesites, lo llenas aquí (offline, streaming)
+> y creas la VM con él en `volumes[]`.
+
+---
+
+## Ficheros de una VM
+
+### `PUT`/`GET /v1/vms/{id}/files?path=…` — subir/bajar un fichero
+
+Transfiere un fichero a/desde una VM. **Transparente al estado**: si la VM está
+**running** va por vsock (funciona incluso sin red); si está **stopped** lee/
+escribe su disco offline con `debugfs` (ruta *post-mortem*: sacar evidencias sin
+arrancar). En streaming de punta a punta — memoria constante a cualquier tamaño.
+
+```bash
+# subir (Content-Length automático con --data-binary @fichero)
+curl -X PUT "localhost:8080/v1/vms/VMID/files?path=/root/entrada.bin" --data-binary @entrada.bin
+# bajar
+curl "localhost:8080/v1/vms/VMID/files?path=/root/salida.bin" -o salida.bin
+```
+
+**Respuesta 204** (PUT) / **200** con el fichero (GET) · **400** si falta
+`path` · **404** si la VM no existe · **409** si la VM no está `running` ni
+`stopped`.
+
+Ojo con el tamaño del disco raíz (`disk_mb`) si subes un fichero grande ahí;
+para datos grandes usa un **volumen** dimensionado, no el rootfs.
+
+---
+
 ## Lo que falta (ver `SESSIONS.md` → "Próxima sesión")
 
-- `PUT`/`PATCH` para "actualizar" una VM: subir un archivo/playbook a su
-  disco, o parametrizar con qué contenido nace.
 - Poder crear a partir de un disco ya usado (no solo de la plantilla dorada).
 - `GET /v1/vms` con más forma de "`docker ps`" (uptime, columnas pensadas
   para un panel web).

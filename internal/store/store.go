@@ -32,6 +32,12 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite at %s: %w", path, err)
 	}
+	// SQLite allows one writer at a time; with the pool's default of many
+	// connections, concurrent writers (e.g. parallel bulk destroy) surface as
+	// SQLITE_BUSY errors instead of queueing. A single connection makes the
+	// pool itself the queue. Statements here are all point reads/writes, so
+	// serialization costs microseconds.
+	db.SetMaxOpenConns(1)
 
 	schema := []string{
 		`CREATE TABLE IF NOT EXISTS vms (
@@ -47,6 +53,14 @@ func Open(path string) (*Store, error) {
 		)`,
 		`CREATE TABLE IF NOT EXISTS snapshots (
 			id   TEXT PRIMARY KEY,
+			data TEXT NOT NULL
+		)`,
+		// name is UNIQUE so the DB enforces one volume per name — the manager
+		// resolves attach requests by name and relies on this to keep them
+		// unambiguous, same as networks.
+		`CREATE TABLE IF NOT EXISTS volumes (
+			id   TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
 			data TEXT NOT NULL
 		)`,
 	}
@@ -162,6 +176,54 @@ func (s *Store) ListSnapshots() ([]*types.Snapshot, error) {
 		snaps = append(snaps, &snap)
 	}
 	return snaps, rows.Err()
+}
+
+// SaveVolume upserts a volume record. Called on create and whenever a volume's
+// attachment changes (attach on VM create, release on destroy).
+func (s *Store) SaveVolume(v *types.Volume) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshaling volume %s: %w", v.Name, err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO volumes (id, name, data) VALUES (?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET name = excluded.name, data = excluded.data`,
+		v.ID, v.Name, string(data),
+	); err != nil {
+		return fmt.Errorf("saving volume %s: %w", v.Name, err)
+	}
+	return nil
+}
+
+// DeleteVolume removes a volume record by id. Idempotent.
+func (s *Store) DeleteVolume(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM volumes WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting volume %s: %w", id, err)
+	}
+	return nil
+}
+
+// ListVolumes returns every persisted volume record, loaded once at startup.
+func (s *Store) ListVolumes() ([]*types.Volume, error) {
+	rows, err := s.db.Query(`SELECT data FROM volumes`)
+	if err != nil {
+		return nil, fmt.Errorf("querying volumes: %w", err)
+	}
+	defer rows.Close()
+
+	var vols []*types.Volume
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scanning volume row: %w", err)
+		}
+		var v types.Volume
+		if err := json.Unmarshal([]byte(data), &v); err != nil {
+			return nil, fmt.Errorf("unmarshaling volume row: %w", err)
+		}
+		vols = append(vols, &v)
+	}
+	return vols, rows.Err()
 }
 
 // SaveNetwork upserts a network record. The UNIQUE constraint on name means a

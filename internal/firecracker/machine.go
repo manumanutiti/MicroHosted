@@ -54,12 +54,7 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 		// An empty (non-nil) slice disables forwarding entirely; the VM's
 		// lifetime is the manager's, ended only by an explicit Destroy.
 		ForwardSignals: []os.Signal{},
-		Drives: []models.Drive{{
-			DriveID:      fc.String("rootfs"),
-			PathOnHost:   fc.String(vm.Rootfs),
-			IsRootDevice: fc.Bool(true),
-			IsReadOnly:   fc.Bool(false),
-		}},
+		Drives:         buildDrives(vm),
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  fc.Int64(vm.VCPUs),
 			MemSizeMib: fc.Int64(vm.MemMB),
@@ -113,6 +108,31 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// buildDrives assembles the drive list for a VM: the root device first, then one
+// secondary drive per attached volume. Firecracker exposes secondary drives as
+// /dev/vdb, /dev/vdc… in this order, which is why VMConfig.Volumes preserves the
+// order the volumes were requested — the manager's auto-mount depends on it. A
+// read-only volume is a read-only block device (is_read_only), so a sample
+// attached that way can't be altered by the guest inspecting it, not merely
+// mounted with -o ro.
+func buildDrives(vm types.VMConfig) []models.Drive {
+	drives := []models.Drive{{
+		DriveID:      fc.String("rootfs"),
+		PathOnHost:   fc.String(vm.Rootfs),
+		IsRootDevice: fc.Bool(true),
+		IsReadOnly:   fc.Bool(false),
+	}}
+	for _, vol := range vm.Volumes {
+		drives = append(drives, models.Drive{
+			DriveID:      fc.String(vol.DriveID),
+			PathOnHost:   fc.String(vol.HostPath),
+			IsRootDevice: fc.Bool(false),
+			IsReadOnly:   fc.Bool(vol.ReadOnly),
+		})
+	}
+	return drives
 }
 
 // deriveMAC builds a locally-administered, unicast MAC from an IPv4 address:
@@ -298,4 +318,21 @@ func Stop(ctx context.Context, m *fc.Machine) error {
 	_ = m.Wait(shutdownCtx)
 
 	return m.StopVMM()
+}
+
+// Kill terminates a machine without offering the guest a graceful power-off.
+// This is for Destroy, where the disk is deleted right afterwards — an orderly
+// guest shutdown buys nothing there, and waiting for one (which most minimal
+// guests ignore anyway) costs Stop's full 5-second window per VM. StopVMM only
+// sends SIGTERM and returns, so wait for the process to actually exit before
+// the caller removes the jail dir out from under it; the VMM dies in
+// milliseconds, the timeout is just a backstop against a wedged process.
+func Kill(ctx context.Context, m *fc.Machine) error {
+	err := m.StopVMM()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_ = m.Wait(waitCtx)
+
+	return err
 }

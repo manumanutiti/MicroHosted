@@ -99,6 +99,14 @@ func main() {
 
 	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)
 
+	// Volumes load before Reconcile: sweeping a dead VM releases its volumes, so
+	// the volume index must already be populated when Reconcile runs.
+	vols, err := st.ListVolumes()
+	if err != nil {
+		log.Fatalf("cargando volúmenes persistidos: %v", err)
+	}
+	mgr.LoadVolumes(vols)
+
 	// Recover state from a previous run before serving: adopt VMs still
 	// running, sweep those that died while we were down. This also tells us
 	// which tap devices are live so the orphan sweep below doesn't tear down a

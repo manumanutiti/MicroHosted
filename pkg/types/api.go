@@ -23,6 +23,12 @@ type CreateVMRequest struct {
 	// intended channel for those is vsock, not SSH over a TAP link. Network
 	// stays on by default so existing callers keep working unchanged.
 	NoNetwork bool `json:"no_network,omitempty"`
+
+	// Volumes attaches existing persistent volumes to the VM at boot: a sample
+	// mounted read-only to analyse without altering it, plus a writable volume
+	// to collect artifacts that survive the VM's destruction. Each is mounted at
+	// /vol/<name> (or its guest_path) after boot. See VolumeAttachRequest.
+	Volumes []VolumeAttachRequest `json:"volumes,omitempty"`
 }
 
 // VMResponse is the JSON representation of a VM returned by the API.
@@ -41,7 +47,9 @@ type VMResponse struct {
 	Quarantine bool `json:"quarantine,omitempty"`
 	// RestoredFrom is the snapshot this VM was forked/restored from, if any.
 	RestoredFrom string `json:"restored_from,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	// Volumes are the persistent volumes attached to this VM.
+	Volumes   []MountResponse `json:"volumes,omitempty"`
+	CreatedAt string          `json:"created_at"`
 }
 
 // BulkDeleteResponse is returned by bulk-delete endpoints (DELETE /v1/vms,
@@ -80,6 +88,24 @@ func NewVMResponse(vm *VM) VMResponse {
 		LogPath:      vm.LogPath,
 		Quarantine:   vm.Config.Quarantine,
 		RestoredFrom: vm.Config.RestoredFrom,
+		Volumes:      newMountResponses(vm.Config.Volumes),
 		CreatedAt:    vm.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
+}
+
+// newMountResponses maps a VM's attached volumes to their wire DTOs, returning
+// nil (omitted from JSON) when the VM has none.
+func newMountResponses(mounts []VolumeMount) []MountResponse {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]MountResponse, 0, len(mounts))
+	for _, m := range mounts {
+		out = append(out, MountResponse{
+			Volume:    m.VolumeName,
+			ReadOnly:  m.ReadOnly,
+			GuestPath: m.GuestPath,
+		})
+	}
+	return out
 }

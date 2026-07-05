@@ -85,11 +85,40 @@ if [[ "$DO_VSOCK" -eq 1 ]]; then
   fi
 
   echo "==> Instalando el listener vsock (microhosted-exec, puerto ${AGENT_PORT})..."
+  # El agente multiplexa tres verbos sobre la misma conexión, según la primera
+  # línea: comando pelado (exec, contrato histórico), PUT (subir fichero) y GET
+  # (bajar fichero). PUT/GET son el canal de datos en volumen: meter una muestra
+  # o sacar artefactos sin red. Lee la primera línea entera con `IFS= read -r`
+  # para no tocar los espacios del comando; el resto del stdin (los bytes de un
+  # PUT) lo consume `head -c` byte a byte, así que read no se lo come por delante.
   sudo tee "$MOUNT_DIR/usr/local/bin/microhosted-exec" >/dev/null <<'AGENT'
 #!/bin/sh
-read -r cmd
-sh -c "$cmd" 2>&1
-echo "___MICROHOSTED_EXIT___:$?"
+IFS= read -r line
+verb=${line%% *}
+case "$verb" in
+  PUT)
+    rest=${line#PUT }
+    path=${rest% *}
+    len=${rest##* }
+    mkdir -p "$(dirname "$path")" 2>/dev/null
+    head -c "$len" > "$path"
+    echo "___MICROHOSTED_EXIT___:$?"
+    ;;
+  GET)
+    path=${line#GET }
+    if [ -f "$path" ]; then
+      len=$(wc -c < "$path")
+      printf 'OK %s\n' "$len"
+      cat "$path"
+    else
+      printf 'ERR no such file: %s\n' "$path"
+    fi
+    ;;
+  *)
+    sh -c "$line" 2>&1
+    echo "___MICROHOSTED_EXIT___:$?"
+    ;;
+esac
 AGENT
   sudo chmod 0755 "$MOUNT_DIR/usr/local/bin/microhosted-exec"
 

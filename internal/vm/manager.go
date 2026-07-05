@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -68,6 +69,14 @@ type Manager struct {
 	vms   map[string]*types.VM
 	run   map[string]*running
 	snaps map[string]*types.Snapshot
+	vols  map[string]*types.Volume
+	// volIO/vmIO mark a volume or a VM's disk as busy with an offline debugfs
+	// operation. debugfs runs unlocked (a multi-GB transfer can't hold the
+	// manager lock), so these guard against a concurrent attach/boot writing
+	// the same ext4 out from under it — writing a mounted filesystem corrupts
+	// it. Both are set/cleared under mu.
+	volIO map[string]bool
+	vmIO  map[string]bool
 }
 
 // NewManager wires a Manager to its template catalog, jailer defaults, the
@@ -75,6 +84,12 @@ type Manager struct {
 // manager it attaches VMs through, and the store that persists VM records
 // across daemon restarts.
 func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDir string, st *store.Store, netmgr *network.Manager) *Manager {
+	// Sweep any staging temps a previous run left mid-transfer (a crash between
+	// stageFile and its deferred Remove). Safe at startup: no transfer is live
+	// yet. Best-effort — a failure here just means a few stale files, not a
+	// reason to refuse to boot.
+	_ = os.RemoveAll(filepath.Join(instancesDir, "staging"))
+
 	return &Manager{
 		catalog:        catalog,
 		jailerCfg:      jailerCfg,
@@ -85,6 +100,27 @@ func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDi
 		vms:            make(map[string]*types.VM),
 		run:            make(map[string]*running),
 		snaps:          make(map[string]*types.Snapshot),
+		vols:           make(map[string]*types.Volume),
+		volIO:          make(map[string]bool),
+		vmIO:           make(map[string]bool),
+	}
+}
+
+// LoadVolumes seeds the manager's volume index from persisted records at
+// startup. Like snapshots there's no process liveness to reconcile, but a
+// volume whose backing file vanished (removed out-of-band) is dropped rather
+// than offered for an attach that can only fail. Must run before Reconcile so
+// the sweep of dead VMs can find and release their volumes.
+func (m *Manager) LoadVolumes(records []*types.Volume) {
+	for _, vol := range records {
+		if _, err := os.Stat(vol.Path); err != nil {
+			log.Printf("reconcile: dropping volume %s (%s): file %s missing", vol.ID, vol.Name, vol.Path)
+			_ = m.store.DeleteVolume(vol.ID)
+			continue
+		}
+		m.mu.Lock()
+		m.vols[vol.ID] = vol
+		m.mu.Unlock()
 	}
 }
 
@@ -163,6 +199,7 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 
 		// Dead while we were down — sweep whatever it left behind and forget it.
 		m.cleanupNetwork(rec.Config.NetworkName, rec.Config.TapDevice, id)
+		m.releaseVolumes(id, rec.Config.Volumes)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
 		_ = removeIfExists(rec.LogPath)
@@ -173,6 +210,252 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 	}
 
 	return keepTaps
+}
+
+// CreateVolume provisions a new persistent volume: a fresh ext4 image on the
+// CoW store plus its record. Volumes exist independently of VMs — they're the
+// data plane (a read-only sample, a writable artifact scratch disk) and survive
+// a VM's destruction.
+func (m *Manager) CreateVolume(req types.CreateVolumeRequest) (*types.Volume, error) {
+	if req.Name == "" {
+		return nil, fmt.Errorf("volume name is required")
+	}
+	m.mu.Lock()
+	for _, v := range m.vols {
+		if v.Name == req.Name {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: a volume named %q already exists", ErrConflict, req.Name)
+		}
+	}
+	m.mu.Unlock()
+
+	id := uuid.NewString()[:8]
+	path, err := storage.CreateVolume(m.instancesDir, id, req.SizeMB, m.jailerCfg.UID, m.jailerCfg.GID)
+	if err != nil {
+		return nil, err
+	}
+
+	vol := &types.Volume{
+		ID:        id,
+		Name:      req.Name,
+		SizeMB:    req.SizeMB,
+		Path:      path,
+		CreatedAt: time.Now(),
+	}
+	if err := m.store.SaveVolume(vol); err != nil {
+		_ = storage.DeleteVolume(m.instancesDir, id)
+		return nil, fmt.Errorf("persisting volume %s: %w", req.Name, err)
+	}
+
+	m.mu.Lock()
+	m.vols[id] = vol
+	m.mu.Unlock()
+	return vol, nil
+}
+
+// DeleteVolume removes a volume's image and record. Refuses while the volume is
+// attached to a VM — the data would vanish from under a running guest, and the
+// VM's config still references it. Detach by destroying that VM first.
+func (m *Manager) DeleteVolume(id string) error {
+	m.mu.Lock()
+	vol, ok := m.vols[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: volume %s", ErrVMNotFound, id)
+	}
+	if vol.AttachedTo != "" {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: volume %s is attached to vm %s — destroy it first", ErrConflict, id, vol.AttachedTo)
+	}
+	delete(m.vols, id)
+	m.mu.Unlock()
+
+	fileErr := storage.DeleteVolume(m.instancesDir, id)
+	storeErr := m.store.DeleteVolume(id)
+	return errors.Join(
+		wrapErr("removing volume image %s", id, fileErr),
+		wrapErr("removing volume record %s", id, storeErr),
+	)
+}
+
+// GetVolume returns a single volume by ID.
+func (m *Manager) GetVolume(id string) (*types.Volume, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.vols[id]
+	return v, ok
+}
+
+// Volumes returns every volume currently tracked.
+func (m *Manager) Volumes() []*types.Volume {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	list := make([]*types.Volume, 0, len(m.vols))
+	for _, v := range m.vols {
+		list = append(list, v)
+	}
+	return list
+}
+
+// attachVolumes resolves each attach request by volume name, claims the volume
+// for vmID (rejecting one already held by another VM, or named twice in one
+// request), and returns the VolumeMounts to record on the VM. The claim is taken
+// under the lock so two concurrent Creates can't grab the same volume; on any
+// failure every claim made so far is released before returning.
+func (m *Manager) attachVolumes(vmID string, reqs []types.VolumeAttachRequest) ([]types.VolumeMount, error) {
+	if len(reqs) == 0 {
+		return nil, nil
+	}
+
+	m.mu.Lock()
+	byName := make(map[string]*types.Volume, len(m.vols))
+	for _, v := range m.vols {
+		byName[v.Name] = v
+	}
+
+	mounts := make([]types.VolumeMount, 0, len(reqs))
+	claimed := make([]*types.Volume, 0, len(reqs))
+	seen := make(map[string]bool, len(reqs))
+	for _, req := range reqs {
+		vol, ok := byName[req.Name]
+		if !ok {
+			m.releaseClaimsLocked(claimed)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: volume %q", ErrVMNotFound, req.Name)
+		}
+		if seen[vol.ID] {
+			m.releaseClaimsLocked(claimed)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: volume %q attached more than once", ErrConflict, req.Name)
+		}
+		if vol.AttachedTo != "" {
+			m.releaseClaimsLocked(claimed)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: volume %q is already attached to vm %s", ErrConflict, req.Name, vol.AttachedTo)
+		}
+		if m.volIO[vol.ID] {
+			m.releaseClaimsLocked(claimed)
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: volume %q is busy with an offline file operation", ErrConflict, req.Name)
+		}
+		vol.AttachedTo = vmID
+		seen[vol.ID] = true
+		claimed = append(claimed, vol)
+
+		guestPath := req.GuestPath
+		if guestPath == "" {
+			guestPath = "/vol/" + vol.Name
+		}
+		mounts = append(mounts, types.VolumeMount{
+			VolumeID:   vol.ID,
+			VolumeName: vol.Name,
+			ReadOnly:   req.ReadOnly,
+			GuestPath:  guestPath,
+			// Underscore, not hyphen: Firecracker rejects a drive_id with any
+			// non-alphanumeric/underscore character ("API Resource IDs can only
+			// contain alphanumeric characters and underscores").
+			DriveID:  "vol_" + vol.ID,
+			HostPath: vol.Path,
+		})
+	}
+	m.mu.Unlock()
+
+	// Persist the claims so a restart still sees them attached. A persist failure
+	// rolls every claim back — a volume marked attached in memory but not on disk
+	// would desync after a restart.
+	for _, vol := range claimed {
+		if err := m.store.SaveVolume(vol); err != nil {
+			m.releaseVolumes(vmID, mounts)
+			return nil, fmt.Errorf("persisting volume attachment %s: %w", vol.Name, err)
+		}
+	}
+	return mounts, nil
+}
+
+// releaseClaimsLocked clears AttachedTo on volumes claimed earlier in the same
+// attach attempt. Caller must hold m.mu. In-memory only — these claims were
+// never persisted (attachVolumes persists after the whole loop succeeds).
+func (m *Manager) releaseClaimsLocked(claimed []*types.Volume) {
+	for _, vol := range claimed {
+		vol.AttachedTo = ""
+	}
+}
+
+// releaseVolumes detaches vmID's volumes: clears AttachedTo and persists, so the
+// volumes become free for another VM. The image files are left untouched — a
+// volume's whole point is to outlive the VM. Errors are logged, not returned:
+// a detach is part of teardown and shouldn't fail the caller.
+func (m *Manager) releaseVolumes(vmID string, mounts []types.VolumeMount) {
+	if len(mounts) == 0 {
+		return
+	}
+	m.mu.Lock()
+	toSave := make([]*types.Volume, 0, len(mounts))
+	for _, mt := range mounts {
+		if vol, ok := m.vols[mt.VolumeID]; ok && vol.AttachedTo == vmID {
+			vol.AttachedTo = ""
+			toSave = append(toSave, vol)
+		}
+	}
+	m.mu.Unlock()
+	for _, vol := range toSave {
+		if err := m.store.SaveVolume(vol); err != nil {
+			log.Printf("releasing volume %s from vm %s: %v", vol.ID, vmID, err)
+		}
+	}
+}
+
+// mountVolumes waits for the guest's vsock agent to come up, then mounts each
+// attached volume inside the guest. Firecracker exposes the secondary drives as
+// /dev/vdb, /dev/vdc… in VMConfig.Volumes order, so index i maps to /dev/vd{b+i}.
+// A read-only attachment is mounted -o ro. A volume with no GuestPath is left as
+// a raw device for the guest to mount itself.
+func (m *Manager) mountVolumes(record *types.VM) error {
+	if len(record.Config.Volumes) == 0 {
+		return nil
+	}
+	if err := m.waitAgentReady(record.VsockPath); err != nil {
+		return err
+	}
+	for i, mt := range record.Config.Volumes {
+		if mt.GuestPath == "" {
+			continue
+		}
+		device := "/dev/vd" + string(rune('b'+i))
+		opts := ""
+		if mt.ReadOnly {
+			opts = "-o ro "
+		}
+		cmd := fmt.Sprintf("mkdir -p %s && mount %s%s %s", mt.GuestPath, opts, device, mt.GuestPath)
+		out, code, err := vsock.Exec(record.VsockPath, cmd)
+		if err != nil {
+			return fmt.Errorf("mounting volume %s at %s: %w", mt.VolumeName, mt.GuestPath, err)
+		}
+		if code != 0 {
+			return fmt.Errorf("mounting volume %s at %s failed (exit %d): %s", mt.VolumeName, mt.GuestPath, code, strings.TrimSpace(out))
+		}
+	}
+	return nil
+}
+
+// waitAgentReady polls the guest's vsock exec agent until it answers, so an
+// auto-mount issued right after boot doesn't race the guest still coming up.
+func (m *Manager) waitAgentReady(vsockPath string) error {
+	const (
+		budget   = 30 * time.Second
+		interval = 500 * time.Millisecond
+	)
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if _, _, err := vsock.Exec(vsockPath, "true"); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(interval)
+	}
+	return fmt.Errorf("guest vsock agent not ready after %s: %w", budget, lastErr)
 }
 
 // Create clones a template's disk, wires up networking, and launches a new
@@ -233,6 +516,16 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		guestIP, gatewayIP, bridge, prefixLen = ip, gw, br, prefix
 	}
 
+	// Attach any requested volumes before boot: their drives must be in the
+	// Firecracker config (built inside boot), and claiming them here means a
+	// failure rolls back the network/clone above cleanly.
+	mounts, err := m.attachVolumes(id, req.Volumes)
+	if err != nil {
+		m.cleanupNetwork(networkName, tapName, id)
+		_ = storage.DeleteClone(m.instancesDir, id)
+		return nil, fmt.Errorf("attaching volumes: %w", err)
+	}
+
 	vmCfg := types.VMConfig{
 		ID:           id,
 		TemplateName: tpl.Name,
@@ -247,6 +540,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		GuestIP:      guestIP,
 		GatewayIP:    gatewayIP,
 		PrefixLen:    prefixLen,
+		Volumes:      mounts,
 	}
 
 	record := &types.VM{
@@ -262,6 +556,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	// removes Jailer's directory, and a leftover would break a retried launch
 	// under the same ID and leak disk otherwise.
 	if err := m.boot(record); err != nil {
+		m.releaseVolumes(id, mounts)
 		m.cleanupNetwork(networkName, tapName, id)
 		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
 		_ = storage.DeleteClone(m.instancesDir, id)
@@ -271,6 +566,15 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	m.mu.Lock()
 	m.vms[id] = record
 	m.mu.Unlock()
+
+	// Mount attached volumes inside the guest over vsock, now that it's up and
+	// tracked. A mount failure tears the whole VM down (Destroy releases the
+	// volume claims, network, clone and jail dir) — a half-mounted VM isn't what
+	// the caller asked for.
+	if err := m.mountVolumes(record); err != nil {
+		_ = m.Destroy(context.Background(), id)
+		return nil, fmt.Errorf("mounting volumes: %w", err)
+	}
 
 	// Persist last, once the VM is fully up and tracked. A record we can't
 	// persist is exactly the orphan the store exists to prevent, so a failure
@@ -336,6 +640,32 @@ func (m *Manager) boot(record *types.VM) error {
 	return nil
 }
 
+// powerOff stops a VM's running process and releases its TAP + jail dir, leaving
+// the disk and IP intact — the shared teardown behind Stop and behind a failed
+// volume auto-mount on Start. It does NOT touch the store or the VM's tracked
+// state; the caller decides what state to record.
+func (m *Manager) powerOff(ctx context.Context, record *types.VM, r *running) error {
+	id := record.Config.ID
+	var stopErr error
+	switch {
+	case r != nil && r.machine != nil:
+		stopErr = firecracker.Stop(ctx, r.machine)
+	case record.PID > 0:
+		stopErr = stopByPID(record.PID)
+	}
+	if r != nil && r.logFile != nil {
+		_ = r.logFile.Close()
+	}
+	if record.Config.TapDevice != "" {
+		_ = network.DeleteTap(record.Config.TapDevice)
+	}
+	jailErr := jailer.RemoveInstanceDir(m.jailerCfg, id)
+	return errors.Join(
+		wrapErr("stopping vm %s", id, stopErr),
+		wrapErr("removing jail dir for vm %s", id, jailErr),
+	)
+}
+
 // Destroy stops the machine and releases every resource associated with it.
 func (m *Manager) Destroy(ctx context.Context, id string) error {
 	m.mu.Lock()
@@ -350,7 +680,10 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	switch {
 	case r != nil && r.machine != nil:
 		// Normal path: we own a live SDK handle from this daemon's lifetime.
-		stopErr = firecracker.Stop(ctx, r.machine)
+		// Kill, not Stop: the disk is deleted below, so there's nothing for a
+		// graceful guest power-off to protect, and skipping its 5s window is
+		// what keeps Destroy fast.
+		stopErr = firecracker.Kill(ctx, r.machine)
 	case record.PID > 0:
 		// Adopted VM: recovered from the store after a restart, so there's no
 		// SDK handle to drive a graceful shutdown — signal the process directly.
@@ -365,6 +698,9 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	// or the leak compounds on every crash. Errors are collected, not returned
 	// early, so one failed step never skips the rest.
 	m.cleanupNetwork(record.Config.NetworkName, record.Config.TapDevice, id)
+	// Detach volumes (clear their AttachedTo) but keep their image files: a
+	// volume is persistent by definition and survives the VM it was attached to.
+	m.releaseVolumes(id, record.Config.Volumes)
 	cloneErr := storage.DeleteClone(m.instancesDir, id)
 	// Jailer never removes its own per-VM directory; without this the chroot
 	// (rootfs/kernel hardlinks, api socket, cgroup leftovers) accumulates under
@@ -454,9 +790,15 @@ func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
 func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	m.mu.Lock()
 	record, ok := m.vms[id]
+	busyIO := m.vmIO[id]
 	m.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	// An offline file op is writing this VM's disk right now; booting Firecracker
+	// on it mid-write would corrupt it. Make the caller retry once the op is done.
+	if busyIO {
+		return nil, fmt.Errorf("%w: vm %s is busy with an offline file operation", ErrConflict, id)
 	}
 	if record.State != types.VMStateStopped {
 		return nil, fmt.Errorf("%w: vm %s is not stopped (state %s)", ErrVMState, id, record.State)
@@ -478,6 +820,26 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 			_ = network.DeleteTap(record.Config.TapDevice)
 		}
 		return nil, err
+	}
+
+	// Re-mount the VM's volumes (the block devices are back with the fresh boot).
+	// On failure, power the VM back off and leave it stopped — the volumes stay
+	// attached and the disk is intact, so Start is retryable; unlike Create, a
+	// failed Start must not destroy an existing VM.
+	if err := m.mountVolumes(record); err != nil {
+		m.mu.Lock()
+		r := m.run[id]
+		m.mu.Unlock()
+		_ = m.powerOff(ctx, record, r)
+		m.mu.Lock()
+		record.State = types.VMStateStopped
+		record.PID = 0
+		record.SocketPath = ""
+		record.VsockPath = ""
+		m.run[id] = &running{}
+		m.mu.Unlock()
+		_ = m.store.SaveVM(record)
+		return nil, fmt.Errorf("mounting volumes for vm %s: %w", id, err)
 	}
 
 	if err := m.store.SaveVM(record); err != nil {
@@ -514,6 +876,9 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 	}
 	if record.State != types.VMStateRunning {
 		return nil, fmt.Errorf("%w: vm %s is not running (state %s)", ErrVMState, vmID, record.State)
+	}
+	if len(record.Config.Volumes) > 0 {
+		return nil, errVolumesAttached(vmID)
 	}
 
 	sid := uuid.NewString()[:8]
@@ -744,6 +1109,13 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 // Callers who want to keep the frozen point for later restores should use
 // Snapshot + Fork instead.
 func (m *Manager) ForkVM(ctx context.Context, vmID string, quarantine bool) (*types.VM, error) {
+	m.mu.Lock()
+	record, ok := m.vms[vmID]
+	m.mu.Unlock()
+	if ok && len(record.Config.Volumes) > 0 {
+		return nil, errVolumesAttached(vmID)
+	}
+
 	snap, err := m.Snapshot(ctx, vmID, "fork-ephemeral")
 	if err != nil {
 		return nil, err
@@ -786,6 +1158,9 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	}
 	if record.State != types.VMStateRunning && record.State != types.VMStateStopped {
 		return nil, fmt.Errorf("%w: vm %s is %s", ErrVMState, vmID, record.State)
+	}
+	if len(record.Config.Volumes) > 0 {
+		return nil, errVolumesAttached(vmID)
 	}
 
 	// Tear down the current incarnation the way Stop does — process, jail dir,
@@ -961,6 +1336,14 @@ func (m *Manager) DeleteSnapshot(id string) error {
 	)
 }
 
+// errVolumesAttached is the ErrConflict returned when a snapshot/fork/restore is
+// attempted on a VM with volumes attached. In v1 that combination isn't
+// supported: the snapshotted RAM holds the volume mounted (page cache, journal),
+// and restoring over a volume that changed since would corrupt it.
+func errVolumesAttached(vmID string) error {
+	return fmt.Errorf("%w: vm %s has volumes attached — snapshot/fork/restore of a VM with volumes is not supported; destroy it (volumes persist) and recreate without them first", ErrConflict, vmID)
+}
+
 // wrapErr annotates err with a formatted context prefix, or returns nil if
 // err is nil so it drops out of an errors.Join cleanly.
 func wrapErr(format, id string, err error) error {
@@ -997,14 +1380,38 @@ func (m *Manager) destroyMatching(ctx context.Context, match func(*types.VM) boo
 	}
 	m.mu.Unlock()
 
+	// Destroys run in parallel: each one can spend seconds blocked on process
+	// shutdown, and those waits are independent, so serially a bulk delete
+	// costs their sum where in parallel it costs roughly the slowest one.
+	// Per-VM state is disjoint (each has its own tap/clone/jail dir/store
+	// row) and the shared structures (manager maps, IPAM, store) take their
+	// own locks. Concurrency is capped so a large fleet doesn't stampede
+	// netlink and the filesystem with hundreds of simultaneous teardowns.
+	const maxConcurrent = 8
+	sem := make(chan struct{}, maxConcurrent)
+	var (
+		wg    sync.WaitGroup
+		resMu sync.Mutex
+	)
 	failed = make(map[string]error)
 	for _, id := range ids {
-		if err := m.Destroy(ctx, id); err != nil {
-			failed[id] = err
-			continue
-		}
-		deleted = append(deleted, id)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := m.Destroy(ctx, id)
+
+			resMu.Lock()
+			defer resMu.Unlock()
+			if err != nil {
+				failed[id] = err
+				return
+			}
+			deleted = append(deleted, id)
+		}()
 	}
+	wg.Wait()
 	return deleted, failed
 }
 
@@ -1022,6 +1429,205 @@ func (m *Manager) Exec(id, cmd string) (string, int, error) {
 	}
 
 	return vsock.Exec(record.VsockPath, cmd)
+}
+
+// stagingDir is where offline debugfs I/O stages its temp files: on the store,
+// never /tmp (which is often tmpfs = RAM — a 4 GB inject there would blow up
+// memory, defeating the whole streaming design). The store is a real on-disk
+// filesystem, so a staged file costs disk, not RAM.
+func (m *Manager) stagingDir() string {
+	return filepath.Join(m.instancesDir, "staging")
+}
+
+// PutFile writes data into a VM at guestPath, in constant memory whatever the
+// size. For a running VM it streams over vsock (works even with no network); for
+// a stopped VM it streams into the VM's disk offline with debugfs — never
+// mounting the guest filesystem on the host. Any other state is rejected.
+//
+// size is the byte length when known (from Content-Length), or negative when
+// unknown. The vsock protocol needs the length up front, so an unknown-length
+// upload to a running VM is first staged to a file on the store to measure it,
+// then streamed — still constant memory, just via disk. The debugfs path stages
+// regardless (debugfs can't read a stream), so size is irrelevant there.
+func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) error {
+	m.mu.Lock()
+	record, ok := m.vms[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	state := record.State
+	vsockPath := record.VsockPath
+	rootfs := record.Config.Rootfs
+	// Reserve the disk against a concurrent Start (which would boot Firecracker
+	// on this rootfs while debugfs is writing it — corruption). Only the offline
+	// path needs it; the running path talks to the live guest over vsock.
+	if state == types.VMStateStopped {
+		if m.vmIO[id] {
+			m.mu.Unlock()
+			return fmt.Errorf("%w: vm %s is busy with another file operation", ErrConflict, id)
+		}
+		m.vmIO[id] = true
+	}
+	m.mu.Unlock()
+
+	switch state {
+	case types.VMStateRunning:
+		if size >= 0 {
+			return vsock.PutFile(vsockPath, guestPath, data, size)
+		}
+		staged, n, err := m.stageReader(data)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(staged)
+		f, err := os.Open(staged)
+		if err != nil {
+			return fmt.Errorf("reopening staged upload: %w", err)
+		}
+		defer f.Close()
+		return vsock.PutFile(vsockPath, guestPath, f, n)
+	case types.VMStateStopped:
+		defer m.endVMDiskIO(id)
+		return storage.InjectFile(rootfs, guestPath, data, m.stagingDir())
+	default:
+		return fmt.Errorf("%w: vm %s is %s (files need it running or stopped)", ErrVMState, id, state)
+	}
+}
+
+func (m *Manager) endVMDiskIO(id string) {
+	m.mu.Lock()
+	delete(m.vmIO, id)
+	m.mu.Unlock()
+}
+
+// stageReader streams data to a temp file on the store and returns its path and
+// size — constant memory, on disk not RAM. Used when the vsock path needs a
+// length it wasn't given up front.
+func (m *Manager) stageReader(data io.Reader) (string, int64, error) {
+	dir := m.stagingDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", 0, fmt.Errorf("creating staging dir %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, "upload-*")
+	if err != nil {
+		return "", 0, fmt.Errorf("staging upload: %w", err)
+	}
+	n, err := io.Copy(f, data)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", 0, fmt.Errorf("staging upload: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", 0, err
+	}
+	return f.Name(), n, nil
+}
+
+// GetFileStream reads guestPath out of a VM as a streaming reader plus its size,
+// in constant memory. Running → over vsock; stopped → off the disk offline with
+// debugfs (no host mount). This is the post-mortem artifact path: stop a
+// detonation VM and pull files straight off its disk. The caller must Close the
+// returned reader.
+func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, error) {
+	m.mu.Lock()
+	record, ok := m.vms[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, 0, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	state := record.State
+	vsockPath := record.VsockPath
+	rootfs := record.Config.Rootfs
+	if state == types.VMStateStopped {
+		if m.vmIO[id] {
+			m.mu.Unlock()
+			return nil, 0, fmt.Errorf("%w: vm %s is busy with another file operation", ErrConflict, id)
+		}
+		m.vmIO[id] = true
+	}
+	m.mu.Unlock()
+
+	switch state {
+	case types.VMStateRunning:
+		return vsock.GetFileStream(vsockPath, guestPath)
+	case types.VMStateStopped:
+		// The debugfs read finishes inside ExtractFileStream (into an unlinked
+		// temp the reader wraps), so releasing the reservation here is safe even
+		// though the caller reads the stream afterwards.
+		defer m.endVMDiskIO(id)
+		f, size, err := storage.ExtractFileStream(rootfs, guestPath, m.stagingDir())
+		if err != nil {
+			return nil, 0, err
+		}
+		return f, size, nil
+	default:
+		return nil, 0, fmt.Errorf("%w: vm %s is %s (files need it running or stopped)", ErrVMState, id, state)
+	}
+}
+
+// beginVolumeIO reserves a detached volume for an offline debugfs operation,
+// returning its path. It fails if the volume is attached to a VM or already
+// busy with another file operation — either would mean two writers on one ext4.
+// Pair every success with endVolumeIO.
+func (m *Manager) beginVolumeIO(volID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	vol, ok := m.vols[volID]
+	if !ok {
+		return "", fmt.Errorf("%w: volume %s", ErrVMNotFound, volID)
+	}
+	if vol.AttachedTo != "" {
+		return "", fmt.Errorf("%w: volume %s is attached to vm %s — write/read through that VM instead", ErrConflict, volID, vol.AttachedTo)
+	}
+	if m.volIO[volID] {
+		return "", fmt.Errorf("%w: volume %s is busy with another file operation", ErrConflict, volID)
+	}
+	m.volIO[volID] = true
+	return vol.Path, nil
+}
+
+func (m *Manager) endVolumeIO(volID string) {
+	m.mu.Lock()
+	delete(m.volIO, volID)
+	m.mu.Unlock()
+}
+
+// InjectToVolume streams data into a detached volume at guestPath, offline with
+// debugfs (no host mount), in constant memory. Refuses while the volume is
+// attached to a VM or busy with another file op — a write underneath a running
+// guest's mounted filesystem (or a concurrent debugfs write) corrupts it; use
+// the VM's live channel (PutFile) for an attached volume. This is the path for
+// filling a large volume (e.g. a multi-GB dataset) before attaching it at VM
+// create time — Firecracker has no disk hot-plug, so prepare-then-attach is the
+// clean model, not attaching to an already-running VM.
+func (m *Manager) InjectToVolume(volID, guestPath string, data io.Reader) error {
+	path, err := m.beginVolumeIO(volID)
+	if err != nil {
+		return err
+	}
+	defer m.endVolumeIO(volID)
+	return storage.InjectFile(path, guestPath, data, m.stagingDir())
+}
+
+// ExtractFromVolumeStream reads guestPath out of a detached volume as a
+// streaming reader plus its size, offline with debugfs. Same guard as
+// InjectToVolume. The debugfs read completes before this returns (into an
+// unlinked temp the reader wraps), so the busy reservation is released here even
+// though the caller consumes the stream afterwards. The caller must Close it.
+func (m *Manager) ExtractFromVolumeStream(volID, guestPath string) (io.ReadCloser, int64, error) {
+	path, err := m.beginVolumeIO(volID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer m.endVolumeIO(volID)
+	f, size, err := storage.ExtractFileStream(path, guestPath, m.stagingDir())
+	if err != nil {
+		return nil, 0, err
+	}
+	return f, size, nil
 }
 
 // Get returns a single VM by ID.

@@ -187,3 +187,50 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("DeleteSnapshot (absent): %v", err)
 	}
 }
+
+func TestVolumeRoundTrip(t *testing.T) {
+	st := openTemp(t)
+	want := &types.Volume{
+		ID:         "vol12345",
+		Name:       "sample-in",
+		SizeMB:     256,
+		Path:       "/var/lib/microhosted/store/volumes/vol12345.ext4",
+		AttachedTo: "abc12345",
+		CreatedAt:  time.Now().Truncate(time.Second),
+	}
+
+	if err := st.SaveVolume(want); err != nil {
+		t.Fatalf("SaveVolume: %v", err)
+	}
+
+	// The attachment change is an upsert, same row.
+	want.AttachedTo = ""
+	if err := st.SaveVolume(want); err != nil {
+		t.Fatalf("SaveVolume (detach upsert): %v", err)
+	}
+
+	got, err := st.ListVolumes()
+	if err != nil {
+		t.Fatalf("ListVolumes: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d volumes, want 1", len(got))
+	}
+	if *got[0] != *want {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got[0], want)
+	}
+
+	if err := st.DeleteVolume("vol12345"); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+	got, err = st.ListVolumes()
+	if err != nil {
+		t.Fatalf("ListVolumes after delete: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d volumes after delete, want 0", len(got))
+	}
+	if err := st.DeleteVolume("vol12345"); err != nil {
+		t.Fatalf("DeleteVolume (absent): %v", err)
+	}
+}

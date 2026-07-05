@@ -436,6 +436,100 @@ resueltas:
 
 ---
 
+## Fase 2 (parte 2) — Volúmenes + plano de datos seguro (2026-07-04, implementada + tests; arranque con volumen confirmado en hardware, batería completa pendiente)
+
+**Objetivo**: meter y sacar datos de las VMs de forma segura, sin que el host se
+vea afectado. Volúmenes persistentes (muestra RO + salida escribible para
+artefactos) y transferencia de ficheros. Es la Fase 2 (volúmenes) + el "Update"
+de Fase 3 del plan.
+
+**Regla de seguridad rectora — el host NUNCA monta un filesystem del guest.**
+`mount(2)` de un ext4 no confiable corre el parser ext4 del *kernel del host*
+sobre bytes del atacante (la superficie de escape clásica). Todo el I/O
+host-side va por **`debugfs`** (espacio de usuario, sin montar). Verificado con
+grep: cero `mount` de imágenes del guest.
+
+**Qué hay** (detalle en `docs/volumes.md` + `docs/api.md`):
+- **Entidad `Volume`**: ext4 persistente en el store (`<store>/volumes/<id>.ext4`,
+  `mkfs.ext4 -F` sin tabla de particiones como los goldens), sobrevive al destroy.
+  CRUD `POST/GET/DELETE /v1/volumes`. Un volumen está adjunto a lo sumo a una VM
+  (`AttachedTo`).
+- **Adjuntar** = al crear la VM, campo `volumes:[{name,read_only,guest_path}]` de
+  `POST /v1/vms` (Firecracker NO tiene hot-plug de discos → no hay attach a una
+  VM viva; modelo prepare-then-attach). Se añade un `Drive` secundario por
+  volumen (RO → `is_read_only`, el bloque rechaza escrituras de verdad) y el
+  daemon lo **auto-monta por vsock** tras el boot en `/vol/<name>` (o `guest_path`).
+- **Transferencia de ficheros** `PUT/GET /v1/vms/{id}/files?path=` — transparente
+  al estado: VM viva → vsock (funciona sin red); VM parada → `debugfs` sobre el
+  disco (ruta post-mortem, sin arrancar).
+- **I/O offline en volumen suelto** `PUT/GET /v1/volumes/{id}/files?path=` — con
+  `debugfs`, para prellenar una muestra antes de adjuntar o sacar artefactos tras
+  el destroy. Solo con el volumen libre.
+- Agente guest (`prepare-image.sh`) multiplexa 3 verbos en el puerto vsock 52:
+  comando pelado (exec, contrato intacto), `PUT <path> <len>`, `GET <path>`.
+- Snapshot/fork/restore **rechazan (409)** una VM con volúmenes: la RAM del
+  snapshot tiene el volumen montado; restaurar sobre un volumen mutado lo
+  corrompe (límite honesto de v1).
+
+**Plano de datos en STREAMING de punta a punta (RAM constante)** — el primer
+corte buffeaba el fichero entero (`io.ReadAll`, `[]byte`) → 4 GB = 4 GB de RAM
+del host; y el staging de `debugfs` caía en `/tmp` (tmpfs = RAM). Reescrito:
+subida/bajada streamean con búfer fijo, el staging de `debugfs` va al **store**
+(disco real, nunca `/tmp`) y se barre al arrancar. Un dataset de varios GB no
+carga la RAM. Test de regresión con payload de 40 MiB por hash.
+
+**Bug de runtime cazado EN hardware** (no salta en build/vet/tests): el
+`drive_id` de los volúmenes llevaba guion (`vol-<id>`) y Firecracker solo acepta
+alfanuméricos y guion bajo → `PUT /drives` daba 400. Arreglado a `vol_<id>`.
+Tras el arreglo, VM con volumen arranca y monta en `/vol/datos` OK (medido: ~3.3s
+de create, dominado por esperar a que el agente vsock del guest esté listo para
+auto-montar — inherente al diseño, solo afecta a VMs con volumen).
+
+**Auditoría de seguridad** (a petición del usuario: que nada nuevo reviente el
+air-gap ni el host):
+- **Air-gap intacto**: los volúmenes son dispositivos de bloque (sin red); el
+  vsock es control host→guest (el daemon solo *dial*ea el puerto 52 del guest,
+  nunca escucha → guest→host por vsock no tiene dónde aterrizar; vsock no es
+  salida de red).
+- **Host intacto**: sin `mount(2)`, `debugfs` en espacio de usuario, sin
+  hot-plug falso, staging en el store no en RAM.
+- **Bug real encontrado + arreglado (TOCTOU introducido en el primer corte)**:
+  el I/O offline comprobaba "volumen libre" bajo lock, lo soltaba y LUEGO corría
+  `debugfs`; un `Create`/`Start` concurrente podía adjuntar+montar (o arrancar
+  sobre el disco) en medio → `debugfs` escribiría un ext4 montado y lo
+  corrompería. Cerrado con guards de "ocupado" por recurso (`volIO`/`vmIO` bajo
+  el lock): attach y Start rechazan (409) mientras hay un `debugfs` en curso.
+  Tests en `internal/vm/volume_guard_test.go`.
+- **Riesgo residual señalado (no mitigado, recomendado para Fase 4)**: `debugfs`
+  corre como **root** sobre ext4 controlado por el atacante (rootfs de una VM
+  parada) — superficie mucho menor que `mount(2)` del kernel, pero un RCE en
+  debugfs/libext2fs sería root en el host; recomendación: bajar `debugfs` al
+  uid/gid del jailer (necesita permisos de staging + validación en hardware).
+- Notas de modelo de amenaza (no bugs): un volumen escribible reusado entre VMs
+  es un canal de datos intencionado entre ejecuciones; una subida enorme puede
+  llenar el disco del store (DoS de almacenamiento, no escape).
+
+**Ficheros clave**: `pkg/types/volume.go`, `internal/storage/volume.go` +
+`offline.go` (debugfs, streaming), `internal/store` (tabla volumes),
+`internal/vsock/exec.go` (PutFile/GetFileStream), `internal/vm/manager.go`
+(CRUD, attach, auto-mount, guards, streaming), `internal/firecracker/machine.go`
+(drives extra), `internal/api/server.go` (rutas), `scripts/prepare-image.sh`
+(agente multi-verbo).
+
+**PENDIENTE de validar en hardware** (batería completa): muestra RO inyectada
+por debugfs → montada RO rechaza escritura; escribir en volumen RW desde el
+guest → destroy → el volumen persiste y se lee de vuelta (probado el ciclo
+destroy→re-attach conservando datos); fichero grande (~GB) por vsock con
+checksum y RSS del daemon plana; GET post-mortem por debugfs sobre VM parada;
+409 en snapshot-con-volúmenes.
+
+**Decisión de ritmo (usuario)**: los ~3.3s del create-con-volumen se dejan como
+están de momento (aceptable para el workflow de detonación). Palancas futuras si
+molesta: sondeo del agente más fino (500ms→200ms) y/o adelantar el arranque del
+servicio vsock en el guest.
+
+---
+
 ## Sesión 7 — API propia (pendiente)
 
 **Objetivo**: HTTP/gRPC local para gestionar sandboxes.

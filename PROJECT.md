@@ -321,14 +321,20 @@ Claves estratégicas:
   `setup-host.sh`). Todo lo que Jailer clona/hardlinka (golden, kernel, chroot)
   vive en el mismo btrfs por invariante — reflink y hardlink no cruzan FS. Ver
   `SESSIONS.md` (Fase 2 parte 1) y `docs/layers.md` L3.
-- *(pendiente)* Entidad `Volume` (nombre, tamaño, ext4 persistente que sobrevive
+- *(hecho)* Entidad `Volume` (nombre, tamaño, ext4 persistente que sobrevive
   al destroy) + CRUD `/v1/volumes`; attach como drive extra (Firecracker
-  `Drives`). Ciber: muestra montada read-only + volumen de salida writable para
-  artefactos.
+  `Drives`), read-only o writable, auto-montado en el guest por vsock. Ciber:
+  muestra montada read-only + volumen de salida writable para artefactos. Una VM
+  con volúmenes no puede snapshotear/fork/restore en v1 (409). Ver
+  `docs/volumes.md`.
 
 **Fase 3 — Completar el CRUD**
-- Update: inyectar archivo/playbook a un disco (vía vsock si viva, montando el
-  ext4 si parada).
+- *(hecho)* Update: inyectar/extraer archivos a una VM o volumen. Vía vsock si
+  la VM está viva (`PUT/GET /v1/vms/{id}/files`, canal de datos en volumen sin
+  red); vía `debugfs` **sin montar** si está parada o el volumen está suelto
+  (`/v1/volumes/{id}/files`). Regla de seguridad: el host NUNCA monta un fs del
+  guest — `mount(2)` de una imagen no confiable expone el parser ext4 del kernel
+  del host. Ver `docs/volumes.md`.
 - Read estilo `docker ps`: estado, imagen base, red, volúmenes.
 
 **Fase 4 — Endurecimiento + prueba de resistencia**

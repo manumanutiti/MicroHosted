@@ -52,6 +52,14 @@ type VMConfig struct {
 	// later doesn't affect a VM already restored from it (the restore took
 	// reflink copies / extra hardlinks, never a live dependency).
 	RestoredFrom string
+
+	// Volumes are the persistent volumes attached to this VM, in the order they
+	// were requested — which is the order Firecracker assigns /dev/vdb, /dev/vdc…
+	// so it must stay stable across a Stop/Start (the auto-mount relies on it).
+	// A VM with any volume attached cannot be snapshotted/forked/restored (the
+	// snapshotted RAM holds the volume mounted; restoring over a since-mutated
+	// volume corrupts it) — those paths reject it with ErrConflict.
+	Volumes []VolumeMount
 }
 
 type VM struct {
