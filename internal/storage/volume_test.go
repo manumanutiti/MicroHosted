@@ -58,7 +58,8 @@ func TestInjectAndExtractFileRoundTrip(t *testing.T) {
 	}
 
 	want := []byte("sample artifact bytes \x00\x01\x02 not-just-text")
-	if err := InjectFile(path, "/out/sub/artifact.bin", bytes.NewReader(want), dir); err != nil {
+	oio := OfflineIO{StagingDir: dir}
+	if err := oio.InjectFile(path, "/out/sub/artifact.bin", bytes.NewReader(want)); err != nil {
 		t.Fatalf("InjectFile: %v", err)
 	}
 
@@ -72,7 +73,7 @@ func TestInjectAndExtractFileRoundTrip(t *testing.T) {
 // helper mirror of ExtractFileStream for assertions.
 func extractBytes(t *testing.T, imagePath, guestPath, stagingDir string) []byte {
 	t.Helper()
-	f, _, err := ExtractFileStream(imagePath, guestPath, stagingDir)
+	f, _, err := OfflineIO{StagingDir: stagingDir}.ExtractFileStream(imagePath, guestPath)
 	if err != nil {
 		t.Fatalf("ExtractFileStream(%s): %v", guestPath, err)
 	}
@@ -94,10 +95,11 @@ func TestInjectFileOverwrites(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	if err := InjectFile(path, "/f", bytes.NewReader([]byte("first-longer-content")), dir); err != nil {
+	oio := OfflineIO{StagingDir: dir}
+	if err := oio.InjectFile(path, "/f", bytes.NewReader([]byte("first-longer-content"))); err != nil {
 		t.Fatalf("first InjectFile: %v", err)
 	}
-	if err := InjectFile(path, "/f", bytes.NewReader([]byte("second")), dir); err != nil {
+	if err := oio.InjectFile(path, "/f", bytes.NewReader([]byte("second"))); err != nil {
 		t.Fatalf("second InjectFile: %v", err)
 	}
 	if got := extractBytes(t, path, "/f", dir); string(got) != "second" {
@@ -114,7 +116,7 @@ func TestExtractMissingFileErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if _, _, err := ExtractFileStream(path, "/nope", dir); err == nil {
+	if _, _, err := (OfflineIO{StagingDir: dir}).ExtractFileStream(path, "/nope"); err == nil {
 		t.Fatal("expected error extracting a missing file, got nil")
 	}
 }
@@ -128,15 +130,16 @@ func TestExtractDirPullsTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := InjectFile(path, "/arts/a.txt", bytes.NewReader([]byte("aaa")), dir); err != nil {
+	oio := OfflineIO{StagingDir: dir}
+	if err := oio.InjectFile(path, "/arts/a.txt", bytes.NewReader([]byte("aaa"))); err != nil {
 		t.Fatalf("inject a: %v", err)
 	}
-	if err := InjectFile(path, "/arts/b.txt", bytes.NewReader([]byte("bbb")), dir); err != nil {
+	if err := oio.InjectFile(path, "/arts/b.txt", bytes.NewReader([]byte("bbb"))); err != nil {
 		t.Fatalf("inject b: %v", err)
 	}
 
 	dest := filepath.Join(dir, "extracted")
-	if err := ExtractDir(path, "/arts", dest, dir); err != nil {
+	if err := oio.ExtractDir(path, "/arts", dest); err != nil {
 		t.Fatalf("ExtractDir: %v", err)
 	}
 	// rdump reproduces the tree under dest/arts.
@@ -182,11 +185,12 @@ func TestInjectExtractLargeFileStreams(t *testing.T) {
 		t.Fatalf("open payload: %v", err)
 	}
 	defer in.Close()
-	if err := InjectFile(path, "/big.bin", in, dir); err != nil {
+	oio := OfflineIO{StagingDir: dir}
+	if err := oio.InjectFile(path, "/big.bin", in); err != nil {
 		t.Fatalf("InjectFile: %v", err)
 	}
 
-	rc, gotSize, err := ExtractFileStream(path, "/big.bin", dir)
+	rc, gotSize, err := oio.ExtractFileStream(path, "/big.bin")
 	if err != nil {
 		t.Fatalf("ExtractFileStream: %v", err)
 	}

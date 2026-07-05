@@ -74,6 +74,14 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// Ping verifies the database is reachable and answering — the health check's
+// probe. sql.DB.Ping alone can pass on a broken file (connections are lazy),
+// so this runs an actual query.
+func (s *Store) Ping() error {
+	var one int
+	return s.db.QueryRow("SELECT 1").Scan(&one)
+}
+
 // Close releases the underlying database handle.
 func (s *Store) Close() error {
 	return s.db.Close()

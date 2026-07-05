@@ -1,6 +1,7 @@
 package jailer
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -84,17 +85,19 @@ func WorkspaceRoot(d Defaults, vmID string) string {
 	return filepath.Join(InstanceDir(d, vmID), "root")
 }
 
-// RemoveInstanceDir deletes a VM's whole jail directory (see InstanceDir).
-// Only safe once the Firecracker process is gone — Destroy calls it after
-// firecracker.Stop. Safe to call even if the directory doesn't exist. The
-// daemon runs as root, so it can remove files Jailer left owned by the jailed
-// uid/gid.
+// RemoveInstanceDir deletes a VM's whole jail directory (see InstanceDir)
+// and its cgroup (see RemoveCgroup) — the two pieces of per-VM host residue
+// Jailer creates and never cleans up itself. Only safe once the Firecracker
+// process is gone — Destroy calls it after firecracker.Stop. Safe to call
+// even if neither exists. The daemon runs as root, so it can remove files
+// Jailer left owned by the jailed uid/gid.
 func RemoveInstanceDir(d Defaults, vmID string) error {
 	dir := InstanceDir(d, vmID)
+	var dirErr error
 	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("removing jail dir %s: %w", dir, err)
+		dirErr = fmt.Errorf("removing jail dir %s: %w", dir, err)
 	}
-	return nil
+	return errors.Join(dirErr, RemoveCgroup(d, vmID))
 }
 
 // Build constructs the per-VM JailerConfig. kernelPath is needed up front

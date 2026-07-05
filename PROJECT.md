@@ -344,6 +344,92 @@ Claves estratégicas:
 
 ---
 
+## Pivote de nicho (2026-07-05) — Gateway de aislamiento IoT/OT
+
+Decisión de dirección: **el proyecto se especializa en el nicho IoT/OT edge.**
+El motor (microVMs Firecracker+Jailer, redes segmentadas nftables, CoW btrfs,
+snapshots/fork, vsock, volúmenes, cgroups, observabilidad) queda como está —
+está lo bastante avanzado como para soportar un vertical de verdad, y este
+vertical no requiere rediseñarlo, solo extenderlo.
+
+### Por qué IoT/OT y no detonación primero
+
+- El mercado de sandbox para IA está saturado (constatado 2026-07-03). El de
+  detonación tiene hueco, pero exige competir contra hábitos (CAPEv2) y un
+  ciclo de adopción de analistas.
+- En IoT/OT el hueco es **estructural**: los gateways edge actuales (Greengrass,
+  balena, KubeEdge, EdgeX) usan contenedores = kernel compartido; un exploit en
+  el parser de un sensor compromete la planta. Nadie ofrece "aislamiento de
+  hipervisor por sensor, en el gateway, instalable en una tarde". EVE-OS es el
+  vecino más cercano y es orquestación pesada genérica, no este patrón.
+- El argumento de venta es el mismo foso de siempre (procesar datos no
+  confiables sin que toquen el host) aplicado a tramas de sensores en vez de
+  muestras de malware. La detonación pasa a **segundo acto** sobre el mismo
+  motor, no se tira nada.
+
+### El producto
+
+Un **gateway de aislamiento**: cada sensor (o grupo pequeño de sensores) tiene
+su microVM-parser desechable. El host no expone ningún puerto hacia los
+sensores ni parsea ningún protocolo; los datos validados salen de la VM por
+vsock. Si un sensor comprometido explota su parser, compromete una VM de
+~32MB sin red hacia el host que se regenera desde snapshot en ~100ms.
+
+Dos modos de ingesta, en este orden:
+
+1. **Pull (primero)** — la VM se levanta (restore desde snapshot), interroga a
+   su sensor (egress restringido a esa IP:puerto), valida, entrega por vsock y
+   se destruye. Es el modelo **nativo de OT** (Modbus/OPC-UA son polling), el
+   más simple y el más seguro: no existe camino de entrada en ningún momento.
+2. **Push (después)** — para MQTT/HTTP: el kernel detecta la conexión entrante
+   (nftables/NFQUEUE), se restaura la VM, DNAT hacia ella, el SYN reintentado
+   del sensor aterriza ya dentro de la VM. Exige anti-DoS (tope global de VMs
+   + rate-limit por origen).
+
+**Ciclo de vida transaccional** como dial del producto: VM *por transacción*
+(estado limpio por dato), *por ventana* (vive N segundos, procesa el lote),
+o *por anomalía* (persistente con reset programado/reactivo — un implante no
+puede persistir). Los tres usan la misma maquinaria snapshot/restore/destroy.
+
+**Gemelos digitales** como caso secundario del mismo motor: clones CoW +
+MAC/IP únicas por VM = simular flotas de dispositivos para pruebas de estrés
+de brokers, OTA y ataques dirigidos.
+
+### Correcciones de expectativas (para no venderse humo)
+
+- Los "<5MB por microVM" de Firecracker son el *overhead del VMM*, no la RAM
+  del guest. Un Linux mínimo real necesita 20-50MB. La densidad alta viene de
+  (a) imagen ultra-mínima y (b) restore masivo desde snapshot compartido (la
+  memoria se mapea copy-on-write — ya implementado): cada VM paga solo sus
+  páginas sucias.
+- Objetivo realista: **decenas de VMs en una Pi de 4GB, 100-300 en una Pi 5 de
+  8/16GB (vía snapshot + imagen mínima), 1000+ en gateway industrial x86.**
+  Cifras a validar en hardware, no promesas.
+
+### Necesidades y plan de sesiones
+
+Diseño completo, huecos con mapeo al código y criterios de éxito por sesión en
+**`docs/iot-edge.md`**. Resumen de prioridades:
+
+1. **Spike ARM64** (riesgo existencial: hasta que una microVM arranque en una
+   Raspberry Pi 5, el hardware objetivo es teoría).
+2. **Egress de grano fino** (VM solo puede hablar con su sensor IP:puerto) —
+   prerequisito del modo pull.
+3. **Orquestador transaccional pull v1** (restore→poll→validar→extraer→destruir,
+   con los 3 modos de vida) — el MVP del producto, desarrollable en x86.
+4. **Imagen sensor ultra-mínima** (kernel tinyconfig + parser estático;
+   objetivo `mem_mb ≤ 32`).
+5. **Densidad**: pool masivo desde snapshot + medición honesta en Pi y x86.
+6. **Modo push** (DNAT + trigger NFQUEUE + anti-DoS).
+7. **Puente serie ciego** (RS-485/Modbus RTU → vsock, daemon sin parser).
+
+El hardening pendiente (Fase 4: validación cgroups/seccomp, soak test) **sigue
+vigente y sube de importancia** — en OT el argumento de venta es la garantía
+de aislamiento, y eso se demuestra con el modelo de amenaza + tests
+adversariales ya planeados.
+
+---
+
 ## Referencias clave
 
 - [Firecracker GitHub](https://github.com/firecracker-microvm/firecracker)

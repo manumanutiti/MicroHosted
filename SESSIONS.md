@@ -530,6 +530,159 @@ servicio vsock en el guest.
 
 ---
 
+## Observabilidad — `/v1/system` + `/v1/health` + consumo por VM (2026-07-05, implementada + tests; PENDIENTE validar en hardware)
+
+**Objetivo (usuario)**: endpoint(s) para saber la salud general, el estado del
+almacenamiento del host, la ubicación de todo lo importante (VMs, rutas) y el
+consumo de RAM/CPU — pensado para usabilidad y funcionalidad.
+
+**Diseño — dos consumidores, dos endpoints** (singletons de solo lectura, se
+suman a la convención de rutas en `docs/api.md`):
+- `GET /v1/health` — para un **monitor**: 6 checks (`kvm`, `database`,
+  `store_writable`, `disk_space` con suelo max(5%, 1 GiB), `store_cow`,
+  `firecracker`) y responde por **código HTTP** (200 `ok` / 503 `degraded`)
+  para que systemd/uptime-checkers no parseen JSON. `degraded` en cuanto
+  falla un check; cada check lleva `detail` con el motivo.
+- `GET /v1/system` — para un **panel/operador**: informe completo en una
+  llamada (siempre 200; la salud va embebida). Bloques: `daemon` (pid,
+  uptime, versión de Firecracker, capacidad `network_overrides`, y `paths`
+  con TODAS las rutas del host: store/goldens/kernels/snapshots/volúmenes/
+  chroots/db/catálogo/binarios), `host` (cpus, load 1/5/15, RAM
+  total/usada/disponible de `/proc/meminfo` — used=total−available),
+  `storage` (statfs del store: fs_type/cow/total/usado/libre + breakdown
+  estilo `du` por categoría con su ruta) y `fleet` (VMs por estado,
+  `allocated{vcpus,mem_mb}` de las running = visibilidad de overcommit
+  contra `host`, redes/snapshots/volúmenes attached/templates).
+- **Consumo por VM** en cada `VMResponse` (esto convierte `GET /v1/vms` en el
+  "`docker ps`" pendiente de Fase 3): `vcpus/mem_mb/disk_mb` (forma),
+  `rootfs_path` (dónde está su disco) y, solo en running, `uptime_seconds`
+  (desde el arranque del PROCESO, no created_at), `mem_rss_mb` (RAM residente
+  real — lo que la VM cuesta al host AHORA; suele ir muy por debajo de
+  `mem_mb` porque el guest paginia bajo demanda) y `cpu_seconds` (acumulada;
+  un panel la diferencia entre sondeos para sacar %).
+
+**Decisiones técnicas**:
+- **Sin recolectores de fondo ni histórico**: todo se calcula al momento de la
+  petición desde `/proc`, `statfs` y el estado en memoria del manager. El
+  histórico es del cliente (sondea y diferencia) — el daemon responde "ahora"
+  barato y honesto. Nuevo paquete `internal/hostinfo` (meminfo, loadavg,
+  statfs con nombres de FS por magic, tamaños du-style por `st_blocks` — los
+  sparse no engañan —, stats por PID de `/proc/<pid>/stat|statm` con parseo
+  anclado al último `)` del comm).
+- El breakdown de storage cuenta extents reflink una vez POR FICHERO: las
+  categorías pueden sumar más que `used_mb`; cada cifra = "cuánto liberaría
+  borrar esto como máximo" (documentado; `btrfs fi du` es la referencia).
+- `store.Ping()` hace `SELECT 1` real (el Ping de database/sql puede pasar
+  sobre un fichero roto: las conexiones son perezosas).
+- `firecracker.Version()` (string completa) separado de
+  `SupportsNetworkOverrides` (capacidad); versión sondeada una vez al montar
+  las rutas, capacidad expuesta en `daemon.network_overrides` porque su
+  ausencia explica 409s de fork que de otro modo desconciertan.
+- El informe host degrada con elegancia: una lectura de `/proc` que falle
+  deja ceros en su bloque, nunca un 500 — el endpoint para diagnosticar
+  problemas no puede caerse por el problema.
+- `/v1/vms` enriquece con stats vivas vía `liveVMResponse` en la capa API
+  (best-effort: si el proceso murió entre listar y leer, la VM sale sin
+  stats); `NewVMResponse` se mantiene puro (sin I/O en `pkg/types`).
+
+**Ficheros**: `internal/hostinfo/` (nuevo, con tests de parseo), 
+`pkg/types/system.go` (DTOs), `internal/api/system.go` (rutas + checks +
+informe), `internal/vm/system.go` (`Facts`/`FleetStats`/`CheckDB`/
+`StoreIsCoW`), `store.Ping`, `firecracker.Version`, `VMResponse` ampliado,
+`NewServer` recibe `api.SystemConfig{DBPath,CatalogPath,StartedAt}`.
+Tests: `internal/api/system_test.go` levanta el mux real con manager real
+(store/catálogo temporales, sin root) y verifica la forma del informe y que
+sin binario de Firecracker el estado es `degraded` con 503 en `/v1/health`.
+`docs/api.md` → sección "Observabilidad" completa con ejemplo.
+
+**PENDIENTE validar en hardware** (el binario nuevo no se pudo instalar en la
+sesión — `make install-service` pide sudo interactivo): tras reinstalar,
+`curl /v1/health` (200 ok con checks verdes), `curl /v1/system | jq` (rutas y
+breakdown coherentes con el store real, `cow: true`, fleet cuadra con
+`/v1/vms`), y en `GET /v1/vms` de una VM corriendo: `mem_rss_mb` < `mem_mb`,
+`uptime_seconds` razonable, `cpu_seconds` creciendo entre sondeos.
+
+---
+
+## Hardening — límites cgroup v2 por VM + debugfs sin root (2026-07-05, implementada + tests; PENDIENTE validar en hardware)
+
+**Objetivo (usuario)**: (1) escribir límites de CPU, memoria y PIDs en el
+cgroup de Jailer de cada VM para que un guest no pueda hacer DoS al host;
+(2) bajar los privilegios del `debugfs` host-side al uid/gid del jailer para
+mitigar escapes a nivel de parser ext4.
+
+**Límites cgroup v2** (`internal/jailer/cgroup.go`):
+- El SDK v1.0.0 no permite pasar `--cgroup` extra al jailer (solo emite el
+  par cpuset de NUMA), así que los escribe el **daemon** justo tras el launch
+  (con el PID ya conocido), en `/sys/fs/cgroup/firecracker/<vm-id>` — el
+  layout de Jailer con `--cgroup-version 2` (parent-cgroup = basename del
+  exec-file, espejo de la fórmula del chroot).
+- Valores dimensionados por la config de la propia VM: `cpu.max` =
+  vCPUs × período completo (100 ms), `memory.max` = MemMB + 64 MiB de margen
+  VMM (heap/virtio/page tables; el overhead documentado de FC es <5 MiB),
+  `memory.swap.max=0` (una VM capada debe chocar con su límite, no empujar
+  al host a swap), `pids.max` = vCPUs + 16 (el controller cuenta threads;
+  FC corre 1 por vCPU + VMM + API y nunca forkea → un fork bomb del VMM
+  comprometido muere en EAGAIN).
+- Robusto ante que Jailer no cree el grupo (solo lo hace si recibe algún
+  `--cgroup`): `ApplyLimits` hace MkdirAll + habilita `+cpu +memory +pids`
+  en `subtree_control` de root y del padre (Jailer solo habilita lo que
+  escribe: cpuset) + inscribe el PID en `cgroup.procs` él mismo (re-attach
+  al mismo grupo es no-op si Jailer ya lo movió).
+- **Fail-closed**: si los límites no se pueden aplicar, el boot se aborta y
+  el proceso se mata (una VM sin capar es exactamente el DoS que esto
+  cierra). Única excepción: host con cgroups v1 (`ErrCgroupV1`) → warning
+  ruidoso por boot y arranca sin límites (comportamiento pre-feature).
+- Aplica en los dos caminos de arranque (`boot` y `bootFromSnapshot` — los
+  forks/restores heredan el sizing del snapshot).
+- **Limpieza**: Jailer nunca borra su cgroup → `RemoveInstanceDir` ahora
+  también hace `RemoveCgroup` (rmdir con reintentos ante EBUSY: la salida
+  del proceso es asíncrona al SIGTERM), así todos los caminos de teardown
+  (Destroy/Stop/rollbacks/sweep de Reconcile) lo heredan y se cierra una
+  fuga que ya existía.
+
+**debugfs sin root** (`internal/storage/offline.go`):
+- `InjectFile/ExtractFileStream/ExtractDir` pasan a métodos de
+  `OfflineIO{StagingDir, UID, GID}`; cuando el daemon corre como root, cada
+  `debugfs` corre con `Credential{uid,gid}` del jailer y `Groups: []` (sin
+  los grupos suplementarios de root). Un exploit del parser ext4 aterriza en
+  un proceso sin privilegios, no en root. Es **mitigación, no jaula**
+  (comparte namespaces del host): elimina el premio de shell root, no la
+  superficie.
+- Funciona porque las imágenes ya son de ese uid (clones y volúmenes se
+  chownean al crearse); los temporales del staging (fichero de comandos,
+  fuente de inject, destino de dump/rdump) se chownean al uid en
+  `stageFile`/`grant` manteniendo 0600. En ejecuciones sin root (tests) no
+  hay drop: debugfs corre como el usuario del daemon, que ya es dueño de lo
+  que crea.
+- El manager construye el contexto en `offlineIO()` (staging del store +
+  uid/gid del jailer) — los 4 call sites (PutFile/GetFileStream offline,
+  Inject/Extract de volúmenes) lo usan.
+
+**Ficheros**: `internal/jailer/cgroup.go` (nuevo) + `cgroup_test.go` (nuevo;
+root de cgroup falseado con temp dir — la parte kernel es territorio de
+validación en hardware), `internal/jailer/config.go` (`RemoveInstanceDir`
+integra `RemoveCgroup`), `internal/storage/offline.go` (refactor a
+`OfflineIO` + drop de privilegios), `internal/vm/manager.go` (`applyLimits`
+fail-closed en ambos boots, `offlineIO()`), tests de storage adaptados.
+`docs/layers.md` (L2: límites) y `docs/volumes.md` (drop de debugfs)
+actualizados.
+
+**PENDIENTE validar en hardware** (los tests unitarios no ejercitan el
+kernel): tras reinstalar el binario —
+- Crear una VM y comprobar `cat /sys/fs/cgroup/firecracker/<id>/{cpu.max,memory.max,memory.swap.max,pids.max,cgroup.procs}`
+  (valores dimensionados y el PID de firecracker inscrito).
+- Dentro del guest: `yes > /dev/null &` × N no debe pasar del % de CPU de sus
+  vCPUs en el host (`top`); un `stress` de memoria debe morir por OOM del
+  cgroup sin tocar el swap del host.
+- Destroy/Stop → el directorio del cgroup desaparece (no se acumulan).
+- `PUT`/`GET` de ficheros con VM parada y con volumen suelto: `ps -o user`
+  del proceso debugfs durante una transferencia grande = uid del jailer, y
+  los round-trips siguen funcionando (permisos del staging correctos).
+- Host cgroups v1 (si hay alguno): la VM arranca con el warning en el log.
+
+---
+
 ## Sesión 7 — API propia (pendiente)
 
 **Objetivo**: HTTP/gRPC local para gestionar sandboxes.

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -19,7 +20,18 @@ import (
 // (a long history of ext4/journal CVEs). Instead every host-side access goes
 // through debugfs (from e2fsprogs, already a host dependency), a userspace ext4
 // tool: a malformed image can at worst make debugfs itself misbehave in its own
-// unprivileged process, never touch the host kernel.
+// process, never touch the host kernel.
+//
+// And that process is NOT the daemon's root: when the daemon runs as root,
+// every debugfs invocation drops to the jailer uid/gid (OfflineIO.UID/GID) —
+// the same unprivileged identity the jailed Firecracker runs as, and the owner
+// of every image file it touches (clones and volumes are chowned to it at
+// creation). A debugfs parser exploit triggered by a malicious image then
+// lands in an unprivileged process with no capabilities, not in root: it can
+// scribble on the store's images (which it could anyway — it IS the parser
+// writing them) but not on the host. This is mitigation, not a jail — the
+// process still shares the host's namespaces — but it removes the root-shell
+// prize from the ext4-parser attack surface.
 //
 // Used for two cases the live vsock channel can't serve: injecting a sample into
 // a detached volume with no VM running, and extracting artifacts from a stopped
@@ -30,7 +42,7 @@ import (
 // bytes are staged to a temp file and copied with io.Copy's fixed buffer — a
 // 4 GB inject costs a few KB of RAM, not 4 GB. The staging directory must be a
 // real on-disk location on the store (never /tmp, which is often tmpfs = RAM),
-// which is why every entry point takes a stagingDir the caller roots on the CoW
+// which is why OfflineIO carries a StagingDir the caller roots on the CoW
 // store.
 
 // debugfsTimeout caps any single debugfs invocation. A corrupt or adversarial
@@ -38,19 +50,52 @@ import (
 // fast even for a large dump (it streams to the output file).
 const debugfsTimeout = 30 * time.Minute
 
+// OfflineIO carries the host-side context every offline operation needs: where
+// to stage temp files (on the store, never /tmp) and the unprivileged identity
+// debugfs drops to (see the package comment). UID/GID are the jailer's; the
+// drop only happens when the daemon itself runs as root — in unprivileged runs
+// (tests) debugfs simply runs as the daemon's own user, which already owns the
+// images it creates.
+type OfflineIO struct {
+	StagingDir string
+	UID        int
+	GID        int
+}
+
+// dropPrivs reports whether debugfs should switch to UID/GID: only meaningful
+// (and only permitted — setuid needs CAP_SETUID) when running as root, and
+// never to uid 0 itself.
+func (o OfflineIO) dropPrivs() bool {
+	return os.Geteuid() == 0 && o.UID > 0
+}
+
+// grant hands a staged file or directory to the debugfs identity. The staging
+// dir itself stays root-owned 0755 (traversal is enough); the files debugfs
+// must open — its command file, an inject source, an extract destination —
+// get chowned so the 0600 temp perms keep excluding everyone else.
+func (o OfflineIO) grant(path string) error {
+	if !o.dropPrivs() {
+		return nil
+	}
+	if err := os.Chown(path, o.UID, o.GID); err != nil {
+		return fmt.Errorf("granting %s to debugfs uid %d:%d: %w", path, o.UID, o.GID, err)
+	}
+	return nil
+}
+
 // InjectFile writes data to guestPath inside the ext4 image at imagePath,
 // creating parent directories as needed and overwriting any existing file. It
-// streams data to a staged file under stagingDir first (debugfs needs a real
+// streams data to a staged file under StagingDir first (debugfs needs a real
 // host file as its write source), so memory stays constant for any size.
 // imagePath must be a detached volume or a stopped VM's disk — never a mounted
 // image, or the write races the guest's own view of the filesystem.
-func InjectFile(imagePath, guestPath string, data io.Reader, stagingDir string) error {
+func (o OfflineIO) InjectFile(imagePath, guestPath string, data io.Reader) error {
 	clean, err := cleanGuestPath(guestPath)
 	if err != nil {
 		return err
 	}
 
-	tmp, err := stageFile(stagingDir, "inject-*")
+	tmp, err := o.stageFile("inject-*")
 	if err != nil {
 		return err
 	}
@@ -74,13 +119,13 @@ func InjectFile(imagePath, guestPath string, data io.Reader, stagingDir string) 
 	fmt.Fprintf(&script, "rm %s\n", clean)
 	fmt.Fprintf(&script, "write %s %s\n", tmp.Name(), clean)
 
-	if _, err := runDebugfs(imagePath, true, script.String(), stagingDir); err != nil {
+	if _, err := o.runDebugfs(imagePath, true, script.String()); err != nil {
 		return err
 	}
 
 	// debugfs exits 0 even when the write failed (e.g. no space), so verify the
 	// file is actually there rather than trusting the exit code.
-	if err := statInImage(imagePath, clean, stagingDir); err != nil {
+	if err := o.statInImage(imagePath, clean); err != nil {
 		return fmt.Errorf("injecting %s: %w", guestPath, err)
 	}
 	return nil
@@ -92,7 +137,7 @@ func InjectFile(imagePath, guestPath string, data io.Reader, stagingDir string) 
 // so the caller just streams it to its destination and Close()s it — nothing is
 // buffered in memory and no temp file is left behind. Used to pull an artifact
 // off a detached volume or a stopped VM.
-func ExtractFileStream(imagePath, guestPath, stagingDir string) (*os.File, int64, error) {
+func (o OfflineIO) ExtractFileStream(imagePath, guestPath string) (*os.File, int64, error) {
 	clean, err := cleanGuestPath(guestPath)
 	if err != nil {
 		return nil, 0, err
@@ -100,18 +145,18 @@ func ExtractFileStream(imagePath, guestPath, stagingDir string) (*os.File, int64
 
 	// dump on a missing file leaves the stage empty and still exits 0, so a
 	// prior stat is what turns "not there" into a clean error.
-	if err := statInImage(imagePath, clean, stagingDir); err != nil {
+	if err := o.statInImage(imagePath, clean); err != nil {
 		return nil, 0, fmt.Errorf("extracting %s: %w", guestPath, err)
 	}
 
-	tmp, err := stageFile(stagingDir, "extract-*")
+	tmp, err := o.stageFile("extract-*")
 	if err != nil {
 		return nil, 0, err
 	}
 	tmpName := tmp.Name()
 	_ = tmp.Close()
 
-	if _, err := runDebugfs(imagePath, false, fmt.Sprintf("dump %s %s\n", clean, tmpName), stagingDir); err != nil {
+	if _, err := o.runDebugfs(imagePath, false, fmt.Sprintf("dump %s %s\n", clean, tmpName)); err != nil {
 		_ = os.Remove(tmpName)
 		return nil, 0, err
 	}
@@ -137,8 +182,10 @@ func ExtractFileStream(imagePath, guestPath, stagingDir string) (*os.File, int64
 // into destDir on the host (destDir gets a subdirectory named after guestPath's
 // last component). The one-shot way to collect a whole artifact tree — pcaps,
 // memory dumps — from a stopped VM's disk. debugfs streams straight to destDir,
-// so this is constant-memory too.
-func ExtractDir(imagePath, guestPath, destDir, stagingDir string) error {
+// so this is constant-memory too. destDir is chowned to the debugfs identity
+// (rdump has to create entries in it), so expect its contents owned by the
+// jailer uid, not root.
+func (o OfflineIO) ExtractDir(imagePath, guestPath, destDir string) error {
 	clean, err := cleanGuestPath(guestPath)
 	if err != nil {
 		return err
@@ -146,38 +193,49 @@ func ExtractDir(imagePath, guestPath, destDir, stagingDir string) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("creating extract dest %s: %w", destDir, err)
 	}
-	if err := statInImage(imagePath, clean, stagingDir); err != nil {
+	if err := o.grant(destDir); err != nil {
+		return err
+	}
+	if err := o.statInImage(imagePath, clean); err != nil {
 		return fmt.Errorf("extracting dir %s: %w", guestPath, err)
 	}
-	if _, err := runDebugfs(imagePath, false, fmt.Sprintf("rdump %s %s\n", clean, destDir), stagingDir); err != nil {
+	if _, err := o.runDebugfs(imagePath, false, fmt.Sprintf("rdump %s %s\n", clean, destDir)); err != nil {
 		return err
 	}
 	return nil
 }
 
-// stageFile creates a temp file under stagingDir (rooted on the store by the
-// caller, never /tmp), making the directory if needed.
-func stageFile(stagingDir, pattern string) (*os.File, error) {
-	if stagingDir == "" {
+// stageFile creates a temp file under StagingDir (rooted on the store by the
+// caller, never /tmp), making the directory if needed, and grants it to the
+// debugfs identity — every staged file is either read or written by the
+// dropped-privilege debugfs process.
+func (o OfflineIO) stageFile(pattern string) (*os.File, error) {
+	if o.StagingDir == "" {
 		return nil, fmt.Errorf("staging dir is required")
 	}
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return nil, fmt.Errorf("creating staging dir %s: %w", stagingDir, err)
+	if err := os.MkdirAll(o.StagingDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating staging dir %s: %w", o.StagingDir, err)
 	}
-	f, err := os.CreateTemp(stagingDir, pattern)
+	f, err := os.CreateTemp(o.StagingDir, pattern)
 	if err != nil {
-		return nil, fmt.Errorf("creating staging file in %s: %w", stagingDir, err)
+		return nil, fmt.Errorf("creating staging file in %s: %w", o.StagingDir, err)
+	}
+	if err := o.grant(f.Name()); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return nil, err
 	}
 	return f, nil
 }
 
-// runDebugfs runs a script of debugfs commands (one per line) against image.
+// runDebugfs runs a script of debugfs commands (one per line) against image,
+// as the dropped-privilege identity when the daemon is root (see dropPrivs).
 // write enables -w (read-write mode); leave it false for read-only extraction so
 // a bug can't mutate the image. The script is fed via a temp command file (-f)
 // rather than -R so multi-command sequences work. The command file is small but
 // still staged on the store, not /tmp, to keep the "never /tmp" rule uniform.
-func runDebugfs(image string, write bool, script, stagingDir string) (string, error) {
-	cmdFile, err := stageFile(stagingDir, "debugfs-*.cmd")
+func (o OfflineIO) runDebugfs(image string, write bool, script string) (string, error) {
+	cmdFile, err := o.stageFile("debugfs-*.cmd")
 	if err != nil {
 		return "", err
 	}
@@ -199,7 +257,21 @@ func runDebugfs(image string, write bool, script, stagingDir string) (string, er
 	}
 	args = append(args, "-f", cmdFile.Name(), image)
 
-	out, err := exec.CommandContext(ctx, "debugfs", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "debugfs", args...)
+	if o.dropPrivs() {
+		// Groups is set to empty explicitly: without it the child inherits
+		// root's supplementary groups, quietly keeping privileges the drop is
+		// supposed to shed.
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{
+				Uid:    uint32(o.UID),
+				Gid:    uint32(o.GID),
+				Groups: []uint32{},
+			},
+		}
+	}
+
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("debugfs on %s: %v: %s", image, err, out)
 	}
@@ -209,8 +281,8 @@ func runDebugfs(image string, write bool, script, stagingDir string) (string, er
 // statInImage reports whether guestPath exists inside image, translating
 // debugfs's "File not found" output into an error. debugfs exits 0 whether or
 // not the file exists, so the output string is the only signal.
-func statInImage(image, guestPath, stagingDir string) error {
-	out, err := runDebugfs(image, false, fmt.Sprintf("stat %s\n", guestPath), stagingDir)
+func (o OfflineIO) statInImage(image, guestPath string) error {
+	out, err := o.runDebugfs(image, false, fmt.Sprintf("stat %s\n", guestPath))
 	if err != nil {
 		return err
 	}

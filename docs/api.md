@@ -4,9 +4,10 @@ Servida por `internal/api` (`cmd/microhosted`, flag `--addr`, por defecto
 `:8080`). Todos los cuerpos son JSON. No hay autenticación todavía — pensada
 para correr detrás de un panel/backend propio, no expuesta directamente.
 
-Estado: cubre create/read/delete + stop/start + exec. El CRUD completo (incluyendo
-"update" y matices de create/delete) está en marcha — ver `SESSIONS.md`,
-sección "Próxima sesión".
+Estado: cubre create/read/delete + stop/start + exec + snapshots/fork +
+volúmenes/ficheros + observabilidad (`/v1/system`, `/v1/health`). El CRUD
+completo (incluyendo "update" y matices de create/delete) está en marcha —
+ver `SESSIONS.md`, sección "Próxima sesión".
 
 **Convención de rutas** (toda la API sigue esta regla):
 
@@ -18,6 +19,8 @@ sección "Próxima sesión".
   `/snapshots/{id}` con el mismo body y la misma respuesta; solo cambia el
   origen). Lo que una acción crea vive después en su colección: `snapshot`
   crea en `/v1/snapshots`, `fork` crea en `/v1/vms`.
+- **Singletons de solo lectura**: `GET /v1/system` y `GET /v1/health` —
+  recursos únicos (el host solo hay uno), sin `{id}` (ver `## Observabilidad`).
 
 ---
 
@@ -176,9 +179,14 @@ curl localhost:8080/v1/vms/a1b2c3d4
 | `template`    | nombre de la plantilla de la que se clonó                                   |
 | `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (se usan `running` y `stopped`) |
 | `pid`         | PID del proceso Firecracker (jailed)                                        |
+| `vcpus` / `mem_mb` / `disk_mb` | forma prometida a la VM al crearla                          |
+| `uptime_seconds` | solo `running`: segundos desde que arrancó el proceso Firecracker (boot/restore, no `created_at`) |
+| `mem_rss_mb`  | solo `running`: RAM residente REAL del proceso — lo que la VM cuesta al host ahora mismo (la RAM del guest se pagina bajo demanda: normalmente muy por debajo de `mem_mb`) |
+| `cpu_seconds` | solo `running`: CPU acumulada del proceso; para una tasa de uso, difierénciala entre dos sondeos |
 | `network`     | nombre de la red segmentada a la que está conectada (vacío si `no_network`) |
 | `guest_ip`    | IP del guest en la subred de su red (vacío si `no_network`)                 |
 | `tap_device`  | nombre del TAP, enslavado al bridge de la red (vacío si `no_network`)       |
+| `rootfs_path` | el disco de la VM (clon del rootfs) en el host                              |
 | `log_path`    | archivo con la consola serie + logs de Jailer/Firecracker de esta VM        |
 | `created_at`  | timestamp RFC3339                                                            |
 
@@ -562,9 +570,128 @@ para datos grandes usa un **volumen** dimensionado, no el rootfs.
 
 ---
 
+## Observabilidad
+
+Dos singletons de solo lectura, pensados para dos consumidores distintos:
+
+- **`GET /v1/health`** — para un **monitor** (systemd, uptime-checker, load
+  balancer): barato, responde por código HTTP (**200** `ok` / **503**
+  `degraded`), sin necesidad de parsear el body.
+- **`GET /v1/system`** — para un **panel/operador**: el informe completo en
+  una llamada (siempre **200**; la salud va dentro). Todo se calcula en el
+  momento de la petición desde `/proc`, `statfs` y el estado en memoria del
+  manager — sin recolectores de fondo ni histórico (el histórico es del
+  cliente: sondea y diferencia).
+
+### `GET /v1/health` — sonda de salud
+
+```bash
+curl -s localhost:8080/v1/health
+```
+
+**Respuesta 200/503** (`HealthResponse`): `{"status": "ok"|"degraded", "checks": [...]}`.
+`status` es `degraded` en cuanto falla UN check. Cada check lleva `name`,
+`ok` y `detail` (el motivo en fallo; en `disk_space`, las cifras siempre):
+
+| check            | qué verifica                                                              |
+|------------------|----------------------------------------------------------------------------|
+| `kvm`            | `/dev/kvm` presente — sin él no arranca ninguna VM                        |
+| `database`       | la SQLite de estado responde (query real, no solo ping)                   |
+| `store_writable` | se puede crear un fichero en el store (donde van clones/volúmenes)        |
+| `disk_space`     | espacio libre del store ≥ max(5% del total, 1 GiB) — un store lleno hace fallar cada create/snapshot/upload de formas peores |
+| `store_cow`      | el store soporta reflink; sin CoW cada VM es una copia completa del rootfs (mismo aviso que el daemon loguea al arrancar, hecho sondeable) |
+| `firecracker`    | el binario de Firecracker existe y responde a `--version`                 |
+
+### `GET /v1/system` — informe completo
+
+```bash
+curl -s localhost:8080/v1/system | jq .
+```
+
+**Respuesta 200** (`SystemResponse`), cinco bloques:
+
+- **`status` + `checks`** — lo mismo que `/v1/health`, embebido para que un
+  panel necesite una sola llamada.
+- **`daemon`** — el proceso y el mapa de "dónde está todo": `pid`,
+  `started_at`, `uptime_seconds`, `firecracker_version`,
+  `network_overrides` (FC ≥ 1.12: forks simultáneos posibles — su ausencia
+  explica los 409 de fork) y `paths` con TODAS las rutas del host que un
+  operador puede necesitar inspeccionar o respaldar: `store` (clones + logs
+  de consola en su raíz), `goldens`, `kernels`, `snapshots`, `volumes`,
+  `chroot_base` (jaulas de Jailer), `database`, `catalog`, `firecracker`,
+  `jailer`.
+- **`host`** — recursos vivos del host físico: `hostname`, `kernel`, `cpus`,
+  `load1/5/15` (júzgalas contra `cpus`) y `memory{total_mb, used_mb,
+  available_mb}` (`used` = total−available: la caché reclamable no cuenta
+  como usada; `available_mb` es lo que las VMs nuevas pueden reclamar).
+- **`storage`** — capacidad del store: `path`, `fs_type`, `cow`,
+  `total_mb/used_mb/free_mb` (statfs del filesystem) y `breakdown` por
+  categoría (`vm_disks_and_logs`, `goldens`, `kernels`, `snapshots`,
+  `volumes`, `jailer_chroots`), cada una con su ruta y tamaño ASIGNADO
+  (estilo `du`, bloques reales — los ficheros sparse no engañan). **Ojo en
+  CoW**: los extents compartidos por reflink se cuentan una vez por fichero,
+  así que las categorías pueden sumar más que `used_mb` — cada cifra
+  responde "cuánto liberaría borrar esto como máximo", no "cuánto posee en
+  exclusiva" (`btrfs filesystem du` es la referencia exacta).
+- **`fleet`** — lo que gestiona el daemon: `vms{total,running,stopped}`,
+  `allocated{vcpus,mem_mb}` (lo PROMETIDO en agregado a las VMs `running` —
+  visibilidad de overcommit contra `host`; el consumo real por VM va en
+  `mem_rss_mb` de cada `VMResponse`), `networks`, `snapshots`,
+  `volumes{total,attached}`, `templates`.
+
+```json
+{
+  "status": "ok",
+  "checks": [{"name":"kvm","ok":true}, {"name":"disk_space","ok":true,"detail":"18432 MiB free of 20480 MiB"}],
+  "daemon": {
+    "pid": 95974, "started_at": "2026-07-05T12:00:00+02:00", "uptime_seconds": 3600,
+    "firecracker_version": "v1.10.1", "network_overrides": false,
+    "paths": {
+      "store": "/var/lib/microhosted/store",
+      "goldens": "/var/lib/microhosted/store/rootfs",
+      "kernels": "/var/lib/microhosted/store/kernels",
+      "snapshots": "/var/lib/microhosted/store/snapshots",
+      "volumes": "/var/lib/microhosted/store/volumes",
+      "chroot_base": "/var/lib/microhosted/store/jailer",
+      "database": "/home/manu/own/MicroHosted/images/microhosted.db",
+      "catalog": "/home/manu/own/MicroHosted/images/catalog.json",
+      "firecracker": "/usr/local/bin/firecracker",
+      "jailer": "/usr/local/bin/jailer"
+    }
+  },
+  "host": {
+    "hostname": "lab", "kernel": "6.17.0-35-generic", "cpus": 8,
+    "load1": 0.42, "load5": 0.31, "load15": 0.25,
+    "memory": {"total_mb": 31855, "used_mb": 7200, "available_mb": 24655}
+  },
+  "storage": {
+    "path": "/var/lib/microhosted/store", "fs_type": "btrfs", "cow": true,
+    "total_mb": 20480, "used_mb": 2048, "free_mb": 18432,
+    "breakdown": [
+      {"what": "vm_disks_and_logs", "path": "/var/lib/microhosted/store", "size_mb": 610},
+      {"what": "goldens", "path": "/var/lib/microhosted/store/rootfs", "size_mb": 300},
+      {"what": "snapshots", "path": "/var/lib/microhosted/store/snapshots", "size_mb": 450}
+    ]
+  },
+  "fleet": {
+    "vms": {"total": 3, "running": 2, "stopped": 1},
+    "allocated": {"vcpus": 2, "mem_mb": 256},
+    "networks": 2, "snapshots": 1,
+    "volumes": {"total": 2, "attached": 1}, "templates": 1
+  }
+}
+```
+
+El consumo **por VM** (RAM residente real, CPU acumulada, uptime) no vive
+aquí sino en cada `VMResponse` de `GET /v1/vms` — ver su tabla arriba. Con
+eso `GET /v1/vms` ya es el "`docker ps`" de microVMs: estado, forma, consumo
+real, red y rutas de cada una.
+
+---
+
 ## Lo que falta (ver `SESSIONS.md` → "Próxima sesión")
 
 - Poder crear a partir de un disco ya usado (no solo de la plantilla dorada).
-- `GET /v1/vms` con más forma de "`docker ps`" (uptime, columnas pensadas
-  para un panel web).
+- `GET /v1/vms`: filtros/orden para paneles (uptime/consumo/rutas ya están
+  en `VMResponse` desde la sesión de observabilidad).
 - Auditoría de que `DELETE` no deja huérfanos en ningún camino de fallo.

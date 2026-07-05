@@ -131,7 +131,20 @@ func main() {
 		log.Fatalf("limpiando tap devices huérfanos: %v", err)
 	}
 
-	srv := api.NewServer(mgr, netmgr, *addr)
+	// The observability report shows these paths to an operator working
+	// anywhere on the host — absolute, so they don't depend on the daemon's
+	// cwd. Best-effort: on failure the flag value is shown as given.
+	absOr := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
+	srv := api.NewServer(mgr, netmgr, *addr, api.SystemConfig{
+		DBPath:      absOr(*dbPath),
+		CatalogPath: absOr(*catalogPath),
+		StartedAt:   time.Now(),
+	})
 
 	go func() {
 		log.Printf("microhosted escuchando en %s", *addr)

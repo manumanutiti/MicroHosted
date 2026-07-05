@@ -623,6 +623,11 @@ func (m *Manager) boot(record *types.VM) error {
 	}
 
 	pid, _ := machine.PID()
+	if err := m.applyLimits(id, pid, record.Config); err != nil {
+		_ = firecracker.Kill(context.Background(), machine)
+		_ = logFile.Close()
+		return err
+	}
 	record.PID = pid
 	// machine.Cfg.SocketPath (not fcCfg.SocketPath) because Jailer rewrites it
 	// to the absolute path inside the chroot once launched.
@@ -638,6 +643,25 @@ func (m *Manager) boot(record *types.VM) error {
 	m.mu.Unlock()
 
 	return nil
+}
+
+// applyLimits caps a just-launched VM's host resources by writing cgroup v2
+// limits (CPU, memory, PIDs — sized from its own config) into its Jailer
+// cgroup. Fail-closed: a VM the host can't cap is exactly the DoS vector the
+// limits exist to prevent, so an error here aborts the boot and the caller
+// kills the process. The one tolerated failure is a cgroup v1 host, where
+// limits simply aren't supported — those hosts predate this feature and keep
+// working, with a loud warning per boot.
+func (m *Manager) applyLimits(id string, pid int, cfg types.VMConfig) error {
+	err := jailer.ApplyLimits(m.jailerCfg, id, pid, cfg.VCPUs, cfg.MemMB)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, jailer.ErrCgroupV1) {
+		log.Printf("vm %s: host on cgroup v1 — CPU/memory/PID limits NOT applied (guest can contend for host resources)", id)
+		return nil
+	}
+	return fmt.Errorf("applying resource limits to vm %s: %w", id, err)
 }
 
 // powerOff stops a VM's running process and releases its TAP + jail dir, leaving
@@ -1267,6 +1291,11 @@ func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error
 	}
 
 	pid, _ := machine.PID()
+	if err := m.applyLimits(id, pid, record.Config); err != nil {
+		_ = firecracker.Kill(context.Background(), machine)
+		_ = logFile.Close()
+		return err
+	}
 	record.PID = pid
 	record.SocketPath = machine.Cfg.SocketPath
 	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
@@ -1439,6 +1468,18 @@ func (m *Manager) stagingDir() string {
 	return filepath.Join(m.instancesDir, "staging")
 }
 
+// offlineIO builds the context for offline debugfs operations: staging on the
+// store, and debugfs dropped to the jailer uid/gid — the untrusted-ext4 parser
+// runs with the same unprivileged identity as the VMs themselves, never as the
+// daemon's root (see internal/storage/offline.go).
+func (m *Manager) offlineIO() storage.OfflineIO {
+	return storage.OfflineIO{
+		StagingDir: m.stagingDir(),
+		UID:        m.jailerCfg.UID,
+		GID:        m.jailerCfg.GID,
+	}
+}
+
 // PutFile writes data into a VM at guestPath, in constant memory whatever the
 // size. For a running VM it streams over vsock (works even with no network); for
 // a stopped VM it streams into the VM's disk offline with debugfs — never
@@ -1489,7 +1530,7 @@ func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) erro
 		return vsock.PutFile(vsockPath, guestPath, f, n)
 	case types.VMStateStopped:
 		defer m.endVMDiskIO(id)
-		return storage.InjectFile(rootfs, guestPath, data, m.stagingDir())
+		return m.offlineIO().InjectFile(rootfs, guestPath, data)
 	default:
 		return fmt.Errorf("%w: vm %s is %s (files need it running or stopped)", ErrVMState, id, state)
 	}
@@ -1558,7 +1599,7 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 		// temp the reader wraps), so releasing the reservation here is safe even
 		// though the caller reads the stream afterwards.
 		defer m.endVMDiskIO(id)
-		f, size, err := storage.ExtractFileStream(rootfs, guestPath, m.stagingDir())
+		f, size, err := m.offlineIO().ExtractFileStream(rootfs, guestPath)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1609,7 +1650,7 @@ func (m *Manager) InjectToVolume(volID, guestPath string, data io.Reader) error 
 		return err
 	}
 	defer m.endVolumeIO(volID)
-	return storage.InjectFile(path, guestPath, data, m.stagingDir())
+	return m.offlineIO().InjectFile(path, guestPath, data)
 }
 
 // ExtractFromVolumeStream reads guestPath out of a detached volume as a
@@ -1623,7 +1664,7 @@ func (m *Manager) ExtractFromVolumeStream(volID, guestPath string) (io.ReadClose
 		return nil, 0, err
 	}
 	defer m.endVolumeIO(volID)
-	f, size, err := storage.ExtractFileStream(path, guestPath, m.stagingDir())
+	f, size, err := m.offlineIO().ExtractFileStream(path, guestPath)
 	if err != nil {
 		return nil, 0, err
 	}

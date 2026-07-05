@@ -19,8 +19,12 @@ import (
 // integration point Sesión 7 originally planned for — it exists from the
 // start here so a panel can be built against it without reshaping the
 // manager underneath.
-func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Server {
+func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg SystemConfig) *http.Server {
 	mux := http.NewServeMux()
+
+	// Observability: GET /v1/system (full report) + GET /v1/health (cheap
+	// 200/503 probe). See system.go.
+	registerSystemRoutes(mux, mgr, netmgr, sysCfg)
 
 	mux.HandleFunc("GET /v1/templates", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mgr.Templates())
@@ -182,14 +186,14 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, types.NewVMResponse(record))
+		writeJSON(w, http.StatusCreated, liveVMResponse(record))
 	})
 
 	mux.HandleFunc("GET /v1/vms", func(w http.ResponseWriter, r *http.Request) {
 		vms := mgr.List()
 		resp := make([]types.VMResponse, 0, len(vms))
 		for _, v := range vms {
-			resp = append(resp, types.NewVMResponse(v))
+			resp = append(resp, liveVMResponse(v))
 		}
 		writeJSON(w, http.StatusOK, resp)
 	})
@@ -201,7 +205,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeError(w, http.StatusNotFound, fmt.Errorf("vm %q not found", id))
 			return
 		}
-		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+		writeJSON(w, http.StatusOK, liveVMResponse(record))
 	})
 
 	mux.HandleFunc("DELETE /v1/vms/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -232,7 +236,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeVMOpError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+		writeJSON(w, http.StatusOK, liveVMResponse(record))
 	})
 
 	mux.HandleFunc("POST /v1/vms/{id}/start", func(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +245,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeVMOpError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+		writeJSON(w, http.StatusOK, liveVMResponse(record))
 	})
 
 	// Snapshot: freeze a running VM's memory+disk as a restorable point in
@@ -307,7 +311,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeVMOpError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, types.NewVMResponse(record))
+		writeJSON(w, http.StatusCreated, liveVMResponse(record))
 	})
 
 	// Direct fork: clone a RUNNING VM in one call, no user-managed snapshot —
@@ -325,7 +329,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeVMOpError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, types.NewVMResponse(record))
+		writeJSON(w, http.StatusCreated, liveVMResponse(record))
 	})
 
 	// Restore: rewind THIS VM, in place, to one of its own snapshots — same
@@ -346,7 +350,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string) *http.Serv
 			writeVMOpError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, types.NewVMResponse(record))
+		writeJSON(w, http.StatusOK, liveVMResponse(record))
 	})
 
 	mux.HandleFunc("POST /v1/vms/{id}/exec", func(w http.ResponseWriter, r *http.Request) {

@@ -59,6 +59,16 @@ The engine. **Firecracker** is the microVM monitor (it runs the guest).
 **Jailer** is a wrapper that drops Firecracker into a locked-down chroot +
 cgroup before it starts, so a compromised VMM still can't see the host.
 
+Jailer creates the per-VM cgroup but writes no limits into it on its own; the
+daemon does, right after launch: `cpu.max` (the VM's vCPU count × one full
+period), `memory.max` (guest memory + a fixed VMM overhead margin, swap
+disabled) and `pids.max` (vCPUs + a small headroom — Firecracker never forks)
+go into `/sys/fs/cgroup/firecracker/<vm-id>` on every boot. Without them a
+guest could DoS the host from inside its jail: pin every core, balloon the
+VMM, or fork-bomb the host's PID space. Fail-closed: a VM whose limits can't
+be applied doesn't boot (cgroup v2 hosts; on v1 the daemon warns and boots
+uncapped, the pre-limits behavior).
+
 - **Needs:** L0 (KVM) and L1.
 - **You install / it creates** (via `scripts/install-fc.sh`): the `firecracker`
   and `jailer` binaries in `/usr/local/bin` (both from the exact same release —

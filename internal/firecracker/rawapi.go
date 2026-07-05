@@ -36,6 +36,26 @@ import (
 // whose first line looks like "Firecracker v1.10.1".
 var versionRe = regexp.MustCompile(`v(\d+)\.(\d+)`)
 
+// Version returns the firecracker binary's version string (e.g. "v1.10.1")
+// for the observability report, or "" if the binary can't be run or its
+// output not parsed. Same probe SupportsNetworkOverrides does, kept separate
+// because one answers "what do we have" and the other "what can it do".
+func Version(execFile string) string {
+	out, err := exec.Command(execFile, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	m := fullVersionRe.Find(out)
+	if m == nil {
+		return ""
+	}
+	return string(m)
+}
+
+// fullVersionRe captures the complete version tag from `firecracker
+// --version`, first line "Firecracker v1.10.1".
+var fullVersionRe = regexp.MustCompile(`v\d+\.\d+\.\d+`)
+
 // SupportsNetworkOverrides reports whether the firecracker binary at execFile
 // accepts `network_overrides` in PUT /snapshot/load — added in Firecracker
 // v1.12.0. Probed once at startup by running the binary with --version; a

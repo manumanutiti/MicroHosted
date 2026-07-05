@@ -33,15 +33,31 @@ type CreateVMRequest struct {
 
 // VMResponse is the JSON representation of a VM returned by the API.
 type VMResponse struct {
-	ID        string  `json:"id"`
-	Template  string  `json:"template"`
-	State     VMState `json:"state"`
-	PID       int     `json:"pid,omitempty"`
-	Network   string  `json:"network,omitempty"`
-	GuestIP   string  `json:"guest_ip,omitempty"`
-	HostIP    string  `json:"host_ip,omitempty"`
-	TapDevice string  `json:"tap_device,omitempty"`
-	LogPath   string  `json:"log_path,omitempty"`
+	ID       string  `json:"id"`
+	Template string  `json:"template"`
+	State    VMState `json:"state"`
+	PID      int     `json:"pid,omitempty"`
+	// Shape: what the VM was promised at create time.
+	VCPUs  int64 `json:"vcpus"`
+	MemMB  int64 `json:"mem_mb"`
+	DiskMB int64 `json:"disk_mb,omitempty"`
+	// Live consumption of the Firecracker process, present only while
+	// running (filled by the API layer from /proc, not by NewVMResponse):
+	// MemRSSMB is what the VM costs the host RIGHT NOW (guest RAM faults in
+	// on demand, so usually well under mem_mb); CPUSeconds is cumulative —
+	// diff between two polls for a usage rate; UptimeSeconds counts from the
+	// process's start (boot/restore), not from created_at.
+	UptimeSeconds int64   `json:"uptime_seconds,omitempty"`
+	MemRSSMB      int64   `json:"mem_rss_mb,omitempty"`
+	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
+	Network       string  `json:"network,omitempty"`
+	GuestIP       string  `json:"guest_ip,omitempty"`
+	HostIP        string  `json:"host_ip,omitempty"`
+	TapDevice     string  `json:"tap_device,omitempty"`
+	// RootfsPath is the VM's disk (the rootfs clone) on the host — with
+	// LogPath, the two per-VM artifacts an operator inspects directly.
+	RootfsPath string `json:"rootfs_path,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
 	// Quarantine: forked from a snapshot with its TAP on no bridge — guest_ip
 	// is the address the guest believes it has, not a live reservation.
 	Quarantine bool `json:"quarantine,omitempty"`
@@ -81,10 +97,14 @@ func NewVMResponse(vm *VM) VMResponse {
 		Template:     vm.Config.TemplateName,
 		State:        vm.State,
 		PID:          vm.PID,
+		VCPUs:        vm.Config.VCPUs,
+		MemMB:        vm.Config.MemMB,
+		DiskMB:       vm.Config.DiskMB,
 		Network:      vm.Config.NetworkName,
 		GuestIP:      vm.Config.GuestIP,
 		HostIP:       vm.Config.HostIP,
 		TapDevice:    vm.Config.TapDevice,
+		RootfsPath:   vm.Config.Rootfs,
 		LogPath:      vm.LogPath,
 		Quarantine:   vm.Config.Quarantine,
 		RestoredFrom: vm.Config.RestoredFrom,

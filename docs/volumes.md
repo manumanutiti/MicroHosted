@@ -13,6 +13,17 @@ host-side va por **`debugfs`** (de `e2fsprogs`), una herramienta de espacio de
 usuario que lee/escribe ext4 **sin montar**: una imagen maliciosa como mucho hace
 fallar al propio proceso `debugfs`, nunca toca el kernel del host.
 
+Y ese proceso **no corre como root**: cuando el daemon corre como root, cada
+invocación de `debugfs` baja al uid/gid del jailer (`--jailer-uid/-gid`, la
+misma identidad sin privilegios con la que corre el Firecracker enjaulado, y
+dueña de todas las imágenes del store). Un exploit del parser de `debugfs`
+disparado por una imagen maliciosa aterriza así en un proceso sin privilegios
+ni capabilities — puede pintarrajear imágenes del store (cosa que ya podía: él
+*es* el parser que las escribe), pero no el host. Es mitigación, no una jaula
+(comparte los namespaces del host); lo que elimina es el premio de shell root
+de la superficie de ataque del parser ext4. Los temporales del staging se
+chownean a ese uid para que el proceso degradado pueda leerlos/escribirlos.
+
 Hay dos canales de datos, según dónde esté la VM:
 
 | Canal | Cuándo | Cómo |
