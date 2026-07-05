@@ -7,5 +7,14 @@
     "vcpus": 1,
     "mem_mb": 128,
     "disk_mb": 1024
+  },
+  {
+    "name": "base-ubuntu-noble",
+    "description": "Ubuntu noble (debootstrap, make prepare-image)",
+    "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
+    "rootfs_path": "/var/lib/microhosted/store/rootfs/base-ubuntu-noble.ext4",
+    "vcpus": 1,
+    "mem_mb": 128,
+    "disk_mb": 1024
   }
 ]

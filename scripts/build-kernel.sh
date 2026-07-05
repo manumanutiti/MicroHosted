@@ -8,7 +8,15 @@ set -euo pipefail
 # Versión del kernel mantenida por Firecracker CI (sin prefijo "v" en el nombre de archivo)
 FC_KERNEL_VERSION="${1:-6.1.102}"
 OUTPUT_DIR="${2:-images/kernels}"
-ARCH="$(uname -m)"
+
+# Arquitectura del kernel: la de la máquina, o forzada con ARCH= (el bucket de
+# Firecracker CI publica x86_64 y aarch64 con el mismo layout).
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  amd64|x86|x86_64)  ARCH=x86_64 ;;
+  arm|arm64|aarch64) ARCH=aarch64 ;;
+  *) echo "ERROR: arquitectura no soportada: $ARCH (usa x86_64 o aarch64)" >&2; exit 1 ;;
+esac
 
 mkdir -p "$OUTPUT_DIR"
 

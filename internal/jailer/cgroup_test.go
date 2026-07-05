@@ -39,7 +39,11 @@ func TestApplyLimitsWritesSizedValues(t *testing.T) {
 		t.Fatalf("ApplyLimits: %v", err)
 	}
 
-	dir := filepath.Join(root, "firecracker", "vm1")
+	// The limits tree is the daemon's own (<mount>/microhosted/<id>), NOT
+	// Jailer's parent cgroup: enabling controllers there would trip cgroup
+	// v2's no-internal-process rule on hosts where Jailer attaches the
+	// process to its parent directly (no NUMA sysfs → no --cgroup flags).
+	dir := filepath.Join(root, "microhosted", "vm1")
 	if got := CgroupDir(d, "vm1"); got != dir {
 		t.Fatalf("CgroupDir = %s, want %s", got, dir)
 	}
@@ -59,10 +63,16 @@ func TestApplyLimitsWritesSizedValues(t *testing.T) {
 	// Ancestors must have cpu/memory/pids enabled or the leaf files above
 	// wouldn't exist on a real cgroupfs. The fake root records only the last
 	// single-controller write; presence of the file is what's checkable here.
-	for _, anc := range []string{root, filepath.Join(root, "firecracker")} {
+	for _, anc := range []string{root, filepath.Join(root, "microhosted")} {
 		if _, err := os.Stat(filepath.Join(anc, "cgroup.subtree_control")); err != nil {
 			t.Errorf("subtree_control not written in %s: %v", anc, err)
 		}
+	}
+
+	// Jailer's own parent cgroup must stay untouched — writing its
+	// subtree_control is exactly the poison this layout exists to avoid.
+	if _, err := os.Stat(filepath.Join(root, "firecracker")); !os.IsNotExist(err) {
+		t.Errorf("ApplyLimits touched jailer's parent cgroup: stat = %v", err)
 	}
 }
 
@@ -86,18 +96,26 @@ func TestApplyLimitsRejectsInvalidSizing(t *testing.T) {
 
 func TestRemoveCgroup(t *testing.T) {
 	root, d := withFakeCgroupRoot(t)
-	dir := filepath.Join(root, "firecracker", "vm1")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	// Both per-VM groups can exist: the daemon's limits group always, and
+	// Jailer's own child on hosts where it got --cgroup flags.
+	limitsDir := filepath.Join(root, "microhosted", "vm1")
+	jailerDir := filepath.Join(root, "firecracker", "vm1")
+	for _, dir := range []string{limitsDir, jailerDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := RemoveCgroup(d, "vm1"); err != nil {
 		t.Fatalf("RemoveCgroup: %v", err)
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("cgroup dir still present after RemoveCgroup: %v", err)
+	for _, dir := range []string{limitsDir, jailerDir} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("cgroup dir %s still present after RemoveCgroup: %v", dir, err)
+		}
 	}
-	// Absent dir (never launched, or a v1 host) is success, not an error.
+	// Absent dirs (never launched, a v1 host, or no NUMA sysfs so Jailer
+	// never built its child) are success, not an error.
 	if err := RemoveCgroup(d, "vm1"); err != nil {
-		t.Fatalf("RemoveCgroup on missing dir: %v", err)
+		t.Fatalf("RemoveCgroup on missing dirs: %v", err)
 	}
 }

@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Descarga firecracker y jailer de la misma versión desde GitHub Releases.
-# Sin argumentos instala la ÚLTIMA release publicada (la plataforma necesita
-# >= 1.12 para network_overrides, que habilita forks simultáneos de snapshots).
-# Uso: ./scripts/install-fc.sh [VERSION] [INSTALL_DIR]
+# Sin argumentos instala la versión FIJADA de la plataforma (la validada en
+# hardware; se necesita >= 1.12 para network_overrides / forks simultáneos).
+# "latest" instala la última release publicada — decisión consciente: los
+# snapshots existentes van ligados a la versión que los creó.
+# Uso: ./scripts/install-fc.sh [VERSION|latest] [INSTALL_DIR]
 # Ejemplo: ./scripts/install-fc.sh v1.16.1 /usr/local/bin
 
 set -euo pipefail
 
-FC_VERSION="${1:-latest}"
+FC_VERSION="${1:-v1.16.1}"
 INSTALL_DIR="${2:-/usr/local/bin}"
-ARCH="$(uname -m)"
+
+# Arquitectura: la de la máquina (los binarios se ejecutan AQUÍ; instalar los
+# de otra arquitectura solo tiene sentido para copiarlos a otro equipo).
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  amd64|x86|x86_64)  ARCH=x86_64 ;;
+  arm|arm64|aarch64) ARCH=aarch64 ;;
+esac
 
 if [[ "$FC_VERSION" == "latest" ]]; then
   # /releases/latest redirige a /releases/tag/vX.Y.Z — resolver la versión
@@ -55,9 +64,14 @@ echo "==> Instalando en ${INSTALL_DIR}..."
 sudo install -o root -g root -m 0755 "$FC_BIN"     "${INSTALL_DIR}/firecracker"
 sudo install -o root -g root -m 0755 "$JAILER_BIN" "${INSTALL_DIR}/jailer"
 
-echo "==> Verificando versiones:"
-firecracker --version
-jailer --version
+if [[ "$ARCH" == "$(uname -m)" ]]; then
+  echo "==> Verificando versiones:"
+  firecracker --version
+  jailer --version
+else
+  echo "==> AVISO: binarios ${ARCH} instalados en una máquina $(uname -m) — no se"
+  echo "    pueden ejecutar aquí; cópialos a la máquina destino."
+fi
 
 echo ""
 echo "OK: firecracker y jailer instalados en ${INSTALL_DIR}"

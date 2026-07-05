@@ -617,6 +617,9 @@ mitigar escapes a nivel de parser ext4.
   (con el PID ya conocido), en `/sys/fs/cgroup/firecracker/<vm-id>` — el
   layout de Jailer con `--cgroup-version 2` (parent-cgroup = basename del
   exec-file, espejo de la fórmula del chroot).
+  **NOTA (2026-07-05, mismo día por la tarde): este layout resultó ser el
+  origen de un bug grave en ARM y se cambió a `/sys/fs/cgroup/microhosted/<id>`
+  — ver la sesión "Portabilidad ARM" más abajo.**
 - Valores dimensionados por la config de la propia VM: `cpu.max` =
   vCPUs × período completo (100 ms), `memory.max` = MemMB + 64 MiB de margen
   VMM (heap/virtio/page tables; el overhead documentado de FC es <5 MiB),
@@ -670,8 +673,9 @@ actualizados.
 
 **PENDIENTE validar en hardware** (los tests unitarios no ejercitan el
 kernel): tras reinstalar el binario —
-- Crear una VM y comprobar `cat /sys/fs/cgroup/firecracker/<id>/{cpu.max,memory.max,memory.swap.max,pids.max,cgroup.procs}`
-  (valores dimensionados y el PID de firecracker inscrito).
+- Crear una VM y comprobar `cat /sys/fs/cgroup/microhosted/<id>/{cpu.max,memory.max,memory.swap.max,pids.max,cgroup.procs}`
+  (valores dimensionados y el PID de firecracker inscrito; ruta actualizada
+  tras el fix de la sesión "Portabilidad ARM").
 - Dentro del guest: `yes > /dev/null &` × N no debe pasar del % de CPU de sus
   vCPUs en el host (`top`); un `stress` de memoria debe morir por OOM del
   cgroup sin tocar el swap del host.
@@ -680,6 +684,71 @@ kernel): tras reinstalar el binario —
   del proceso debugfs durante una transferencia grande = uid del jailer, y
   los round-trips siguen funcionando (permisos del staging correctos).
 - Host cgroups v1 (si hay alguno): la VM arranca con el warning en el log.
+
+---
+
+## Portabilidad ARM — Bug #9: "la primera VM arranca, todas las siguientes fallan" (2026-07-05, VALIDADO EN HARDWARE — Raspberry Pi, kernel 6.17 raspi)
+
+**Contexto**: primera prueba de la plataforma completa en aarch64 (Raspberry
+Pi). En x86 todo iba bien. `make full-install` + `make prepare-image`
+funcionaron; la **primera** microVM arrancó, respondió a `exec` por vsock…
+y a partir de ahí **todo `POST /v1/vms` fallaba** con
+`Firecracker did not create API socket … exit status 1`, sobreviviendo a
+reinicios del daemon. Solo un reboot del host devolvía exactamente UNA VM más.
+
+**Cómo se encontró**: el journal solo decía "exit status 1"; el stderr real
+del jailer estaba en el log por-VM (`/var/lib/microhosted/store/<id>.log`):
+`CgroupMove("/sys/fs/cgroup/firecracker") Resource busy (EBUSY)`.
+
+**Cadena de causas (las cuatro piezas)**:
+1. El kernel de la Pi no tiene NUMA → no existe `/sys/devices/system/node`.
+   El firecracker-go-sdk solo emite sus flags `--cgroup cpuset.*` si puede
+   leer `node0/cpulist` → **en ARM el jailer arranca sin ningún `--cgroup`**.
+   (En x86 el fichero existe: por eso ahí nunca se manifestó.)
+2. Sin flags `--cgroup`, el jailer (v1.16.1) no crea el cgroup hijo por VM:
+   mete el proceso **directamente en el padre** `/sys/fs/cgroup/firecracker`.
+3. `ApplyLimits` (hardening de esta misma mañana) habilitaba `+cpu +memory
+   +pids` en el `subtree_control` de ese MISMO padre para poder poner límites
+   en el hijo.
+4. Regla cgroup v2 de **"no internal processes"**: un cgroup con
+   controladores delegados en `subtree_control` no admite procesos directos.
+   La primera VM entra con el padre limpio; `ApplyLimits` lo "envenena"; cada
+   jailer posterior recibe EBUSY y muere antes de crear el socket. El estado
+   persiste hasta el reboot — por eso reiniciar el daemon no ayudaba.
+
+**El fix (general, no un parche ARM)**: el árbol de límites se muda a un
+cgroup propiedad del daemon, **`/sys/fs/cgroup/microhosted/<id>`**, en vez de
+imitar la convención interna del jailer. Así el `subtree_control` de
+`/sys/fs/cgroup/firecracker` no se toca jamás → el attach del jailer al padre
+siempre funciona, con 1 o con 50 VMs; `ApplyLimits` migra el PID desde donde
+lo dejara el jailer (root siempre puede migrar). Un solo camino de código para
+x86 y ARM: se elimina la dependencia oculta de "existe NUMA sysfs". Costes
+asumidos y documentados: en hosts NUMA la migración pierde el pinning cpuset
+del jailer (no-op en máquinas de un solo nodo, que son todos los objetivos), y
+`RemoveCgroup` ahora limpia DOS directorios (el de límites + el hijo
+`firecracker/<id>` que el jailer sí crea en x86, que si no se fugaría).
+
+**Ficheros**: `internal/jailer/cgroup.go` (layout nuevo + `jailerCgroupDir` +
+`RemoveCgroup` doble, con el porqué completo en el comentario de paquete),
+`cgroup_test.go` (layout nuevo + assert explícito de que `ApplyLimits` NO toca
+el padre del jailer — el test codifica el invariante anti-regresión).
+
+**Operativo**: el fix necesita una limpieza única del estado envenenado de la
+sesión en curso (`echo -cpu/-memory/-pids > .../firecracker/cgroup.subtree_control`
+tras borrar hijos huérfanos) o un reboot; después ya no puede reproducirse.
+
+**VALIDADO en hardware**: tras instalar el binario y limpiar, múltiples VMs
+consecutivas arrancan en la Pi (con los límites fail-closed activos — si
+`ApplyLimits` fallara, el boot abortaría, así que el camino nuevo de cgroups
+queda ejercitado en cada create). El usuario confirmó "ya funciona".
+Queda pendiente (heredado de la sesión de Hardening) verificar los VALORES de
+los límites en `/sys/fs/cgroup/microhosted/<id>` y el resto de su batería.
+
+**Lección para el registro**: `CgroupDir` funcionaba en x86 *por
+coincidencia* — replicaba la convención de nombres del jailer y asumía un
+comportamiento (crear el hijo) que depende de flags que el SDK solo emite a
+veces. Cuando un componente externo es dueño de un recurso (el cgroup padre
+del jailer), no se le comparte el `subtree_control`: árbol propio y migrar.
 
 ---
 

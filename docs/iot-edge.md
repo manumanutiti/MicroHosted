@@ -170,10 +170,12 @@ Todas las cifras de la tabla son **estimaciones a validar en hardware**
 2. **Orquestador transaccional** — el bucle restore→poll→validar→extraer→
    destruir con los 3 modos de vida, watchdog, circuit breaker y tope global
    de VMs. Es el producto; el motor son primitivas.
-3. **ARM64** — Firecracker soporta aarch64 e `install-fc.sh` lo contempla,
-   pero: `build-rootfs.sh` tiene `--arch=amd64` hardcodeado, el pipeline de
-   kernel es x86, y nada se ha probado sobre KVM de una Pi. Riesgo existencial
-   del hardware objetivo.
+3. **ARM64** — el pipeline de instalación e imágenes ya es multi-arch
+   (`make full-install` / `make prepare-image` detectan o aceptan
+   `ARCH=aarch64`: binarios FC, kernel del bucket CI, debootstrap arm64 con
+   mirror de ports, cross-build vía qemu-user-static). Lo que falta es la
+   **validación real**: nada se ha probado sobre KVM de una Pi. Riesgo
+   existencial del hardware objetivo.
 4. **Imagen sensor ultra-mínima** — kernel tinyconfig sin módulos + init
    estático + runtime del parser. Objetivo: VM funcional con `mem_mb: 24-32`.
    (Enlaza con las imágenes ultra-optimizadas ya pendientes.)
@@ -201,11 +203,13 @@ dependencias (egress fino antes que pull). IoT-2/3/4 se desarrollan en x86 —
 no esperan al spike ARM.
 
 ### IoT-1 — Spike ARM64 (riesgo existencial)
-Compilar el daemon (`GOARCH=arm64`), kernel aarch64 mínimo, rootfs arm64
-(`build-rootfs.sh` parametrizado), revisar supuestos x86 (kernel args,
-scripts). Arrancar una microVM en una Raspberry Pi 5.
+El tooling ya está listo (`make full-install` y `make prepare-image` son
+multi-arch); el spike es ejecutarlo de verdad en una Raspberry Pi 5 y cazar
+los supuestos x86 que solo aparecen en hardware (kernel args aarch64,
+comportamiento de KVM en Pi, rendimiento del store en SD/NVMe).
 
-**Criterio de éxito**: `create` + `exec` por vsock + `destroy` en una Pi 5,
+**Criterio de éxito**: `make full-install && make prepare-image` en una Pi 5
+dejan el sistema entero funcionando: `create` + `exec` por vsock + `destroy`,
 con jailer y límites cgroup activos. Si KVM en Pi resulta inviable, pivotar el
 hardware objetivo a gateways industriales ARM/x86 — decisión, no derrota.
 

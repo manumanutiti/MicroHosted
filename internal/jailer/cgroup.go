@@ -9,22 +9,31 @@ import (
 	"time"
 )
 
-// Per-VM resource limits, written into the cgroup v2 directory Jailer creates
-// for each microVM. Without them a guest can DoS the host from inside its
-// jail: spin every vCPU at 100% (Firecracker's vCPU threads are ordinary host
-// threads with no quota), balloon the VMM's memory, or — cheapest of all —
-// fork-bomb the host's PID space. Jailer itself only writes the cgroup values
-// it's told on the command line, and firecracker-go-sdk v1.0.0 exposes no way
-// to pass extra --cgroup flags (it only emits the NUMA cpuset pair), so the
-// daemon writes the limits directly after launch instead.
+// Per-VM resource limits, written into a cgroup v2 directory owned by this
+// daemon. Without them a guest can DoS the host from inside its jail: spin
+// every vCPU at 100% (Firecracker's vCPU threads are ordinary host threads
+// with no quota), balloon the VMM's memory, or — cheapest of all — fork-bomb
+// the host's PID space. Jailer itself only writes the cgroup values it's told
+// on the command line, and firecracker-go-sdk v1.0.0 exposes no way to pass
+// extra --cgroup flags (it only emits the NUMA cpuset pair), so the daemon
+// writes the limits directly after launch instead.
 //
-// Layout: with --cgroup-version 2, Jailer creates
-// <mount>/<parent_cgroup>/<id> where parent_cgroup defaults to the exec-file
-// basename — the exact mirror of the chroot's InstanceDir formula. Jailer
-// moves the Firecracker process in there before exec'ing it, but only when it
-// got at least one --cgroup flag, so ApplyLimits both writes the limit files
-// AND enrolls the PID itself — correct whether or not Jailer created the
-// group first.
+// Layout: the limits live in the daemon's own tree, <mount>/microhosted/<id>
+// — deliberately NOT under Jailer's parent cgroup (<mount>/firecracker).
+// Jailer's cgroup behaviour depends on the flags the SDK gives it, and the
+// SDK only emits its cpuset --cgroup pair when the host exposes NUMA sysfs
+// (/sys/devices/system/node). On hosts without it (e.g. Raspberry Pi
+// kernels), Jailer gets no --cgroup flags and attaches the Firecracker
+// process directly to <mount>/firecracker itself. If ApplyLimits enabled
+// controllers in that cgroup's subtree_control — as it must for any child
+// under it to have limit files — cgroup v2's no-internal-process rule makes
+// every later attach fail with EBUSY: the first VM boots, every one after it
+// dies before creating its API socket, until reboot. Keeping the limits tree
+// out of Jailer's parent means Jailer's attach always succeeds and
+// ApplyLimits just migrates the PID over afterwards (root can always
+// migrate). The cost: on NUMA hosts the migration drops the cpuset pinning
+// Jailer applied — a no-op on single-node machines, which is every host this
+// targets.
 
 // cgroupMountPoint is where the unified cgroup2 hierarchy is mounted. A var,
 // not a const, so tests can point it at a temp directory and exercise the
@@ -59,10 +68,25 @@ const (
 	pidsHeadroom = 16
 )
 
-// CgroupDir returns the host-side path of a VM's cgroup v2 directory:
-// <mount>/<basename(ExecFile)>/<vmID> — Jailer's default --parent-cgroup is
-// the exec-file basename, same convention as the chroot layout.
+// limitsParent is the daemon-owned cgroup all per-VM limit groups live under.
+// Its subtree_control is safe to populate precisely because nothing but
+// ApplyLimits ever attaches processes here — see the package comment for why
+// Jailer's own parent cgroup can't play that role.
+const limitsParent = "microhosted"
+
+// CgroupDir returns the host-side path of a VM's limits cgroup:
+// <mount>/microhosted/<vmID>. This is the daemon's tree, not the one Jailer
+// touches (see jailerCgroupDir).
 func CgroupDir(d Defaults, vmID string) string {
+	return filepath.Join(cgroupMountPoint, limitsParent, vmID)
+}
+
+// jailerCgroupDir returns the cgroup Jailer itself creates when it got at
+// least one --cgroup flag: <mount>/<basename(ExecFile)>/<vmID> (its default
+// --parent-cgroup is the exec-file basename, same convention as the chroot
+// layout). The daemon never writes into it — ApplyLimits migrates the PID out
+// — but it's per-VM residue Jailer never removes, so RemoveCgroup must.
+func jailerCgroupDir(d Defaults, vmID string) string {
 	return filepath.Join(cgroupMountPoint, filepath.Base(d.ExecFile), vmID)
 }
 
@@ -85,17 +109,17 @@ func ApplyLimits(d Defaults, vmID string, pid int, vcpus, memMB int64) error {
 	}
 
 	dir := CgroupDir(d, vmID)
-	// MkdirAll, not a stat check: Jailer only creates the group when given a
-	// --cgroup flag (the SDK's NUMA cpuset pair — present on normal hosts but
-	// not guaranteed). Creating it here makes the limits hold either way.
+	// This tree is the daemon's own — Jailer never creates anything under it,
+	// so the whole path has to be made here.
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating cgroup %s: %w", dir, err)
 	}
 
 	// A child only gets a controller's limit files if every ancestor enables
-	// it in cgroup.subtree_control. Jailer enables only what it writes
-	// (cpuset), so cpu/memory/pids must be switched on here — root first,
-	// then the parent. Re-enabling an already-enabled controller is a no-op.
+	// it in cgroup.subtree_control — root first, then the parent. Re-enabling
+	// an already-enabled controller is a no-op. Safe here (and only here)
+	// because no process is ever attached to <mount>/microhosted itself; see
+	// the package comment.
 	for _, anc := range []string{cgroupMountPoint, filepath.Dir(dir)} {
 		if err := enableControllers(anc); err != nil {
 			return err
@@ -114,35 +138,44 @@ func ApplyLimits(d Defaults, vmID string, pid int, vcpus, memMB int64) error {
 		}
 	}
 
-	// Enroll the process. If Jailer already moved it here this re-attach is a
-	// no-op; if it didn't (no --cgroup flags reached it), this is what makes
-	// the limits above actually bind. Root can always migrate.
+	// Migrate the process in from wherever Jailer left it — its own cpuset
+	// child on NUMA hosts, its parent cgroup (or nowhere) on hosts without
+	// NUMA sysfs. Root can always migrate; this write is what makes the
+	// limits above actually bind.
 	if err := writeCgroupFile(filepath.Join(dir, "cgroup.procs"), strconv.Itoa(pid)); err != nil {
 		return fmt.Errorf("enrolling pid %d: %w", pid, err)
 	}
 	return nil
 }
 
-// RemoveCgroup deletes a VM's cgroup directory once its process is gone.
-// Jailer never cleans these up, so without it every create/destroy cycle
-// leaks an empty cgroup. The kernel only allows rmdir on an empty group, and
-// process exit is asynchronous with the SIGTERM that caused it, so EBUSY is
-// retried briefly. Missing directory (v1 host, VM that never launched) is
-// success.
+// RemoveCgroup deletes a VM's per-VM cgroup directories once its process is
+// gone: the daemon's limits group (CgroupDir) and, on hosts where Jailer got
+// --cgroup flags and built its own child, Jailer's leftover group too.
+// Neither is ever cleaned up by anyone else, so without this every
+// create/destroy cycle leaks empty cgroups. The kernel only allows rmdir on
+// an empty group, and process exit is asynchronous with the SIGTERM that
+// caused it, so EBUSY is retried briefly. Missing directories (v1 host, VM
+// that never launched, no NUMA sysfs) are success.
 func RemoveCgroup(d Defaults, vmID string) error {
 	if d.CgroupVersion != "2" {
 		return nil
 	}
-	dir := CgroupDir(d, vmID)
-	var err error
-	for i := 0; i < 40; i++ {
-		err = os.Remove(dir)
-		if err == nil || os.IsNotExist(err) {
-			return nil
+	var errs []error
+	for _, dir := range []string{CgroupDir(d, vmID), jailerCgroupDir(d, vmID)} {
+		var err error
+		for i := 0; i < 40; i++ {
+			err = os.Remove(dir)
+			if err == nil || os.IsNotExist(err) {
+				err = nil
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("removing cgroup %s: %w", dir, err))
+		}
 	}
-	return fmt.Errorf("removing cgroup %s: %w", dir, err)
+	return errors.Join(errs...)
 }
 
 // enableControllers turns on the cpu, memory and pids controllers for dir's
