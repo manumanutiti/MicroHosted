@@ -74,6 +74,63 @@ func dial(sockPath string, deadline time.Duration) (net.Conn, *bufio.Reader, err
 	return conn, reader, nil
 }
 
+// readToMarker consumes the agent's response until its terminating exit-marker
+// line and returns the output before the marker plus the exit code. It
+// deliberately does NOT read to EOF: after a snapshot restore, Firecracker
+// (observed on v1.16.1) stops propagating the guest-side close of a
+// host-initiated vsock connection as EOF on the host UDS — every byte of the
+// response arrives, the connection just never reads as closed, so anything
+// blocking on EOF hangs until its deadline. The marker line the agent always
+// emits last is the protocol's own explicit terminator; stopping there behaves
+// identically on fresh-booted and restored VMs (and also unhangs execs whose
+// command leaked the connection fd to a background process). EOF before a
+// marker is still an error: agent missing, or it died mid-response.
+func readToMarker(reader *bufio.Reader) (output string, exitCode int, err error) {
+	var buf strings.Builder
+	for {
+		chunk, rerr := reader.ReadString('\n')
+		buf.WriteString(chunk)
+		if out, code, ok := parseMarkerTail(buf.String()); ok {
+			return out, code, nil
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return buf.String(), 0, fmt.Errorf("guest agent response missing exit marker — is scripts/prepare-image.sh applied to this VM's template?")
+			}
+			return buf.String(), 0, fmt.Errorf("reading agent response: %w", rerr)
+		}
+	}
+}
+
+// parseMarkerTail reports whether full ends with a complete exit-marker line
+// ("<marker><int>\n", possibly glued to output that lacked a trailing newline)
+// and, if so, returns the output preceding it. Only a bounded tail is
+// inspected, so responses of any size stay O(1) per check. In-band framing has
+// one inherent ambiguity: an output line that itself ends exactly like the
+// terminator would end the read early — the same class of ambiguity the old
+// read-to-EOF parser had, just resolved at the first candidate instead of the
+// last.
+func parseMarkerTail(full string) (string, int, bool) {
+	if len(full) == 0 || full[len(full)-1] != '\n' {
+		return "", 0, false
+	}
+	tailStart := len(full) - (len(exitMarker) + 16)
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	idx := strings.LastIndex(full[tailStart:], exitMarker)
+	if idx == -1 {
+		return "", 0, false
+	}
+	idx += tailStart
+	codeStr := full[idx+len(exitMarker) : len(full)-1]
+	code, err := strconv.Atoi(codeStr)
+	if err != nil {
+		return "", 0, false
+	}
+	return full[:idx], code, true
+}
+
 // Exec runs cmd inside the guest and returns its combined stdout+stderr and
 // exit code. sockPath is the host-side path to Firecracker's vsock UDS
 // (computed with jailer.WorkspaceRoot + the device path from
@@ -89,25 +146,7 @@ func Exec(sockPath, cmd string) (output string, exitCode int, err error) {
 		return "", 0, fmt.Errorf("sending command: %w", err)
 	}
 
-	rest, err := io.ReadAll(reader)
-	if err != nil {
-		return "", 0, fmt.Errorf("reading command output: %w", err)
-	}
-
-	full := string(rest)
-	idx := strings.LastIndex(full, exitMarker)
-	if idx == -1 {
-		return full, 0, fmt.Errorf("guest agent response missing exit marker — is scripts/prepare-image.sh applied to this VM's template?")
-	}
-
-	output = full[:idx]
-	codeStr := strings.TrimSpace(full[idx+len(exitMarker):])
-	code, convErr := strconv.Atoi(codeStr)
-	if convErr != nil {
-		return output, 0, fmt.Errorf("parsing exit code %q: %w", codeStr, convErr)
-	}
-
-	return output, code, nil
+	return readToMarker(reader)
 }
 
 // PutFile streams data (size bytes) into the guest at guestPath, creating parent
@@ -128,22 +167,12 @@ func PutFile(sockPath, guestPath string, data io.Reader, size int64) error {
 		return fmt.Errorf("streaming file to guest: %w", err)
 	}
 
-	rest, err := io.ReadAll(reader)
+	out, code, err := readToMarker(reader)
 	if err != nil {
 		return fmt.Errorf("reading PUT result: %w", err)
 	}
-	full := string(rest)
-	idx := strings.LastIndex(full, exitMarker)
-	if idx == -1 {
-		return fmt.Errorf("guest agent response missing exit marker on PUT — is scripts/prepare-image.sh applied to this VM's template?")
-	}
-	codeStr := strings.TrimSpace(full[idx+len(exitMarker):])
-	code, convErr := strconv.Atoi(codeStr)
-	if convErr != nil {
-		return fmt.Errorf("parsing PUT exit code %q: %w", codeStr, convErr)
-	}
 	if code != 0 {
-		return fmt.Errorf("guest failed to write %s (exit %d): %s", guestPath, code, strings.TrimSpace(full[:idx]))
+		return fmt.Errorf("guest failed to write %s (exit %d): %s", guestPath, code, strings.TrimSpace(out))
 	}
 	return nil
 }

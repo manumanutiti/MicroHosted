@@ -44,7 +44,7 @@ KERNEL_VERSION ?= 6.1.102
 
 .PHONY: all build clean install-fc setup-host kernel rootfs lint test \
         install-service uninstall-service service-logs full-install \
-        prepare-image check
+        uninstall prepare-image check
 
 all: build
 
@@ -67,6 +67,19 @@ clean:
 full-install:
 	chmod +x scripts/*.sh
 	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) ./scripts/full-install.sh
+
+# ---------------------------------------------------------------------------
+# Desinstalación completa: el inverso de full-install. Mata las VMs vivas,
+# quita servicio, nftables, bridges/taps, desmonta y borra el store CoW
+# (imagen btrfs + fstab) y elimina los binarios y la DB de estado.
+#   make uninstall
+#   make uninstall DRY_RUN=1   # solo mostrar lo que haría
+#   make uninstall KEEP_FC=1   # conservar firecracker/jailer
+#   make uninstall PURGE=1     # borrar también images/{kernels,rootfs,...}
+# ---------------------------------------------------------------------------
+uninstall:
+	chmod +x scripts/uninstall.sh
+	sudo DRY_RUN=$(DRY_RUN) KEEP_FC=$(KEEP_FC) PURGE=$(PURGE) ./scripts/uninstall.sh
 
 # ---------------------------------------------------------------------------
 # Pipeline completo de imagen: kernel + rootfs (debootstrap, arch correcta) +
