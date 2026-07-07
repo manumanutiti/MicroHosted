@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>MicroHosted | Gateway Command</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&amp;family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "tertiary-container": "#ffbd45",
+                        "surface-container-lowest": "#0b0e11",
+                        "error-container": "#93000a",
+                        "background": "#111417",
+                        "on-primary-container": "#00612e",
+                        "inverse-primary": "#006d35",
+                        "on-error-container": "#ffdad6",
+                        "tertiary-fixed": "#ffdeac",
+                        "on-tertiary-container": "#714d00",
+                        "outline": "#859585",
+                        "on-secondary-container": "#b1b5bd",
+                        "error": "#ffb4ab",
+                        "inverse-on-surface": "#2e3134",
+                        "on-secondary": "#2c3137",
+                        "secondary-container": "#42474e",
+                        "surface-variant": "#323538",
+                        "on-secondary-fixed": "#171c22",
+                        "surface-container-highest": "#323538",
+                        "on-surface": "#e1e2e7",
+                        "surface-tint": "#00e475",
+                        "primary-fixed-dim": "#00e475",
+                        "primary": "#75ff9e",
+                        "on-tertiary": "#432c00",
+                        "outline-variant": "#3b4a3d",
+                        "surface": "#111417",
+                        "on-background": "#e1e2e7",
+                        "on-primary": "#003918",
+                        "on-primary-fixed": "#00210b",
+                        "secondary-fixed-dim": "#c2c7cf",
+                        "surface-container-low": "#191c1f",
+                        "surface-container": "#1d2023",
+                        "tertiary": "#ffe0b4",
+                        "secondary-fixed": "#dee3eb",
+                        "secondary": "#c2c7cf",
+                        "surface-bright": "#37393d",
+                        "on-tertiary-fixed-variant": "#604100",
+                        "surface-container-high": "#272a2e",
+                        "inverse-surface": "#e1e2e7",
+                        "primary-fixed": "#62ff96",
+                        "on-surface-variant": "#bacbb9",
+                        "primary-container": "#00e676",
+                        "surface-dim": "#111417",
+                        "on-error": "#690005",
+                        "on-primary-fixed-variant": "#005226",
+                        "on-secondary-fixed-variant": "#42474e",
+                        "on-tertiary-fixed": "#281900",
+                        "tertiary-fixed-dim": "#ffba38"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "spacing": {
+                        "panel-padding": "12px",
+                        "gutter": "16px",
+                        "unit": "4px",
+                        "margin": "24px"
+                    },
+                    "fontFamily": {
+                        "data-lg": ["JetBrains Mono"],
+                        "headline-md": ["Inter"],
+                        "label-xs": ["Inter"],
+                        "data-mono": ["JetBrains Mono"],
+                        "body-md": ["Inter"],
+                        "headline-lg": ["Inter"]
+                    },
+                    "fontSize": {
+                        "data-lg": ["18px", {"lineHeight": "24px", "fontWeight": "600"}],
+                        "headline-md": ["18px", {"lineHeight": "24px", "fontWeight": "600"}],
+                        "label-xs": ["11px", {"lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "700"}],
+                        "data-mono": ["13px", {"lineHeight": "18px", "fontWeight": "500"}],
+                        "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                        "headline-lg": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.02em", "fontWeight": "600"}]
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        body {
+            background-color: #0b0e11;
+            color: #e1e2e7;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .grid-bg {
+            background-image: radial-gradient(circle at 1px 1px, #1c2127 1px, transparent 0);
+            background-size: 24px 24px;
+        }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .glow-green { box-shadow: 0 0 15px rgba(117, 255, 158, 0.15); }
+        .scanline {
+            width: 100%;
+            height: 2px;
+            background: linear-gradient(to bottom, rgba(117, 255, 158, 0) 0%, rgba(117, 255, 158, 0.1) 50%, rgba(117, 255, 158, 0) 100%);
+            position: absolute;
+            animation: scan 8s linear infinite;
+        }
+        @keyframes scan {
+            from { top: 0; }
+            to { top: 100%; }
+        }
+    </style>
+</head>
+<body class="flex h-screen w-screen selection:bg-primary selection:text-on-primary">
+<!-- TopAppBar -->
+<header class="fixed top-0 left-0 right-0 h-[56px] z-50 flex justify-between items-center px-margin bg-background border-b border-outline-variant">
+<div class="flex items-center gap-6">
+<h1 class="text-headline-md font-headline-md font-extrabold text-primary tracking-tighter">MicroHosted</h1>
+<div class="h-6 w-[1px] bg-outline-variant"></div>
+<div class="flex items-center gap-3">
+<span class="flex items-center gap-2 px-2 py-1 bg-on-primary-container/10 border border-on-primary-container/20 rounded text-primary text-label-xs font-label-xs uppercase tracking-widest">
+<span class="w-2 h-2 rounded-full bg-primary animate-pulse"></span>
+                    HOST HEALTH: OK
+                </span>
+<div class="flex flex-col gap-0.5">
+<div class="flex justify-between items-center w-32">
+<span class="text-[10px] text-on-surface-variant mono">RAM USAGE</span>
+<span class="text-[10px] text-on-surface-variant mono">12.4 / 20GB</span>
+</div>
+<div class="w-32 h-1 bg-surface-variant rounded-full overflow-hidden">
+<div class="h-full bg-primary" style="width: 62%"></div>
+</div>
+</div>
+<div class="px-3 py-1 bg-surface-variant/50 border border-outline-variant rounded flex items-center gap-2">
+<span class="material-symbols-outlined text-sm text-primary">memory</span>
+<span class="text-label-xs font-label-xs">Live microVMs: 42</span>
+</div>
+</div>
+</div>
+<div class="flex items-center gap-2">
+<div class="flex items-center gap-1.5 mr-4 overflow-hidden">
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[kvm ✓]</span>
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[database ✓]</span>
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[store_writable ✓]</span>
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[disk_space ✓ (19099 MiB free)]</span>
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[store_cow ✓]</span>
+<span class="px-1.5 py-0.5 bg-surface-container-high border border-outline-variant text-[9px] font-bold text-primary rounded">[firecracker ✓]</span>
+</div>
+<div class="flex gap-1">
+<button class="p-2 text-on-surface-variant hover:bg-surface-variant transition-colors rounded"><span class="material-symbols-outlined text-sm">database</span></button>
+<button class="p-2 text-on-surface-variant hover:bg-surface-variant transition-colors rounded"><span class="material-symbols-outlined text-sm">storage</span></button>
+<button class="p-2 text-on-surface-variant hover:bg-surface-variant transition-colors rounded"><span class="material-symbols-outlined text-sm">settings</span></button>
+</div>
+</div>
+</header>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-[56px] h-[calc(100vh-56px)] w-[240px] bg-surface-container-low border-r border-outline-variant flex flex-col py-panel-padding z-40">
+<div class="px-4 mb-6">
+<div class="flex items-center gap-3 mb-1">
+<div class="w-8 h-8 rounded bg-primary/20 flex items-center justify-center border border-primary/30">
+<span class="material-symbols-outlined text-primary text-xl">hub</span>
+</div>
+<div>
+<div class="text-label-xs font-bold text-primary leading-tight">MicroHosted GW</div>
+<div class="text-[10px] text-on-surface-variant mono">0x882A-NODE-01</div>
+</div>
+</div>
+</div>
+<nav class="flex-1 space-y-1">
+<div class="px-4 py-2 text-[10px] font-bold text-on-surface-variant/50 uppercase tracking-widest">Networks</div>
+<a class="flex items-center justify-between text-primary bg-primary-container/10 border-l-2 border-primary px-4 py-2 transition-all duration-200" href="#">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-sm">lan</span>
+<div class="flex flex-col">
+<span class="text-label-xs font-bold">iot-modbus</span>
+<span class="text-[9px] mono opacity-70">172.16.8.0/24</span>
+</div>
+</div>
+<span class="px-1.5 py-0.5 bg-primary/10 rounded text-[9px] mono font-bold">12</span>
+</a>
+<a class="flex items-center justify-between text-on-surface-variant px-4 py-2 hover:bg-surface-container-high transition-all duration-200" href="#">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-sm">settings_input_component</span>
+<div class="flex flex-col">
+<span class="text-label-xs font-bold">iot-opcua</span>
+<span class="text-[9px] mono opacity-70">172.16.9.0/24</span>
+</div>
+</div>
+<span class="px-1.5 py-0.5 bg-surface-variant rounded text-[9px] mono font-bold">08</span>
+</a>
+<a class="flex items-center justify-between text-on-surface-variant px-4 py-2 hover:bg-surface-container-high transition-all duration-200" href="#">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-sm">router</span>
+<div class="flex flex-col">
+<span class="text-label-xs font-bold">iot-bacnet</span>
+<span class="text-[9px] mono opacity-70">172.16.10.0/24</span>
+</div>
+</div>
+<span class="px-1.5 py-0.5 bg-surface-variant rounded text-[9px] mono font-bold">14</span>
+</a>
+<a class="flex items-center justify-between text-on-surface-variant px-4 py-2 hover:bg-surface-container-high transition-all duration-200" href="#">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-sm">factory</span>
+<div class="flex flex-col">
+<span class="text-label-xs font-bold">planta-norte</span>
+<span class="text-[9px] mono opacity-70">10.0.5.0/24</span>
+</div>
+</div>
+<span class="px-1.5 py-0.5 bg-surface-variant rounded text-[9px] mono font-bold">08</span>
+</a>
+</nav>
+<div class="px-4 mt-auto space-y-4">
+<button class="w-full py-2 bg-primary text-on-primary font-bold text-label-xs rounded-sm hover:opacity-90 transition-opacity flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm">add_box</span>
+                Deploy Network Zone
+            </button>
+<div class="space-y-1">
+<a class="flex items-center gap-3 text-on-surface-variant px-4 py-2 hover:bg-surface-container-high text-label-xs font-label-xs transition-colors" href="#">
+<span class="material-symbols-outlined text-sm">list_alt</span>
+                    System Logs
+                </a>
+<a class="flex items-center gap-3 text-on-surface-variant px-4 py-2 hover:bg-surface-container-high text-label-xs font-label-xs transition-colors" href="#">
+<span class="material-symbols-outlined text-sm">hub</span>
+                    Network Topology
+                </a>
+</div>
+</div>
+</aside>
+<!-- Main Content Area -->
+<main class="ml-[240px] mt-[56px] w-[calc(100vw-240px)] h-[calc(100vh-56px)] overflow-hidden flex flex-col grid-bg">
+<div class="flex-1 overflow-y-auto scrollbar-hide p-6 space-y-6">
+<!-- Sensor Grid -->
+<div>
+<div class="flex items-center justify-between mb-4">
+<h2 class="text-label-xs font-bold uppercase tracking-widest text-on-surface-variant">Active Isolation Layer: Nodes (8)</h2>
+<div class="flex items-center gap-2">
+<span class="text-[10px] text-on-surface-variant mono">Filter: ALL_SEGMENTS</span>
+<span class="material-symbols-outlined text-sm text-on-surface-variant">filter_list</span>
+</div>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+<!-- Card 1: Online -->
+<div class="bg-surface-container border border-outline-variant p-4 relative group hover:border-primary/50 transition-colors">
+<div class="scanline"></div>
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">Modbus-RTU-Temp-01</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.15:5020</div>
+</div>
+<div class="flex flex-col items-end">
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                    Online (3s ago)
+                                </span>
+<span class="text-[10px] mono text-on-surface-variant">v-m: 0fdeb15d</span>
+</div>
+</div>
+<div class="flex items-end justify-between py-2 border-y border-outline-variant/30 mb-3">
+<div>
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold text-primary">23.3 °C</div>
+</div>
+<div class="w-24 h-8">
+<svg class="w-full h-full" viewbox="0 0 100 30">
+<path d="M0 25 L10 22 L20 28 L30 18 L40 22 L50 15 L60 20 L70 12 L80 18 L90 10 L100 15" fill="none" stroke="#75ff9e" stroke-width="1.5"></path>
+</svg>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<div class="flex gap-3">
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">State</span>
+<span class="text-[10px] mono text-primary">RUNNING</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">Memory</span>
+<span class="text-[10px] mono">9MB</span>
+</div>
+</div>
+<button class="px-3 py-1 border border-outline-variant text-[10px] font-bold uppercase hover:bg-surface-variant transition-colors">Reset VM</button>
+</div>
+</div>
+<!-- Card 2: Degraded -->
+<div class="bg-surface-container border border-outline-variant p-4 relative hover:border-tertiary-container/50 transition-colors">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">BACnet-Flow-Meter</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.22:4840</div>
+</div>
+<div class="flex flex-col items-end">
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-tertiary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-tertiary animate-pulse"></span>
+                                    Degraded
+                                </span>
+<span class="text-[10px] mono text-on-surface-variant">Latency 140ms</span>
+</div>
+</div>
+<div class="flex items-end justify-between py-2 border-y border-outline-variant/30 mb-3">
+<div>
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold text-tertiary">41.5 % Hum</div>
+</div>
+<div class="w-24 h-8 opacity-50">
+<svg class="w-full h-full" viewbox="0 0 100 30">
+<path d="M0 15 L20 18 L40 12 L60 25 L80 20 L100 22" fill="none" stroke="#ffbd45" stroke-width="1.5"></path>
+</svg>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<div class="flex gap-3">
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">State</span>
+<span class="text-[10px] mono text-primary">RUNNING</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">Memory</span>
+<span class="text-[10px] mono">11MB</span>
+</div>
+</div>
+<span class="text-[10px] mono text-on-surface-variant italic">v-m: 8a2c3d11</span>
+</div>
+</div>
+<!-- Card 3: QUARANTINE -->
+<div class="bg-surface-container-lowest border-2 border-error-container p-4 relative shadow-[inset_0_0_20px_rgba(147,0,10,0.2)]">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1 text-error">Legacy-PLC-04</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.45:502</div>
+</div>
+<span class="px-1.5 py-0.5 bg-error-container text-on-error-container text-[9px] font-black uppercase tracking-tighter rounded">IN QUARANTINE</span>
+</div>
+<div class="flex flex-col items-center justify-center py-4 bg-error-container/5 rounded mb-3 border border-error-container/20">
+<span class="material-symbols-outlined text-error text-3xl mb-1">report</span>
+<div class="text-[10px] mono text-error font-bold">NO RESPONSE FROM HOST</div>
+</div>
+<div class="flex items-center justify-between">
+<div class="flex gap-3">
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">State</span>
+<span class="text-[10px] mono text-error">ISOLATED</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[9px] text-on-surface-variant uppercase font-bold">Memory</span>
+<span class="text-[10px] mono">0MB</span>
+</div>
+</div>
+<button class="px-3 py-1 bg-error-container text-white text-[10px] font-bold uppercase hover:opacity-80 transition-all">Restore from Snapshot</button>
+</div>
+</div>
+<!-- Card 4: Normal -->
+<div class="bg-surface-container border border-outline-variant p-4">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">Edge-Scanner-Z1</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.10:5020</div>
+</div>
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                Online
+                            </span>
+</div>
+<div class="py-2 border-y border-outline-variant/30 mb-3">
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold">88.2 MHz</div>
+</div>
+<div class="flex items-center justify-between text-[10px] mono text-on-surface-variant">
+<span>VM: e34f9a12</span>
+<span>Memory: 4.2MB</span>
+</div>
+</div>
+<!-- Card 5: Normal -->
+<div class="bg-surface-container border border-outline-variant p-4">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">Valve-Ctrl-North</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.33:502</div>
+</div>
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                Online
+                            </span>
+</div>
+<div class="py-2 border-y border-outline-variant/30 mb-3">
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold">OPEN (100%)</div>
+</div>
+<div class="flex items-center justify-between text-[10px] mono text-on-surface-variant">
+<span>VM: c0228d77</span>
+<span>Memory: 6.8MB</span>
+</div>
+</div>
+<!-- Card 6: Online -->
+<div class="bg-surface-container border border-outline-variant p-4">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">Power-Grid-L2</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.99:5020</div>
+</div>
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                Online
+                            </span>
+</div>
+<div class="py-2 border-y border-outline-variant/30 mb-3">
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold">440.2 V</div>
+</div>
+<div class="flex items-center justify-between text-[10px] mono text-on-surface-variant">
+<span>VM: b882e311</span>
+<span>Memory: 14.5MB</span>
+</div>
+</div>
+<!-- Card 7: Normal -->
+<div class="bg-surface-container border border-outline-variant p-4">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">HMI-Bridge-01</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.5:4840</div>
+</div>
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                Online
+                            </span>
+</div>
+<div class="py-2 border-y border-outline-variant/30 mb-3">
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold">ACTIVE</div>
+</div>
+<div class="flex items-center justify-between text-[10px] mono text-on-surface-variant">
+<span>VM: ff1290bb</span>
+<span>Memory: 12.0MB</span>
+</div>
+</div>
+<!-- Card 8: Normal -->
+<div class="bg-surface-container border border-outline-variant p-4">
+<div class="flex justify-between items-start mb-3">
+<div>
+<h3 class="text-body-md font-bold leading-none mb-1">Sensor-Array-P5</h3>
+<div class="text-[11px] mono text-on-surface-variant">192.168.0.60:502</div>
+</div>
+<span class="flex items-center gap-1.5 text-[10px] font-bold text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+                                Online
+                            </span>
+</div>
+<div class="py-2 border-y border-outline-variant/30 mb-3">
+<div class="text-[10px] text-on-surface-variant uppercase font-bold mb-1">Telemetry</div>
+<div class="text-2xl mono font-bold">12,402 RPM</div>
+</div>
+<div class="flex items-center justify-between text-[10px] mono text-on-surface-variant">
+<span>VM: d6119a0a</span>
+<span>Memory: 8.4MB</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Bottom Panels: Topology & Audit -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+<!-- Topology Visualization -->
+<div class="bg-surface-container border border-outline-variant p-4 flex flex-col h-[320px]">
+<div class="flex justify-between items-center mb-6">
+<h2 class="text-label-xs font-bold uppercase tracking-widest text-on-surface-variant">Trust-Boundary Topology</h2>
+<span class="text-[10px] mono text-primary">LAYER: ENFORCED</span>
+</div>
+<div class="flex-1 flex items-center justify-between px-8">
+<!-- Sensors -->
+<div class="flex flex-col items-center gap-4">
+<div class="w-16 h-16 border border-outline-variant bg-surface-container-low flex flex-col items-center justify-center rounded-lg">
+<span class="material-symbols-outlined text-2xl text-on-surface-variant">sensors</span>
+<span class="text-[9px] font-bold mt-1 uppercase text-on-surface-variant">Sensors</span>
+</div>
+<div class="text-[8px] mono text-center text-on-surface-variant opacity-50 uppercase">External Devices</div>
+</div>
+<!-- Arrow -->
+<div class="flex-1 flex items-center justify-center relative">
+<div class="h-px bg-outline-variant w-full"></div>
+<div class="absolute right-0 w-2 h-2 border-t border-r border-outline-variant rotate-45"></div>
+</div>
+<!-- microVM Isolation -->
+<div class="flex flex-col items-center gap-4 mx-4">
+<div class="relative">
+<div class="w-20 h-20 border-2 border-dashed border-primary/40 bg-primary/5 flex flex-col items-center justify-center rounded-xl">
+<span class="material-symbols-outlined text-3xl text-primary">security</span>
+<span class="text-[9px] font-bold mt-1 uppercase text-primary">Isolation</span>
+</div>
+<div class="absolute -top-1 -right-1 w-3 h-3 bg-primary rounded-full animate-ping opacity-20"></div>
+</div>
+<div class="text-[8px] mono text-center text-primary font-bold uppercase tracking-widest">Firecracker Layer</div>
+</div>
+<!-- Arrow -->
+<div class="flex-1 flex items-center justify-center relative">
+<div class="h-px bg-outline-variant w-full"></div>
+<div class="absolute right-0 w-2 h-2 border-t border-r border-outline-variant rotate-45"></div>
+</div>
+<!-- Orchestrator -->
+<div class="flex flex-col items-center gap-4">
+<div class="w-16 h-16 border border-outline-variant bg-surface-container-low flex flex-col items-center justify-center rounded-lg">
+<span class="material-symbols-outlined text-2xl text-on-surface-variant">settings_input_composite</span>
+<span class="text-[9px] font-bold mt-1 uppercase text-on-surface-variant">API Orchestrator</span>
+</div>
+</div>
+<!-- Arrow -->
+<div class="flex-1 flex items-center justify-center relative">
+<div class="h-px bg-outline-variant w-full"></div>
+<div class="absolute right-0 w-2 h-2 border-t border-r border-outline-variant rotate-45"></div>
+</div>
+<!-- Secure Host -->
+<div class="flex flex-col items-center gap-4">
+<div class="w-16 h-16 border-2 border-primary bg-primary/10 flex flex-col items-center justify-center rounded-lg glow-green">
+<span class="material-symbols-outlined text-2xl text-primary">terminal</span>
+<span class="text-[9px] font-bold mt-1 uppercase text-primary">Host</span>
+</div>
+<div class="px-2 py-0.5 bg-primary text-on-primary text-[8px] font-black rounded uppercase">Untouched</div>
+</div>
+</div>
+</div>
+<!-- Audit Trail (Technical Log) -->
+<div class="bg-surface-container border border-outline-variant p-4 flex flex-col h-[320px]">
+<div class="flex justify-between items-center mb-4">
+<h2 class="text-label-xs font-bold uppercase tracking-widest text-on-surface-variant">System Audit Trail</h2>
+<button class="text-[10px] mono text-primary hover:underline">EXPORT CSV</button>
+</div>
+<div class="flex-1 overflow-y-auto space-y-3 scrollbar-hide">
+<!-- Log Entries -->
+<div class="flex gap-4 items-start group">
+<div class="w-16 text-[10px] mono text-on-surface-variant opacity-50 shrink-0">14:38:02</div>
+<div class="flex-1 pb-3 border-b border-outline-variant/30">
+<div class="text-[11px] mono text-error font-bold mb-0.5">ALERT — VM a1ad67b2 isolated in quarantine</div>
+<div class="text-[10px] text-on-surface-variant">Reason: Protocol anomaly detected in Modbus sequence 0xF4. Automatic sandbox trigger active.</div>
+</div>
+</div>
+<div class="flex gap-4 items-start group">
+<div class="w-16 text-[10px] mono text-on-surface-variant opacity-50 shrink-0">14:35:10</div>
+<div class="flex-1 pb-3 border-b border-outline-variant/30">
+<div class="text-[11px] mono text-tertiary font-bold mb-0.5">WARNING — Latency spike detected</div>
+<div class="text-[10px] text-on-surface-variant">Target: BACnet-Flow-Meter (192.168.0.22). Current: 142ms. Threshold: 50ms.</div>
+</div>
+</div>
+<div class="flex gap-4 items-start group">
+<div class="w-16 text-[10px] mono text-on-surface-variant opacity-50 shrink-0">13:48:36</div>
+<div class="flex-1 pb-3 border-b border-outline-variant/30">
+<div class="text-[11px] mono text-primary font-bold mb-0.5">INFO — Network zone initialized</div>
+<div class="text-[10px] text-on-surface-variant">Successfully created iot-modbus on bridge interface br0. Subnet 172.16.8.0/24 mapped.</div>
+</div>
+</div>
+<div class="flex gap-4 items-start group">
+<div class="w-16 text-[10px] mono text-on-surface-variant opacity-50 shrink-0">13:45:00</div>
+<div class="flex-1 pb-3 border-b border-outline-variant/30">
+<div class="text-[11px] mono text-primary font-bold mb-0.5">SYSTEM — Host initialization complete</div>
+<div class="text-[10px] text-on-surface-variant">MicroHosted core engine 2.4.1 initialized. 0 errors detected. 42 existing VMs re-attached.</div>
+</div>
+</div>
+<div class="flex gap-4 items-start group">
+<div class="w-16 text-[10px] mono text-on-surface-variant opacity-50 shrink-0">12:00:15</div>
+<div class="flex-1 pb-3 border-b border-outline-variant/30">
+<div class="text-[11px] mono text-on-surface-variant mb-0.5">LOG — Daily health check initiated</div>
+<div class="text-[10px] text-on-surface-variant">Automated scan of all 42 microVM storage backends. Consistency verified.</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- System Status Bar -->
+<footer class="h-8 bg-surface-container-low border-t border-outline-variant flex items-center justify-between px-6 text-[10px] mono">
+<div class="flex gap-6">
+<span class="flex items-center gap-2">
+<span class="text-on-surface-variant">CPU:</span>
+<span class="text-primary font-bold">14.2%</span>
+</span>
+<span class="flex items-center gap-2">
+<span class="text-on-surface-variant">DISK IO:</span>
+<span class="text-primary font-bold">1.2 MB/s</span>
+</span>
+<span class="flex items-center gap-2">
+<span class="text-on-surface-variant">UPTIME:</span>
+<span class="text-on-surface">14d 22h 11m</span>
+</span>
+</div>
+<div class="flex items-center gap-4">
+<span class="text-on-surface-variant">GATEWAY ID: <span class="text-on-surface">0x882A-NODE-01</span></span>
+<div class="h-3 w-[1px] bg-outline-variant"></div>
+<span class="text-primary font-bold">● ENCRYPTED CONNECTION</span>
+</div>
+</footer>
+</main>
+<script>
+        // Micro-interaction: Periodic update simulation
+        setInterval(() => {
+            const cpuSpan = document.querySelector('footer div span:nth-child(1) .text-primary');
+            if(cpuSpan) {
+                const newVal = (14 + Math.random() * 2).toFixed(1);
+                cpuSpan.textContent = newVal + '%';
+            }
+        }, 3000);
+    </script>
+</body></html>
