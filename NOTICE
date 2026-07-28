@@ -1,0 +1,12 @@
+MicroHosted
+Copyright 2026 Manuel Gutierrez
+
+Licensed under the Apache License, Version 2.0 (the "License").
+You may obtain a copy of the License in the LICENSE file or at
+http://www.apache.org/licenses/LICENSE-2.0
+
+This product depends on third-party software, each under its own license
+(all permissive: Apache-2.0, BSD, MIT, MPL-2.0). Notably it builds on the
+Firecracker project and the firecracker-go-sdk
+(https://github.com/firecracker-microvm), licensed under Apache-2.0.
+See go.mod / go.sum for the full dependency list.

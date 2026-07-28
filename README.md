@@ -43,3 +43,8 @@ make build     # build the daemon (CGO_ENABLED=0, cross-compile with ARCH=aarch6
 make test      # go test ./...
 make lint      # golangci-lint
 ```
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for
+third-party attributions.
