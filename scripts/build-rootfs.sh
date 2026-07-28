@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Genera un rootfs.ext4 mínimo para microVMs usando debootstrap.
-# Soporta x86_64 y aarch64 (nativo o cross con qemu-user-static).
+# Generates a minimal rootfs.ext4 for microVMs using debootstrap.
+# Supports x86_64 and aarch64 (native or cross with qemu-user-static).
 #
-# Uso: sudo ./scripts/build-rootfs.sh [OUTPUT] [SIZE_MB]
+# Usage: sudo ./scripts/build-rootfs.sh [OUTPUT] [SIZE_MB]
 #      ARCH=aarch64 sudo -E ./scripts/build-rootfs.sh images/rootfs/pi.ext4 1024
 #
-# Incluye SIEMPRE socat (lo exige el listener vsock que instala
-# prepare-image.sh) y openssh-server (la vía de acceso interactiva).
+# ALWAYS includes socat (required by the vsock listener that prepare-image.sh
+# installs) and openssh-server (the interactive access path).
 
 set -euo pipefail
 
@@ -19,12 +19,12 @@ ARCH="${ARCH:-$(uname -m)}"
 case "$ARCH" in
   amd64|x86|x86_64)  ARCH=x86_64 ;;
   arm|arm64|aarch64) ARCH=aarch64 ;;
-  *) echo "ERROR: arquitectura no soportada: $ARCH (usa x86_64 o aarch64)" >&2; exit 1 ;;
+  *) echo "ERROR: unsupported architecture: $ARCH (use x86_64 or aarch64)" >&2; exit 1 ;;
 esac
 
-# Arquitectura Debian + mirror. OJO: archive.ubuntu.com solo sirve amd64/i386;
-# arm64 vive en ports.ubuntu.com — con el mirror equivocado debootstrap falla
-# con un críptico "no packages found".
+# Debian architecture + mirror. NOTE: archive.ubuntu.com only serves amd64/i386;
+# arm64 lives on ports.ubuntu.com — with the wrong mirror debootstrap fails with
+# a cryptic "no packages found".
 if [[ "$ARCH" == "x86_64" ]]; then
   DEBARCH=amd64
   MIRROR="${MIRROR:-http://archive.ubuntu.com/ubuntu}"
@@ -42,13 +42,13 @@ CROSS=0
 [[ "$DEBARCH" != "$NATIVE_DEBARCH" ]] && CROSS=1
 
 if ! command -v debootstrap &>/dev/null; then
-  echo "==> Instalando debootstrap..."
+  echo "==> Installing debootstrap..."
   sudo apt-get install -y debootstrap
 fi
 
-# Cross-arch: los binarios del rootfs (postinst de los .deb, el chroot de
-# configuración) son de otra CPU — hace falta qemu-user-static + binfmt para
-# que el kernel los ejecute de forma transparente.
+# Cross-arch: the rootfs binaries (the .deb postinst, the configuration chroot)
+# are for another CPU — qemu-user-static + binfmt is needed so the kernel runs
+# them transparently.
 QEMU_BIN=""
 if [[ "$CROSS" -eq 1 ]]; then
   case "$DEBARCH" in
@@ -56,7 +56,7 @@ if [[ "$CROSS" -eq 1 ]]; then
     amd64) QEMU_BIN=/usr/bin/qemu-x86_64-static ;;
   esac
   if [[ ! -x "$QEMU_BIN" ]]; then
-    echo "==> Instalando qemu-user-static (cross ${NATIVE_DEBARCH} → ${DEBARCH})..."
+    echo "==> Installing qemu-user-static (cross ${NATIVE_DEBARCH} → ${DEBARCH})..."
     sudo apt-get install -y qemu-user-static binfmt-support
   fi
 fi
@@ -69,54 +69,54 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Creando rootfs ${DEBARCH} de ${SIZE_MB}MB en ${OUTPUT}..."
+echo "==> Creating a ${SIZE_MB}MB ${DEBARCH} rootfs at ${OUTPUT}..."
 mkdir -p "$(dirname "$OUTPUT")"
-truncate -s "${SIZE_MB}M" "$OUTPUT"   # sparse: solo ocupa lo que se escriba
+truncate -s "${SIZE_MB}M" "$OUTPUT"   # sparse: only takes up what gets written
 mkfs.ext4 -q -F "$OUTPUT"
 
-echo "==> Montando imagen..."
+echo "==> Mounting the image..."
 mkdir -p "$MOUNT_DIR"
 sudo mount -o loop "$OUTPUT" "$MOUNT_DIR"
 
 if [[ "$CROSS" -eq 0 ]]; then
-  echo "==> debootstrap ${DISTRO}/${DEBARCH} (nativo)..."
+  echo "==> debootstrap ${DISTRO}/${DEBARCH} (native)..."
   sudo debootstrap --arch="$DEBARCH" --include="$INCLUDE" \
     "$DISTRO" "$MOUNT_DIR" "$MIRROR"
 else
-  echo "==> debootstrap ${DISTRO}/${DEBARCH} (cross, dos etapas con qemu)..."
+  echo "==> debootstrap ${DISTRO}/${DEBARCH} (cross, two stages with qemu)..."
   sudo debootstrap --foreign --arch="$DEBARCH" --include="$INCLUDE" \
     "$DISTRO" "$MOUNT_DIR" "$MIRROR"
   sudo cp "$QEMU_BIN" "$MOUNT_DIR/usr/bin/"
   sudo chroot "$MOUNT_DIR" /debootstrap/debootstrap --second-stage
 fi
 
-echo "==> Configurando guest mínimo..."
+echo "==> Configuring a minimal guest..."
 sudo chroot "$MOUNT_DIR" /bin/bash -euo pipefail <<'CHROOT'
-  # Contraseña root vacía para consola serie
+  # Empty root password for the serial console
   passwd -d root
 
   # Hostname
   echo "microvm" > /etc/hostname
 
-  # /etc/fstab mínimo
+  # Minimal /etc/fstab
   echo "LABEL=rootfs / ext4 defaults,noatime 0 1" > /etc/fstab
 
-  # Deshabilitar servicios innecesarios
+  # Disable unnecessary services
   systemctl disable --now snapd.service 2>/dev/null || true
   systemctl disable --now apt-daily.service 2>/dev/null || true
 CHROOT
 
-# SSH activo al primer arranque (enlace de unit offline; no ejecuta nada del guest)
+# SSH enabled on first boot (offline unit link; runs nothing from the guest)
 sudo systemctl --root="$MOUNT_DIR" enable ssh.service 2>/dev/null || true
 
 if [[ "$CROSS" -eq 1 ]]; then
   sudo rm -f "$MOUNT_DIR/usr/bin/$(basename "$QEMU_BIN")"
 fi
 
-echo "==> Desmontando..."
+echo "==> Unmounting..."
 sudo umount "$MOUNT_DIR"
 sudo e2label "$OUTPUT" rootfs
 
 echo ""
-echo "OK: rootfs ${DEBARCH} generado en ${OUTPUT} (${SIZE_MB}MB)"
-echo "    Siguiente paso: sudo ./scripts/prepare-image.sh ${OUTPUT}"
+echo "OK: ${DEBARCH} rootfs generated at ${OUTPUT} (${SIZE_MB}MB)"
+echo "    Next step: sudo ./scripts/prepare-image.sh ${OUTPUT}"

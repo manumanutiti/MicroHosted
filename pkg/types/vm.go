@@ -24,9 +24,10 @@ type VMConfig struct {
 	// already has; the actual growth happens once, in storage.CloneRootfs.
 	DiskMB int64
 
-	// Red. En el modelo segmentado (Fase 1) el TAP se enslava al bridge de la
-	// red; GuestIP sale del IPAM de la red y GatewayIP es el gateway del bridge.
-	// HostIP queda del modelo /30 anterior y ya no se usa en redes segmentadas.
+	// Networking. In the segmented model (Phase 1) the TAP is enslaved to the
+	// network's bridge; GuestIP comes from the network's IPAM and GatewayIP is
+	// the bridge's gateway. HostIP is a leftover of the older /30 model and is no
+	// longer used in segmented networks.
 	NetworkName string
 	Bridge      string
 	TapDevice   string

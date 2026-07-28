@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Prepara una plantilla (rootfs dorado) para usarse con la plataforma. Deja
-# listas las dos vías de acceso a las VMs clonadas de esa imagen — cuál usar
-# en cada caso es cosa del operador, no de este script:
+# Prepares a template (golden rootfs) for use with the platform. It sets up the
+# two access paths to the VMs cloned from that image — which one to use in each
+# case is the operator's call, not this script's:
 #
-#   - vsock (POST /v1/vms/{id}/exec): programático, no necesita red ni claves,
-#     funciona incluso en VMs creadas con no_network:true.
-#   - SSH: shell interactiva de verdad, necesita que la VM tenga red.
+#   - vsock (POST /v1/vms/{id}/exec): programmatic, needs no network or keys,
+#     works even on VMs created with no_network:true.
+#   - SSH: a real interactive shell, needs the VM to have a network.
 #
-# Es el ÚNICO paso de preparación de imagen — se corre una vez por rootfs
-# dorado (internal/storage.CloneRootfs copia lo que haya en él a cada VM), no
-# una vez por VM.
+# It's the ONLY image-preparation step — run once per golden rootfs
+# (internal/storage.CloneRootfs copies whatever is in it to each VM), not once
+# per VM.
 #
-# Uso: sudo ./scripts/prepare-image.sh <rootfs.ext4> [--no-ssh] [--no-vsock] [clave-publica.pub]
+# Usage: sudo ./scripts/prepare-image.sh <rootfs.ext4> [--no-ssh] [--no-vsock] [public-key.pub]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,12 +40,12 @@ for arg in "$@"; do
 done
 
 if [[ -z "$ROOTFS" ]]; then
-  echo "uso: sudo ./scripts/prepare-image.sh <rootfs.ext4> [--no-ssh] [--no-vsock] [clave-publica.pub]"
+  echo "usage: sudo ./scripts/prepare-image.sh <rootfs.ext4> [--no-ssh] [--no-vsock] [public-key.pub]"
   exit 1
 fi
 
 if [[ ! -f "$ROOTFS" ]]; then
-  echo "ERROR: no existe $ROOTFS"
+  echo "ERROR: $ROOTFS doesn't exist"
   exit 1
 fi
 
@@ -56,41 +56,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Montando ${ROOTFS}..."
+echo "==> Mounting ${ROOTFS}..."
 sudo mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
-# DNS: la IP/gateway/nameservers que pasamos por firecracker-go-sdk
-# (IPConfiguration) no llegan al guest como config de red normal — el kernel
-# los escribe en /proc/net/pnp (mecanismo heredado de nfsroot/netboot; ver el
-# comentario de IPConfiguration en el SDK). Para que el guest los use,
-# /etc/resolv.conf tiene que ser un symlink a /proc/net/pnp. Muchas imágenes
-# (systemd-resolved, netplan, cloud-init) lo dejan como archivo normal o
-# symlink a su propio stub — sin este paso, `ping`/`curl` a una IP funcionan
-# pero resolver nombres (google.com) falla con "Temporary failure in name
-# resolution" aunque la VM tenga egress e internet real. Siempre se hace,
-# independientemente de --no-ssh/--no-vsock: es funcionalidad de red básica,
-# no parte del acceso.
-echo "==> Configurando DNS del guest (/etc/resolv.conf -> /proc/net/pnp)..."
+# DNS: the IP/gateway/nameservers we pass through firecracker-go-sdk
+# (IPConfiguration) don't reach the guest as normal network config — the kernel
+# writes them into /proc/net/pnp (a mechanism inherited from nfsroot/netboot; see
+# the IPConfiguration comment in the SDK). For the guest to use them,
+# /etc/resolv.conf has to be a symlink to /proc/net/pnp. Many images
+# (systemd-resolved, netplan, cloud-init) leave it as a regular file or a symlink
+# to their own stub — without this step, `ping`/`curl` to an IP work but
+# resolving names (google.com) fails with "Temporary failure in name resolution"
+# even though the VM has egress and real internet. Always done, regardless of
+# --no-ssh/--no-vsock: it's basic network functionality, not part of access.
+echo "==> Configuring guest DNS (/etc/resolv.conf -> /proc/net/pnp)..."
 if [[ -e "$MOUNT_DIR/etc/resolv.conf" && ! -L "$MOUNT_DIR/etc/resolv.conf" ]]; then
   sudo mv "$MOUNT_DIR/etc/resolv.conf" "$MOUNT_DIR/etc/resolv.conf.microhosted-orig"
 fi
 sudo ln -sf /proc/net/pnp "$MOUNT_DIR/etc/resolv.conf"
-echo "    OK: resolución DNS lista (usa los nameservers que microhosted asigna a cada VM)."
+echo "    OK: DNS resolution ready (uses the nameservers microhosted assigns to each VM)."
 
 if [[ "$DO_VSOCK" -eq 1 ]]; then
   if [[ ! -x "$MOUNT_DIR/usr/bin/socat" ]]; then
-    echo "ERROR: esta imagen no tiene socat instalado (necesario para el canal vsock)."
-    echo "       instálalo dentro de la imagen o vuelve a correr con --no-vsock."
+    echo "ERROR: this image doesn't have socat installed (needed for the vsock channel)."
+    echo "       install it inside the image or re-run with --no-vsock."
     exit 1
   fi
 
-  echo "==> Instalando el listener vsock (microhosted-exec, puerto ${AGENT_PORT})..."
-  # El agente multiplexa tres verbos sobre la misma conexión, según la primera
-  # línea: comando pelado (exec, contrato histórico), PUT (subir fichero) y GET
-  # (bajar fichero). PUT/GET son el canal de datos en volumen: meter una muestra
-  # o sacar artefactos sin red. Lee la primera línea entera con `IFS= read -r`
-  # para no tocar los espacios del comando; el resto del stdin (los bytes de un
-  # PUT) lo consume `head -c` byte a byte, así que read no se lo come por delante.
+  echo "==> Installing the vsock listener (microhosted-exec, port ${AGENT_PORT})..."
+  # The agent multiplexes three verbs over the same connection, based on the first
+  # line: a bare command (exec, the historical contract), PUT (upload a file), and
+  # GET (download a file). PUT/GET are the volume data channel: inject a sample or
+  # pull artifacts with no network. It reads the whole first line with
+  # `IFS= read -r` so as not to touch the command's spaces; the rest of stdin (a
+  # PUT's bytes) is consumed by `head -c` byte by byte, so read doesn't eat it first.
   sudo tee "$MOUNT_DIR/usr/local/bin/microhosted-exec" >/dev/null <<'AGENT'
 #!/bin/sh
 IFS= read -r line
@@ -135,36 +134,36 @@ WantedBy=multi-user.target
 UNIT
 
   sudo systemctl --root="$MOUNT_DIR" enable microhosted-exec.service
-  echo "    OK: acceso programático (vsock) listo."
+  echo "    OK: programmatic access (vsock) ready."
 fi
 
 if [[ "$DO_SSH" -eq 1 ]]; then
   if [[ "$PUBKEY" == "$DEFAULT_PUBKEY" && ! -f "$DEFAULT_PUBKEY" ]]; then
-    echo "==> No hay todavía una clave del proyecto, generando ${DEFAULT_PRIVATE_KEY}..."
+    echo "==> No project key yet, generating ${DEFAULT_PRIVATE_KEY}..."
     mkdir -p "$KEY_DIR"
-    ssh-keygen -t ed25519 -f "$DEFAULT_PRIVATE_KEY" -N '' -C "microhosted (generada localmente, no commitear)"
+    ssh-keygen -t ed25519 -f "$DEFAULT_PRIVATE_KEY" -N '' -C "microhosted (generated locally, do not commit)"
   fi
 
   if [[ ! -f "$PUBKEY" ]]; then
-    echo "ERROR: no existe $PUBKEY"
+    echo "ERROR: $PUBKEY doesn't exist"
     exit 1
   fi
 
-  echo "==> Añadiendo ${PUBKEY} a /root/.ssh/authorized_keys..."
+  echo "==> Adding ${PUBKEY} to /root/.ssh/authorized_keys..."
   sudo mkdir -p "$MOUNT_DIR/root/.ssh"
   sudo bash -c "cat '$PUBKEY' >> '$MOUNT_DIR/root/.ssh/authorized_keys'"
   sudo chmod 700 "$MOUNT_DIR/root/.ssh"
   sudo chmod 600 "$MOUNT_DIR/root/.ssh/authorized_keys"
   sudo chown -R 0:0 "$MOUNT_DIR/root/.ssh"
-  echo "    OK: acceso interactivo (SSH) listo."
+  echo "    OK: interactive access (SSH) ready."
 fi
 
 echo ""
-echo "OK: ${ROOTFS} preparado."
-echo "    Crea una VM NUEVA (las que ya existían se clonaron antes de este cambio) y:"
+echo "OK: ${ROOTFS} prepared."
+echo "    Create a NEW VM (existing ones were cloned before this change) and:"
 if [[ "$DO_VSOCK" -eq 1 ]]; then
-  echo "    - ejecuta comandos con: curl -X POST localhost:8080/v1/vms/<id>/exec -d '{\"cmd\":\"...\"}'"
+  echo "    - run commands with: curl -X POST localhost:8080/v1/vms/<id>/exec -d '{\"cmd\":\"...\"}'"
 fi
 if [[ "$DO_SSH" -eq 1 ]]; then
-  echo "    - entra por shell con: ssh -i ${DEFAULT_PRIVATE_KEY} root@<guest_ip>"
+  echo "    - get a shell with: ssh -i ${DEFAULT_PRIVATE_KEY} root@<guest_ip>"
 fi

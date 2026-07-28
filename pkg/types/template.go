@@ -1,8 +1,8 @@
 package types
 
-// Template describes a reusable "micromáquina": a golden kernel + rootfs pair
+// Template describes a reusable "micro-machine": a golden kernel + rootfs pair
 // plus default sizing, that VMs are cloned from. The catalog is the seed of
-// what will later become a full image library (Sesión 5).
+// what will later become a full image library (Stage 5).
 type Template struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`

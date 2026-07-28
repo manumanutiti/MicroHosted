@@ -13,7 +13,7 @@
 //   - GET <path>\n            → return "OK <len>\n"+bytes, or "ERR <msg>\n"
 //
 // PUT/GET are the bulk data channel: pushing a sample into a live VM or pulling
-// artifacts back out — "sacar muchos datos por el vsock" — without a network.
+// artifacts back out — moving a lot of data over vsock — without a network.
 package vsock
 
 import (

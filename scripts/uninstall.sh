@@ -1,31 +1,31 @@
 #!/usr/bin/env bash
-# Desinstalación COMPLETA de MicroHosted en esta máquina — el inverso de
-# full-install.sh. Devuelve el sistema a su estado original:
+# COMPLETE uninstallation of MicroHosted on this machine — the inverse of
+# full-install.sh. Returns the system to its original state:
 #
-#   1. mata las VMs vivas (KillMode=process las deja corriendo al parar el
-#      servicio, así que hay que matarlas explícitamente)
-#   2. para, deshabilita y borra el servicio systemd
-#   3. borra la tabla nftables 'inet microhosted' (única tabla nuestra;
-#      no toca las tablas del host ni las de Docker)
-#   4. borra los bridges mhbr* y sus taps (solo los nuestros: el prefijo
-#      mhbr es propio; docker0/br-* quedan intactos)
-#   5. borra los cgroups del daemon (/sys/fs/cgroup/microhosted y el
-#      /sys/fs/cgroup/firecracker del Jailer)
-#   6. desmonta el store CoW, quita su línea de /etc/fstab y borra el
-#      fichero-imagen btrfs y /var/lib/microhosted entero
-#   7. borra los binarios instalados (microhosted; firecracker y jailer
-#      salvo KEEP_FC=1) y la DB de estado del repo
+#   1. kills the live VMs (KillMode=process leaves them running when the
+#      service stops, so they have to be killed explicitly)
+#   2. stops, disables, and removes the systemd service
+#   3. deletes the nftables table 'inet microhosted' (our only table;
+#      doesn't touch the host's tables or Docker's)
+#   4. deletes the mhbr* bridges and their taps (only ours: the mhbr prefix
+#      is our own; docker0/br-* are left intact)
+#   5. deletes the daemon's cgroups (/sys/fs/cgroup/microhosted and the
+#      Jailer's /sys/fs/cgroup/firecracker)
+#   6. unmounts the CoW store, removes its /etc/fstab line, and deletes the
+#      btrfs image file and all of /var/lib/microhosted
+#   7. deletes the installed binaries (microhosted; firecracker and jailer
+#      unless KEEP_FC=1) and the repo's state DB
 #
-# Idempotente: se puede reejecutar sobre una instalación parcial sin fallar.
+# Idempotent: it can be re-run over a partial installation without failing.
 #
-# Uso:  sudo ./scripts/uninstall.sh
-#       DRY_RUN=1  solo muestra lo que haría, sin tocar nada
-#       KEEP_FC=1  conserva firecracker/jailer en /usr/local/bin
-#       PURGE=1    borra también los artefactos de imagen del repo
-#                  (images/kernels, rootfs, instances, keys)
+# Usage:  sudo ./scripts/uninstall.sh
+#         DRY_RUN=1  only shows what it would do, touching nothing
+#         KEEP_FC=1  keeps firecracker/jailer in /usr/local/bin
+#         PURGE=1    also deletes the repo's image artifacts
+#                    (images/kernels, rootfs, instances, keys)
 #
-# NO se revierte (se avisa al final): paquetes apt (nftables, btrfs-progs,
-# iproute2), net.ipv4.ip_forward, permisos de /dev/kvm y grupo kvm.
+# NOT reverted (warned about at the end): apt packages (nftables, btrfs-progs,
+# iproute2), net.ipv4.ip_forward, /dev/kvm permissions and the kvm group.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +36,7 @@ BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 UNIT="/etc/systemd/system/microhosted.service"
 
 if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: ejecutar con sudo o como root." >&2
+  echo "ERROR: run with sudo or as root." >&2
   exit 1
 fi
 
@@ -50,23 +50,23 @@ run() {
 }
 
 echo "=============================================="
-echo " MicroHosted — desinstalación completa"
-[[ -n "$DRY_RUN" ]] && echo " (DRY_RUN: no se toca nada)" || true
+echo " MicroHosted — complete uninstallation"
+[[ -n "$DRY_RUN" ]] && echo " (DRY_RUN: nothing is touched)" || true
 echo "=============================================="
 
-# --- [1/7] VMs vivas ----------------------------------------------------------
-# Parar el servicio ANTES de matar las VMs: si no, Restart=on-failure +
-# reconcile podrían readoptarlas o relanzar el daemon a mitad de limpieza.
+# --- [1/7] Live VMs ----------------------------------------------------------
+# Stop the service BEFORE killing the VMs: otherwise Restart=on-failure +
+# reconcile could re-adopt them or relaunch the daemon mid-cleanup.
 echo ""
-echo "==> [1/7] Parando servicio y matando VMs vivas..."
+echo "==> [1/7] Stopping the service and killing live VMs..."
 if systemctl list-unit-files microhosted.service &>/dev/null && \
    systemctl is-active --quiet microhosted 2>/dev/null; then
   run systemctl stop microhosted
 fi
 
-# Las VMs son procesos firecracker cuyo root (chroot del Jailer) vive dentro
-# del store — esa comprobación evita matar un firecracker ajeno. Los jailer
-# aún sin exec también se incluyen (son efímeros y siempre nuestros).
+# The VMs are firecracker processes whose root (the Jailer chroot) lives inside
+# the store — that check avoids killing an unrelated firecracker. Jailers still
+# without an exec are also included (they're ephemeral and always ours).
 VM_PIDS=()
 for pid in $(pgrep -x firecracker 2>/dev/null || true); do
   root="$(readlink "/proc/$pid/root" 2>/dev/null || true)"
@@ -77,7 +77,7 @@ for pid in $(pgrep -x jailer 2>/dev/null || true); do
 done
 
 if [[ ${#VM_PIDS[@]} -gt 0 ]]; then
-  echo "  matando ${#VM_PIDS[@]} VM(s): ${VM_PIDS[*]}"
+  echo "  killing ${#VM_PIDS[@]} VM(s): ${VM_PIDS[*]}"
   run kill -TERM "${VM_PIDS[@]}" 2>/dev/null || true
   if [[ -z "$DRY_RUN" ]]; then
     for _ in $(seq 1 10); do
@@ -91,65 +91,65 @@ if [[ ${#VM_PIDS[@]} -gt 0 ]]; then
     for pid in "${VM_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
   fi
 else
-  echo "  no hay VMs vivas"
+  echo "  no live VMs"
 fi
 
-# --- [2/7] Servicio systemd -----------------------------------------------------
+# --- [2/7] systemd service ----------------------------------------------------
 echo ""
-echo "==> [2/7] Eliminando el servicio systemd..."
+echo "==> [2/7] Removing the systemd service..."
 if [[ -f "$UNIT" ]]; then
   run systemctl disable --now microhosted 2>/dev/null || true
   run rm -f "$UNIT"
   run systemctl daemon-reload
   run systemctl reset-failed microhosted 2>/dev/null || true
-  echo "  $UNIT: eliminado"
+  echo "  $UNIT: removed"
 else
-  echo "  no estaba instalado"
+  echo "  wasn't installed"
 fi
 
 # --- [3/7] nftables --------------------------------------------------------------
 echo ""
-echo "==> [3/7] Eliminando la tabla nftables 'inet microhosted'..."
+echo "==> [3/7] Removing the nftables table 'inet microhosted'..."
 if command -v nft &>/dev/null && nft list table inet microhosted &>/dev/null; then
   run nft delete table inet microhosted
-  echo "  tabla eliminada"
+  echo "  table removed"
 else
-  echo "  no existía"
+  echo "  didn't exist"
 fi
 
-# --- [4/7] Bridges y taps ---------------------------------------------------------
+# --- [4/7] Bridges and taps ---------------------------------------------------------
 echo ""
-echo "==> [4/7] Eliminando bridges mhbr* y sus taps..."
+echo "==> [4/7] Removing mhbr* bridges and their taps..."
 BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep '^mhbr' || true)"
 if [[ -n "$BRIDGES" ]]; then
   for br in $BRIDGES; do
-    # Los taps son persistentes (sobreviven al proceso): borrarlos explícitamente.
+    # The taps are persistent (they outlive the process): delete them explicitly.
     for tap in $(ip -o link show master "$br" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
       run ip link del "$tap" 2>/dev/null || true
     done
     run ip link del "$br"
-    echo "  $br: eliminado"
+    echo "  $br: removed"
   done
 else
-  echo "  no hay bridges mhbr*"
+  echo "  no mhbr* bridges"
 fi
 
 # --- [5/7] cgroups -----------------------------------------------------------------
 echo ""
-echo "==> [5/7] Eliminando cgroups..."
+echo "==> [5/7] Removing cgroups..."
 for cgparent in /sys/fs/cgroup/microhosted /sys/fs/cgroup/firecracker; do
   if [[ -d "$cgparent" ]]; then
     for d in "$cgparent"/*/; do
       if [[ -d "$d" ]]; then run rmdir "$d" 2>/dev/null || true; fi
     done
     run rmdir "$cgparent" 2>/dev/null || true
-    echo "  $cgparent: eliminado"
+    echo "  $cgparent: removed"
   fi
 done
 
-# --- [6/7] Store CoW ---------------------------------------------------------------
+# --- [6/7] CoW store ---------------------------------------------------------------
 echo ""
-echo "==> [6/7] Desmontando y borrando el store CoW..."
+echo "==> [6/7] Unmounting and deleting the CoW store..."
 if mountpoint -q "$INSTANCES_DIR" 2>/dev/null; then
   UMOUNT_OK=0
   for _ in $(seq 1 5); do
@@ -158,73 +158,74 @@ if mountpoint -q "$INSTANCES_DIR" 2>/dev/null; then
   done
   if [[ -n "$DRY_RUN" ]]; then UMOUNT_OK=1; fi
   if [[ "$UMOUNT_OK" -ne 1 ]]; then
-    echo "ERROR: no se pudo desmontar $INSTANCES_DIR (target is busy)." >&2
-    echo "       Mira qué lo usa:  sudo lsof +f -- $INSTANCES_DIR" >&2
-    echo "       y reejecuta el uninstall." >&2
+    echo "ERROR: couldn't unmount $INSTANCES_DIR (target is busy)." >&2
+    echo "       Check what's using it:  sudo lsof +f -- $INSTANCES_DIR" >&2
+    echo "       and re-run the uninstall." >&2
     exit 1
   fi
-  echo "  $INSTANCES_DIR: desmontado"
+  echo "  $INSTANCES_DIR: unmounted"
 fi
 
-# Quitar la línea de fstab del loopback (por imagen, cubre también montajes
-# históricos en otro punto) y refrescar las unidades .mount generadas.
+# Remove the loopback's fstab line (by image, so it also covers historical mounts
+# at another point) and refresh the generated .mount units.
 if grep -qF "$COW_IMG" /etc/fstab 2>/dev/null; then
   run sed -i "\#${COW_IMG}#d" /etc/fstab
   run systemctl daemon-reload
-  echo "  línea de /etc/fstab: eliminada"
+  echo "  /etc/fstab line: removed"
 fi
 
-# Si quedó algún loop device colgando de la imagen, soltarlo antes de borrarla.
+# If a loop device is left hanging off the image, detach it before deleting it.
 for loopdev in $(losetup -j "$COW_IMG" 2>/dev/null | cut -d: -f1); do
   run losetup -d "$loopdev" 2>/dev/null || true
 done
 
 if [[ -d "$STATE_ROOT" ]]; then
-  # Doble seguro: jamás borrar el árbol con algo aún montado dentro. (findmnt -R
-  # no vale: solo mira si el target MISMO es mountpoint, no sus hijos.)
+  # Double safety: never delete the tree with something still mounted inside.
+  # (findmnt -R won't do: it only checks whether the target ITSELF is a
+  # mountpoint, not its children.)
   if [[ -z "$DRY_RUN" ]] && findmnt -rn -o TARGET | grep -Eq "^${STATE_ROOT}(/|\$)"; then
-    echo "ERROR: sigue habiendo un filesystem montado bajo $STATE_ROOT — no borro nada." >&2
+    echo "ERROR: there's still a filesystem mounted under $STATE_ROOT — deleting nothing." >&2
     exit 1
   fi
   run rm -rf "$STATE_ROOT"
-  echo "  $STATE_ROOT: eliminado (imagen btrfs incluida)"
+  echo "  $STATE_ROOT: deleted (btrfs image included)"
 else
-  echo "  $STATE_ROOT no existía"
+  echo "  $STATE_ROOT didn't exist"
 fi
 
-# --- [7/7] Binarios y estado del repo ------------------------------------------------
+# --- [7/7] Repo binaries and state ------------------------------------------------
 echo ""
-echo "==> [7/7] Eliminando binarios y DB de estado..."
+echo "==> [7/7] Removing binaries and the state DB..."
 run rm -f "$BIN_DIR/microhosted"
-echo "  $BIN_DIR/microhosted: eliminado"
+echo "  $BIN_DIR/microhosted: removed"
 if [[ -n "${KEEP_FC:-}" ]]; then
-  echo "  firecracker/jailer: conservados (KEEP_FC=1)"
+  echo "  firecracker/jailer: kept (KEEP_FC=1)"
 else
   run rm -f "$BIN_DIR/firecracker" "$BIN_DIR/jailer"
-  echo "  $BIN_DIR/{firecracker,jailer}: eliminados"
+  echo "  $BIN_DIR/{firecracker,jailer}: removed"
 fi
 
-# La DB apunta a VMs/clones del store recién borrado: dejarla solo envenena
-# una futura reinstalación con estado fantasma.
+# The DB points to VMs/clones in the just-deleted store: leaving it only poisons
+# a future reinstall with phantom state.
 run rm -f "$REPO_ROOT/images/microhosted.db"
-echo "  images/microhosted.db: eliminada"
+echo "  images/microhosted.db: removed"
 
 if [[ -n "${PURGE:-}" ]]; then
   run rm -rf "$REPO_ROOT/images/kernels" "$REPO_ROOT/images/rootfs" \
              "$REPO_ROOT/images/instances" "$REPO_ROOT/images/keys"
-  echo "  PURGE: images/{kernels,rootfs,instances,keys} eliminados"
+  echo "  PURGE: images/{kernels,rootfs,instances,keys} removed"
 fi
 
 echo ""
 echo "=============================================="
-echo " Desinstalación completada"
+echo " Uninstallation complete"
 echo "=============================================="
-echo "  Queda en el sistema (revertir a mano si se quiere):"
-echo "    - paquetes apt: nftables, btrfs-progs, iproute2"
-echo "    - net.ipv4.ip_forward=1 (si otras cargas no lo usan:"
+echo "  Left on the system (revert by hand if you want):"
+echo "    - apt packages: nftables, btrfs-progs, iproute2"
+echo "    - net.ipv4.ip_forward=1 (if no other workloads use it:"
 echo "      sudo sysctl -w net.ipv4.ip_forward=0)"
-echo "    - permisos de /dev/kvm y pertenencia al grupo kvm"
+echo "    - /dev/kvm permissions and kvm group membership"
 if [[ -z "${PURGE:-}" ]]; then
-  echo "  En el repo quedan los artefactos de imagen (images/); PURGE=1 los borra."
+  echo "  The image artifacts remain in the repo (images/); PURGE=1 deletes them."
 fi
-echo "  El catálogo (images/catalog.json) está versionado: git checkout lo restaura."
+echo "  The catalog (images/catalog.json) is versioned: git checkout restores it."

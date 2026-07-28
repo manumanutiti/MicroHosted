@@ -1,439 +1,436 @@
-# MicroHosted — Orquestador propio de microVMs
+# MicroHosted — A self-hosted microVM orchestrator
 
-## Por qué existe
+## Why it exists
 
-Necesidad real sin cubrir: **aislamiento fuerte y auto-alojado** para cargas efímeras
-(agentes de IA, CI, entornos de prueba) sin depender de un tercero (E2B, Daytona,
-Modal...) y sin la sobrecarga de VMs tradicionales.
+A real, unmet need: **strong, self-hosted isolation** for ephemeral workloads
+(AI agents, CI, test environments) without depending on a third party (E2B,
+Daytona, Modal...) and without the overhead of traditional VMs.
 
-Proxmox lleva desde 2020 con peticiones abiertas de soporte de microVMs sin plan de
-implementarlo. El único intento reciente (`pve-microvm`) es un parche experimental sobre
-QEMU, no una herramienta nativa de Firecracker+Jailer.
+Proxmox has had open requests for microVM support since 2020, with no plan to
+implement it. The only recent attempt (`pve-microvm`) is an experimental patch
+on top of QEMU, not a native Firecracker+Jailer tool.
 
-**El hueco**: herramienta pequeña y propia, con el modelo de seguridad real de Jailer
-(chroot + cgroups + seccomp), pensada desde cero para cargas efímeras aisladas.
+**The gap**: a small, self-owned tool with Jailer's real security model
+(chroot + cgroups + seccomp), designed from scratch for isolated ephemeral
+workloads.
 
-No compite con Nomad, Kubernetes ni startups grandes. Alcance controlado, problema
-concreto, puede crecer si demuestra que funciona.
-
----
-
-## Alcance de la primera etapa
-
-**Solo viabilidad del núcleo técnico**: crear, usar y destruir microVMs aisladas de
-forma programática y repetible.
-
-Fuera de alcance por ahora: interfaz web, multi-tenencia seria, alta disponibilidad.
+It doesn't compete with Nomad, Kubernetes, or large startups. Controlled scope,
+a concrete problem, room to grow if it proves itself.
 
 ---
 
-## Stack técnico
+## Scope of the first stage
 
-| Componente | Elección | Razón |
+**Core technical viability only**: create, use, and destroy isolated microVMs
+programmatically and repeatably.
+
+Out of scope for now: web interface, serious multi-tenancy, high availability.
+
+---
+
+## Technical stack
+
+| Component | Choice | Reason |
 |---|---|---|
-| Lenguaje | Go | `firecracker-go-sdk` oficial evita escribir el cliente HTTP desde cero |
-| Hipervisor | Firecracker | Arranque < 125ms, footprint mínimo, modelo de seguridad serio |
-| Aislamiento | Jailer | chroot + cgroups v2 + seccomp — el modelo real, no un workaround |
-| Red (etapa 1) | TAP + IP estática | Sin CNI por ahora, sin overhead |
-| Comunicación host↔guest | vsock | Patrón de toda plataforma de sandboxing seria |
-| Estado | SQLite → Postgres | SQLite primero, migrar cuando haya multi-host |
+| Language | Go | The official `firecracker-go-sdk` avoids writing the HTTP client from scratch |
+| Hypervisor | Firecracker | Boot < 125ms, minimal footprint, serious security model |
+| Isolation | Jailer | chroot + cgroups v2 + seccomp — the real model, not a workaround |
+| Networking (stage 1) | TAP + static IP | No CNI for now, no overhead |
+| Host↔guest communication | vsock | The pattern used by every serious sandboxing platform |
+| State | SQLite → Postgres | SQLite first, migrate once there's multi-host |
 
 ---
 
-## Tres conceptos fundamentales (entender antes de escribir código)
+## Three fundamental concepts (understand before writing code)
 
-**1. API de Firecracker**
+**1. The Firecracker API**
 
-Firecracker se controla con una API REST sobre un socket Unix. No hay CLI de "arrancar
-VM". Todo es `PUT`/`PATCH` a endpoints:
+Firecracker is controlled through a REST API over a Unix socket. There's no
+"start VM" CLI. Everything is a `PUT`/`PATCH` to endpoints:
 
 ```
 PUT /boot-source      # kernel + cmdline
-PUT /drives/rootfs    # disco raíz
-PUT /machine-config   # vCPUs, memoria
-PUT /network-interfaces/eth0  # red
+PUT /drives/rootfs    # root disk
+PUT /machine-config   # vCPUs, memory
+PUT /network-interfaces/eth0  # networking
 PUT /actions          # InstanceStart / SendCtrlAltDel / FlushMetrics
 ```
 
-**2. Layout de Jailer**
+**2. Jailer layout**
 
 ```
 /srv/jailer/<exec-file>/<id>/root/
 ```
 
-- `jailer` y `firecracker` deben ser binarios de la **misma versión exacta**
-- El socket de la API vive dentro del chroot
-- Jailer monta `/dev/kvm`, el socket, etc. dentro del chroot antes de ejecutar
+- `jailer` and `firecracker` must be binaries of the **exact same version**
+- The API socket lives inside the chroot
+- Jailer mounts `/dev/kvm`, the socket, etc. inside the chroot before executing
 
-**3. Comunicación host↔guest**
+**3. Host↔guest communication**
 
-Para todo lo que no sea red (mandar comandos a ejecutar, leer resultados) se usa
-**vsock**, no red normal. Es el patrón que usan E2B, Kata Containers,
-firecracker-containerd. El guest escucha en un puerto vsock; el host conecta al CID
-de la VM.
+For everything that isn't networking (sending commands to run, reading results),
+**vsock** is used, not regular networking. It's the pattern used by E2B, Kata
+Containers, and firecracker-containerd. The guest listens on a vsock port; the
+host connects to the VM's CID.
 
 ---
 
-## Requisitos del host
+## Host requirements
 
-- Linux con `/dev/kvm` accesible (`ls -la /dev/kvm`)
-- Kernel 5.10+ (recomendado 6.x)
-- cgroups v2 montados (`mount | grep cgroup2`)
-- Capacidad de crear TAP devices (`ip tuntap`)
+- Linux with `/dev/kvm` accessible (`ls -la /dev/kvm`)
+- Kernel 5.10+ (6.x recommended)
+- cgroups v2 mounted (`mount | grep cgroup2`)
+- Ability to create TAP devices (`ip tuntap`)
 - Go 1.22+
-- `firecracker` y `jailer` del mismo release (instalados por `scripts/install-fc.sh`)
+- `firecracker` and `jailer` from the same release (installed by `scripts/install-fc.sh`)
 
-Para verificar KVM:
+To verify KVM:
 ```bash
-[ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "OK" || echo "Falta permisos o KVM"
+[ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "OK" || echo "Missing permissions or KVM"
 ```
 
 ---
 
-## Estructura del repositorio
+## Repository structure
 
 ```
 MicroHosted/
 ├── cmd/
-│   └── microhosted/       # Punto de entrada del binario principal
+│   └── microhosted/       # Entry point of the main binary
 │       └── main.go
 ├── internal/
-│   ├── firecracker/       # Wrapper del SDK + llamadas al API REST
-│   ├── jailer/            # Configuración del chroot y lanzamiento con Jailer
-│   ├── network/           # TAP devices, asignación de IPs, limpieza de red
-│   ├── storage/           # Gestión de kernels y rootfs
-│   ├── vm/                # Ciclo de vida de VMs (create/destroy/snapshot)
-│   └── api/               # Servidor HTTP/gRPC expuesto hacia afuera
+│   ├── firecracker/       # SDK wrapper + REST API calls
+│   ├── jailer/            # chroot configuration and launch via Jailer
+│   ├── network/           # TAP devices, IP allocation, network cleanup
+│   ├── storage/           # Kernel and rootfs management
+│   ├── vm/                # VM lifecycle (create/destroy/snapshot)
+│   └── api/               # HTTP/gRPC server exposed outward
 ├── pkg/
-│   └── types/             # Tipos compartidos (VMConfig, VMState, etc.)
+│   └── types/             # Shared types (VMConfig, VMState, etc.)
 ├── scripts/
-│   ├── install-fc.sh      # Descarga firecracker + jailer (misma versión)
-│   ├── build-kernel.sh    # Compila kernel mínimo para microVMs
-│   ├── build-rootfs.sh    # Genera rootfs.ext4 desde una definición
-│   └── setup-host.sh      # Configura el host (cgroups, permisos, TAP, etc.)
+│   ├── install-fc.sh      # Downloads firecracker + jailer (same version)
+│   ├── build-kernel.sh    # Builds a minimal kernel for microVMs
+│   ├── build-rootfs.sh    # Generates rootfs.ext4 from a definition
+│   └── setup-host.sh      # Configures the host (cgroups, permissions, TAP, etc.)
 ├── images/
-│   ├── kernels/           # vmlinux versionados (.gitignore los binarios)
-│   └── rootfs/            # rootfs.ext4 base (.gitignore las imágenes)
-├── sessions/              # Notas técnicas por sesión de trabajo
-│   └── session-00.md
+│   ├── kernels/           # Versioned vmlinux (binaries are git-ignored)
+│   └── rootfs/            # Base rootfs.ext4 (images are git-ignored)
 ├── docs/
 │   └── architecture.md
-├── PROJECT.md             # Este archivo
-├── SESSIONS.md            # Registro de avance por sesión
+├── PROJECT.md             # This file
 ├── Makefile
 ├── .gitignore
 ├── go.mod
 └── go.sum
 ```
 
-> **Nota sobre imágenes**: Los binarios grandes (kernels, rootfs) no se commitean.
-> Se descargan o construyen localmente con los scripts de `scripts/`.
+> **Note on images**: Large binaries (kernels, rootfs) are not committed. They
+> are downloaded or built locally with the scripts in `scripts/`.
 
 ---
 
-## Roadmap por sesiones
+## Roadmap by stages
 
-### Sesión 0 — Arranque manual, sin código
-Conseguir `firecracker` y `jailer` (misma versión). Descargar kernel mínimo y rootfs
-de ejemplo. Arrancar una microVM **a mano** con `curl` contra el socket Unix.
+### Stage 0 — Manual boot, no code
+Obtain `firecracker` and `jailer` (same version). Download a minimal kernel and
+example rootfs. Boot a microVM **by hand** with `curl` against the Unix socket.
 
-**Criterio de éxito**: entrar por consola serie a una microVM levantada a mano y
-apagarla limpio. Si no se puede hacer esto sin fallos, no seguir — depurar aquí.
-
----
-
-### Sesión 1 — Cliente propio del API de Firecracker (sin Jailer)
-Primer código: programa que reemplaza los `curl` de la Sesión 0 usando
-`firecracker-go-sdk`. Parámetros: ruta del kernel, rootfs, vCPUs, memoria.
-
-**Criterio de éxito**: `./microhosted create --kernel ... --rootfs ...` levanta VM;
-`./microhosted destroy <id>` la apaga y limpia.
+**Success criterion**: get a serial console into a manually booted microVM and
+shut it down cleanly. If this can't be done without failures, don't proceed —
+debug here.
 
 ---
 
-### Sesión 2 — Envolver con Jailer
-Agregar la capa de aislamiento real: chroot, cgroups, lanzar Firecracker vía Jailer.
+### Stage 1 — Own Firecracker API client (no Jailer)
+First code: a program that replaces the `curl` calls from Stage 0 using
+`firecracker-go-sdk`. Parameters: kernel path, rootfs, vCPUs, memory.
 
-**Criterio de éxito**: `ps`/`nsenter` confirma que el proceso de Firecracker no puede
-ver el resto del filesystem del host.
-
----
-
-### Sesión 3 — Red para una sola microVM
-TAP device + configuración de IP estática (sin CNI todavía).
-
-**Criterio de éxito**: `ping`/SSH desde el host a la microVM.
+**Success criterion**: `./microhosted create --kernel ... --rootfs ...` boots a
+VM; `./microhosted destroy <id>` shuts it down and cleans up.
 
 ---
 
-### Sesión 4 — Concurrencia: varias microVMs simultáneas
-Generalizar sesiones 1-3: sockets únicos, IDs únicos, IPs únicas, cgroups únicos,
-limpieza correcta al destruir.
+### Stage 2 — Wrap with Jailer
+Add the real isolation layer: chroot, cgroups, launch Firecracker via Jailer.
 
-**Criterio de éxito**: 5 microVMs simultáneas, cada una accesible por separado,
-destruir una no afecta a las demás ni deja recursos huérfanos.
-
----
-
-### Sesión 5 — Pipeline de imágenes reproducible
-Automatizar construcción de kernel mínimo y rootfs propios (no los de ejemplo de AWS),
-con plantillas versionadas.
-
-**Criterio de éxito**: script que, a partir de una definición simple (paquetes,
-comandos de setup), genera `rootfs.ext4` + `vmlinux` listos para usar.
+**Success criterion**: `ps`/`nsenter` confirms the Firecracker process can't see
+the rest of the host filesystem.
 
 ---
 
-### Sesión 6 — Snapshot / restore
-Implementar pausa + snapshot + restauración para arranques casi instantáneos.
+### Stage 3 — Networking for a single microVM
+TAP device + static IP configuration (no CNI yet).
 
-**Criterio de éxito**: medir y comparar tiempo desde snapshot frente a arranque en
-frío. Referencia de la industria: ~150-200ms restaurando snapshot.
-
----
-
-### Sesión 7 — Agente de host con API propia
-Envolver todo detrás de una API HTTP/gRPC local: `POST /sandboxes`,
-`DELETE /sandboxes/:id`, `GET /sandboxes`. Primer componente que pasa de "script"
-a "servicio".
-
-**Criterio de éxito**: crear, listar y destruir sandboxes solo hablando con la API,
-sin invocar Firecracker/Jailer directamente desde afuera.
+**Success criterion**: `ping`/SSH from the host to the microVM.
 
 ---
 
-### Sesión 8 — Estado persistente
-Guardar estado en SQLite (luego Postgres), no en memoria.
+### Stage 4 — Concurrency: several simultaneous microVMs
+Generalize stages 1-3: unique sockets, unique IDs, unique IPs, unique cgroups,
+correct cleanup on destroy.
 
-**Criterio de éxito**: reiniciar el proceso y recuperar correctamente qué sandboxes
-existían, sin perder ni duplicar estado.
-
----
-
-### Sesión 9 — Multi-host y selector simple
-Extender a 2+ hosts físicos. Selector simple: "el host con más capacidad libre".
-
-**Criterio de éxito**: con 2 hosts, el sistema coloca sandboxes en el que tiene
-capacidad y detecta si un host deja de responder.
+**Success criterion**: 5 simultaneous microVMs, each accessible separately;
+destroying one doesn't affect the others or leave orphaned resources.
 
 ---
 
-### Sesión 10 — Cierre de etapa: prueba de resistencia
-Bucle de creación/destrucción repetida, medición de fugas (cgroups, TAP devices,
-sockets, memoria) y tiempos reales.
+### Stage 5 — Reproducible image pipeline
+Automate building a minimal kernel and custom rootfs (not the AWS examples),
+with versioned templates.
 
-**Criterio de éxito**: N ciclos de creación/destrucción sin fugas ni caídas.
-Aquí termina la etapa de "viabilidad del core".
-
----
-
-## Después de esta etapa (referencia futura)
-
-Interfaz web tipo panel, multi-tenencia y aislamiento de red entre clientes,
-observabilidad/métricas, hardening de seguridad más profundo, y — si todo funciona
-bien — evaluar si darle forma de proyecto open source público.
+**Success criterion**: a script that, from a simple definition (packages, setup
+commands), generates `rootfs.ext4` + `vmlinux` ready to use.
 
 ---
 
-## Dirección refinada (2026-07-01)
+### Stage 6 — Snapshot / restore
+Implement pause + snapshot + restore for near-instant boots.
 
-Tras validar el núcleo (sesiones 1-3 + acceso vsock/SSH), se afina el rumbo y el
-público objetivo.
+**Success criterion**: measure and compare snapshot restore time versus cold
+boot. Industry reference: ~150-200ms restoring a snapshot.
 
-### Dos casos de uso, un mismo núcleo
-- **Sandboxing de ciberseguridad / forense**: detonar binarios no confiables,
-  análisis de malware, ejecutar Volatility u otras herramientas sobre volcados,
-  recoger artefactos (pcaps, dumps de memoria) — todo con aislamiento de
-  hipervisor real y revert a estado limpio entre muestras.
-- **Sandboxing para agentes de IA**: ejecución de código aislada y efímera,
-  auto-alojada, sin mandar código/datos a un tercero (E2B/Daytona/Modal).
+---
 
-Ambos comparten el mismo requisito: correr algo no confiable sin que toque el
-host. Endurecer para malware da gratis el aislamiento que el caso IA también
-quiere. (Cuotas de GPU para IA y un agente de prueba tipo ONNX quedan aparcados
-para más adelante — primero el core.)
+### Stage 7 — Host agent with its own API
+Wrap everything behind a local HTTP/gRPC API: `POST /sandboxes`,
+`DELETE /sandboxes/:id`, `GET /sandboxes`. The first component to move from
+"script" to "service".
 
-### Refinamiento del posicionamiento (2026-07-02)
+**Success criterion**: create, list, and destroy sandboxes by talking only to
+the API, without invoking Firecracker/Jailer directly from outside.
 
-El encuadre madura de "dos casos de uso" a un **posicionamiento único**:
-**plataforma de sandboxing de seguridad AUTOHOSTED**. Separar en dos capas:
+---
 
-- **El motor** (ciclo de vida de microVMs + aislamiento + snapshots): general y
-  neutral, agnóstico al caso de uso. La calidad se mide en correctitud y
-  garantías.
-- **El producto**: una **librería curada de imágenes desechables** para distintos
-  usos defensivos (detonación de malware, honeypots/deception, bancos DFIR,
-  rangos blue-team, labs/CTF; el sandbox de agentes IA es un segundo acto sobre
-  el mismo motor).
+### Stage 8 — Persistent state
+Store state in SQLite (later Postgres), not in memory.
 
-Claves estratégicas:
-- **Foso = soberanía del dato.** El autohosted es el eje donde los sandboxes
-  cloud (ANY.RUN, Joe Sandbox, e2b) no pueden competir por estructura: no mandas
-  la muestra/el dato a un tercero. Para banca/defensa/sanidad/air-gap es un "no"
-  rotundo, no una preferencia.
-- **Incumbente a desplazar = CAPEv2/Cuckoo** (sandbox de malware self-hosted
-  clásico, QEMU pesado, doloroso de operar). Ángulo: el sucesor moderno en
-  microVMs Firecracker, API-first, que sí se instala.
-- **Disciplina: motor general, primer workflow afilado.** "Biblioteca para
-  distintos usos" es la promesa, no el lanzamiento. Se lanza con UN workflow
-  hondo (detonación: muestra → VM aislada sin egress → corre → captura artefactos
-  → reset a limpio) y se expande desde ahí. Amplitud = promesa; profundidad-de-uno
-  = prueba.
-- **Consecuencias**: el catálogo/sistema de imágenes sube a activo de primera
-  clase (templates versionadas, manifests, builds reproducibles, firma) — enlaza
-  con las imágenes ultra-optimizadas pendientes (Alpine/Rocky). **Snapshots** son
-  lo más estratégico (reset-a-limpio, bifurcar en el punto de infección), por
-  encima de multi-host/HA. **Modelo de amenaza escrito + tests adversariales**
-  pasa a ser argumento de venta, no higiene.
-- **Orden**: control plane, colas, HA y multi-host son etapas posteriores; su
-  orden lo dicta un caso de uso que tira, no una checklist de escalar. Siguiente:
-  soak test (robustez en operación) → snapshots → workflow vertical de detonación.
+**Success criterion**: restart the process and correctly recover which sandboxes
+existed, without losing or duplicating state.
 
-### Decisiones de arquitectura fijadas
-- **Red segmentada por nombre** (no el `/30` punto-a-punto actual, donde el host
-  es gateway de todas las VMs y dos VMs no pueden verse). Bridge por red nombrada;
-  las VMs se unen por nombre; `nftables` fuerza por defecto: `guest→host`
-  bloqueado, cross-segment bloqueado, salida a internet como flag por red (deny
-  por defecto = malware-safe; opt-in NAT). Un solo mecanismo cubre inter-VM Y
-  aislamiento.
-- **Persistencia SQLite** desde ya: un backend que olvida su estado al reiniciar
-  no es "funcional". Reemplaza el estado en memoria del `Manager` y el `Allocator`.
+---
 
-### Plan del backend funcional (por dependencias)
+### Stage 9 — Multi-host and a simple scheduler
+Extend to 2+ physical hosts. Simple scheduler: "the host with the most free
+capacity".
 
-**Fase 0 — Fundamento: limpieza total + persistencia**
-- Auditar `Destroy`: hoy NO borra el chroot de Jailer
-  (`/srv/jailer/<exec>/<id>/`) — fuga de disco en bucles crear/destruir. Cerrarla
-  y auditar todos los caminos de fallo.
-- SQLite: persistir VMs/redes/volúmenes; reconciliar procesos vivos al arrancar.
-- Límites cgroup por VM (CPU/mem/pids): evita fork-bomb / agotar el host.
+**Success criterion**: with 2 hosts, the system places sandboxes on the one with
+capacity and detects when a host stops responding.
 
-**Fase 1 — Red segmentada** (rediseño de `internal/network`)
-- Entidad `Network` (nombre, subred, `egress`) + CRUD `/v1/networks`.
-- Bridge por red; TAP de cada VM enslavado al bridge; IPAM por-red.
-- `nftables`: drop guest→host, drop cross-segment, NAT condicional.
-- `NoNetwork` sigue válido para el sandbox más hermético.
+---
 
-**Fase 2 — Almacenamiento**
-- *(hecho, validado en hardware 2026-07-02)* **Tamaño de disco configurable**
-  (`disk_mb` en template/request; el clon se agranda con `resize2fs`) + **store
-  copy-on-write** (loopback btrfs, agnóstico al host, provisionado por
-  `setup-host.sh`). Todo lo que Jailer clona/hardlinka (golden, kernel, chroot)
-  vive en el mismo btrfs por invariante — reflink y hardlink no cruzan FS. Ver
-  `SESSIONS.md` (Fase 2 parte 1) y `docs/layers.md` L3.
-- *(hecho)* Entidad `Volume` (nombre, tamaño, ext4 persistente que sobrevive
-  al destroy) + CRUD `/v1/volumes`; attach como drive extra (Firecracker
-  `Drives`), read-only o writable, auto-montado en el guest por vsock. Ciber:
-  muestra montada read-only + volumen de salida writable para artefactos. Una VM
-  con volúmenes no puede snapshotear/fork/restore en v1 (409). Ver
+### Stage 10 — Stage close: stress test
+A repeated create/destroy loop, measuring leaks (cgroups, TAP devices, sockets,
+memory) and real timings.
+
+**Success criterion**: N create/destroy cycles without leaks or crashes. This is
+where the "core viability" stage ends.
+
+---
+
+## After this stage (future reference)
+
+A dashboard-style web interface, multi-tenancy and network isolation between
+clients, observability/metrics, deeper security hardening, and — if everything
+works well — evaluating whether to shape it into a public open-source project.
+
+---
+
+## Refined direction (2026-07-01)
+
+After validating the core (stages 1-3 + vsock/SSH access), the direction and
+target audience are sharpened.
+
+### Two use cases, one core
+- **Cybersecurity / forensics sandboxing**: detonate untrusted binaries, malware
+  analysis, run Volatility or other tools over dumps, collect artifacts (pcaps,
+  memory dumps) — all with real hypervisor isolation and revert to a clean state
+  between samples.
+- **Sandboxing for AI agents**: isolated, ephemeral, self-hosted code execution,
+  without sending code/data to a third party (E2B/Daytona/Modal).
+
+Both share the same requirement: run something untrusted without letting it
+touch the host. Hardening for malware gives, for free, the isolation the AI case
+also wants. (GPU quotas for AI and an ONNX-style test agent are parked for later
+— core first.)
+
+### Positioning refinement (2026-07-02)
+
+The framing matures from "two use cases" to a **single positioning**: a
+**SELF-HOSTED security sandboxing platform**. Split into two layers:
+
+- **The engine** (microVM lifecycle + isolation + snapshots): general and
+  neutral, agnostic to the use case. Quality is measured in correctness and
+  guarantees.
+- **The product**: a **curated library of disposable images** for various
+  defensive uses (malware detonation, honeypots/deception, DFIR benches,
+  blue-team ranges, labs/CTF; the AI agent sandbox is a second act on the same
+  engine).
+
+Strategic keys:
+- **Moat = data sovereignty.** Self-hosting is the axis where cloud sandboxes
+  (ANY.RUN, Joe Sandbox, e2b) structurally can't compete: you don't send the
+  sample/data to a third party. For banking/defense/healthcare/air-gap it's a
+  hard "no", not a preference.
+- **Incumbent to displace = CAPEv2/Cuckoo** (the classic self-hosted malware
+  sandbox, heavy QEMU, painful to operate). Angle: the modern successor on
+  Firecracker microVMs, API-first, that actually installs.
+- **Discipline: general engine, first workflow sharp.** "A library for various
+  uses" is the promise, not the launch. Launch with ONE deep workflow
+  (detonation: sample → isolated VM with no egress → run → capture artifacts →
+  reset to clean) and expand from there. Breadth = promise; depth-of-one = proof.
+- **Consequences**: the catalog/image system becomes a first-class asset
+  (versioned templates, manifests, reproducible builds, signing) — it ties into
+  the pending ultra-optimized images (Alpine/Rocky). **Snapshots** are the most
+  strategic piece (reset-to-clean, fork at the point of infection), above
+  multi-host/HA. **A written threat model + adversarial tests** become a selling
+  point, not hygiene.
+- **Order**: control plane, queues, HA, and multi-host are later stages; their
+  order is dictated by a use case that pulls, not a scaling checklist. Next: soak
+  test (operational robustness) → snapshots → vertical detonation workflow.
+
+### Fixed architecture decisions
+- **Networking segmented by name** (not the current point-to-point `/30`, where
+  the host is the gateway for every VM and two VMs can't see each other). One
+  bridge per named network; VMs join by name; `nftables` enforces by default:
+  `guest→host` blocked, cross-segment blocked, internet egress as a per-network
+  flag (deny by default = malware-safe; opt-in NAT). A single mechanism covers
+  both inter-VM AND isolation.
+- **SQLite persistence** from now on: a backend that forgets its state on restart
+  isn't "functional". It replaces the in-memory state of the `Manager` and the
+  `Allocator`.
+
+### Functional backend plan (by dependencies)
+
+**Phase 0 — Foundation: full cleanup + persistence**
+- Audit `Destroy`: today it does NOT delete the Jailer chroot
+  (`/srv/jailer/<exec>/<id>/`) — a disk leak in create/destroy loops. Close it
+  and audit every failure path.
+- SQLite: persist VMs/networks/volumes; reconcile live processes on startup.
+- Per-VM cgroup limits (CPU/mem/pids): prevents fork-bombs / exhausting the host.
+
+**Phase 1 — Segmented networking** (redesign of `internal/network`)
+- A `Network` entity (name, subnet, `egress`) + CRUD `/v1/networks`.
+- One bridge per network; each VM's TAP enslaved to the bridge; per-network IPAM.
+- `nftables`: drop guest→host, drop cross-segment, conditional NAT.
+- `NoNetwork` remains valid for the most hermetic sandbox.
+
+**Phase 2 — Storage**
+- *(done, validated on hardware 2026-07-02)* **Configurable disk size**
+  (`disk_mb` in template/request; the clone is grown with `resize2fs`) + a
+  **copy-on-write store** (btrfs loopback, host-agnostic, provisioned by
+  `setup-host.sh`). Everything Jailer clones/hardlinks (golden, kernel, chroot)
+  lives on the same btrfs by invariant — reflink and hardlink don't cross
+  filesystems. See `docs/layers.md` L3.
+- *(done)* A `Volume` entity (name, size, persistent ext4 that survives destroy)
+  + CRUD `/v1/volumes`; attach as an extra drive (Firecracker `Drives`),
+  read-only or writable, auto-mounted in the guest over vsock. Security: a sample
+  mounted read-only + a writable output volume for artifacts. A VM with volumes
+  can't snapshot/fork/restore in v1 (409). See `docs/volumes.md`.
+
+**Phase 3 — Complete the CRUD**
+- *(done)* Update: inject/extract files to a VM or volume. Via vsock if the VM is
+  alive (`PUT/GET /v1/vms/{id}/files`, data channel on a volume with no network);
+  via `debugfs` **without mounting** if it's stopped or the volume is detached
+  (`/v1/volumes/{id}/files`). Security rule: the host NEVER mounts a guest fs —
+  `mount(2)` of an untrusted image exposes the host kernel's ext4 parser. See
   `docs/volumes.md`.
+- `docker ps`-style read: state, base image, network, volumes.
 
-**Fase 3 — Completar el CRUD**
-- *(hecho)* Update: inyectar/extraer archivos a una VM o volumen. Vía vsock si
-  la VM está viva (`PUT/GET /v1/vms/{id}/files`, canal de datos en volumen sin
-  red); vía `debugfs` **sin montar** si está parada o el volumen está suelto
-  (`/v1/volumes/{id}/files`). Regla de seguridad: el host NUNCA monta un fs del
-  guest — `mount(2)` de una imagen no confiable expone el parser ext4 del kernel
-  del host. Ver `docs/volumes.md`.
-- Read estilo `docker ps`: estado, imagen base, red, volúmenes.
-
-**Fase 4 — Endurecimiento + prueba de resistencia**
-- Verificar seccomp, caps cgroup, egress denegado por defecto.
-- Test de escape (no ve FS del host, no alcanza host ni otra red, fork-bomb no
-  tumba el host) + N ciclos crear/destruir sin fugas.
+**Phase 4 — Hardening + stress test**
+- Verify seccomp, cgroup caps, egress denied by default.
+- Escape test (can't see the host FS, can't reach the host or another network,
+  fork-bomb doesn't take down the host) + N create/destroy cycles without leaks.
 
 ---
 
-## Pivote de nicho (2026-07-05) — Gateway de aislamiento IoT/OT
+## Niche pivot (2026-07-05) — IoT/OT isolation gateway
 
-Decisión de dirección: **el proyecto se especializa en el nicho IoT/OT edge.**
-El motor (microVMs Firecracker+Jailer, redes segmentadas nftables, CoW btrfs,
-snapshots/fork, vsock, volúmenes, cgroups, observabilidad) queda como está —
-está lo bastante avanzado como para soportar un vertical de verdad, y este
-vertical no requiere rediseñarlo, solo extenderlo.
+Direction decision: **the project specializes in the IoT/OT edge niche.** The
+engine (Firecracker+Jailer microVMs, nftables segmented networks, btrfs CoW,
+snapshots/fork, vsock, volumes, cgroups, observability) stays as is — it's
+advanced enough to support a real vertical, and this vertical doesn't require
+redesigning it, only extending it.
 
-### Por qué IoT/OT y no detonación primero
+### Why IoT/OT and not detonation first
 
-- El mercado de sandbox para IA está saturado (constatado 2026-07-03). El de
-  detonación tiene hueco, pero exige competir contra hábitos (CAPEv2) y un
-  ciclo de adopción de analistas.
-- En IoT/OT el hueco es **estructural**: los gateways edge actuales (Greengrass,
-  balena, KubeEdge, EdgeX) usan contenedores = kernel compartido; un exploit en
-  el parser de un sensor compromete la planta. Nadie ofrece "aislamiento de
-  hipervisor por sensor, en el gateway, instalable en una tarde". EVE-OS es el
-  vecino más cercano y es orquestación pesada genérica, no este patrón.
-- El argumento de venta es el mismo foso de siempre (procesar datos no
-  confiables sin que toquen el host) aplicado a tramas de sensores en vez de
-  muestras de malware. La detonación pasa a **segundo acto** sobre el mismo
-  motor, no se tira nada.
+- The AI sandbox market is saturated (confirmed 2026-07-03). The detonation one
+  has room, but it demands competing against habits (CAPEv2) and an analyst
+  adoption cycle.
+- In IoT/OT the gap is **structural**: today's edge gateways (Greengrass, balena,
+  KubeEdge, EdgeX) use containers = shared kernel; an exploit in a sensor's
+  parser compromises the plant. Nobody offers "hypervisor isolation per sensor,
+  at the gateway, installable in an afternoon". EVE-OS is the closest neighbor
+  and it's heavy generic orchestration, not this pattern.
+- The selling point is the same old moat (process untrusted data without letting
+  it touch the host) applied to sensor frames instead of malware samples.
+  Detonation becomes a **second act** on the same engine; nothing is thrown away.
 
-### El producto
+### The product
 
-Un **gateway de aislamiento**: cada sensor (o grupo pequeño de sensores) tiene
-su microVM-parser desechable. El host no expone ningún puerto hacia los
-sensores ni parsea ningún protocolo; los datos validados salen de la VM por
-vsock. Si un sensor comprometido explota su parser, compromete una VM de
-~32MB sin red hacia el host que se regenera desde snapshot en ~100ms.
+An **isolation gateway**: each sensor (or a small group of sensors) has its own
+disposable parser-microVM. The host exposes no port toward the sensors and
+parses no protocol; validated data leaves the VM over vsock. If a compromised
+sensor exploits its parser, it compromises a ~32MB VM with no network to the
+host, which regenerates from a snapshot in ~100ms.
 
-Dos modos de ingesta, en este orden:
+Two ingestion modes, in this order:
 
-1. **Pull (primero)** — la VM se levanta (restore desde snapshot), interroga a
-   su sensor (egress restringido a esa IP:puerto), valida, entrega por vsock y
-   se destruye. Es el modelo **nativo de OT** (Modbus/OPC-UA son polling), el
-   más simple y el más seguro: no existe camino de entrada en ningún momento.
-2. **Push (después)** — para MQTT/HTTP: el kernel detecta la conexión entrante
-   (nftables/NFQUEUE), se restaura la VM, DNAT hacia ella, el SYN reintentado
-   del sensor aterriza ya dentro de la VM. Exige anti-DoS (tope global de VMs
-   + rate-limit por origen).
+1. **Pull (first)** — the VM boots (restore from snapshot), interrogates its
+   sensor (egress restricted to that IP:port), validates, delivers over vsock,
+   and is destroyed. It's the **native OT model** (Modbus/OPC-UA are polling),
+   the simplest and safest: there is no inbound path at any moment.
+2. **Push (later)** — for MQTT/HTTP: the kernel detects the incoming connection
+   (nftables/NFQUEUE), the VM is restored, DNAT toward it, and the sensor's
+   retried SYN lands inside the VM. It requires anti-DoS (a global VM cap +
+   per-source rate limiting).
 
-**Ciclo de vida transaccional** como dial del producto: VM *por transacción*
-(estado limpio por dato), *por ventana* (vive N segundos, procesa el lote),
-o *por anomalía* (persistente con reset programado/reactivo — un implante no
-puede persistir). Los tres usan la misma maquinaria snapshot/restore/destroy.
+**Transactional lifecycle** as the product's dial: a VM *per transaction* (clean
+state per datum), *per window* (lives N seconds, processes the batch), or *per
+anomaly* (persistent with a scheduled/reactive reset — an implant can't persist).
+All three use the same snapshot/restore/destroy machinery.
 
-**Gemelos digitales** como caso secundario del mismo motor: clones CoW +
-MAC/IP únicas por VM = simular flotas de dispositivos para pruebas de estrés
-de brokers, OTA y ataques dirigidos.
+**Digital twins** as a secondary use case of the same engine: CoW clones +
+unique MAC/IP per VM = simulate device fleets for broker stress tests, OTA, and
+targeted attacks.
 
-### Correcciones de expectativas (para no venderse humo)
+### Expectation corrections (so as not to oversell)
 
-- Los "<5MB por microVM" de Firecracker son el *overhead del VMM*, no la RAM
-  del guest. Un Linux mínimo real necesita 20-50MB. La densidad alta viene de
-  (a) imagen ultra-mínima y (b) restore masivo desde snapshot compartido (la
-  memoria se mapea copy-on-write — ya implementado): cada VM paga solo sus
-  páginas sucias.
-- Objetivo realista: **decenas de VMs en una Pi de 4GB, 100-300 en una Pi 5 de
-  8/16GB (vía snapshot + imagen mínima), 1000+ en gateway industrial x86.**
-  Cifras a validar en hardware, no promesas.
+- Firecracker's "<5MB per microVM" is the *VMM overhead*, not the guest RAM. A
+  real minimal Linux needs 20-50MB. High density comes from (a) an ultra-minimal
+  image and (b) mass restore from a shared snapshot (memory is mapped
+  copy-on-write — already implemented): each VM pays only for its dirty pages.
+- Realistic target: **dozens of VMs on a 4GB Pi, 100-300 on an 8/16GB Pi 5 (via
+  snapshot + minimal image), 1000+ on an industrial x86 gateway.** Figures to be
+  validated on hardware, not promises.
 
-### Necesidades y plan de sesiones
+### Needs and session plan
 
-Diseño completo, huecos con mapeo al código y criterios de éxito por sesión en
-**`docs/iot-edge.md`**. Resumen de prioridades:
+The full design, gaps with code mapping, and success criteria per session are in
+**`docs/iot-edge.md`**. Priority summary:
 
-1. **Spike ARM64** (riesgo existencial: hasta que una microVM arranque en una
-   Raspberry Pi 5, el hardware objetivo es teoría).
-2. **Egress de grano fino** (VM solo puede hablar con su sensor IP:puerto) —
-   prerequisito del modo pull.
-3. **Orquestador transaccional pull v1** (restore→poll→validar→extraer→destruir,
-   con los 3 modos de vida) — el MVP del producto, desarrollable en x86.
-4. **Imagen sensor ultra-mínima** (kernel tinyconfig + parser estático;
-   objetivo `mem_mb ≤ 32`).
-5. **Densidad**: pool masivo desde snapshot + medición honesta en Pi y x86.
-6. **Modo push** (DNAT + trigger NFQUEUE + anti-DoS).
-7. **Puente serie ciego** (RS-485/Modbus RTU → vsock, daemon sin parser).
+1. **ARM64 spike** (existential risk: until a microVM boots on a Raspberry Pi 5,
+   the target hardware is theory).
+2. **Fine-grained egress** (a VM can only talk to its sensor IP:port) —
+   prerequisite of the pull mode.
+3. **Transactional pull orchestrator v1** (restore→poll→validate→extract→destroy,
+   with the 3 lifecycle modes) — the product MVP, developable on x86.
+4. **Ultra-minimal sensor image** (tinyconfig kernel + static parser; target
+   `mem_mb ≤ 32`).
+5. **Density**: mass pool from snapshot + honest measurement on Pi and x86.
+6. **Push mode** (DNAT + NFQUEUE trigger + anti-DoS).
+7. **Blind serial bridge** (RS-485/Modbus RTU → vsock, a daemon with no parser).
 
-El hardening pendiente (Fase 4: validación cgroups/seccomp, soak test) **sigue
-vigente y sube de importancia** — en OT el argumento de venta es la garantía
-de aislamiento, y eso se demuestra con el modelo de amenaza + tests
-adversariales ya planeados.
+The pending hardening (Phase 4: cgroups/seccomp validation, soak test) **remains
+in force and rises in importance** — in OT the selling point is the isolation
+guarantee, and that's demonstrated with the threat model + adversarial tests
+already planned.
 
 ---
 
-## Referencias clave
+## Key references
 
 - [Firecracker GitHub](https://github.com/firecracker-microvm/firecracker)
 - [firecracker-go-sdk](https://github.com/firecracker-microvm/firecracker-go-sdk)
 - [Firecracker Getting Started](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
 - [Jailer documentation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)
-- [firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd) (referencia arquitectural)
+- [firecracker-containerd](https://github.com/firecracker-microvm/firecracker-containerd) (architectural reference)

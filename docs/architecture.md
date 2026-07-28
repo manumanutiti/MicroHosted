@@ -1,6 +1,6 @@
-# Arquitectura — MicroHosted
+# Architecture — MicroHosted
 
-## Flujo de una microVM (etapa 1)
+## Flow of a microVM (stage 1)
 
 ```
 CLI / API
@@ -8,136 +8,134 @@ CLI / API
     ▼
 vm.Manager
     │
-    ├─► storage.CloneRootfs # clona el golden (reflink CoW) y lo agranda a disk_mb
+    ├─► storage.CloneRootfs # clones the golden (reflink CoW) and grows it to disk_mb
     │       └─► /var/lib/microhosted/store/<id>.ext4
     │
-    ├─► jailer.Runner      # crea el chroot, lanza jailer → firecracker
+    ├─► jailer.Runner      # creates the chroot, launches jailer → firecracker
     │       └─► /var/lib/microhosted/store/jailer/firecracker/<id>/root/
     │
-    ├─► firecracker.Client # habla con el socket Unix dentro del chroot
+    ├─► firecracker.Client # talks to the Unix socket inside the chroot
     │       PUT /boot-source
     │       PUT /drives/rootfs
     │       PUT /machine-config
     │       PUT /network-interfaces/eth0
     │       PUT /actions { InstanceStart }
     │
-    └─► network.Manager    # red segmentada: bridge por red + TAP enslavado
-            ip tuntap add tapN mode tap        # TAP sin IP
-            ip link set tapN master mhbr<red>  # enslavado al bridge de la red
+    └─► network.Manager    # segmented networking: one bridge per network + enslaved TAP
+            ip tuntap add tapN mode tap        # TAP without IP
+            ip link set tapN master mhbr<net>  # enslaved to the network's bridge
             ip link set tapN up
-            # IP del guest la fija Firecracker (estática, vía kernel); nftables
-            # aísla: drop guest→host, drop cross-segment, egress NAT opcional.
+            # The guest IP is set by Firecracker (static, via kernel); nftables
+            # isolates: drop guest→host, drop cross-segment, optional egress NAT.
 ```
 
-(El modelo `/30` punto-a-punto original, con el host como gateway de cada VM, se
-retiró en la Fase 1 — ver `docs/networking.md`.)
+(The original point-to-point `/30` model, with the host as the gateway for every
+VM, was retired in Phase 1 — see `docs/networking.md`.)
 
-## Comunicación host ↔ guest
+## Host ↔ guest communication
 
-- **Red**: TAP device → IP estática → SSH/HTTP normal
-- **Comandos/resultados**: vsock (virtio-vsock)
-  - Guest expone un servidor en `VSOCK_PORT`
-  - Host conecta al CID de la VM
-  - No usa red IP — funciona aunque no haya red configurada
+- **Networking**: TAP device → static IP → regular SSH/HTTP
+- **Commands/results**: vsock (virtio-vsock)
+  - The guest exposes a server on `VSOCK_PORT`
+  - The host connects to the VM's CID
+  - It doesn't use IP networking — it works even with no network configured
 
-## Estado de una VM
+## VM state
 
 ```
 creating → running → paused → running
                   └──────────────────→ stopped
 ```
 
-## Almacenamiento: store copy-on-write
+## Storage: copy-on-write store
 
-Todos los discos de VM viven en un **store btrfs con copy-on-write** montado en
-`/var/lib/microhosted/store` (un loopback btrfs que `setup-host.sh` provisiona en cualquier
-host, sin reparticionar). Clonar un golden es un reflink instantáneo: cada VM
-comparte los bloques del golden y solo cuesta lo que escribe (medido: ~236 KiB
-por clon de 1GB, no 300MB).
+Every VM disk lives in a **btrfs copy-on-write store** mounted at
+`/var/lib/microhosted/store` (a btrfs loopback that `setup-host.sh` provisions on
+any host, without repartitioning). Cloning a golden is an instant reflink: each
+VM shares the golden's blocks and only costs what it writes (measured: ~236 KiB
+per 1GB clone, not 300MB).
 
-`storage.CloneRootfs` clona el golden y lo agranda al `disk_mb` del template con
-`resize2fs` (offline: los goldens son ext4 sobre el dispositivo entero, sin tabla
-de particiones, así que basta `truncate` + `resize2fs`), para que el guest tenga
-espacio libre — un golden va casi lleno y sin esto un `apt install` se queda sin
-disco.
+`storage.CloneRootfs` clones the golden and grows it to the template's `disk_mb`
+with `resize2fs` (offline: goldens are ext4 over the whole device, with no
+partition table, so `truncate` + `resize2fs` is enough), so the guest has free
+space — a golden ships nearly full and, without this, an `apt install` runs out
+of disk.
 
-**Invariante clave**: todo lo que el daemon clona o hardlinka comparte este mismo
-filesystem, porque ni el reflink (`cp --reflink`) ni el hardlink cruzan
-filesystems en Linux. Por eso goldens, kernels y el chroot del Jailer viven todos
-bajo el store:
+**Key invariant**: everything the daemon clones or hardlinks shares this same
+filesystem, because neither reflink (`cp --reflink`) nor hardlink cross
+filesystems on Linux. That's why goldens, kernels, and the Jailer chroot all
+live under the store:
 
 ```
 /var/lib/microhosted/store/            (btrfs, CoW)
-├── rootfs/                   # goldens (fuente del reflink)
-├── kernels/                  # kernels (Jailer los hardlinka al chroot)
-├── jailer/                   # base del chroot del Jailer (chroot-base derivado)
+├── rootfs/                   # goldens (reflink source)
+├── kernels/                  # kernels (Jailer hardlinks them into the chroot)
+├── jailer/                   # Jailer chroot base (derived chroot-base)
 │   └── firecracker/<vm-id>/root/
-│       ├── firecracker          # hard link al binario
-│       ├── firecracker.socket   # socket de la API REST
-│       ├── vmlinux              # hard link al kernel del store
-│       └── <id>.ext4            # hard link al clon (MISMO inodo → Stop conserva disco)
-├── snapshots/                # snapshots (memoria+estado+disco congelados)
+│       ├── firecracker          # hard link to the binary
+│       ├── firecracker.socket   # REST API socket
+│       ├── vmlinux              # hard link to the store kernel
+│       └── <id>.ext4            # hard link to the clone (SAME inode → Stop keeps the disk)
+├── snapshots/                # snapshots (frozen memory+state+disk)
 │   └── <snap-id>/
-│       ├── vmstate              # estado de dispositivos/vCPUs (Firecracker)
-│       ├── mem                  # memoria del guest (los restores la mapean CoW)
-│       └── disk.ext4            # reflink del disco tomado con la VM pausada
-└── <id>.ext4                 # clon de la VM (reflink del golden, agrandado)
+│       ├── vmstate              # device/vCPU state (Firecracker)
+│       ├── mem                  # guest memory (restores map it CoW)
+│       └── disk.ext4            # reflink of the disk taken with the VM paused
+└── <id>.ext4                 # VM clone (reflink of the golden, grown)
 ```
 
-Jailer hace chroot a `root/` antes de ejecutar Firecracker; el proceso resultante
-no ve nada fuera de ese directorio. El `--chroot-base` del daemon **deriva de
-`--instances-dir`** (`<instances>/jailer`) precisamente para garantizar el mismo
-FS. Ver `docs/layers.md` (L3) para el detalle.
+Jailer chroots into `root/` before executing Firecracker; the resulting process
+sees nothing outside that directory. The daemon's `--chroot-base` **derives from
+`--instances-dir`** (`<instances>/jailer`) precisely to guarantee the same FS.
+See `docs/layers.md` (L3) for the detail.
 
-## Snapshots y bifurcación
+## Snapshots and forking
 
-**Crear** (`vm.Manager.Snapshot`): pausa la VM (`PATCH /vm`), le pide a
-Firecracker un snapshot Full (`PUT /snapshot/create` — el proceso está
-chrooteado, así que escribe vmstate+mem dentro de su propio chroot), el daemon
-los mueve con `os.Rename` (mismo FS ⇒ gratis) a `snapshots/<sid>/`, reflinka el
-disco **aún en pausa** (memoria y disco quedan mutuamente consistentes) y
-reanuda. Estas llamadas van directas al socket UDS (`internal/firecracker/rawapi.go`),
-no por el SDK: así funcionan igual sobre VMs adoptadas tras un reinicio del
-daemon (sin handle del SDK) y dan acceso a campos que el SDK v1.0.0 no conoce.
+**Create** (`vm.Manager.Snapshot`): pauses the VM (`PATCH /vm`), asks Firecracker
+for a Full snapshot (`PUT /snapshot/create` — the process is chrooted, so it
+writes vmstate+mem inside its own chroot), the daemon moves them with `os.Rename`
+(same FS ⇒ free) to `snapshots/<sid>/`, reflinks the disk **while still paused**
+(memory and disk stay mutually consistent), and resumes. These calls go straight
+to the UDS socket (`internal/firecracker/rawapi.go`), not through the SDK: this
+way they work the same on VMs adopted after a daemon restart (no SDK handle) and
+give access to fields the SDK v1.0.0 doesn't know about.
 
-**Restaurar/bifurcar** (`vm.Manager.Fork` / `Restore`): se lanza un Firecracker
-nuevo vía Jailer **sin boot** — se sustituye el pipeline de arranque del SDK por
-StartVMM + un handler propio (`internal/firecracker.LaunchFromSnapshot`) que
-hardlinka vmstate/mem/disco al chroot recién creado y hace `PUT /snapshot/load`
-con `resume_vm`. El mem se mapea copy-on-write: N VMs pueden restaurar del
-mismo snapshot a la vez sin copiarlo.
+**Restore/fork** (`vm.Manager.Fork` / `Restore`): a new Firecracker is launched
+via Jailer **without boot** — the SDK's boot pipeline is replaced by StartVMM + a
+custom handler (`internal/firecracker.LaunchFromSnapshot`) that hardlinks
+vmstate/mem/disk into the freshly created chroot and does `PUT /snapshot/load`
+with `resume_vm`. The mem is mapped copy-on-write: N VMs can restore from the
+same snapshot at once without copying it.
 
-**TAP y versión de Firecracker**: el vmstate recuerda el nombre del TAP
-original, y `network_overrides` (el campo de `/snapshot/load` que permite
-remapear la NIC a otro TAP) **solo existe desde Firecracker v1.12.0**. El
-daemon sondea la versión del binario al arrancar
-(`firecracker.SupportsNetworkOverrides`) y adapta la estrategia:
-- **Restore in-place**: recrea el TAP con su nombre original → nunca necesita
-  override → funciona en cualquier versión.
-- **Fork en FC ≥1.12**: TAP propio (`tap<nuevo-id>`) + override. Sin
-  restricciones.
-- **Fork en FC <1.12**: reutiliza el nombre de TAP original del snapshot si
-  está libre (original destruida/parada); si está ocupado → 409 explicando que
-  los forks simultáneos requieren actualizar Firecracker. Ojo al actualizar:
-  el formato de snapshot va ligado a la versión de FC — los snapshots
-  existentes hay que recrearlos.
+**TAP and Firecracker version**: the vmstate remembers the original TAP's name,
+and `network_overrides` (the `/snapshot/load` field that lets you remap the NIC
+to another TAP) **only exists from Firecracker v1.12.0 onward**. The daemon
+probes the binary's version at startup (`firecracker.SupportsNetworkOverrides`)
+and adapts the strategy:
+- **In-place restore**: recreates the TAP with its original name → never needs an
+  override → works on any version.
+- **Fork on FC ≥1.12**: its own TAP (`tap<new-id>`) + override. No restrictions.
+- **Fork on FC <1.12**: reuses the snapshot's original TAP name if it's free
+  (original destroyed/stopped); if it's taken → 409 explaining that simultaneous
+  forks require upgrading Firecracker. Careful when upgrading: the snapshot format
+  is tied to the FC version — existing snapshots have to be recreated.
 
-Medido en hardware (2026-07-04, host FC 1.10.1): snapshot 271ms, restore
-in-place 109ms, fork 113ms (endpoint completo, VM de 128MB).
+Measured on hardware (2026-07-04, host FC 1.10.1): snapshot 271ms, in-place
+restore 109ms, fork 113ms (full endpoint, 128MB VM).
 
-**Identidad congelada**: la IP/MAC del guest viven en la memoria snapshoteada y
-no se pueden cambiar al restaurar. Por eso el fork tiene dos modos: unirse a la
-red de origen reclamando la IP exacta del snapshot (reserva estricta,
-`ClaimVM` — 409 si está ocupada), o `quarantine` (TAP sin bridge: el guest cree
-tener red, todo muere en el host, acceso solo por vsock — N forks simultáneos).
+**Frozen identity**: the guest's IP/MAC live in the snapshotted memory and can't
+be changed on restore. That's why a fork has two modes: join the origin network
+by reclaiming the snapshot's exact IP (strict reservation, `ClaimVM` — 409 if
+taken), or `quarantine` (a TAP with no bridge: the guest thinks it has a network,
+everything dies at the host, access only over vsock — N simultaneous forks).
 
-## Decisiones de diseño
+## Design decisions
 
-| Decisión | Alternativa descartada | Razón |
+| Decision | Rejected alternative | Reason |
 |---|---|---|
-| Go + firecracker-go-sdk | Python / Rust desde cero | SDK oficial mantenido, evita escribir el cliente HTTP |
-| SQLite primero | Postgres desde el inicio | Un solo host no necesita Postgres; migrar cuando llegue multi-host |
-| IP estática (etapa 1) | CNI / IPAM | CNI añade complejidad sin aportar nada en un solo host |
-| vsock para host↔guest | SSH para todo | vsock no necesita IP configurada, latencia menor, patrón de la industria |
-| Store btrfs CoW (loopback) | copia completa en ext4 | clones = deltas, no rootfs enteros; loopback = agnóstico al host, sin reparticionar |
-| Golden/kernel/chroot en el store | rutas dispersas (/srv/jailer, images/kernels) | reflink y hardlink no cruzan FS; todo en un FS o el clon/arranque fallan |
+| Go + firecracker-go-sdk | Python / Rust from scratch | Maintained official SDK, avoids writing the HTTP client |
+| SQLite first | Postgres from the start | A single host doesn't need Postgres; migrate once multi-host arrives |
+| Static IP (stage 1) | CNI / IPAM | CNI adds complexity without contributing anything on a single host |
+| vsock for host↔guest | SSH for everything | vsock needs no configured IP, lower latency, industry pattern |
+| btrfs CoW store (loopback) | full copy on ext4 | clones = deltas, not whole rootfs; loopback = host-agnostic, no repartitioning |
+| Golden/kernel/chroot in the store | scattered paths (/srv/jailer, images/kernels) | reflink and hardlink don't cross FS; everything on one FS or the clone/boot fails |

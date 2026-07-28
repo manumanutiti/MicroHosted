@@ -22,47 +22,47 @@ import (
 func main() {
 	def := jailer.DefaultDefaults()
 
-	addr := flag.String("addr", ":8080", "dirección donde escucha la API HTTP")
-	catalogPath := flag.String("catalog", "images/catalog.json", "ruta al catálogo de plantillas (JSON)")
-	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "store de discos (btrfs CoW): clones, goldens, kernels y chroot del Jailer. Fuera del repo a propósito: son datos de runtime de root, no fuentes")
-	dbPath := flag.String("db", "images/microhosted.db", "ruta a la base de datos SQLite de estado")
-	chrootBase := flag.String("chroot-base", "", "directorio base de chroot de Jailer (por defecto <instances-dir>/jailer)")
-	jailerBinary := flag.String("jailer-binary", def.JailerBinary, "ruta al binario jailer")
-	execFile := flag.String("exec-file", def.ExecFile, "ruta al binario firecracker")
-	uid := flag.Int("jailer-uid", def.UID, "uid con el que Jailer ejecuta firecracker")
-	gid := flag.Int("jailer-gid", def.GID, "gid con el que Jailer ejecuta firecracker")
-	cgroupVersion := flag.String("cgroup-version", def.CgroupVersion, "versión de cgroup que usa Jailer (autodetectada; solo forzarla si hace falta)")
+	addr := flag.String("addr", ":8080", "address the HTTP API listens on")
+	catalogPath := flag.String("catalog", "images/catalog.json", "path to the template catalog (JSON)")
+	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "disk store (btrfs CoW): clones, goldens, kernels, and the Jailer chroot. Outside the repo on purpose: it's root-owned runtime data, not sources")
+	dbPath := flag.String("db", "images/microhosted.db", "path to the SQLite state database")
+	chrootBase := flag.String("chroot-base", "", "Jailer chroot base directory (default <instances-dir>/jailer)")
+	jailerBinary := flag.String("jailer-binary", def.JailerBinary, "path to the jailer binary")
+	execFile := flag.String("exec-file", def.ExecFile, "path to the firecracker binary")
+	uid := flag.Int("jailer-uid", def.UID, "uid Jailer runs firecracker as")
+	gid := flag.Int("jailer-gid", def.GID, "gid Jailer runs firecracker as")
+	cgroupVersion := flag.String("cgroup-version", def.CgroupVersion, "cgroup version Jailer uses (auto-detected; only force it if needed)")
 	flag.Parse()
 
-	// El chroot del Jailer DEBE vivir en el mismo filesystem que los clones de
-	// rootfs: Jailer hardlinka el rootfs (y el kernel) dentro del chroot, y un
-	// hardlink no cruza dispositivos (EXDEV). Con el store CoW los clones están
-	// en un btrfs aparte, así que el chroot deriva por defecto de --instances-dir
-	// (queda como <instances-dir>/jailer, mismo FS) en vez del histórico
-	// /srv/jailer, que estaría en otro filesystem y rompería el arranque. El
-	// kernel del catálogo debe estar en ese mismo FS por la misma razón (ver
-	// scripts/setup-host.sh, que lo deja en <instances-dir>/kernels).
-	// Resolvemos a rutas absolutas para que los hardlinks no dependan del cwd.
+	// The Jailer chroot MUST live on the same filesystem as the rootfs clones:
+	// Jailer hardlinks the rootfs (and the kernel) into the chroot, and a
+	// hardlink doesn't cross devices (EXDEV). With the CoW store the clones are
+	// on a separate btrfs, so the chroot derives by default from --instances-dir
+	// (ends up as <instances-dir>/jailer, same FS) instead of the historical
+	// /srv/jailer, which would be on another filesystem and break the boot. The
+	// catalog's kernel must be on that same FS for the same reason (see
+	// scripts/setup-host.sh, which places it in <instances-dir>/kernels).
+	// We resolve to absolute paths so the hardlinks don't depend on the cwd.
 	absInstances, err := filepath.Abs(*instancesDir)
 	if err != nil {
-		log.Fatalf("resolviendo instances-dir %s: %v", *instancesDir, err)
+		log.Fatalf("resolving instances-dir %s: %v", *instancesDir, err)
 	}
 	*instancesDir = absInstances
 	if *chrootBase == "" {
 		*chrootBase = filepath.Join(absInstances, "jailer")
 	}
 	if err := os.MkdirAll(*chrootBase, 0o755); err != nil {
-		log.Fatalf("creando chroot base %s: %v", *chrootBase, err)
+		log.Fatalf("creating chroot base %s: %v", *chrootBase, err)
 	}
 
 	catalog, err := storage.LoadCatalog(*catalogPath)
 	if err != nil {
-		log.Fatalf("cargando catálogo: %v", err)
+		log.Fatalf("loading catalog: %v", err)
 	}
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
-		log.Fatalf("abriendo base de datos de estado: %v", err)
+		log.Fatalf("opening state database: %v", err)
 	}
 	defer st.Close()
 
@@ -80,7 +80,7 @@ func main() {
 	// so VMs adopted just below can re-reserve their IPs on live networks.
 	netmgr := network.NewManager(st)
 	if err := netmgr.Reconcile(); err != nil {
-		log.Fatalf("reconciliando redes: %v", err)
+		log.Fatalf("reconciling networks: %v", err)
 	}
 
 	// Warn loudly, once, if the instances store can't do copy-on-write clones.
@@ -89,12 +89,12 @@ func main() {
 	// scripts/setup-host.sh. Just a warning, not fatal: full-copy clones still
 	// work, they just don't scale.
 	if err := os.MkdirAll(*instancesDir, 0o755); err != nil {
-		log.Fatalf("creando directorio de instancias %s: %v", *instancesDir, err)
+		log.Fatalf("creating instances directory %s: %v", *instancesDir, err)
 	}
 	if !storage.SupportsReflink(*instancesDir) {
-		log.Printf("AVISO: el store de instancias %s NO soporta copy-on-write (reflink): "+
-			"cada VM será una COPIA COMPLETA de su rootfs y el disco se llenará rápido. "+
-			"Provisiona un store CoW con scripts/setup-host.sh.", *instancesDir)
+		log.Printf("WARNING: the instances store %s does NOT support copy-on-write (reflink): "+
+			"every VM will be a FULL COPY of its rootfs and the disk will fill up fast. "+
+			"Provision a CoW store with scripts/setup-host.sh.", *instancesDir)
 	}
 
 	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)
@@ -103,7 +103,7 @@ func main() {
 	// the volume index must already be populated when Reconcile runs.
 	vols, err := st.ListVolumes()
 	if err != nil {
-		log.Fatalf("cargando volúmenes persistidos: %v", err)
+		log.Fatalf("loading persisted volumes: %v", err)
 	}
 	mgr.LoadVolumes(vols)
 
@@ -113,7 +113,7 @@ func main() {
 	// healthy adopted VM's networking.
 	records, err := st.ListVMs()
 	if err != nil {
-		log.Fatalf("cargando estado persistido: %v", err)
+		log.Fatalf("loading persisted state: %v", err)
 	}
 	keepTaps := mgr.Reconcile(records)
 
@@ -121,14 +121,14 @@ func main() {
 	// dropping any whose files were removed out-of-band.
 	snaps, err := st.ListSnapshots()
 	if err != nil {
-		log.Fatalf("cargando snapshots persistidos: %v", err)
+		log.Fatalf("loading persisted snapshots: %v", err)
 	}
 	mgr.LoadSnapshots(snaps)
 
 	// Remove tap devices left by an uncleanly-terminated previous run, except
 	// those belonging to VMs we just adopted — see network.SweepOrphans.
 	if err := network.SweepOrphans(keepTaps); err != nil {
-		log.Fatalf("limpiando tap devices huérfanos: %v", err)
+		log.Fatalf("cleaning up orphaned tap devices: %v", err)
 	}
 
 	// The observability report shows these paths to an operator working
@@ -147,9 +147,9 @@ func main() {
 	})
 
 	go func() {
-		log.Printf("microhosted escuchando en %s", *addr)
+		log.Printf("microhosted listening on %s", *addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("servidor HTTP: %v", err)
+			log.Fatalf("HTTP server: %v", err)
 		}
 	}()
 
@@ -157,10 +157,10 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	log.Println("apagando...")
+	log.Println("shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("error al apagar el servidor: %v", err)
+		log.Printf("error shutting down the server: %v", err)
 	}
 }

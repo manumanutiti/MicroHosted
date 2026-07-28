@@ -1,31 +1,30 @@
-# Gateway de aislamiento IoT/OT
+# IoT/OT isolation gateway
 
-> Documento de diseño del pivote de nicho (2026-07-05). Contexto estratégico en
-> `PROJECT.md` → "Pivote de nicho". Este documento fija el patrón, mapea qué
-> existe ya en el código, enumera los huecos y define el plan de sesiones con
-> criterios de éxito.
+> Design document for the niche pivot (2026-07-05). Strategic context in
+> `PROJECT.md` → "Niche pivot". This document fixes the pattern, maps what
+> already exists in the code, enumerates the gaps, and defines the session plan
+> with success criteria.
 
-## El problema
+## The problem
 
-En un gateway edge tradicional (el concentrador local de decenas de sensores:
-ESP32, cámaras, PLCs), la superficie de ingesta vive en el host:
+In a traditional edge gateway (the local concentrator for dozens of sensors:
+ESP32, cameras, PLCs), the ingestion surface lives on the host:
 
-- El broker/parser (MQTT, HTTP, CoAP, Modbus) corre en espacio de usuario del
-  host. Una trama maliciosa que explote el parser toma el gateway entero — y
-  desde ahí, la planta.
-- Los contenedores (Greengrass, balena, KubeEdge) no arreglan esto: comparten
-  kernel. Una escalada de privilegios de kernel compromete todo.
-- Las VMs tradicionales (QEMU) no caben: demasiada RAM/disco para un gateway
-  de 2-8GB.
+- The broker/parser (MQTT, HTTP, CoAP, Modbus) runs in the host's userspace. A
+  malicious frame that exploits the parser takes the whole gateway — and from
+  there, the plant.
+- Containers (Greengrass, balena, KubeEdge) don't fix this: they share a kernel.
+  A kernel privilege escalation compromises everything.
+- Traditional VMs (QEMU) don't fit: too much RAM/disk for a 2-8GB gateway.
 
-## El patrón: proxy de telemetría aislado
+## The pattern: isolated telemetry proxy
 
-Una microVM-parser desechable por sensor (o por grupo pequeño de sensores).
-El host **no expone puertos hacia los sensores y no parsea ningún protocolo**;
-los datos ya validados salen de la VM por vsock.
+One disposable parser-microVM per sensor (or per small group of sensors). The
+host **exposes no ports toward the sensors and parses no protocol**; the
+already-validated data leaves the VM over vsock.
 
 ```
-[ Sensores físicos / red ]
+[ Physical sensors / network ]
        │            │
        ▼            ▼
   ┌────────────────────────────────────────────────────┐
@@ -33,238 +32,236 @@ los datos ya validados salen de la VM por vsock.
   │                                                    │
   │  ┌───────────────┐  ┌───────────────┐              │
   │  │ microVM 1     │  │ microVM 2     │   … × N      │
-  │  │ parser MQTT   │  │ parser Modbus │              │
+  │  │ MQTT parser   │  │ Modbus parser │              │
   │  └───────┬───────┘  └───────┬───────┘              │
   │          │ vsock            │ vsock                │
   │          ▼                  ▼                      │
   │  ┌──────────────────────────────────────────────┐  │
-  │  │ microhosted daemon (sin listeners hacia OT)  │  │
+  │  │ microhosted daemon (no listeners toward OT)  │  │
   │  └──────────────────────┬───────────────────────┘  │
   └─────────────────────────┼──────────────────────────┘
                             ▼
-                   [ BD local / nube ]
+                   [ local DB / cloud ]
 ```
 
-Garantía: si un sensor comprometido explota su parser, compromete una VM de
-~32MB, sin red hacia el host (guest→host ya es DROP por diseño), que se
-regenera desde snapshot en ~100ms (medido: restore 109ms, fork 113ms).
+Guarantee: if a compromised sensor exploits its parser, it compromises a ~32MB
+VM, with no network to the host (guest→host is already DROP by design), which
+regenerates from a snapshot in ~100ms (measured: restore 109ms, fork 113ms).
 
-## Modos de ingesta
+## Ingestion modes
 
-### Modo pull (primero) — el nativo de OT
+### Pull mode (first) — the OT-native one
 
-La VM interroga al sensor; el sensor nunca inicia nada. **Modbus, OPC-UA,
-M-Bus y la mayoría de protocolos industriales ya son maestro/esclavo con el
-gateway como maestro** — no imponemos un modelo raro, ponemos hipervisor
-debajo del flujo que las plantas ya usan.
+The VM interrogates the sensor; the sensor never initiates anything. **Modbus,
+OPC-UA, M-Bus, and most industrial protocols are already master/slave with the
+gateway as master** — we're not imposing a strange model, we're putting a
+hypervisor underneath the flow that plants already use.
 
-Ciclo: `restore desde snapshot → la VM interroga a SU sensor → valida/parsea
-→ entrega resultado por vsock → destroy`.
+Cycle: `restore from snapshot → the VM interrogates ITS sensor → validate/parse
+→ deliver the result over vsock → destroy`.
 
-- No existe camino de entrada en ningún momento: ni listener, ni DNAT, nada.
-- Requiere **egress de grano fino**: la VM solo puede alcanzar
-  `IP_sensor:puerto`, nada más (hoy egress es un booleano por red — hueco #1).
-- La extracción usa el canal ya existente (`vsock.Exec`/`GetFileStream`,
-  host→guest): el host *recoge* el resultado, el guest no puede iniciar nada
-  hacia el host. Coherente con el modelo de seguridad actual.
+- There's no inbound path at any moment: no listener, no DNAT, nothing.
+- It requires **fine-grained egress**: the VM can only reach `sensor_IP:port`,
+  nothing else (today egress is a per-network boolean — gap #1).
+- Extraction uses the existing channel (`vsock.Exec`/`GetFileStream`,
+  host→guest): the host *collects* the result, the guest can't initiate anything
+  toward the host. Consistent with the current security model.
 
-### Modo push (después) — para MQTT/HTTP
+### Push mode (later) — for MQTT/HTTP
 
-El sensor inicia la conexión y la VM debe existir para recibirla. El problema:
-algo tiene que ver llegar la conexión antes de que la VM exista, **sin parsear
-un solo byte**:
+The sensor initiates the connection and the VM must exist to receive it. The
+problem: something has to see the connection arrive before the VM exists,
+**without parsing a single byte**:
 
-1. nftables marca el primer SYN hacia el puerto de ingesta y lo entrega al
-   daemon vía NFQUEUE/NFLOG (metadatos L3/L4 del kernel, cero payload).
-2. El daemon restaura la VM del sensor (por IP origen) e instala el DNAT.
-3. El SYN retransmitido del sensor (~1s, automático en TCP) aterriza ya dentro
-   de la VM. Los bytes del payload nunca tocan espacio de usuario del host.
+1. nftables marks the first SYN toward the ingestion port and hands it to the
+   daemon via NFQUEUE/NFLOG (kernel L3/L4 metadata, zero payload).
+2. The daemon restores the sensor's VM (by source IP) and installs the DNAT.
+3. The sensor's retransmitted SYN (~1s, automatic in TCP) lands inside the VM.
+   The payload bytes never touch the host's userspace.
 
-Latencia efectiva ~1s en frío — irrelevante para telemetría cada 30s. Para
-sensores de alta frecuencia: VM caliente por sensor (modo "por anomalía").
+Effective latency ~1s when cold — irrelevant for telemetry every 30s. For
+high-frequency sensors: a hot VM per sensor ("per anomaly" mode).
 
-**Anti-DoS obligatorio**: un atacante que spamea SYNs provoca tormenta de VMs.
-Tope global de VMs concurrentes + rate-limit por IP origen + circuit breaker
-por sensor (si su VM muere N veces seguidas, cuarentena y alerta — eso ES la
-detección de compromiso).
+**Anti-DoS mandatory**: an attacker spamming SYNs triggers a VM storm. A global
+cap on concurrent VMs + per-source-IP rate limit + per-sensor circuit breaker
+(if its VM dies N times in a row, quarantine and alert — that IS the compromise
+detection).
 
-### Cable físico (RS-485 / Modbus RTU / USB serie)
+### Physical wire (RS-485 / Modbus RTU / USB serial)
 
-Firecracker no hace passthrough de dispositivos de caracteres. Solución:
-**puente serie ciego** — daemon del host que copia bytes crudos
-`/dev/ttyUSB0 ↔ vsock` de la VM correspondiente, sin ninguna lógica de
-protocolo (cero superficie de parsing en el host). El parser Modbus corre
-dentro de la VM. El `dial()` + handshake CONNECT de `internal/vsock` ya es la
-mitad del trabajo.
+Firecracker doesn't do character-device passthrough. Solution: a **blind serial
+bridge** — a host daemon that copies raw bytes `/dev/ttyUSB0 ↔ vsock` of the
+corresponding VM, with no protocol logic whatsoever (zero parsing surface on the
+host). The Modbus parser runs inside the VM. The `dial()` + CONNECT handshake of
+`internal/vsock` is already half the work.
 
-## Ciclo de vida transaccional: el dial del producto
+## Transactional lifecycle: the product's dial
 
-Los tres modos usan la misma maquinaria (snapshot/restore/kill ya validada en
-hardware); el operador elige el punto de la curva seguridad/coste por sensor:
+The three modes use the same machinery (snapshot/restore/kill already validated
+on hardware); the operator picks the point on the security/cost-per-sensor
+curve:
 
-| Modo | Vida de la VM | Cuándo |
+| Mode | VM lifetime | When |
 |---|---|---|
-| Por transacción | restore → 1 lectura → destroy | datos críticos o lentos (≥30s entre lecturas) |
-| Por ventana | vive N segundos, procesa el lote, destroy | telemetría frecuente |
-| Por anomalía | persistente; reset a snapshot programado (higiene: cada N horas) o reactivo (watchdog) | alta frecuencia / baja latencia |
+| Per transaction | restore → 1 read → destroy | critical or slow data (≥30s between reads) |
+| Per window | lives N seconds, processes the batch, destroy | frequent telemetry |
+| Per anomaly | persistent; reset to snapshot scheduled (hygiene: every N hours) or reactive (watchdog) | high frequency / low latency |
 
-Regla de dimensionado: a 1 lectura/s × 100 sensores, "por transacción" son 100
-restores/s — churn absurdo; ahí se usa ventana o anomalía. El framing de
-producto: **el parser es desechable; el compromiso no puede persistir** —
-ningún contenedor ni edge-stack actual regenera el aislamiento, solo lo
-mantienen.
+Sizing rule: at 1 read/s × 100 sensors, "per transaction" is 100 restores/s —
+absurd churn; there you use window or anomaly. The product framing: **the parser
+is disposable; the compromise can't persist** — no current container or
+edge-stack regenerates isolation, they only maintain it.
 
-El watchdog del modo reactivo cierra el bucle "aislar comportamientos":
-VM que no responde al poll vsock / excede su cgroup / se comporta raro →
-`Kill` + restore a limpio + evento de alerta. Todo el material existe; falta
-el controlador.
+The reactive mode's watchdog closes the "isolate behaviors" loop: a VM that
+doesn't respond to the vsock poll / exceeds its cgroup / behaves strangely →
+`Kill` + restore to clean + alert event. All the material exists; the controller
+is missing.
 
-## Densidad: la aritmética honesta
+## Density: the honest arithmetic
 
-El techo no es CPU (sensores casi siempre idle + `cpu.max` por VM ya
-implementado) ni disco (reflink: 236KiB exclusivos medidos por clon). Es
-**RAM del guest**. Y ojo: los "<5MB por microVM" de Firecracker son el
-overhead del VMM, no la RAM del guest.
+The ceiling isn't CPU (sensors are almost always idle + `cpu.max` per VM already
+implemented) or disk (reflink: 236KiB exclusive measured per clone). It's
+**guest RAM**. And note: Firecracker's "<5MB per microVM" is the VMM overhead,
+not the guest RAM.
 
-| Nivel de ingeniería | RAM incremental/VM | Pi 5 8GB (~7GB útiles) |
+| Engineering level | Incremental RAM/VM | Pi 5 8GB (~7GB usable) |
 |---|---|---|
-| Imagen actual (ubuntu, 128MB) | ~130-190MB | ~40-50 |
-| Kernel tinyconfig + init estático + parser | ~20-32MB | ~200-300 |
-| + restore masivo desde snapshot compartido | ~5-15MB sucios | ~300-500 |
+| Current image (ubuntu, 128MB) | ~130-190MB | ~40-50 |
+| tinyconfig kernel + static init + parser | ~20-32MB | ~200-300 |
+| + mass restore from a shared snapshot | ~5-15MB dirty | ~300-500 |
 
-La palanca del tercer nivel **ya está implementada**: el fichero de memoria
-del snapshot se restaura con backend File = mapeo copy-on-write
-(`internal/firecracker/machine.go`) — N VMs restauradas del mismo snapshot
-comparten las páginas no escritas en page cache; cada una paga solo lo que
-ensucia. Es el mismo mecanismo de densidad de E2B/Lambda.
+The third level's lever is **already implemented**: the snapshot's memory file
+is restored with the File backend = copy-on-write mapping
+(`internal/firecracker/machine.go`) — N VMs restored from the same snapshot
+share the unwritten pages in page cache; each pays only for what it dirties. It's
+the same density mechanism as E2B/Lambda.
 
-Cuellos de botella conocidos del camino de creación en frío (no aplican al
-camino snapshot): `growRootfs` corre `e2fsck -fy` + `resize2fs` por clon
-(`internal/storage/clone.go`) — ya es no-op si `disk_mb` no crece, así que las
-plantillas sensor deben venir pre-dimensionadas.
+Known bottlenecks of the cold-creation path (they don't apply to the snapshot
+path): `growRootfs` runs `e2fsck -fy` + `resize2fs` per clone
+(`internal/storage/clone.go`) — it's already a no-op if `disk_mb` doesn't grow,
+so sensor templates should ship pre-sized.
 
-Todas las cifras de la tabla son **estimaciones a validar en hardware**
-(sesión IoT-5); no se prometen públicamente hasta medirlas.
+All the figures in the table are **estimates to be validated on hardware**
+(session IoT-5); they aren't promised publicly until measured.
 
-## Qué existe ya (mapeo al código)
+## What already exists (code mapping)
 
-| Necesidad del patrón | Estado | Dónde |
+| Pattern need | Status | Where |
 |---|---|---|
-| Aislamiento hipervisor + chroot/seccomp/cgroups | ✅ validado HW | motor entero; límites por VM en `internal/jailer/cgroup.go` |
-| VM sin red, solo vsock | ✅ validado HW | `no_network:true`; vsock incondicional (`internal/firecracker/machine.go`) |
-| Host interroga VMs por vsock (el bucle del gateway) | ✅ validado HW | `internal/vsock` Exec/PutFile/GetFileStream |
-| guest→host DROP, cross-segment DROP, egress deny por defecto | ✅ validado HW | `internal/network/nftables.go` |
-| Red/bridge/IPAM por segmento, MAC/IP únicas | ✅ validado HW | `internal/network`, `deriveMAC` |
-| Reset-a-limpio en ~100ms + fork | ✅ validado HW | snapshots (restore 109ms, fork 113ms) |
-| Memoria CoW compartida entre restores | ✅ implementado | backend File en restore |
-| Clones de disco a coste ~0 | ✅ validado HW | store btrfs + reflink |
-| Persistencia + reconcile (VMs sobreviven al daemon) | ✅ validado HW | `internal/store`, `Manager.Reconcile` |
-| Observabilidad (health, capacidad, RSS por VM) | ✅ código | `/v1/health`, `/v1/system` |
+| Hypervisor isolation + chroot/seccomp/cgroups | ✅ HW-validated | the whole engine; per-VM limits in `internal/jailer/cgroup.go` |
+| VM with no network, vsock only | ✅ HW-validated | `no_network:true`; unconditional vsock (`internal/firecracker/machine.go`) |
+| Host interrogates VMs over vsock (the gateway loop) | ✅ HW-validated | `internal/vsock` Exec/PutFile/GetFileStream |
+| guest→host DROP, cross-segment DROP, egress deny by default | ✅ HW-validated | `internal/network/nftables.go` |
+| Per-segment network/bridge/IPAM, unique MAC/IP | ✅ HW-validated | `internal/network`, `deriveMAC` |
+| Reset-to-clean in ~100ms + fork | ✅ HW-validated | snapshots (restore 109ms, fork 113ms) |
+| CoW memory shared across restores | ✅ implemented | File backend on restore |
+| Disk clones at ~0 cost | ✅ HW-validated | btrfs store + reflink |
+| Persistence + reconcile (VMs survive the daemon) | ✅ HW-validated | `internal/store`, `Manager.Reconcile` |
+| Observability (health, capacity, per-VM RSS) | ✅ code | `/v1/health`, `/v1/system` |
 
-## Huecos (lo que hay que construir)
+## Gaps (what needs to be built)
 
-1. **Egress de grano fino** — hoy `egress` es booleano por red. Falta: destino
-   permitido (`IP:puerto`) por red o por VM, renderizado en la tabla
-   `inet microhosted` (el diseño declarativo de `ApplyNftables` lo absorbe
-   limpio). Prerequisito del modo pull.
-2. **Orquestador transaccional** — el bucle restore→poll→validar→extraer→
-   destruir con los 3 modos de vida, watchdog, circuit breaker y tope global
-   de VMs. Es el producto; el motor son primitivas.
-3. **ARM64** — el pipeline de instalación e imágenes ya es multi-arch
-   (`make full-install` / `make prepare-image` detectan o aceptan
-   `ARCH=aarch64`: binarios FC, kernel del bucket CI, debootstrap arm64 con
-   mirror de ports, cross-build vía qemu-user-static). Lo que falta es la
-   **validación real**: nada se ha probado sobre KVM de una Pi. Riesgo
-   existencial del hardware objetivo.
-4. **Imagen sensor ultra-mínima** — kernel tinyconfig sin módulos + init
-   estático + runtime del parser. Objetivo: VM funcional con `mem_mb: 24-32`.
-   (Enlaza con las imágenes ultra-optimizadas ya pendientes.)
-5. **Modo push** — cadena `prerouting` DNAT (hoy no existe) + trigger
-   NFQUEUE/NFLOG + anti-DoS.
-6. **Puente serie ciego** — daemon `tty↔vsock` sin parser.
-7. **Despliegue masivo desde snapshot** — "levanta N workers de esta
-   plantilla" como operación de primera clase (hoy es N llamadas a fork).
+1. **Fine-grained egress** — today `egress` is a per-network boolean. Missing: an
+   allowed destination (`IP:port`) per network or per VM, rendered into the
+   `inet microhosted` table (the declarative design of `ApplyNftables` absorbs it
+   cleanly). Prerequisite of pull mode.
+2. **Transactional orchestrator** — the restore→poll→validate→extract→destroy
+   loop with the 3 lifetime modes, watchdog, circuit breaker, and global VM cap.
+   It's the product; the engine is primitives.
+3. **ARM64** — the install and image pipeline is already multi-arch
+   (`make full-install` / `make prepare-image` detect or accept `ARCH=aarch64`:
+   FC binaries, kernel from the CI bucket, arm64 debootstrap with the ports
+   mirror, cross-build via qemu-user-static). What's missing is the **real
+   validation**: nothing has been tested on a Pi's KVM. Existential risk of the
+   target hardware.
+4. **Ultra-minimal sensor image** — tinyconfig kernel without modules + static
+   init + the parser runtime. Target: a functional VM with `mem_mb: 24-32`.
+   (Ties into the already-pending ultra-optimized images.)
+5. **Push mode** — a `prerouting` DNAT chain (doesn't exist today) + NFQUEUE/NFLOG
+   trigger + anti-DoS.
+6. **Blind serial bridge** — a `tty↔vsock` daemon with no parser.
+7. **Mass deployment from snapshot** — "spin up N workers of this template" as a
+   first-class operation (today it's N calls to fork).
 
-## Requisitos de hardware del gateway
+## Gateway hardware requirements
 
-- CPU con virtualización por hardware: x86_64 o **ARM Cortex-A con KVM**
-  (Pi 4/5 con kernel 64-bit, Jetson, i.MX8). Los microcontroladores (ESP32,
-  Cortex-M) no ejecutan microVMs — son los sensores que hablan con el gateway.
-- Kernel 5.10+ con KVM, cgroups v2 y btrfs (o el loopback btrfs que
-  provisiona `setup-host.sh` — ya agnóstico al host).
-- Para densidad alta en Pi: almacenamiento en NVMe/SSD USB, no SD (el restore
-  masivo lee el snapshot; la SD lo convierte en cuello de botella).
-- GPIO/I2C/SPI directos: las microVMs no los ven; siempre vía puente ciego.
+- A CPU with hardware virtualization: x86_64 or **ARM Cortex-A with KVM** (Pi 4/5
+  with a 64-bit kernel, Jetson, i.MX8). Microcontrollers (ESP32, Cortex-M) don't
+  run microVMs — they're the sensors that talk to the gateway.
+- Kernel 5.10+ with KVM, cgroups v2, and btrfs (or the btrfs loopback that
+  `setup-host.sh` provisions — already host-agnostic).
+- For high density on a Pi: NVMe/USB SSD storage, not an SD card (mass restore
+  reads the snapshot; the SD turns it into a bottleneck).
+- Direct GPIO/I2C/SPI: the microVMs don't see them; always via the blind bridge.
 
-## Plan de sesiones
+## Session plan
 
-El orden mezcla riesgo (ARM primero: valida o mata el hardware objetivo) y
-dependencias (egress fino antes que pull). IoT-2/3/4 se desarrollan en x86 —
-no esperan al spike ARM.
+The order mixes risk (ARM first: it validates or kills the target hardware) and
+dependencies (fine-grained egress before pull). IoT-2/3/4 are developed on x86 —
+they don't wait for the ARM spike.
 
-### IoT-1 — Spike ARM64 (riesgo existencial)
-El tooling ya está listo (`make full-install` y `make prepare-image` son
-multi-arch); el spike es ejecutarlo de verdad en una Raspberry Pi 5 y cazar
-los supuestos x86 que solo aparecen en hardware (kernel args aarch64,
-comportamiento de KVM en Pi, rendimiento del store en SD/NVMe).
+### IoT-1 — ARM64 spike (existential risk)
+The tooling is already ready (`make full-install` and `make prepare-image` are
+multi-arch); the spike is actually running it on a Raspberry Pi 5 and hunting the
+x86 assumptions that only appear on hardware (aarch64 kernel args, KVM behavior
+on the Pi, store performance on SD/NVMe).
 
-**Criterio de éxito**: `make full-install && make prepare-image` en una Pi 5
-dejan el sistema entero funcionando: `create` + `exec` por vsock + `destroy`,
-con jailer y límites cgroup activos. Si KVM en Pi resulta inviable, pivotar el
-hardware objetivo a gateways industriales ARM/x86 — decisión, no derrota.
+**Success criterion**: `make full-install && make prepare-image` on a Pi 5 leave
+the whole system working: `create` + `exec` over vsock + `destroy`, with jailer
+and cgroup limits active. If KVM on the Pi turns out to be unviable, pivot the
+target hardware to industrial ARM/x86 gateways — a decision, not a defeat.
 
-### IoT-2 — Egress de grano fino
-`allowed_egress: [{ip, port, proto}]` por red (o por VM), renderizado en
-nftables. `egress:true/false` sigue funcionando como hasta ahora.
+### IoT-2 — Fine-grained egress
+`allowed_egress: [{ip, port, proto}]` per network (or per VM), rendered into
+nftables. `egress:true/false` keeps working as before.
 
-**Criterio de éxito**: una VM alcanza `IP_sensor:1883` y NADA más (ni otra IP,
-ni otro puerto, ni DNS); guest→host y cross-segment intactos. Validado en HW.
+**Success criterion**: a VM reaches `sensor_IP:1883` and NOTHING else (no other
+IP, no other port, no DNS); guest→host and cross-segment intact. Validated on HW.
 
-### IoT-3 — Orquestador transaccional pull v1 (el MVP)
-Entidad `Ingestor` (sensor, plantilla/snapshot, modo de vida, schedule):
-restore → la VM interroga → resultado por vsock → destroy. Los 3 modos de
-vida. Watchdog (VM no responde → kill+restore+evento). Tope global de VMs.
-Demo con un sensor simulado (otra microVM haciendo de Modbus/MQTT slave —
-dogfooding de gemelos digitales).
+### IoT-3 — Transactional pull orchestrator v1 (the MVP)
+An `Ingestor` entity (sensor, template/snapshot, lifetime mode, schedule):
+restore → the VM interrogates → result over vsock → destroy. The 3 lifetime
+modes. Watchdog (VM doesn't respond → kill+restore+event). Global VM cap. A demo
+with a simulated sensor (another microVM acting as a Modbus/MQTT slave —
+dogfooding of digital twins).
 
-**Criterio de éxito**: demo end-to-end en x86 — sensor simulado → ciclo
-transaccional → dato validado en el host; matar el parser dentro de la VM a
-mitad de transacción produce reset limpio + evento, sin intervención.
+**Success criterion**: an end-to-end demo on x86 — simulated sensor →
+transactional cycle → validated datum on the host; killing the parser inside the
+VM mid-transaction produces a clean reset + event, without intervention.
 
-### IoT-4 — Imagen sensor ultra-mínima
-Kernel tinyconfig + init estático + parser (empezar por Modbus TCP o MQTT).
-Medir RAM real (RSS del VMM + working set).
+### IoT-4 — Ultra-minimal sensor image
+tinyconfig kernel + static init + parser (start with Modbus TCP or MQTT). Measure
+real RAM (VMM RSS + working set).
 
-**Criterio de éxito**: la demo de IoT-3 corre con `mem_mb ≤ 32` y arranca
-desde snapshot en <200ms.
+**Success criterion**: the IoT-3 demo runs with `mem_mb ≤ 32` and boots from a
+snapshot in <200ms.
 
-### IoT-5 — Densidad: medir de verdad
-Despliegue masivo desde snapshot como operación de primera clase. Batería de
-densidad: cuántas VMs-sensor idle+polling caben en (a) la Pi del spike,
-(b) un x86 de referencia, midiendo RSS incremental real, latencia de restore
-bajo carga y comportamiento del store.
+### IoT-5 — Density: measure for real
+Mass deployment from snapshot as a first-class operation. A density battery: how
+many idle+polling sensor-VMs fit on (a) the spike's Pi, (b) a reference x86,
+measuring real incremental RSS, restore latency under load, and store behavior.
 
-**Criterio de éxito**: tabla de densidad publicable con números medidos, no
-estimados. Meta interna: ≥100 VMs-sensor en Pi 5 8GB.
+**Success criterion**: a publishable density table with measured numbers, not
+estimates. Internal goal: ≥100 sensor-VMs on a Pi 5 8GB.
 
-### IoT-6 — Modo push (MQTT/HTTP)
-Cadena prerouting DNAT + trigger NFQUEUE + anti-DoS (rate-limit por origen,
-circuit breaker por sensor).
+### IoT-6 — Push mode (MQTT/HTTP)
+A prerouting DNAT chain + NFQUEUE trigger + anti-DoS (per-source rate limit,
+per-sensor circuit breaker).
 
-**Criterio de éxito**: sensor MQTT real publica → VM se materializa y recibe
-la conexión sin listener en el host; un flood de SYNs no agota el host (el
-tope y el rate-limit contienen).
+**Success criterion**: a real MQTT sensor publishes → the VM materializes and
+receives the connection with no listener on the host; a SYN flood doesn't exhaust
+the host (the cap and rate limit contain it).
 
-### IoT-7 — Puente serie ciego
-Daemon `tty↔vsock` sin parser (RS-485/Modbus RTU/USB).
+### IoT-7 — Blind serial bridge
+A `tty↔vsock` daemon with no parser (RS-485/Modbus RTU/USB).
 
-**Criterio de éxito**: sensor serie (real o simulado con `socat pty`) →
-parser Modbus RTU dentro de la VM → dato validado en el host; el daemon
-puente no contiene ninguna lógica de protocolo (auditable a ojo).
+**Success criterion**: a serial sensor (real or simulated with `socat pty`) → a
+Modbus RTU parser inside the VM → a validated datum on the host; the bridge
+daemon contains no protocol logic (auditable by eye).
 
-### Transversal (no sesión propia, no se cae)
-La Fase 4 pendiente (validación hardware de cgroups/seccomp, soak test, tests
-de escape) sube de prioridad: en OT el producto ES la garantía de aislamiento,
-y se demuestra con modelo de amenaza escrito + tests adversariales. El soak
-test de N ciclos crear/destruir pasa de higiene a requisito del ciclo
-transaccional (miles de restores/día por diseño).
+### Cross-cutting (not its own session, doesn't get dropped)
+The pending Phase 4 (hardware validation of cgroups/seccomp, soak test, escape
+tests) rises in priority: in OT the product IS the isolation guarantee, and it's
+demonstrated with a written threat model + adversarial tests. The soak test of N
+create/destroy cycles moves from hygiene to a requirement of the transactional
+cycle (thousands of restores/day by design).

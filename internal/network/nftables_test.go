@@ -96,7 +96,7 @@ func TestRenderNftablesAllowedEgress(t *testing.T) {
 
 func TestRenderNftablesScalesLinearly(t *testing.T) {
 	// Cross-segment isolation must stay a single aggregate rule no matter how
-	// many networks exist (the red-por-VM topology means one network per
+	// many networks exist (the network-per-VM topology means one network per
 	// device, so N gets big). A per-pair regression would mean O(N²) rules.
 	nets := make([]types.Network, 150)
 	for i := range nets {

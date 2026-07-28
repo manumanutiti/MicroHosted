@@ -1,22 +1,25 @@
-# Binarios compilados
+# Compiled binaries
 build/
 *.ext4
 vmlinux*
+examples/modbus-pull/parser
 
-# Imágenes — descargar con scripts/
+# Downloaded/generated images and artifacts — every machine builds its own
+# (make full-install + make prepare-image); see quick-setup.md
 images/kernels/
 images/rootfs/
 images/instances/
+images/cache/
 
-# Clave SSH del proyecto — generada localmente por scripts/prepare-image.sh,
-# nunca se commitea (es una clave privada)
+# Project SSH key — generated locally by scripts/prepare-image.sh,
+# never committed (it is a private key)
 images/keys/
 
-# Sockets de Firecracker (generados en runtime)
+# Firecracker sockets (generated at runtime)
 *.socket
 /srv/jailer/
 
-# Estado persistente (SQLite) — generado en runtime
+# Persistent state (SQLite) — generated at runtime
 images/microhosted.db
 *.db
 *.db-wal
@@ -25,6 +28,19 @@ images/microhosted.db
 # Go
 *.test
 vendor/
+
+# Local environment
+.env
+.env.*
+
+# Claude Code — local per-user configuration and session logs
+.claude/
+sessions/
+SESSIONS.md
+
+# Local documents (kept out of the public repo)
+docs/*.docx
+docs/*.pdf
 
 # Editor
 .vscode/

@@ -2,19 +2,19 @@ BINARY   := microhosted
 CMD_DIR  := ./cmd/microhosted
 BUILD_DIR := ./build
 
-# Versión de Firecracker/Jailer FIJADA: es la validada en hardware con esta
-# plataforma (los snapshots van ligados a la versión que los creó, y se
-# necesita >=1.12 para network_overrides / forks simultáneos). Actualizarla es
-# una decisión consciente: make full-install FC_VERSION=vX.Y.Z (o =latest).
+# PINNED Firecracker/Jailer version: the one validated on hardware with this
+# platform (snapshots are tied to the version that created them, and >=1.12 is
+# needed for network_overrides / simultaneous forks). Changing it is a conscious
+# decision: make full-install FC_VERSION=vX.Y.Z (or =latest).
 FC_VERSION ?= v1.16.1
 ADDR ?= :8080
 
 # ---------------------------------------------------------------------------
-# Arquitectura objetivo. Por defecto la de esta máquina; se puede forzar con
-# ARCH=x86_64 | aarch64 (acepta alias amd64/x86 y arm64/arm). La instalación
-# completa (full-install) solo tiene sentido en la máquina objetivo (KVM,
-# cgroups y el store son locales); para llevar un binario a otra máquina se
-# puede cross-compilar solo con `make build ARCH=aarch64`.
+# Target architecture. Defaults to this machine's; can be forced with
+# ARCH=x86_64 | aarch64 (accepts the aliases amd64/x86 and arm64/arm). The full
+# installation (full-install) only makes sense on the target machine (KVM,
+# cgroups, and the store are local); to carry a binary to another machine you
+# can cross-compile just it with `make build ARCH=aarch64`.
 # ---------------------------------------------------------------------------
 ARCH ?= $(shell uname -m)
 ifeq ($(ARCH),amd64)
@@ -34,13 +34,18 @@ GOARCH_x86_64  := amd64
 GOARCH_aarch64 := arm64
 GOARCH := $(GOARCH_$(ARCH))
 ifeq ($(GOARCH),)
-  $(error ARCH no soportada: $(ARCH) — usa x86_64 o aarch64)
+  $(error Unsupported ARCH: $(ARCH) — use x86_64 or aarch64)
 endif
 
-# Parámetros del pipeline de imágenes (make prepare-image)
-IMAGE_NAME     ?= base-ubuntu-noble
-IMAGE_SIZE_MB  ?= 1024
+# Image pipeline parameters (make prepare-image).
+# FLAVOR: alpine (ultra-minimal, default) | ubuntu (noble, systemd + SSH).
+# Empty IMAGE_NAME/IMAGE_SIZE_MB → the flavor's default (base-alpine 128MB /
+# base-ubuntu-noble 1024MB), resolved by build-image.sh.
+FLAVOR         ?= alpine
+IMAGE_NAME     ?=
+IMAGE_SIZE_MB  ?=
 KERNEL_VERSION ?= 6.1.102
+EXTRA_PKGS     ?=
 
 .PHONY: all build clean install-fc setup-host kernel rootfs lint test \
         install-service uninstall-service service-logs full-install \
@@ -48,8 +53,8 @@ KERNEL_VERSION ?= 6.1.102
 
 all: build
 
-# CGO_ENABLED=0: todo el árbol es Go puro (sqlite es modernc, sin C), así el
-# binario es estático y el cross-compile a ARM no necesita toolchain de C.
+# CGO_ENABLED=0: the whole tree is pure Go (sqlite is modernc, no C), so the
+# binary is static and cross-compiling to ARM needs no C toolchain.
 build:
 	mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(BINARY) $(CMD_DIR)
@@ -58,41 +63,44 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 # ---------------------------------------------------------------------------
-# Instalación completa en un paso (x86_64 o aarch64, autodetectada):
-#   make full-install                      # todo: host + firecracker + daemon
-#   make full-install FC_VERSION=v1.16.1   # fijar versión de Firecracker
-#   make full-install ADDR=127.0.0.1:9000  # otra dirección de la API
-# Después, para tener una plantilla lista: make prepare-image
+# One-step full installation (x86_64 or aarch64, auto-detected):
+#   make full-install                      # everything: host + firecracker + daemon
+#   make full-install FC_VERSION=v1.16.1   # pin the Firecracker version
+#   make full-install ADDR=127.0.0.1:9000  # a different API address
+# Afterward, to get a template ready: make prepare-image
 # ---------------------------------------------------------------------------
 full-install:
 	chmod +x scripts/*.sh
 	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) ./scripts/full-install.sh
 
 # ---------------------------------------------------------------------------
-# Desinstalación completa: el inverso de full-install. Mata las VMs vivas,
-# quita servicio, nftables, bridges/taps, desmonta y borra el store CoW
-# (imagen btrfs + fstab) y elimina los binarios y la DB de estado.
+# Full uninstallation: the inverse of full-install. Kills the live VMs, removes
+# the service, nftables, bridges/taps, unmounts and deletes the CoW store
+# (btrfs image + fstab), and removes the binaries and the state DB.
 #   make uninstall
-#   make uninstall DRY_RUN=1   # solo mostrar lo que haría
-#   make uninstall KEEP_FC=1   # conservar firecracker/jailer
-#   make uninstall PURGE=1     # borrar también images/{kernels,rootfs,...}
+#   make uninstall DRY_RUN=1   # only show what it would do
+#   make uninstall KEEP_FC=1   # keep firecracker/jailer
+#   make uninstall PURGE=1     # also delete images/{kernels,rootfs,...}
 # ---------------------------------------------------------------------------
 uninstall:
 	chmod +x scripts/uninstall.sh
 	sudo DRY_RUN=$(DRY_RUN) KEEP_FC=$(KEEP_FC) PURGE=$(PURGE) ./scripts/uninstall.sh
 
 # ---------------------------------------------------------------------------
-# Pipeline completo de imagen: kernel + rootfs (debootstrap, arch correcta) +
-# preparación (vsock/SSH/DNS) + instalación en el store CoW + alta en el
-# catálogo. Requiere el host ya configurado (make full-install o setup-host).
+# Complete image pipeline: kernel + rootfs (correct arch, cross with qemu) +
+# preparation (vsock/SSH/DNS) + installation into the CoW store + registration
+# in the catalog. Requires the host already configured (make full-install or
+# setup-host). By default it builds the ultra-minimal Alpine (base-alpine,
+# ~10 MB, vsock exec, no systemd); FLAVOR=ubuntu for the classic noble.
 #   make prepare-image
-#   make prepare-image IMAGE_NAME=sensor-alpine IMAGE_SIZE_MB=512
-#   make prepare-image ARCH=aarch64          # imagen para ARM (cross con qemu)
+#   make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py
+#   make prepare-image FLAVOR=ubuntu         # base-ubuntu-noble (systemd+SSH)
+#   make prepare-image ARCH=aarch64          # image for ARM (cross with qemu)
 # ---------------------------------------------------------------------------
 prepare-image:
 	chmod +x scripts/*.sh
-	ARCH=$(ARCH) IMAGE_NAME=$(IMAGE_NAME) SIZE_MB=$(IMAGE_SIZE_MB) \
-	KERNEL_VERSION=$(KERNEL_VERSION) ./scripts/build-image.sh
+	ARCH=$(ARCH) FLAVOR=$(FLAVOR) IMAGE_NAME=$(IMAGE_NAME) SIZE_MB=$(IMAGE_SIZE_MB) \
+	KERNEL_VERSION=$(KERNEL_VERSION) EXTRA_PKGS="$(EXTRA_PKGS)" ./scripts/build-image.sh
 
 install-fc:
 	chmod +x scripts/install-fc.sh
@@ -110,13 +118,13 @@ rootfs:
 	chmod +x scripts/build-rootfs.sh
 	sudo ARCH=$(ARCH) ./scripts/build-rootfs.sh
 
-# Instala/actualiza microhosted como servicio systemd. Compila como tu usuario
-# (build) y solo el paso de instalación pide sudo, para no compilar como root.
+# Installs/updates microhosted as a systemd service. Builds as your user (build)
+# and only the install step asks for sudo, so as not to build as root.
 install-service: build
 	sudo ./scripts/install-service.sh $(ADDR)
 
-# Desinstala el servicio. Las VMs vivas no se tocan (KillMode=process); si las
-# quieres apagar, destrúyelas por la API antes.
+# Uninstalls the service. Live VMs aren't touched (KillMode=process); if you want
+# to power them off, destroy them via the API first.
 uninstall-service:
 	-sudo systemctl disable --now microhosted
 	sudo rm -f /etc/systemd/system/microhosted.service
@@ -131,16 +139,16 @@ lint:
 test:
 	go test -v ./...
 
-# Verifica el entorno antes de instalar
+# Verify the environment before installing
 check:
-	@echo "==> Arquitectura: $(ARCH) (GOARCH=$(GOARCH))"
+	@echo "==> Architecture: $(ARCH) (GOARCH=$(GOARCH))"
 	@echo "==> KVM:"
-	@ls -la /dev/kvm 2>/dev/null && echo "  OK" || echo "  FALTA"
+	@ls -la /dev/kvm 2>/dev/null && echo "  OK" || echo "  MISSING"
 	@echo "==> cgroup2:"
-	@mount | grep cgroup2 && echo "  OK" || echo "  FALTA"
+	@mount | grep cgroup2 && echo "  OK" || echo "  MISSING"
 	@echo "==> firecracker:"
-	@command -v firecracker && firecracker --version || echo "  FALTA (make install-fc)"
+	@command -v firecracker && firecracker --version || echo "  MISSING (make install-fc)"
 	@echo "==> jailer:"
-	@command -v jailer && jailer --version || echo "  FALTA (make install-fc)"
+	@command -v jailer && jailer --version || echo "  MISSING (make install-fc)"
 	@echo "==> Go:"
-	@go version || echo "  FALTA"
+	@go version || echo "  MISSING"

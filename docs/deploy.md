@@ -1,129 +1,133 @@
-# Despliegue como servicio systemd
+# Deployment as a systemd service
 
-El daemon **no debe correrse en primer plano** en una terminal interactiva:
-un Ctrl-C manda SIGINT a todo el grupo de procesos de la terminal, lo que mata
-también los procesos Firecracker hijos y tira las microVMs. Como servicio
-systemd no hay terminal de control, y la unit está configurada para que las
-VMs sobrevivan a los reinicios del daemon.
+The daemon **must not be run in the foreground** in an interactive terminal: a
+Ctrl-C sends SIGINT to the terminal's entire process group, which also kills the
+child Firecracker processes and takes down the microVMs. As a systemd service
+there is no controlling terminal, and the unit is configured so that VMs survive
+daemon restarts.
 
-## Instalación en un paso (recomendada)
+## One-step installation (recommended)
 
 ```bash
-make full-install       # host (cgroups/nftables/store CoW) + firecracker/jailer
-                        # + compila + servicio systemd + verificación de salud
-make prepare-image      # kernel + rootfs (debootstrap) + vsock/SSH/DNS
-                        # + golden al store + alta en el catálogo
+make full-install       # host (cgroups/nftables/CoW store) + firecracker/jailer
+                        # + build + systemd service + health check
+make prepare-image      # kernel + ultra-minimal Alpine rootfs (default)
+                        # + golden into the store + registration in the catalog
 ```
 
-Con eso el sistema queda funcionando de cero: tras `prepare-image` ya se puede
-crear la primera VM (`POST /v1/vms {"template":"base-ubuntu-noble"}`).
+With that the system is up from scratch: after `prepare-image` you can already
+create the first VM (`POST /v1/vms {"template":"base-alpine"}`). For the classic
+Ubuntu image (systemd + SSH): `make prepare-image FLAVOR=ubuntu` (template
+`base-ubuntu-noble`).
 
-Funciona en **x86_64 y aarch64** (Raspberry Pi 4/5 de 64 bits, Jetson,
-gateways ARM): la arquitectura se autodetecta y todos los pasos la respetan
-(binarios de Firecracker, kernel del bucket de CI, mirror de Ubuntu — arm64
-vive en `ports.ubuntu.com`, no en `archive.ubuntu.com`). Variables útiles:
+It works on **x86_64 and aarch64** (64-bit Raspberry Pi 4/5, Jetson, ARM
+gateways): the architecture is auto-detected and every step respects it
+(Firecracker binaries, kernel from the CI bucket, Ubuntu mirror — arm64 lives on
+`ports.ubuntu.com`, not `archive.ubuntu.com`). Useful variables:
 
 ```bash
 make full-install FC_VERSION=v1.16.1 ADDR=127.0.0.1:9000
-make prepare-image IMAGE_NAME=sensor-base IMAGE_SIZE_MB=512
+make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py   # Alpine + extra apk
+make prepare-image FLAVOR=ubuntu IMAGE_NAME=sensor-base IMAGE_SIZE_MB=512
 ```
 
-`full-install` debe ejecutarse **en la máquina objetivo** (KVM, cgroups y el
-store son locales) y es idempotente: reejecutarlo actualiza binario/servicio
-sin tocar las VMs vivas. La versión de Firecracker va **fijada** en el
-Makefile (`v1.16.1`, la validada en hardware): así toda instalación es
-reproducible. Actualizarla es una decisión consciente
-(`make full-install FC_VERSION=vX.Y.Z`) — los snapshots existentes van
-ligados a la versión que los creó y habrá que recrearlos.
+`full-install` must run **on the target machine** (KVM, cgroups, and the store
+are local) and is idempotent: re-running it updates the binary/service without
+touching live VMs. The Firecracker version is **pinned** in the Makefile
+(`v1.16.1`, the one validated on hardware): this way every install is
+reproducible. Updating it is a conscious decision
+(`make full-install FC_VERSION=vX.Y.Z`) — existing snapshots are tied to the
+version that created them and will need to be recreated.
 
-Para preparar piezas de ARM desde el PC x86 (útil antes de tener la Pi a mano):
+To prepare ARM pieces from an x86 PC (useful before you have the Pi at hand):
 
 ```bash
-make build ARCH=aarch64          # cross-compila solo el binario (Go puro, estático)
-make prepare-image ARCH=aarch64  # imagen arm64 vía qemu-user-static; los ficheros
-                                 # se copian al store de la Pi a mano (no se dan
-                                 # de alta en el catálogo local)
+make build ARCH=aarch64          # cross-compiles only the binary (pure Go, static)
+make prepare-image ARCH=aarch64  # arm64 image via qemu-user-static; the files
+                                 # are copied to the Pi's store by hand (they are
+                                 # not registered in the local catalog)
 ```
 
-## Instalar (paso a paso, si prefieres control fino)
+## Install (step by step, if you prefer fine control)
 
 ```bash
-make setup-host                      # cgroups, nftables, store CoW
-make install-fc                      # firecracker + jailer (misma versión)
-make install-service                 # compila (como tu usuario) e instala la unit
+make setup-host                      # cgroups, nftables, CoW store
+make install-fc                      # firecracker + jailer (same version)
+make install-service                 # builds (as your user) and installs the unit
 sudo systemctl enable --now microhosted
 systemctl status microhosted
 ```
 
-Dirección de escucha distinta:
+Different listen address:
 
 ```bash
 make install-service ADDR=127.0.0.1:9000
 ```
 
-## Operar
+## Operate
 
 ```bash
-journalctl -u microhosted -f         # logs en vivo
-sudo systemctl restart microhosted   # reinicia el daemon SIN matar las VMs vivas
-sudo systemctl stop microhosted      # para el daemon; las VMs siguen corriendo
+journalctl -u microhosted -f         # live logs
+sudo systemctl restart microhosted   # restarts the daemon WITHOUT killing live VMs
+sudo systemctl stop microhosted      # stops the daemon; the VMs keep running
 ```
 
-Tras un `restart` o un arranque, en el log verás `reconcile: adopted running
-vm <id>` por cada VM que seguía viva, o `reconcile: swept dead vm <id>` por las
-que hubieran muerto mientras el daemon estaba parado.
+After a `restart` or a boot, the log will show `reconcile: adopted running vm
+<id>` for each VM that was still alive, or `reconcile: swept dead vm <id>` for any
+that had died while the daemon was stopped.
 
-## Por qué la unit es como es
+## Why the unit is the way it is
 
-- **`KillMode=process`** — systemd solo señala al proceso principal (el
-  orquestador), nunca a los Firecracker hijos. Es lo que permite que
-  `Manager.Reconcile` readopte las VMs por PID al volver a arrancar.
-- **`Delegate=yes`** — Jailer crea un cgroup por VM; delegar el subárbol de
-  cgroup al servicio evita chocar con la gestión de systemd.
-- **`AssertPathExists=/dev/kvm`** — sin KVM el servicio falla claro al arrancar,
-  no más tarde con un error oscuro.
-- Corre como **root**: Jailer necesita crear chroots/cgroups/tap y abrir
+- **`KillMode=process`** — systemd only signals the main process (the
+  orchestrator), never the child Firecrackers. This is what lets
+  `Manager.Reconcile` re-adopt the VMs by PID on restart.
+- **`Delegate=yes`** — Jailer creates one cgroup per VM; delegating the cgroup
+  subtree to the service avoids clashing with systemd's management.
+- **`AssertPathExists=/dev/kvm`** — without KVM the service fails clearly at
+  startup, not later with an obscure error.
+- Runs as **root**: Jailer needs to create chroots/cgroups/tap and open
   `/dev/kvm`.
 
-## Almacenamiento (store copy-on-write)
+## Storage (copy-on-write store)
 
-`scripts/setup-host.sh` provisiona el **store de discos** antes de instalar el
-servicio. Si `/var/lib/microhosted/store` no está ya sobre un filesystem con reflink,
-monta ahí un **loopback btrfs** (`/var/lib/microhosted/instances.btrfs`,
-persistido en `/etc/fstab`) y crea `rootfs/`, `kernels/` y `jailer/` dentro. Así
-los clones de VM son copy-on-write (cada VM cuesta sus deltas, no el rootfs
-entero) y funciona en cualquier host Ubuntu sin reparticionar.
+`scripts/setup-host.sh` provisions the **disk store** before installing the
+service. If `/var/lib/microhosted/store` isn't already on a filesystem with
+reflink, it mounts a **btrfs loopback** there
+(`/var/lib/microhosted/instances.btrfs`, persisted in `/etc/fstab`) and creates
+`rootfs/`, `kernels/`, and `jailer/` inside it. This makes VM clones
+copy-on-write (each VM costs its deltas, not the whole rootfs) and works on any
+Ubuntu host without repartitioning.
 
-Requisito: goldens, kernels y el chroot del Jailer viven todos en ese store — el
-daemon deriva `--chroot-base` de `--instances-dir` justamente para respetarlo
-(reflink y hardlink no cruzan filesystems). Al arrancar, si el store no es CoW el
-daemon lo avisa en el log. El store vive FUERA del repo a propósito: son datos de
-runtime propiedad de root (incluidos los jail dirs), y tenerlos en el árbol de
-código rompe herramientas como `go build ./...`. Detalle en `docs/layers.md`
-(L3) y `docs/architecture.md`.
+Requirement: goldens, kernels, and the Jailer chroot all live in that store — the
+daemon derives `--chroot-base` from `--instances-dir` precisely to respect it
+(reflink and hardlink don't cross filesystems). At startup, if the store isn't
+CoW the daemon warns in the log. The store lives OUTSIDE the repo on purpose:
+it's root-owned runtime data (including the jail dirs), and keeping it in the code
+tree breaks tools like `go build ./...`. Detail in `docs/layers.md` (L3) and
+`docs/architecture.md`.
 
-### Mover el store (migración)
+### Move the store (migration)
 
-`setup-host.sh` es idempotente: si el btrfs del store ya está montado en otro
-punto (p.ej. una instalación vieja en `<repo>/images/instances`), lo detecta con
-`losetup -j`/`findmnt`, lo desmonta, limpia su línea de `/etc/fstab` y lo remonta
-en `/var/lib/microhosted/store` — sin copiar datos (es el mismo subvolumen, los
-goldens/kernels vienen solos).
+`setup-host.sh` is idempotent: if the store's btrfs is already mounted at another
+point (e.g. an old install at `<repo>/images/instances`), it detects it with
+`losetup -j`/`findmnt`, unmounts it, cleans its `/etc/fstab` line, and remounts it
+at `/var/lib/microhosted/store` — without copying data (it's the same subvolume;
+the goldens/kernels come along for free).
 
-**Gotcha**: `KillMode=process` hace que las VMs **sobrevivan** al `systemctl
-stop`, así que un `umount` del store dará `target is busy` mientras queden
-procesos `firecracker` vivos. Antes de migrar hay que apagarlos:
+**Gotcha**: `KillMode=process` makes VMs **survive** a `systemctl stop`, so a
+`umount` of the store will give `target is busy` while any live `firecracker`
+processes remain. Before migrating you have to shut them down:
 
 ```bash
-curl -s -X DELETE localhost:8080/v1/vms   # destruye las VMs (con el daemon vivo)
+curl -s -X DELETE localhost:8080/v1/vms   # destroys the VMs (with the daemon alive)
 sudo systemctl stop microhosted
-sudo pkill -9 -f '/firecracker --id'      # mata cualquier VM huérfana que sobreviva
-sudo ./scripts/setup-host.sh              # remonta el store en el nuevo path
+sudo pkill -9 -f '/firecracker --id'      # kills any orphaned VM that survives
+sudo ./scripts/setup-host.sh              # remounts the store at the new path
 make install-service && sudo systemctl start microhosted
 ```
 
-## Desinstalar
+## Uninstall
 
 ```bash
-make uninstall-service               # para y quita el servicio (no toca las VMs)
+make uninstall-service               # stops and removes the service (doesn't touch the VMs)
 ```

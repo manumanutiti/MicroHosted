@@ -34,7 +34,7 @@ type Network struct {
 	// deny-by-default): every VM's TAP is enslaved as an ISOLATED bridge port,
 	// so VMs reach the gateway (and whatever the egress policy allows) but
 	// never each other. True: plain L2 segment, VMs on the bridge see each
-	// other — the "redes entre máquinas" case, now explicit opt-in.
+	// other — the "networks between machines" case, now explicit opt-in.
 	Intra bool
 
 	CreatedAt time.Time

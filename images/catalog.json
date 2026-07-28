@@ -1,7 +1,7 @@
 [
   {
     "name": "base-ubuntu",
-    "description": "Ubuntu 22.04 (rootfs oficial de Firecracker CI)",
+    "description": "Ubuntu 22.04 (official Firecracker CI rootfs)",
     "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
     "rootfs_path": "/var/lib/microhosted/store/rootfs/ubuntu-22.04.ext4",
     "vcpus": 1,
@@ -10,7 +10,7 @@
   },
   {
     "name": "alpine-py",
-    "description": "Alpine busybox ultra-mínima + python3 (vsock exec, sin systemd)",
+    "description": "Ultra-minimal Alpine busybox + python3 (vsock exec, no systemd)",
     "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
     "rootfs_path": "/var/lib/microhosted/store/rootfs/alpine-py.ext4",
     "vcpus": 1,

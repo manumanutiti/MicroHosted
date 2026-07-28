@@ -11,7 +11,7 @@ import (
 
 // Catalog is the read side of the template library. It's backed by a JSON
 // file today; the interface is small enough to swap for a SQLite-backed
-// store later (Sesión 8) without touching callers.
+// store later (Stage 8) without touching callers.
 type Catalog struct {
 	mu        sync.RWMutex
 	templates map[string]types.Template

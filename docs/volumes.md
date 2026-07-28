@@ -1,101 +1,101 @@
-# Volúmenes y transferencia segura de datos
+# Volumes and secure data transfer
 
-Cómo MicroHosted mete y saca datos de las microVMs sin exponer el host. Es el
-plano de datos de la plataforma: en el workflow de detonación es lo que lleva la
-muestra a la VM aislada y lo que recoge los artefactos después.
+How MicroHosted moves data in and out of microVMs without exposing the host.
+It's the platform's data plane: in the detonation workflow it's what carries the
+sample into the isolated VM and what collects the artifacts afterward.
 
-## Principio rector: el host NUNCA monta un filesystem del guest
+## Guiding principle: the host NEVER mounts a guest filesystem
 
-`mount(2)` de una imagen ext4 no confiable ejecuta el parser ext4 del **kernel
-del host** sobre bytes controlados por el atacante — la superficie de escape
-clásica (histórico largo de CVEs de ext4/journal). Por eso **todo** el I/O
-host-side va por **`debugfs`** (de `e2fsprogs`), una herramienta de espacio de
-usuario que lee/escribe ext4 **sin montar**: una imagen maliciosa como mucho hace
-fallar al propio proceso `debugfs`, nunca toca el kernel del host.
+`mount(2)` of an untrusted ext4 image runs the **host kernel's** ext4 parser
+over attacker-controlled bytes — the classic escape surface (a long history of
+ext4/journal CVEs). That's why **all** host-side I/O goes through **`debugfs`**
+(from `e2fsprogs`), a userspace tool that reads/writes ext4 **without mounting**:
+a malicious image, at worst, crashes the `debugfs` process itself, never touches
+the host kernel.
 
-Y ese proceso **no corre como root**: cuando el daemon corre como root, cada
-invocación de `debugfs` baja al uid/gid del jailer (`--jailer-uid/-gid`, la
-misma identidad sin privilegios con la que corre el Firecracker enjaulado, y
-dueña de todas las imágenes del store). Un exploit del parser de `debugfs`
-disparado por una imagen maliciosa aterriza así en un proceso sin privilegios
-ni capabilities — puede pintarrajear imágenes del store (cosa que ya podía: él
-*es* el parser que las escribe), pero no el host. Es mitigación, no una jaula
-(comparte los namespaces del host); lo que elimina es el premio de shell root
-de la superficie de ataque del parser ext4. Los temporales del staging se
-chownean a ese uid para que el proceso degradado pueda leerlos/escribirlos.
+And that process **doesn't run as root**: when the daemon runs as root, each
+`debugfs` invocation drops to the jailer's uid/gid (`--jailer-uid/-gid`, the same
+unprivileged identity the jailed Firecracker runs as, and the owner of every
+image in the store). An exploit of the `debugfs` parser triggered by a malicious
+image thus lands in a process with no privileges or capabilities — it can scrawl
+over store images (which it already could: it *is* the parser that writes them),
+but not the host. It's mitigation, not a jail (it shares the host namespaces);
+what it removes is the root-shell prize from the ext4 parser's attack surface.
+The staging temporaries are chowned to that uid so the degraded process can
+read/write them.
 
-Hay dos canales de datos, según dónde esté la VM:
+There are two data channels, depending on where the VM is:
 
-| Canal | Cuándo | Cómo |
+| Channel | When | How |
 |---|---|---|
-| **vsock** | VM viva | Streaming por el puerto vsock 52 (mismo canal que `exec`). Funciona sin red (`no_network`, quarantine). |
-| **debugfs** | VM parada / volumen suelto | Lectura/escritura offline sobre el fichero ext4, sin montar. |
+| **vsock** | VM alive | Streaming over vsock port 52 (same channel as `exec`). Works without a network (`no_network`, quarantine). |
+| **debugfs** | VM stopped / volume detached | Offline read/write over the ext4 file, without mounting. |
 
-Los endpoints de ficheros eligen el canal solos según el estado de la VM.
+The file endpoints pick the channel on their own based on the VM's state.
 
-### Memoria constante (streaming de punta a punta)
+### Constant memory (end-to-end streaming)
 
-Toda transferencia va en **streaming**: ni subida ni bajada cargan el fichero
-entero en RAM, así que da igual que sean 4 KB o 40 GB — el coste en memoria del
-daemon es un búfer fijo. Como `debugfs` no lee/escribe un stream (sus verbos
-`write`/`dump` toman ficheros reales del host), el canal offline **stagea** en un
-temporal **en el store** (`<store>/staging/`, disco real), **nunca en `/tmp`**
-(que suele ser tmpfs = RAM). Los temporales de extracción se borran del
-directorio nada más abrirlos (siguen válidos por el descriptor abierto), y un
-crash a medias se barre al reiniciar.
+Every transfer is **streamed**: neither upload nor download loads the whole file
+into RAM, so it makes no difference whether it's 4 KB or 40 GB — the daemon's
+memory cost is a fixed buffer. Since `debugfs` doesn't read/write a stream (its
+`write`/`dump` verbs take real host files), the offline channel **stages** in a
+temporary **on the store** (`<store>/staging/`, real disk), **never in `/tmp`**
+(which is usually tmpfs = RAM). Extraction temporaries are deleted from the
+directory as soon as they're opened (they stay valid via the open descriptor),
+and a half-finished crash is swept on restart.
 
-Si subes por el endpoint de VM (`PUT /v1/vms/{id}/files`) sin `Content-Length`
-(cuerpo *chunked*) y la VM está viva, el daemon stagea primero en el store para
-saber el tamaño que el protocolo vsock necesita — sigue siendo memoria
-constante, solo que pasando por disco. `curl --data-binary @fichero` manda
-`Content-Length`, así que ese caso streamea directo sin stage.
+If you upload via the VM endpoint (`PUT /v1/vms/{id}/files`) without a
+`Content-Length` (a *chunked* body) and the VM is alive, the daemon stages on the
+store first to learn the size the vsock protocol needs — still constant memory,
+just going through disk. `curl --data-binary @file` sends `Content-Length`, so
+that case streams directly without staging.
 
-## Volúmenes
+## Volumes
 
-Un **volumen** es un disco ext4 persistente que vive independiente de las VMs
-(`internal/storage/volume.go`, bajo `<store>/volumes/<id>.ext4`). Sobrevive al
-`destroy` de la VM — es donde persisten los datos. Dos usos canónicos:
+A **volume** is a persistent ext4 disk that lives independently of the VMs
+(`internal/storage/volume.go`, under `<store>/volumes/<id>.ext4`). It survives the
+VM's `destroy` — it's where data persists. Two canonical uses:
 
-- **Muestra read-only**: se adjunta con `read_only:true`; es un dispositivo de
-  bloque de solo lectura, así que el guest que la analiza no puede alterarla (lo
-  rechaza el propio bloque, no solo una opción de mount).
-- **Volumen de salida writable**: recoge artefactos (pcaps, dumps, resultados)
-  que se leen después de que la VM ya no exista.
+- **Read-only sample**: attached with `read_only:true`; it's a read-only block
+  device, so the guest analyzing it can't alter it (the block layer itself rejects
+  it, not just a mount option).
+- **Writable output volume**: collects artifacts (pcaps, dumps, results) that are
+  read after the VM no longer exists.
 
-Un volumen está adjunto **a lo sumo a una VM a la vez** (`AttachedTo`): dos
-guests escribiendo el mismo ext4 lo corromperían.
+A volume is attached **to at most one VM at a time** (`AttachedTo`): two guests
+writing the same ext4 would corrupt it.
 
-### Datos grandes: preparar y luego adjuntar
+### Large data: prepare, then attach
 
-Firecracker **no tiene hot-plug de discos**: no se puede enchufar un volumen
-nuevo a una VM que ya arrancó. El modelo correcto para un dataset grande
-(varios GB) es **preparar el volumen y adjuntarlo al crear la VM**:
+Firecracker has **no disk hot-plug**: you can't plug a new volume into a VM that
+has already booted. The correct model for a large dataset (several GB) is to
+**prepare the volume and attach it when creating the VM**:
 
-1. `POST /v1/volumes` con el `size_mb` que necesites (el volumen es un ext4 de
-   tamaño fijo; ponle los GB que hagan falta — es el sitio para datos grandes,
-   no el disco raíz de la VM).
-2. `PUT /v1/volumes/{id}/files?path=…` para llenarlo **offline por debugfs, en
-   streaming** (sin arrancar VM, memoria constante).
-3. `POST /v1/vms` con ese volumen en `volumes[]` → la VM arranca con el dato ya
-   dentro, montado en `guest_path`.
+1. `POST /v1/volumes` with the `size_mb` you need (the volume is a fixed-size
+   ext4; give it as many GB as required — it's the place for large data, not the
+   VM's root disk).
+2. `PUT /v1/volumes/{id}/files?path=…` to fill it **offline via debugfs,
+   streamed** (no VM booted, constant memory).
+3. `POST /v1/vms` with that volume in `volumes[]` → the VM boots with the data
+   already inside, mounted at `guest_path`.
 
-Si la VM ya existe y ya tiene un volumen adjunto, escribes en él **por vsock en
-streaming** con `PUT /v1/vms/{id}/files` apuntando a una ruta dentro de su
-`guest_path`. Lo que no hay (a propósito, porque Firecracker no lo soporta) es
-adjuntar un volumen a una VM en marcha.
+If the VM already exists and already has a volume attached, you write to it **over
+vsock, streamed** with `PUT /v1/vms/{id}/files` pointing at a path inside its
+`guest_path`. What you can't do (on purpose, because Firecracker doesn't support
+it) is attach a volume to a running VM.
 
-### Ciclo de vida
+### Lifecycle
 
 ```
-POST   /v1/volumes                 {name, size_mb}   -> crea (mkfs.ext4)
-GET    /v1/volumes                                   -> lista
-GET    /v1/volumes/{id}                              -> detalle (incl. attached_to)
-DELETE /v1/volumes/{id}                              -> borra (409 si adjunto)
+POST   /v1/volumes                 {name, size_mb}   -> create (mkfs.ext4)
+GET    /v1/volumes                                   -> list
+GET    /v1/volumes/{id}                              -> detail (incl. attached_to)
+DELETE /v1/volumes/{id}                              -> delete (409 if attached)
 ```
 
-### Adjuntar a una VM
+### Attach to a VM
 
-En `POST /v1/vms`, campo `volumes`:
+In `POST /v1/vms`, the `volumes` field:
 
 ```json
 {
@@ -108,55 +108,53 @@ En `POST /v1/vms`, campo `volumes`:
 }
 ```
 
-Tras el boot, el daemon monta cada volumen **por vsock** en `guest_path` (por
-defecto `/vol/<nombre>`), con `-o ro` si es read-only. Firecracker expone los
-discos secundarios como `/dev/vdb`, `/dev/vdc`… en el orden de la lista, que es
-el orden en que se montan. Si el mount falla, el `Create` falla y hace rollback.
-Un volumen sin `guest_path` se deja como dispositivo crudo para que lo monte el
-guest.
+After boot, the daemon mounts each volume **over vsock** at `guest_path` (default
+`/vol/<name>`), with `-o ro` if it's read-only. Firecracker exposes secondary
+disks as `/dev/vdb`, `/dev/vdc`… in list order, which is the order they're mounted
+in. If the mount fails, the `Create` fails and rolls back. A volume with no
+`guest_path` is left as a raw device for the guest to mount.
 
-Al hacer `destroy` de la VM, los volúmenes se **sueltan** (`AttachedTo` a vacío)
-pero sus ficheros **no se borran**.
+When the VM is `destroy`ed, the volumes are **detached** (`AttachedTo` cleared)
+but their files are **not deleted**.
 
-> **Snapshots + volúmenes**: no soportado en v1. `snapshot`/`fork`/`restore`
-> sobre una VM con volúmenes adjuntos devuelven **409**. La RAM del snapshot
-> tiene el volumen montado (page cache, journal); restaurar sobre un volumen que
-> cambió desde entonces lo corrompe. Destruye la VM (los volúmenes persisten) y
-> recréala sin ellos.
+> **Snapshots + volumes**: not supported in v1. `snapshot`/`fork`/`restore` on a
+> VM with attached volumes return **409**. The snapshot's RAM has the volume
+> mounted (page cache, journal); restoring over a volume that changed since then
+> corrupts it. Destroy the VM (the volumes persist) and recreate it without them.
 
-## Transferencia de ficheros
+## File transfer
 
-### Con la VM (viva → vsock, parada → debugfs)
+### With the VM (alive → vsock, stopped → debugfs)
 
 ```
-PUT /v1/vms/{id}/files?path=/ruta/en/guest      cuerpo = bytes
-GET /v1/vms/{id}/files?path=/ruta/en/guest      respuesta = bytes
+PUT /v1/vms/{id}/files?path=/path/in/guest      body = bytes
+GET /v1/vms/{id}/files?path=/path/in/guest      response = bytes
 ```
 
-Transparente al estado: con la VM **running** va por vsock (incluso sin red);
-con la VM **stopped** lee/escribe el disco offline con `debugfs`. Este segundo
-caso es la ruta **post-mortem**: paras una VM de detonación y sacas ficheros
-directamente de su disco sin arrancarla ni montarla. Ambos en streaming; ojo con
-el tamaño del disco raíz de la VM (`disk_mb`) si subes un fichero grande ahí —
-para datos grandes usa un volumen dimensionado, no el rootfs.
+Transparent to state: with the VM **running** it goes over vsock (even with no
+network); with the VM **stopped** it reads/writes the disk offline with
+`debugfs`. This second case is the **post-mortem** path: you stop a detonation VM
+and pull files straight from its disk without booting or mounting it. Both are
+streamed; watch the size of the VM's root disk (`disk_mb`) if you upload a large
+file there — for large data use a sized volume, not the rootfs.
 
-### Con un volumen suelto (offline, debugfs)
+### With a detached volume (offline, debugfs)
 
 ```
-PUT /v1/volumes/{id}/files?path=/ruta      cuerpo = bytes   (inyecta una muestra antes de adjuntar)
-GET /v1/volumes/{id}/files?path=/ruta      respuesta = bytes (extrae resultados tras el destroy)
+PUT /v1/volumes/{id}/files?path=/path      body = bytes   (inject a sample before attaching)
+GET /v1/volumes/{id}/files?path=/path      response = bytes (extract results after destroy)
 ```
 
-Solo válido con el volumen **no adjunto**: escribir por debajo de un guest que lo
-tiene montado lo corrompe. Si está adjunto y la VM viva, usa el canal de la VM.
+Only valid with the volume **detached**: writing underneath a guest that has it
+mounted corrupts it. If it's attached and the VM alive, use the VM's channel.
 
-## El agente guest
+## The guest agent
 
-`scripts/prepare-image.sh` instala `microhosted-exec`, que multiplexa tres verbos
-sobre el puerto vsock según la primera línea de cada conexión:
+`scripts/prepare-image.sh` installs `microhosted-exec`, which multiplexes three
+verbs over the vsock port based on the first line of each connection:
 
-- comando pelado (sin verbo) → `exec` (contrato histórico intacto)
-- `PUT <path> <len>` + `<len>` bytes → escribe el fichero
-- `GET <path>` → responde `OK <len>` + bytes, o `ERR <msg>`
+- a bare command (no verb) → `exec` (the historical contract, intact)
+- `PUT <path> <len>` + `<len>` bytes → writes the file
+- `GET <path>` → responds `OK <len>` + bytes, or `ERR <msg>`
 
-Requiere `socat` en la imagen (ya necesario para `exec`).
+It requires `socat` in the image (already needed for `exec`).

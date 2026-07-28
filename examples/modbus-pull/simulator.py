@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""simulator.py — sensor Modbus TCP simulado, LADO B (fuera de la microVM).
+"""simulator.py — simulated Modbus TCP sensor, SIDE B (outside the microVM).
 
-Lo mínimo indispensable: un slave Modbus TCP PASIVO que solo responde cuando el
-maestro (parser.c dentro de la VM) le pregunta. Nunca inicia nada, como un
-PLC/sensor real. Corre en OTRA máquina de la red (o en el host, otro puerto).
+The bare minimum: a PASSIVE Modbus TCP slave that only responds when the master
+(parser.c inside the VM) queries it. It never initiates anything, like a real
+PLC/sensor. It runs on ANOTHER machine on the network (or on the host, on a
+different port).
 
-Solo stdlib de Python — sin pymodbus, sin pip. Implementa lo justo del
-protocolo: FC 0x03 (read holding registers). Los valores varían con el tiempo
-para que dos lecturas seguidas difieran (se ve que el pull lee estado vivo).
+Python stdlib only — no pymodbus, no pip. It implements just enough of the
+protocol: FC 0x03 (read holding registers). The values vary over time so that two
+consecutive reads differ (showing that the pull reads live state).
 
-    python3 simulator.py              # escucha en 0.0.0.0:5020
-    python3 simulator.py 0.0.0.0 502  # puerto Modbus estándar (necesita root)
+    python3 simulator.py              # listens on 0.0.0.0:5020
+    python3 simulator.py 0.0.0.0 502  # standard Modbus port (needs root)
 
-Mapa de registros (el mismo contrato que parser.c):
-  0: temperatura (int16 x10 -> C)   2: presión (uint16 hPa)
-  1: humedad     (uint16 x10 -> %)  3: contador de lecturas (uint16)
+Register map (the same contract as parser.c):
+  0: temperature (int16 x10 -> C)   2: pressure (uint16 hPa)
+  1: humidity    (uint16 x10 -> %)  3: reading counter (uint16)
 """
 
 import math
@@ -32,7 +33,7 @@ _counter = 0
 
 
 def current_registers():
-    """Estado 'vivo' del sensor: seno lento + ruido, contador incremental."""
+    """The sensor's 'live' state: slow sine + noise, incremental counter."""
     global _counter
     t = time.time() - _start
     temp_c = 22.5 + 2.5 * math.sin(t / 30.0) + random.uniform(-0.3, 0.3)
@@ -40,10 +41,10 @@ def current_registers():
     pressure = 1013 + int(5 * math.sin(t / 60.0)) + random.randint(-1, 1)
     _counter = (_counter + 1) & 0xFFFF
     return [
-        int(round(temp_c * 10)) & 0xFFFF,   # 0: temp x10 (int16 en complemento a 2)
-        int(round(humidity * 10)) & 0xFFFF,  # 1: humedad x10
-        pressure & 0xFFFF,                    # 2: presión
-        _counter,                             # 3: contador
+        int(round(temp_c * 10)) & 0xFFFF,   # 0: temp x10 (int16 two's complement)
+        int(round(humidity * 10)) & 0xFFFF,  # 1: humidity x10
+        pressure & 0xFFFF,                    # 2: pressure
+        _counter,                             # 3: counter
     ]
 
 
@@ -105,11 +106,11 @@ def main():
     host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5020
     server = ThreadedServer((host, port), ModbusHandler)
-    print(f"[simulator] slave Modbus TCP en {host}:{port} — Ctrl-C para parar")
+    print(f"[simulator] Modbus TCP slave on {host}:{port} — Ctrl-C to stop")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[simulator] parado.")
+        print("\n[simulator] stopped.")
         server.shutdown()
 
 

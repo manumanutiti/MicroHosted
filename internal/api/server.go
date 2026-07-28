@@ -16,7 +16,7 @@ import (
 
 // NewServer builds the HTTP API meant to sit behind a future web panel:
 // create/list/destroy VMs and browse the template catalog. This is the
-// integration point Sesión 7 originally planned for — it exists from the
+// integration point Stage 7 originally planned for — it exists from the
 // start here so a panel can be built against it without reshaping the
 // manager underneath.
 func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg SystemConfig) *http.Server {

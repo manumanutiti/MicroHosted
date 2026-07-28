@@ -1,326 +1,322 @@
-# Red segmentada (Fase 1)
+# Segmented networking (Phase 1)
 
-Reemplaza el modelo `/30` punto-a-punto (donde el host era gateway de cada VM y
-dos VMs no podían verse) por **redes con nombre**, que resuelven a la vez
-"redes entre máquinas" y "aislamiento contra maliciosos" con un solo mecanismo.
+Replaces the point-to-point `/30` model (where the host was the gateway for every
+VM and two VMs couldn't see each other) with **named networks**, which solve
+both "networks between machines" and "isolation against malicious guests" with a
+single mechanism.
 
-## Modelo
+## Model
 
-Una **Network** es un segmento L2 con nombre:
+A **Network** is a named L2 segment:
 
-- un **bridge** Linux (`mhbr<id>`, donde `<id>` son 8 hex — cabe en los 15
-  chars de `IFNAMSIZ`),
-- una **subred** (CIDR, p.ej. `172.16.0.0/24`),
-- un **gateway** = IP del host en el bridge (`.1` de la subred),
-- un flag **egress** (salida a internet sí/no) y opcionalmente **allowed_egress**
-  (egress de grano fino),
-- un flag **intra** (conectividad VM↔VM dentro de la red; **off por defecto**).
+- a Linux **bridge** (`mhbr<id>`, where `<id>` is 8 hex chars — fits in the 15
+  chars of `IFNAMSIZ`),
+- a **subnet** (CIDR, e.g. `172.16.0.0/24`),
+- a **gateway** = the host's IP on the bridge (`.1` of the subnet),
+- an **egress** flag (internet access yes/no) and optionally **allowed_egress**
+  (fine-grained egress),
+- an **intra** flag (VM↔VM connectivity within the network; **off by default**).
 
-Cada VM que entra a una red recibe un **TAP enslavado a ese bridge** (el TAP no
-lleva IP; la IP de gateway vive en el bridge) y una **IP de la subred** de la
-red (IPAM por-red). El gateway del guest es el del bridge.
+Every VM that joins a network gets a **TAP enslaved to that bridge** (the TAP
+carries no IP; the gateway IP lives on the bridge) and an **IP from the network's
+subnet** (per-network IPAM). The guest's gateway is the bridge's.
 
-- VMs en la **misma** red → **aisladas por defecto** (deny-by-default): cada
-  TAP se enslava como *isolated bridge port* del kernel, que no intercambia
-  tramas con otros puertos aislados pero sí con el bridge (el gateway). Solo
-  con `intra: true` la red es un segmento L2 clásico donde las VMs se ven.
-  Esto se hace a nivel L2 a propósito: el tráfico same-bridge **no pasa por
-  nftables** (es switching puro), una regla de forward no podría cortarlo.
-- VMs en redes **distintas** → aisladas (bridges separados + regla nftables que
-  descarta el tráfico cruzado).
-- `no_network: true` sigue válido: VM sin TAP, sin IP, solo vsock. El sandbox
-  más hermético.
+- VMs on the **same** network → **isolated by default** (deny-by-default): each
+  TAP is enslaved as a kernel *isolated bridge port*, which doesn't exchange
+  frames with other isolated ports but does with the bridge (the gateway). Only
+  with `intra: true` is the network a classic L2 segment where VMs see each
+  other. This is done at the L2 level on purpose: same-bridge traffic **doesn't
+  go through nftables** (it's pure switching), a forward rule couldn't cut it.
+- VMs on **different** networks → isolated (separate bridges + an nftables rule
+  that drops cross traffic).
+- `no_network: true` remains valid: a VM with no TAP, no IP, vsock only. The most
+  hermetic sandbox.
 
-## Política nftables (tabla `inet microhosted`)
+## nftables policy (table `inet microhosted`)
 
-- **guest → host**: DROP. La VM no puede alcanzar servicios del host (solo su
-  gateway, y solo para enrutar si hay egress).
-- **cross-segment**: DROP. El tráfico de la subred A hacia la subred B se
-  descarta. Implementado como UNA regla agregada sobre sets (`@mhbridges` +
-  exención `@mhsame` para el tráfico intra-bridge bajo br_netfilter), no una
-  regla por par de bridges: el ruleset se mantiene O(N) con N redes, clave
-  para la topología red-por-VM.
+- **guest → host**: DROP. The VM can't reach host services (only its gateway, and
+  only for routing if there's egress).
+- **cross-segment**: DROP. Traffic from subnet A toward subnet B is dropped.
+  Implemented as ONE aggregated rule over sets (`@mhbridges` + a `@mhsame`
+  exemption for intra-bridge traffic under br_netfilter), not one rule per bridge
+  pair: the ruleset stays O(N) with N networks, key for the network-per-VM
+  topology.
 - **egress**:
-  - `egress: true`  → `MASQUERADE` de la subred por la interfaz de salida por
-    defecto + FORWARD permitido hacia la WAN.
-  - `egress: false` → sin NAT y FORWARD hacia la WAN descartado. **Default**,
-    por seguridad (malware-safe): una muestra no llama a casa salvo que se pida
-    explícitamente.
-  - `egress: false` + **`allowed_egress`** → egress de grano fino: solo los
-    flujos listados (IP/CIDR destino + protocolo + puerto) se aceptan en
-    `forward` **antes** del drop hacia la WAN, y la subred se enmascara para
-    que esos flujos tengan NAT. Todo lo demás sigue cayendo en el drop. Caso
-    típico IoT: un parser que solo puede hablar con su broker MQTT
-    (`203.0.113.7:8883/tcp`) y nada más.
+  - `egress: true`  → `MASQUERADE` of the subnet through the default outbound
+    interface + FORWARD allowed toward the WAN.
+  - `egress: false` → no NAT and FORWARD toward the WAN dropped. **Default**, for
+    security (malware-safe): a sample doesn't call home unless explicitly asked.
+  - `egress: false` + **`allowed_egress`** → fine-grained egress: only the listed
+    flows (destination IP/CIDR + protocol + port) are accepted in `forward`
+    **before** the drop toward the WAN, and the subnet is masqueraded so those
+    flows get NAT. Everything else still falls into the drop. Typical IoT case: a
+    parser that can only talk to its MQTT broker (`203.0.113.7:8883/tcp`) and
+    nothing else.
 
-## Egress de grano fino (`allowed_egress`)
+## Fine-grained egress (`allowed_egress`)
 
-Cada regla es `{ip, protocol, port}`: `ip` es una IPv4 o CIDR IPv4 **en forma
-canónica**, `protocol` ∈ {`tcp`, `udp`, `icmp`} (minúsculas), y `port`
-(1–65535) es obligatorio para tcp/udp y prohibido para icmp. Es **mutuamente
-exclusivo** con `egress: true` (que ya lo permite todo).
+Each rule is `{ip, protocol, port}`: `ip` is an IPv4 or IPv4 CIDR **in canonical
+form**, `protocol` ∈ {`tcp`, `udp`, `icmp`} (lowercase), and `port` (1–65535) is
+required for tcp/udp and forbidden for icmp. It is **mutually exclusive** with
+`egress: true` (which already allows everything).
 
-La validación (`ValidateEgressRules`) es una frontera de seguridad, no una
-comodidad: los campos se interpolan tal cual en el script `nft -f`, así que
-cualquier cosa que no sea estrictamente IPv4 canónica + protocolo conocido +
-puerto numérico se rechaza en `POST /v1/networks` — si no, sería inyección de
-ruleset.
+Validation (`ValidateEgressRules`) is a security boundary, not a convenience: the
+fields are interpolated as-is into the `nft -f` script, so anything that isn't
+strictly canonical IPv4 + a known protocol + a numeric port is rejected in
+`POST /v1/networks` — otherwise it would be ruleset injection.
 
-En el `forward` chain el orden por red restringida es: accepts de
-`allowed_egress` → drop hacia la WAN. En `postrouting`, la subred restringida
-se enmascara entera — es seguro porque postrouting solo ve paquetes que el
-`forward` chain ya aceptó.
+In the `forward` chain, the order per restricted network is: `allowed_egress`
+accepts → drop toward the WAN. In `postrouting`, the restricted subnet is
+masqueraded as a whole — it's safe because postrouting only sees packets the
+`forward` chain already accepted.
 
-### Update en caliente de intra (`PUT /v1/networks/{name}/intra`)
+### Hot update of intra (`PUT /v1/networks/{name}/intra`)
 
-El flag `intra` también se puede cambiar en vivo: se persiste y luego
-`vm.Manager.SyncTapIsolation` recorre los TAPs vivos de la red re-aplicando
-`bridge link set ... isolated on/off`. El reparto de responsabilidades es
-deliberado: el flag vive en el manager de red, pero los nombres de TAP
-pertenecen a las VMs (un fork en Firecracker < 1.12 puede reutilizar el TAP
-del snapshot, así que `tap<id>` no es una convención fiable) — por eso el
-recorrido lo hace el manager de VMs. Si algún TAP no converge al endurecer,
-el endpoint devuelve 500 nombrándolo: un TAP que conserva alcanzabilidad
-antigua es un agujero, no un detalle de log.
+The `intra` flag can also be changed live: it's persisted and then
+`vm.Manager.SyncTapIsolation` walks the network's live TAPs re-applying
+`bridge link set ... isolated on/off`. The division of responsibilities is
+deliberate: the flag lives in the network manager, but TAP names belong to the
+VMs (a fork on Firecracker < 1.12 may reuse the snapshot's TAP, so `tap<id>`
+isn't a reliable convention) — that's why the VM manager does the walk. If any
+TAP fails to converge when hardening, the endpoint returns 500 naming it: a TAP
+that keeps old reachability is a hole, not a log detail.
 
-### Update en caliente de egress (`PUT /v1/networks/{name}/egress`)
+### Hot update of egress (`PUT /v1/networks/{name}/egress`)
 
-La política de egress de una red viva se puede **reemplazar** sin tocar las
-VMs conectadas: bridge, subred e IPs no cambian, solo se re-renderiza el
-ruleset (que ya es declarativo y atómico). El body reemplaza la política
-entera, no hace merge.
+A live network's egress policy can be **replaced** without touching the connected
+VMs: bridge, subnet, and IPs don't change, only the ruleset is re-rendered (which
+is already declarative and atomic). The body replaces the whole policy, it
+doesn't merge.
 
-Decisión de diseño clave: el chain `forward` matchea **sin estado** — no tiene
-el `ct state established,related accept` que sí tiene `input`. Cada paquete de
-un flujo iniciado por un guest re-evalúa la política en cada pasada, así que
-al endurecer las reglas los flujos abiertos bajo la política anterior mueren
-en el siguiente paquete: una entrada conntrack obsoleta no puede colarse por
-un accept de established, y no hace falta el binario `conntrack(8)` para
-flushear nada. Las respuestas (tráfico de vuelta desde la WAN) no las toca
-ningún drop (todos van scoped por `iifname` de bridge), pasan por policy
-accept.
+Key design decision: the `forward` chain matches **statelessly** — it doesn't
+have the `ct state established,related accept` that `input` does. Every packet of
+a guest-initiated flow re-evaluates the policy on each pass, so when the rules are
+hardened, flows opened under the previous policy die on the next packet: a stale
+conntrack entry can't sneak through an established accept, and the `conntrack(8)`
+binary isn't needed to flush anything. Replies (return traffic from the WAN)
+aren't touched by any drop (they're all scoped by bridge `iifname`), they pass via
+policy accept.
 
-## Egress y coexistencia con el firewall del host (LEER — origen de bugs sutiles)
+## Egress and coexistence with the host firewall (READ — a source of subtle bugs)
 
-La salida a internet de una red `egress: true` depende de **dos condiciones a
-nivel de host** que MicroHosted resuelve automáticamente. Documentadas aquí a
-fondo porque son la causa nº1 de "la red funciona pero no hay internet", y el
-comportamiento cambia según haya Docker en la máquina o no.
+Internet egress for an `egress: true` network depends on **two host-level
+conditions** that MicroHosted resolves automatically. Documented here in depth
+because they're the #1 cause of "the network works but there's no internet", and
+the behavior changes depending on whether Docker is on the machine or not.
 
-### Cómo funciona el egress
+### How egress works
 
-Para que un guest (p.ej. `172.16.2.2`) alcance `8.8.8.8`:
+For a guest (e.g. `172.16.2.2`) to reach `8.8.8.8`:
 
-1. El guest manda el paquete a su gateway (la IP del bridge, `172.16.2.1`) a
-   nivel L2.
-2. El host lo **enruta** (destino no es local) → pasa por el hook `forward` de
-   netfilter.
-3. El host lo **enmascara** (`MASQUERADE`) por su interfaz de salida (hook
-   `postrouting`, NAT), reescribiendo el origen a la IP del host.
-4. La respuesta vuelve, conntrack la reconoce (`established`) y la desenmascara.
+1. The guest sends the packet to its gateway (the bridge's IP, `172.16.2.1`) at
+   the L2 level.
+2. The host **routes** it (destination isn't local) → it goes through netfilter's
+   `forward` hook.
+3. The host **masquerades** it (`MASQUERADE`) through its outbound interface
+   (`postrouting` hook, NAT), rewriting the source to the host's IP.
+4. The reply comes back, conntrack recognizes it (`established`) and unmasquerades
+   it.
 
-Nada de esto usa el hook `input` (que es solo para tráfico destinado al propio
-host) — por eso el guest puede **enrutar a través** del gateway aunque tenga
-prohibido **hablar con** el gateway (`ping 172.16.2.1` sigue bloqueado). Esto es
-correcto y deseado.
+None of this uses the `input` hook (which is only for traffic destined to the host
+itself) — that's why the guest can **route through** the gateway even though it's
+forbidden to **talk to** the gateway (`ping 172.16.2.1` is still blocked). This is
+correct and intended.
 
-### Condición 1 — IP forwarding del kernel
+### Condition 1 — kernel IP forwarding
 
-Con `net.ipv4.ip_forward = 0` el kernel descarta el paquete en el paso 2, antes
-de que el NAT actúe. MicroHosted lo activa solo (`network.EnsureIPForward`,
-`internal/network/forward.go`) en cuanto existe **alguna** red con egress. Nunca
-lo desactiva (el host puede tenerlo activo por otros motivos).
+With `net.ipv4.ip_forward = 0` the kernel drops the packet at step 2, before NAT
+acts. MicroHosted enables it on its own (`network.EnsureIPForward`,
+`internal/network/forward.go`) as soon as **any** network with egress exists. It
+never disables it (the host may have it on for other reasons).
 
-### Condición 2 — el firewall del host no debe descartar el FORWARD
+### Condition 2 — the host firewall must not drop the FORWARD
 
-**Semántica clave de netfilter**: en un mismo hook (p.ej. `forward`) pueden
-coexistir **varias cadenas base** de tablas distintas, y **todas se evalúan**.
-Un veredicto `drop` en *cualquiera* de ellas es **final** y descarta el paquete;
-un `accept` solo termina *esa* cadena, no impide que otra cadena posterior lo
-dropee. Consecuencia: **que nuestra tabla `inet microhosted` haga `accept` NO
-basta** si otra tabla del host dropea el forward.
+**Key netfilter semantics**: on the same hook (e.g. `forward`), **several base
+chains** from different tables can coexist, and **all of them are evaluated**. A
+`drop` verdict in *any* of them is **final** and drops the packet; an `accept`
+only ends *that* chain, it doesn't prevent a later chain from dropping it.
+Consequence: **our table `inet microhosted` doing `accept` is NOT enough** if
+another host table drops the forward.
 
-#### Sin Docker (caso habitual)
+#### Without Docker (the usual case)
 
-La política por defecto del hook `forward` suele ser `accept`. Nuestra tabla
-aplica su política fina (drop guest→host, drop cross-segment, drop no-egress→WAN;
-accept + masquerade para egress) y **el egress funciona directo**. MicroHosted no
-toca ningún firewall del host. Nada que configurar.
+The `forward` hook's default policy is usually `accept`. Our table applies its
+fine-grained policy (drop guest→host, drop cross-segment, drop no-egress→WAN;
+accept + masquerade for egress) and **egress works directly**. MicroHosted doesn't
+touch any host firewall. Nothing to configure.
 
-#### Con Docker (rompe el egress hasta coordinarse)
+#### With Docker (breaks egress until coordinated)
 
-Docker instala en la tabla `ip filter` (gestionada por iptables-nft) una cadena
-`FORWARD` con **`policy drop`**, y solo hace `accept` del tráfico de *sus*
-bridges. El tráfico de *nuestros* bridges cae en ese `drop` → **sin internet**,
-aunque `ip_forward=1` y nuestro `masquerade` estén bien. (El cross-segment sí se
-bloquea igual, porque ahí gana *nuestro* `drop` — de ahí el síntoma
-característico: "inter-VM y aislamiento OK, pero egress no sale").
+Docker installs, in the `ip filter` table (managed by iptables-nft), a `FORWARD`
+chain with **`policy drop`**, and only `accept`s traffic from *its* bridges.
+Traffic from *our* bridges falls into that `drop` → **no internet**, even though
+`ip_forward=1` and our `masquerade` are fine. (Cross-segment is still blocked all
+the same, because there *our* `drop` wins — hence the characteristic symptom:
+"inter-VM and isolation OK, but egress doesn't go out".)
 
-Solución (patrón estándar, el mismo que usa libvirt): Docker expone la cadena
-`DOCKER-USER`, a la que salta **antes** de su propia lógica de drop, justo para
-que herramientas externas permitan su tráfico. MicroHosted
-(`network.EnsureDockerForwarding`) añade ahí, de forma idempotente:
+Solution (standard pattern, the same one libvirt uses): Docker exposes the
+`DOCKER-USER` chain, which it jumps to **before** its own drop logic, precisely so
+external tools can allow their traffic. MicroHosted
+(`network.EnsureDockerForwarding`) adds there, idempotently:
 
 ```
 iptables -t filter -I DOCKER-USER -i mhbr+ -j ACCEPT
 iptables -t filter -I DOCKER-USER -o mhbr+ -j ACCEPT
 ```
 
-`mhbr+` es el comodín de iptables para "cualquier interfaz `mhbr...`", así que
-dos reglas estáticas cubren todos los bridges presentes y futuros. Se ejecuta
-solo si existe la cadena `DOCKER-USER` (Docker presente) y solo cuando hay una
-red con egress. **No debilita el aislamiento**: nuestra tabla `inet microhosted`
-se sigue evaluando y sus `drop` (guest→host, cross-segment, no-egress→WAN)
-siguen ganando por la regla del `drop`-final. El `accept` en `DOCKER-USER` solo
-evita que el `drop` genérico de Docker se adelante a nuestra política.
+`mhbr+` is iptables' wildcard for "any `mhbr...` interface", so two static rules
+cover all present and future bridges. It runs only if the `DOCKER-USER` chain
+exists (Docker present) and only when there's a network with egress. **It doesn't
+weaken isolation**: our table `inet microhosted` is still evaluated and its
+`drop`s (guest→host, cross-segment, no-egress→WAN) still win by the final-drop
+rule. The `accept` in `DOCKER-USER` only prevents Docker's generic `drop` from
+getting ahead of our policy.
 
-**Best-effort, nunca fatal**: si programar `DOCKER-USER` o `ip_forward` falla,
-se registra un *warning* en el journal y el daemon sigue vivo (no tumba la
-gestión de las VMs). La tabla `inet microhosted` sí es autoritativa y sí falla
-fuerte. Nota: si **reinicias el servicio Docker**, recrea sus cadenas y puede
-tirar nuestras reglas de `DOCKER-USER`; se reponen solas al siguiente
-crear/borrar red o reinicio de microhosted.
+**Best-effort, never fatal**: if programming `DOCKER-USER` or `ip_forward` fails,
+a *warning* is logged in the journal and the daemon stays alive (it doesn't take
+down VM management). The `inet microhosted` table, however, is authoritative and
+does fail hard. Note: if you **restart the Docker service**, it recreates its
+chains and may drop our `DOCKER-USER` rules; they're re-added on their own on the
+next network create/delete or microhosted restart.
 
-#### Otros firewalls (ufw / firewalld activos)
+#### Other firewalls (ufw / firewalld active)
 
-Mismo principio: si `ufw` o `firewalld` están **activos** con el forward por
-defecto en `drop`, pueden descartar el egress. MicroHosted **no** los reconfigura
-automáticamente (solo Docker, por su punto de extensión estándar). Si usas uno
-de ellos con egress, permite el forward de los bridges `mhbr+`:
+Same principle: if `ufw` or `firewalld` are **active** with the forward default at
+`drop`, they can drop egress. MicroHosted does **not** reconfigure them
+automatically (only Docker, via its standard extension point). If you use one of
+them with egress, allow the forward of the `mhbr+` bridges:
 
 ```bash
-# ufw: política de forward permisiva (o una regla específica para mhbr+)
+# ufw: permissive forward policy (or a specific rule for mhbr+)
 sudo sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw && sudo ufw reload
-# firewalld: poner los bridges en una zona que permita forward, p.ej. trusted
+# firewalld: put the bridges in a zone that allows forward, e.g. trusted
 sudo firewall-cmd --permanent --zone=trusted --add-interface=mhbr+ ; sudo firewall-cmd --reload
 ```
 
-### Matriz de comportamiento (egress: true)
+### Behavior matrix (egress: true)
 
-| Host | Política `forward` ajena | Qué hace MicroHosted | Resultado |
-|------|--------------------------|----------------------|-----------|
-| Sin firewall extra | `accept` | nada (nuestra tabla + `ip_forward`) | egress OK |
-| Docker | `drop` (cadena de Docker) | `ip_forward` + `DOCKER-USER` accept auto | egress OK |
-| ufw/firewalld activos con forward `drop` | `drop` | `ip_forward` (no toca ufw/firewalld) | egress **falla** → aplica el fix de arriba |
+| Host | Foreign `forward` policy | What MicroHosted does | Result |
+|------|--------------------------|----------------------|--------|
+| No extra firewall | `accept` | nothing (our table + `ip_forward`) | egress OK |
+| Docker | `drop` (Docker's chain) | `ip_forward` + auto `DOCKER-USER` accept | egress OK |
+| ufw/firewalld active with forward `drop` | `drop` | `ip_forward` (doesn't touch ufw/firewalld) | egress **fails** → apply the fix above |
 
-### Diagnóstico rápido si egress no sale
+### Quick diagnosis if egress doesn't go out
 
 ```bash
-cat /proc/sys/net/ipv4/ip_forward                 # debe ser 1
-sudo nft list table inet microhosted              # ¿está la línea 'masquerade' de tu subred?
-sudo nft list ruleset | grep -iB1 -A4 'hook forward'  # ¿HAY otra cadena forward con 'policy drop'? (Docker/ufw/firewalld)
-sudo iptables -t filter -S DOCKER-USER 2>/dev/null    # con Docker: deben estar las 2 reglas 'mhbr+ ACCEPT'
-# desde el guest: ruta por defecto + ARP del gateway
+cat /proc/sys/net/ipv4/ip_forward                 # must be 1
+sudo nft list table inet microhosted              # is your subnet's 'masquerade' line there?
+sudo nft list ruleset | grep -iB1 -A4 'hook forward'  # is there ANOTHER forward chain with 'policy drop'? (Docker/ufw/firewalld)
+sudo iptables -t filter -S DOCKER-USER 2>/dev/null    # with Docker: the 2 'mhbr+ ACCEPT' rules must be there
+# from the guest: default route + gateway ARP
 curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"ip route; ip neigh"}'
 ```
 
-Regla mental: **egress roto casi siempre = otra cadena `forward` con `policy
-drop` (Docker/ufw/firewalld) o `ip_forward=0`**. El aislamiento (guest→host,
-cross-segment) NO depende de nada de esto — lo impone nuestra tabla y siempre
-gana.
+Mental rule: **broken egress is almost always = another `forward` chain with
+`policy drop` (Docker/ufw/firewalld) or `ip_forward=0`**. Isolation (guest→host,
+cross-segment) does NOT depend on any of this — our table enforces it and always
+wins.
 
-## DNS en el guest (LEER — síntoma: `ping <IP>` funciona, `ping <dominio>` no)
+## DNS in the guest (READ — symptom: `ping <IP>` works, `ping <domain>` doesn't)
 
-Síntoma característico: `ping 8.8.8.8` responde bien, pero `ping google.com` da
-`Temporary failure in name resolution`. **No es un problema de red ni de
-firewall** (el tráfico IP ya funciona, egress ya está validado) — es que al
-guest nunca le llega qué servidor DNS usar, o le llega pero el guest no lo
-aplica. Dos piezas, las dos ya resueltas en el código/imagen base de este
-repo, documentadas para que cualquier imagen nueva las tenga en cuenta.
+Characteristic symptom: `ping 8.8.8.8` responds fine, but `ping google.com` gives
+`Temporary failure in name resolution`. **It's not a network or firewall problem**
+(IP traffic already works, egress is already validated) — it's that the guest
+never learns which DNS server to use, or it does but the guest doesn't apply it.
+Two pieces, both already solved in this repo's code/base image, documented so any
+new image takes them into account.
 
-### Pieza 1 — decirle al guest qué DNS usar (lado MicroHosted, ya hecho)
+### Piece 1 — tell the guest which DNS to use (MicroHosted side, already done)
 
-`firecracker-go-sdk`'s `IPConfiguration` acepta hasta 2 `Nameservers`, pero
-**nunca se los pasábamos** — solo IP/gateway. `internal/firecracker/machine.go`
-ahora fija `defaultNameservers = ["1.1.1.1", "8.8.8.8"]` para toda VM con red.
+`firecracker-go-sdk`'s `IPConfiguration` accepts up to 2 `Nameservers`, but we
+**never passed them** — only IP/gateway. `internal/firecracker/machine.go` now
+sets `defaultNameservers = ["1.1.1.1", "8.8.8.8"]` for every VM with a network.
 
-**Por qué DNS públicos y no los del host**: el resolver del host (p.ej. el stub
-`127.0.0.53` de systemd-resolved) sería inalcanzable de todas formas —
-`guest→host` está bloqueado por diseño (ver la sección de aislamiento arriba).
-Usar 1.1.1.1/8.8.8.8 es coherente con el modelo: en una red `egress:false` esas
-IPs son tan inalcanzables como cualquier otra IP externa (el DNS falla igual
-que fallaría cualquier tráfico WAN — correcto, malware-safe); en una red
-`egress:true` son alcanzables vía el mismo NAT que ya sale a internet, así que
-DNS funciona sin ninguna pieza adicional.
+**Why public DNS and not the host's**: the host's resolver (e.g. systemd-resolved's
+`127.0.0.53` stub) would be unreachable anyway — `guest→host` is blocked by design
+(see the isolation section above). Using 1.1.1.1/8.8.8.8 is consistent with the
+model: on an `egress:false` network those IPs are as unreachable as any other
+external IP (DNS fails just as any WAN traffic would — correct, malware-safe); on
+an `egress:true` network they're reachable via the same NAT that already goes to
+the internet, so DNS works with no additional piece.
 
-### Pieza 2 — que el guest APLIQUE esos nameservers (lado imagen, en `prepare-image.sh`)
+### Piece 2 — have the guest APPLY those nameservers (image side, in `prepare-image.sh`)
 
-Aquí está la parte no obvia. El SDK **no** edita `/etc/resolv.conf` del guest
-directamente (no tiene forma de tocar el filesystem del rootfs desde fuera).
-Lo que hace es meter IP+gateway+nameservers como parámetro de arranque del
-kernel (`ip=`), un mecanismo heredado de netboot/nfsroot. El **kernel Linux**,
-al arrancar con ese parámetro, escribe esa configuración en
-`/proc/net/pnp` — un pseudo-archivo con sintaxis compatible con
-`/etc/resolv.conf` (líneas `nameserver X.X.X.X`).
+Here's the non-obvious part. The SDK does **not** edit the guest's
+`/etc/resolv.conf` directly (it has no way to touch the rootfs filesystem from
+outside). What it does is pass IP+gateway+nameservers as a kernel boot parameter
+(`ip=`), a mechanism inherited from netboot/nfsroot. The **Linux kernel**, when
+booting with that parameter, writes that configuration into `/proc/net/pnp` — a
+pseudo-file with a syntax compatible with `/etc/resolv.conf` (`nameserver
+X.X.X.X` lines).
 
-Pero que `/proc/net/pnp` tenga los DNS no sirve de nada si **nada en el guest
-lee de ahí**. La mayoría de distros modernas (systemd-resolved, netplan,
-cloud-init, NetworkManager) gestionan `/etc/resolv.conf` a su manera —
-normalmente symlink a su propio stub — e ignoran `/proc/net/pnp` por completo.
-Sin este paso, el guest simplemente no tiene ningún nameserver configurado,
-pase lo que pase del lado de MicroHosted.
+But `/proc/net/pnp` having the DNS is useless if **nothing in the guest reads from
+it**. Most modern distros (systemd-resolved, netplan, cloud-init, NetworkManager)
+manage `/etc/resolv.conf` their own way — usually a symlink to their own stub —
+and ignore `/proc/net/pnp` entirely. Without this step, the guest simply has no
+nameserver configured, no matter what happens on the MicroHosted side.
 
-**Arreglo**: `scripts/prepare-image.sh` ahora, en cada preparación de imagen
-(incondicional, no depende de `--no-ssh`/`--no-vsock` — es red básica, no parte
-del acceso), hace:
+**Fix**: `scripts/prepare-image.sh` now, on every image preparation
+(unconditional, not dependent on `--no-ssh`/`--no-vsock` — it's basic networking,
+not part of access), does:
 
 ```bash
-# si /etc/resolv.conf era un archivo real, se guarda como .microhosted-orig
+# if /etc/resolv.conf was a real file, it's saved as .microhosted-orig
 ln -sf /proc/net/pnp /etc/resolv.conf
 ```
 
-Con eso, cualquier programa del guest que lea `/etc/resolv.conf` (la vía
-estándar en Linux) obtiene automáticamente los nameservers que MicroHosted le
-pasó al arrancar — sin agente propio, sin systemd-resolved, sin DHCP.
+With that, any guest program that reads `/etc/resolv.conf` (the standard way on
+Linux) automatically gets the nameservers MicroHosted passed at boot — with no
+custom agent, no systemd-resolved, no DHCP.
 
-### Por qué esto no depende del host (a diferencia del problema de Docker)
+### Why this doesn't depend on the host (unlike the Docker problem)
 
-A diferencia de la sección de egress (que depende de qué firewall corre en
-**el host**), esto depende únicamente de **la imagen del guest** — es el mismo
-arreglo en cualquier host, Docker o no, ufw o no. Por eso vive en
-`prepare-image.sh` (se aplica una vez por rootfs dorado) y no en el daemon.
+Unlike the egress section (which depends on which firewall runs on **the host**),
+this depends solely on **the guest image** — it's the same fix on any host, Docker
+or not, ufw or not. That's why it lives in `prepare-image.sh` (applied once per
+golden rootfs) and not in the daemon.
 
-### Si preparas una imagen nueva desde cero (no la que ya trae este repo)
+### If you prepare a new image from scratch (not the one this repo ships)
 
-Corre siempre `scripts/prepare-image.sh` sobre el rootfs antes de usarlo como
-plantilla — deja lista tanto la resolución DNS como el acceso (vsock/SSH). Si
-por lo que sea gestionas el rootfs a mano sin este script, el único requisito
-mínimo para DNS es esa línea `ln -sf /proc/net/pnp /etc/resolv.conf` dentro del
-rootfs montado.
+Always run `scripts/prepare-image.sh` over the rootfs before using it as a
+template — it sets up both DNS resolution and access (vsock/SSH). If for some
+reason you manage the rootfs by hand without this script, the only minimal
+requirement for DNS is that `ln -sf /proc/net/pnp /etc/resolv.conf` line inside the
+mounted rootfs.
 
-### Diagnóstico rápido si DNS no resuelve pero las IPs sí
+### Quick diagnosis if DNS doesn't resolve but IPs do
 
 ```bash
-# ¿el kernel recibió y aplicó los nameservers?
+# did the kernel receive and apply the nameservers?
 curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"cat /proc/net/pnp"}'
-# ¿resolv.conf apunta ahí?
+# does resolv.conf point there?
 curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"ls -la /etc/resolv.conf; cat /etc/resolv.conf"}'
-# si /proc/net/pnp tiene los nameservers pero resolv.conf no es el symlink:
-# la imagen no pasó por prepare-image.sh (o algo lo sobreescribió al arrancar,
-# p.ej. systemd-resolved) — vuelve a correr scripts/prepare-image.sh sobre el
-# rootfs dorado y crea una VM NUEVA (las ya clonadas no cambian retroactivamente).
+# if /proc/net/pnp has the nameservers but resolv.conf isn't the symlink:
+# the image didn't go through prepare-image.sh (or something overwrote it at boot,
+# e.g. systemd-resolved) — re-run scripts/prepare-image.sh over the golden rootfs
+# and create a NEW VM (already-cloned ones don't change retroactively).
 ```
 
-**Nota importante para VMs ya creadas**: igual que con cualquier cambio de
-`prepare-image.sh`, solo afecta a rootfs clonados **después** de volver a
-correrlo sobre la plantilla dorada — `internal/storage.CloneRootfs` copia lo
-que hubiera en el momento del clonado. Una VM que ya existía sigue sin DNS
-hasta que se destruye y se crea una nueva desde la plantilla actualizada.
+**Important note for already-created VMs**: as with any `prepare-image.sh` change,
+it only affects rootfs cloned **after** re-running it over the golden template —
+`internal/storage.CloneRootfs` copies whatever was there at clone time. A VM that
+already existed stays without DNS until it's destroyed and a new one is created
+from the updated template.
 
-## Decisiones
+## Decisions
 
-- **Backend**: `nft` (nftables) para nuestra tabla propia `inet microhosted` —
-  moderno y aislado del firewall del host. Excepción: la coexistencia con Docker
-  usa `iptables` (iptables-nft) para la cadena `DOCKER-USER`, porque es la
-  interfaz que Docker gestiona y espera (ver la sección de egress).
-- **Red por defecto**: al arrancar se crea `default` si no existe
-  (`172.16.0.0/24`, `egress: false`). Una VM sin `network` especificado entra a
+- **Backend**: `nft` (nftables) for our own table `inet microhosted` — modern and
+  isolated from the host firewall. Exception: Docker coexistence uses `iptables`
+  (iptables-nft) for the `DOCKER-USER` chain, because that's the interface Docker
+  manages and expects (see the egress section).
+- **Default network**: on startup, `default` is created if it doesn't exist
+  (`172.16.0.0/24`, `egress: false`). A VM with no `network` specified joins
   `default`.
-- **Subred auto**: si no se indica, se asigna un `/24` secuencial del pool
-  `172.16.0.0/12`; el operador puede fijar la subred a mano.
-- **Persistencia**: las redes se guardan en SQLite. Al arrancar, el daemon
-  recrea bridges + reglas desde el estado persistido (una red sobrevive a un
-  reinicio del host, no solo del daemon).
+- **Auto subnet**: if not given, a sequential `/24` is assigned from the
+  `172.16.0.0/12` pool; the operator can set the subnet by hand.
+- **Persistence**: networks are stored in SQLite. On startup, the daemon recreates
+  bridges + rules from the persisted state (a network survives a host reboot, not
+  just a daemon restart).
 
 ## API
 
@@ -328,28 +324,28 @@ hasta que se destruye y se crea una nueva desde la plantilla actualizada.
 POST   /v1/networks     {name, subnet?, egress?}
 GET    /v1/networks
 GET    /v1/networks/{name}
-DELETE /v1/networks/{name}          # falla si tiene VMs conectadas
-POST   /v1/vms          {..., network: "<name>"}   # network vacío = default
+DELETE /v1/networks/{name}          # fails if it has connected VMs
+POST   /v1/vms          {..., network: "<name>"}   # empty network = default
 ```
 
-## Estado de implementación
+## Implementation status
 
-- [x] Modelo de datos (`types.Network`) + persistencia (`store` tabla networks)
-- [x] IPAM por-red (`network.Subnet`)
-- [x] Primitivas de bridge + TAP enslavado (`network` bridge/tap)
-- [x] Reglas nftables por red (`network.ApplyNftables`, declarativo)
-- [x] Orquestación (`network.Manager`: crear/borrar red, attach/detach VM) +
-      reconcile de bridges al arrancar
-- [x] Endpoints `/v1/networks` + `network` en create de VM; `vm.Manager` movido
-      del modelo `/30` al de bridges
-- [x] Egress: `ip_forward` auto + coexistencia con Docker (`DOCKER-USER`)
-- [x] **Validada en hardware (2026-07-02)**: inter-VM misma red OK (0.5ms),
-      aislamiento entre redes OK, guest↛host OK, egress `false` bloqueado /
-      egress `true` con NAT alcanza `8.8.8.8` sobre un host con Docker, todo con
-      el aislamiento intacto.
+- [x] Data model (`types.Network`) + persistence (`store` networks table)
+- [x] Per-network IPAM (`network.Subnet`)
+- [x] Bridge + enslaved TAP primitives (`network` bridge/tap)
+- [x] Per-network nftables rules (`network.ApplyNftables`, declarative)
+- [x] Orchestration (`network.Manager`: create/delete network, attach/detach VM) +
+      bridge reconcile on startup
+- [x] `/v1/networks` endpoints + `network` in VM create; `vm.Manager` moved from
+      the `/30` model to bridges
+- [x] Egress: auto `ip_forward` + Docker coexistence (`DOCKER-USER`)
+- [x] **Validated on hardware (2026-07-02)**: inter-VM same network OK (0.5ms),
+      isolation between networks OK, guest↛host OK, egress `false` blocked /
+      egress `true` with NAT reaches `8.8.8.8` on a host with Docker, all with
+      isolation intact.
 
-> **Fase 1 CERRADA.** La cadena de bugs que destapó la validación en hardware
-> (todos restos de suposiciones del viejo modelo `/30` de "una VM = un enlace
-> aislado", que el bridge compartido rompe): máscara `/30` hardcodeada →
-> broadcast; sin MAC única → colisión en el bridge; `ip_forward=0`; Docker
-> dropeando el FORWARD. Todos resueltos y documentados arriba.
+> **Phase 1 CLOSED.** The chain of bugs that hardware validation uncovered (all
+> leftovers of assumptions from the old `/30` model of "one VM = one isolated
+> link", which the shared bridge breaks): hardcoded `/30` mask → broadcast; no
+> unique MAC → bridge collision; `ip_forward=0`; Docker dropping the FORWARD. All
+> resolved and documented above.

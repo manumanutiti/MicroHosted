@@ -46,8 +46,8 @@ type running struct {
 
 // Manager owns the whole lifecycle of a VM: template lookup, disk cloning,
 // network setup, and launching/stopping through Jailer + Firecracker. It's
-// the single seam meant for future extension — persistence (Sesión 8),
-// multi-host placement (Sesión 9) and snapshot/restore (Sesión 6) all plug
+// the single seam meant for future extension — persistence (Stage 8),
+// multi-host placement (Stage 9) and snapshot/restore (Stage 6) all plug
 // in here without the API layer changing.
 //
 // State is kept in memory only for now; a restart of the daemon forgets

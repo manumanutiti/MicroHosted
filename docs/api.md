@@ -1,42 +1,41 @@
-# API HTTP — referencia
+# HTTP API — reference
 
-Servida por `internal/api` (`cmd/microhosted`, flag `--addr`, por defecto
-`:8080`). Todos los cuerpos son JSON. No hay autenticación todavía — pensada
-para correr detrás de un panel/backend propio, no expuesta directamente.
+Served by `internal/api` (`cmd/microhosted`, flag `--addr`, default `:8080`).
+All bodies are JSON. There's no authentication yet — it's meant to run behind
+your own dashboard/backend, not exposed directly.
 
-Estado: cubre create/read/delete + stop/start + exec + snapshots/fork +
-volúmenes/ficheros + observabilidad (`/v1/system`, `/v1/health`). El CRUD
-completo (incluyendo "update" y matices de create/delete) está en marcha —
-ver `SESSIONS.md`, sección "Próxima sesión".
+Status: covers create/read/delete + stop/start + exec + snapshots/fork +
+volumes/files + observability (`/v1/system`, `/v1/health`). The full CRUD
+(including "update" and create/delete nuances) is in progress.
 
-**Convención de rutas** (toda la API sigue esta regla):
+**Route convention** (the whole API follows this rule):
 
-- **Recursos = sustantivos con CRUD puro**: `POST/GET /v1/<recurso>` y
-  `GET/DELETE /v1/<recurso>/{id}` — `vms`, `snapshots`, `networks`, `templates`.
-- **Acciones = verbos**: `POST /v1/<recurso>/{id}/<verbo>` — `stop`, `start`,
-  `snapshot`, `fork`, `restore`, `exec`. El mismo verbo significa lo mismo
-  cuelgue de donde cuelgue (p. ej. `fork` existe en `/vms/{id}` y en
-  `/snapshots/{id}` con el mismo body y la misma respuesta; solo cambia el
-  origen). Lo que una acción crea vive después en su colección: `snapshot`
-  crea en `/v1/snapshots`, `fork` crea en `/v1/vms`.
-- **Singletons de solo lectura**: `GET /v1/system` y `GET /v1/health` —
-  recursos únicos (el host solo hay uno), sin `{id}` (ver `## Observabilidad`).
+- **Resources = nouns with pure CRUD**: `POST/GET /v1/<resource>` and
+  `GET/DELETE /v1/<resource>/{id}` — `vms`, `snapshots`, `networks`, `templates`.
+- **Actions = verbs**: `POST /v1/<resource>/{id}/<verb>` — `stop`, `start`,
+  `snapshot`, `fork`, `restore`, `exec`. The same verb means the same thing
+  wherever it hangs (e.g. `fork` exists on `/vms/{id}` and on `/snapshots/{id}`
+  with the same body and the same response; only the origin changes). What an
+  action creates then lives in its collection: `snapshot` creates in
+  `/v1/snapshots`, `fork` creates in `/v1/vms`.
+- **Read-only singletons**: `GET /v1/system` and `GET /v1/health` — unique
+  resources (there's only one host), with no `{id}` (see `## Observability`).
 
 ---
 
-## Plantillas (catálogo)
+## Templates (catalog)
 
 ### `GET /v1/templates`
 
-Lista las plantillas ("micromáquinas") disponibles para clonar.
+Lists the templates ("micro-machines") available to clone.
 
-**Respuesta 200** — array de `Template`:
+**200 response** — an array of `Template`:
 
 ```json
 [
   {
     "name": "base-ubuntu",
-    "description": "Ubuntu 22.04 (rootfs oficial de Firecracker CI)",
+    "description": "Ubuntu 22.04 (official Firecracker CI rootfs)",
     "kernel_path": "images/kernels/vmlinux-6.1.102",
     "rootfs_path": "images/rootfs/ubuntu-22.04.ext4",
     "vcpus": 1,
@@ -45,32 +44,32 @@ Lista las plantillas ("micromáquinas") disponibles para clonar.
 ]
 ```
 
-Fuente: `images/catalog.json`, cargado una vez al arrancar el daemon
+Source: `images/catalog.json`, loaded once when the daemon starts
 (`storage.LoadCatalog`).
 
 ---
 
-## Redes
+## Networks
 
-Segmentos L2 con nombre (bridge + subred + política nftables). Detalle del
-modelo en `docs/networking.md`. Al arrancar existe siempre una red `default`
-(`172.16.0.0/24`, sin salida a internet).
+Named L2 segments (bridge + subnet + nftables policy). Model detail in
+`docs/networking.md`. On startup a `default` network always exists
+(`172.16.0.0/24`, no internet egress).
 
-### `POST /v1/networks` — crear
+### `POST /v1/networks` — create
 
 **Body** (`CreateNetworkRequest`):
 
-| campo            | tipo   | requerido | descripción                                                        |
-|------------------|--------|-----------|---------------------------------------------------------------------|
-| `name`           | string | sí        | nombre único de la red                                             |
-| `subnet`         | string | no        | CIDR (p.ej. `10.10.0.0/24`); si se omite, se asigna un `/24` libre |
-| `egress`         | bool   | no        | si `true`, la subred sale a internet vía NAT; `false` por defecto  |
-| `allowed_egress` | array  | no        | egress de grano fino: solo estos flujos salen a la WAN; requiere `egress` a `false`. Ver `docs/networking.md` |
-| `intra`          | bool   | no        | si `true`, las VMs de la red se ven entre sí (L2); `false` por defecto: cada TAP es un puerto aislado del bridge |
+| field            | type   | required | description                                                        |
+|------------------|--------|----------|---------------------------------------------------------------------|
+| `name`           | string | yes      | unique network name                                                |
+| `subnet`         | string | no       | CIDR (e.g. `10.10.0.0/24`); if omitted, a free `/24` is assigned   |
+| `egress`         | bool   | no       | if `true`, the subnet goes to the internet via NAT; `false` by default |
+| `allowed_egress` | array  | no       | fine-grained egress: only these flows reach the WAN; requires `egress` = `false`. See `docs/networking.md` |
+| `intra`          | bool   | no       | if `true`, the network's VMs see each other (L2); `false` by default: each TAP is an isolated bridge port |
 
-Cada elemento de `allowed_egress` es `{"ip", "protocol", "port"}`: `ip` IPv4 o
-CIDR IPv4 canónico, `protocol` ∈ `tcp`/`udp`/`icmp` (minúsculas), `port`
-obligatorio para tcp/udp y prohibido para icmp.
+Each element of `allowed_egress` is `{"ip", "protocol", "port"}`: `ip` an IPv4 or
+canonical IPv4 CIDR, `protocol` ∈ `tcp`/`udp`/`icmp` (lowercase), `port` required
+for tcp/udp and forbidden for icmp.
 
 ```bash
 curl -X POST localhost:8080/v1/networks -d '{"name":"lab"}'
@@ -80,62 +79,62 @@ curl -X POST localhost:8080/v1/networks -d '{"name":"iot","allowed_egress":[
   {"ip":"203.0.113.7","protocol":"icmp"}]}'
 ```
 
-**Respuesta 201** (`NetworkResponse`) · **400** si falta `name`, si una regla
-de `allowed_egress` es inválida, o si se combinan `egress: true` y
-`allowed_egress` · **500** si el nombre ya existe, la subred es inválida o
-falla la creación del bridge.
+**201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
+`allowed_egress` rule is invalid, or if `egress: true` and `allowed_egress` are
+combined · **500** if the name already exists, the subnet is invalid, or bridge
+creation fails.
 
 ### `GET /v1/networks` · `GET /v1/networks/{name}`
 
-Lista todas las redes / detalle de una. **Forma de `NetworkResponse`:**
+Lists all networks / detail of one. **Shape of `NetworkResponse`:**
 
-| campo        | descripción                                             |
+| field        | description                                             |
 |--------------|----------------------------------------------------------|
-| `name`       | nombre de la red                                        |
-| `bridge`     | bridge Linux que la respalda (`mhbr<id>`)               |
-| `subnet`     | CIDR de la red                                          |
-| `gateway`    | IP del host en el bridge (la `.1`, ruta de los guests)  |
-| `egress`     | si tiene salida a internet                              |
-| `allowed_egress` | reglas de egress fino, si las hay (omitido si vacío) |
-| `intra`      | si las VMs de la red pueden verse entre sí              |
-| `created_at` | timestamp RFC3339                                       |
+| `name`       | network name                                            |
+| `bridge`     | Linux bridge backing it (`mhbr<id>`)                    |
+| `subnet`     | the network's CIDR                                      |
+| `gateway`    | the host's IP on the bridge (the `.1`, the guests' route) |
+| `egress`     | whether it has internet egress                          |
+| `allowed_egress` | fine-grained egress rules, if any (omitted if empty) |
+| `intra`      | whether the network's VMs can see each other           |
+| `created_at` | RFC3339 timestamp                                       |
 
-### `PUT /v1/networks/{name}/egress` — actualizar la política de egress en caliente
+### `PUT /v1/networks/{name}/egress` — update the egress policy live
 
-Reemplaza la política de egress **entera** (no hace merge) sin tocar las VMs
-conectadas. Mismos campos y validación que en la creación: `egress` (bool) y
-`allowed_egress` (array), mutuamente exclusivos.
+Replaces the **whole** egress policy (no merge) without touching the connected
+VMs. Same fields and validation as on creation: `egress` (bool) and
+`allowed_egress` (array), mutually exclusive.
 
 ```bash
 curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{"allowed_egress":[
   {"ip":"192.168.0.15","protocol":"icmp"},
   {"ip":"192.168.0.15","protocol":"tcp","port":6565}]}'
 
-# quitar todo el egress: body vacío
+# remove all egress: empty body
 curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{}'
 ```
 
-Los flujos abiertos bajo la política anterior se cortan inmediatamente al
-endurecer (ver `docs/networking.md`, "Update en caliente").
+Flows opened under the previous policy are cut immediately when hardening (see
+`docs/networking.md`, "Hot update").
 
-**Respuesta 200** (`NetworkResponse` actualizado) · **400** si una regla es
-inválida o se combinan `egress: true` y `allowed_egress` · **404** si la red
-no existe.
+**200 response** (updated `NetworkResponse`) · **400** if a rule is invalid or
+`egress: true` and `allowed_egress` are combined · **404** if the network doesn't
+exist.
 
-### `PUT /v1/networks/{name}/intra` — conectividad VM↔VM en caliente
+### `PUT /v1/networks/{name}/intra` — VM↔VM connectivity live
 
-Activa o desactiva el tráfico entre las VMs de la red sin recrearla: persiste
-el flag y re-aplica el aislamiento de puerto a todos los TAPs vivos de la red.
-Las VMs paradas lo cogen al arrancar.
+Enables or disables traffic between the network's VMs without recreating it:
+persists the flag and re-applies port isolation to all the network's live TAPs.
+Stopped VMs pick it up on boot.
 
 ```bash
 curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":true}'
 curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":false}'
 ```
 
-**Respuesta 200** (`NetworkResponse` actualizado) · **400** body inválido ·
-**404** si la red no existe · **500** si el flag se guardó pero algún TAP vivo
-no convergió (el mensaje dice cuáles — re-lanza el PUT).
+**200 response** (updated `NetworkResponse`) · **400** invalid body · **404** if
+the network doesn't exist · **500** if the flag was saved but some live TAP didn't
+converge (the message says which — re-issue the PUT).
 
 ### `DELETE /v1/networks/{name}`
 
@@ -143,176 +142,177 @@ no convergió (el mensaje dice cuáles — re-lanza el PUT).
 curl -X DELETE localhost:8080/v1/networks/lab
 ```
 
-**Respuesta 204** · **404** si no existe · **409** si aún tiene VMs conectadas
-(destrúyelas primero, con el endpoint de abajo).
+**204 response** · **404** if it doesn't exist · **409** if it still has connected
+VMs (destroy them first, with the endpoint below).
 
-### `DELETE /v1/networks/{name}/vms` — borrar todas las VMs de una red
+### `DELETE /v1/networks/{name}/vms` — delete all VMs of a network
 
-Paso previo típico a `DELETE /v1/networks/{name}` cuando aún tiene VMs.
+The typical step before `DELETE /v1/networks/{name}` when it still has VMs.
 
 ```bash
 curl -X DELETE localhost:8080/v1/networks/lab/vms
 ```
 
-**Respuesta 200** (`BulkDeleteResponse`, ver forma más abajo) · **404** si la
-red no existe.
+**200 response** (`BulkDeleteResponse`, shape further below) · **404** if the
+network doesn't exist.
 
 ---
 
 ## VMs
 
-### `POST /v1/vms` — crear
+### `POST /v1/vms` — create
 
 **Body** (`CreateVMRequest`):
 
-| campo         | tipo   | requerido | descripción                                                                 |
-|---------------|--------|-----------|------------------------------------------------------------------------------|
-| `template`    | string | sí        | nombre de una plantilla del catálogo                                        |
-| `vcpus`       | int    | no        | overridea el `vcpus` de la plantilla                                        |
-| `mem_mb`      | int    | no        | overridea el `mem_mb` de la plantilla                                       |
-| `disk_mb`     | int    | no        | overridea el `disk_mb` de la plantilla; solo agranda (nunca encoge)        |
-| `network`     | string | no        | red segmentada a la que conectar la VM (ver `## Redes`); vacío = `default`  |
-| `no_network`  | bool   | no        | si `true`, no crea TAP/IP — la VM solo es accesible por vsock (`/exec`)     |
-| `volumes`     | array  | no        | volúmenes a adjuntar al arrancar (ver `## Volúmenes`); cada uno `{name, read_only?, guest_path?}` |
+| field         | type   | required | description                                                                 |
+|---------------|--------|----------|------------------------------------------------------------------------------|
+| `template`    | string | yes      | name of a catalog template                                                  |
+| `vcpus`       | int    | no       | overrides the template's `vcpus`                                            |
+| `mem_mb`      | int    | no       | overrides the template's `mem_mb`                                           |
+| `disk_mb`     | int    | no       | overrides the template's `disk_mb`; only grows (never shrinks)             |
+| `network`     | string | no       | segmented network to connect the VM to (see `## Networks`); empty = `default` |
+| `no_network`  | bool   | no       | if `true`, no TAP/IP is created — the VM is only reachable over vsock (`/exec`) |
+| `volumes`     | array  | no       | volumes to attach at boot (see `## Volumes`); each one `{name, read_only?, guest_path?}` |
 
 ```bash
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu"}'
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","network":"lab"}'
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true}'
-# muestra montada de solo lectura + volumen de salida escribible
+# read-only mounted sample + writable output volume
 curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true,
-  "volumes":[{"name":"muestra","read_only":true,"guest_path":"/mnt/sample"},
-             {"name":"salida"}]}'
+  "volumes":[{"name":"sample","read_only":true,"guest_path":"/mnt/sample"},
+             {"name":"output"}]}'
 ```
 
-**Respuesta 201** (`VMResponse`, ver más abajo) · **400** si falta `template`
-o el JSON es inválido · **500** si falla el clonado/red/arranque (el mensaje
-de error incluye en qué paso falló).
+**201 response** (`VMResponse`, see below) · **400** if `template` is missing or
+the JSON is invalid · **500** if clone/network/boot fails (the error message
+includes which step failed).
 
-Cada `POST` clona el rootfs de la plantilla desde cero
-(`internal/storage.CloneRootfs`, copy-on-write vía `cp --reflink=auto`) y lo
-agranda a `disk_mb` con `resize2fs` para que el guest tenga espacio libre (un
-rootfs dorado va casi lleno; sin esto un `apt install` se queda sin espacio).
-El CoW solo es real sobre un FS con reflink (btrfs / XFS-reflink); en ext4
-normal `cp` cae a copia completa y cada VM ocupa el disco entero — el daemon
-avisa de esto al arrancar y `scripts/setup-host.sh` provisiona un store CoW.
-Hoy no hay forma de re-arrancar sobre un disco ya modificado de una VM anterior;
-eso es parte del trabajo pendiente (ver `SESSIONS.md`).
+Each `POST` clones the template's rootfs from scratch
+(`internal/storage.CloneRootfs`, copy-on-write via `cp --reflink=auto`) and grows
+it to `disk_mb` with `resize2fs` so the guest has free space (a golden rootfs
+ships nearly full; without this, an `apt install` runs out of space). The CoW is
+only real on a filesystem with reflink (btrfs / XFS-reflink); on plain ext4 `cp`
+falls back to a full copy and each VM takes the whole disk — the daemon warns
+about this on startup and `scripts/setup-host.sh` provisions a CoW store. There's
+no way today to reboot on top of an already-modified disk from a previous VM; that's
+part of the pending work.
 
 ---
 
-### `GET /v1/vms` — listar
+### `GET /v1/vms` — list
 
 ```bash
 curl localhost:8080/v1/vms
 ```
 
-**Respuesta 200** — array de `VMResponse`. Pensado como base del futuro
-"`docker ps` de microVMs" (ver `SESSIONS.md`) — hoy es una lista plana, sin
-filtros ni columnas de estado más allá de `state`.
+**200 response** — an array of `VMResponse`. Intended as the basis of the future
+"`docker ps` of microVMs" — today it's a flat list, with no filters or status
+columns beyond `state`.
 
 ---
 
-### `GET /v1/vms/{id}` — detalle
+### `GET /v1/vms/{id}` — detail
 
 ```bash
 curl localhost:8080/v1/vms/a1b2c3d4
 ```
 
-**Respuesta 200** (`VMResponse`) · **404** si no existe.
+**200 response** (`VMResponse`) · **404** if it doesn't exist.
 
-**Forma de `VMResponse`:**
+**Shape of `VMResponse`:**
 
-| campo         | descripción                                                                 |
+| field         | description                                                                 |
 |---------------|------------------------------------------------------------------------------|
-| `id`          | ID corto (8 hex) de la VM                                                    |
-| `template`    | nombre de la plantilla de la que se clonó                                   |
-| `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (se usan `running` y `stopped`) |
-| `pid`         | PID del proceso Firecracker (jailed)                                        |
-| `vcpus` / `mem_mb` / `disk_mb` | forma prometida a la VM al crearla                          |
-| `uptime_seconds` | solo `running`: segundos desde que arrancó el proceso Firecracker (boot/restore, no `created_at`) |
-| `mem_rss_mb`  | solo `running`: RAM residente REAL del proceso — lo que la VM cuesta al host ahora mismo (la RAM del guest se pagina bajo demanda: normalmente muy por debajo de `mem_mb`) |
-| `cpu_seconds` | solo `running`: CPU acumulada del proceso; para una tasa de uso, difierénciala entre dos sondeos |
-| `network`     | nombre de la red segmentada a la que está conectada (vacío si `no_network`) |
-| `guest_ip`    | IP del guest en la subred de su red (vacío si `no_network`)                 |
-| `tap_device`  | nombre del TAP, enslavado al bridge de la red (vacío si `no_network`)       |
-| `rootfs_path` | el disco de la VM (clon del rootfs) en el host                              |
-| `log_path`    | archivo con la consola serie + logs de Jailer/Firecracker de esta VM        |
-| `created_at`  | timestamp RFC3339                                                            |
+| `id`          | short ID (8 hex) of the VM                                                   |
+| `template`    | name of the template it was cloned from                                     |
+| `state`       | `creating`\|`running`\|`paused`\|`stopped`\|`failed` (`running` and `stopped` are used) |
+| `pid`         | PID of the (jailed) Firecracker process                                     |
+| `vcpus` / `mem_mb` / `disk_mb` | shape promised to the VM at creation                       |
+| `uptime_seconds` | `running` only: seconds since the Firecracker process started (boot/restore, not `created_at`) |
+| `mem_rss_mb`  | `running` only: the process's REAL resident RAM — what the VM costs the host right now (guest RAM is paged in on demand: usually well below `mem_mb`) |
+| `cpu_seconds` | `running` only: the process's accumulated CPU; for a usage rate, difference it between two polls |
+| `network`     | name of the segmented network it's connected to (empty if `no_network`)     |
+| `guest_ip`    | the guest's IP in its network's subnet (empty if `no_network`)              |
+| `tap_device`  | the TAP's name, enslaved to the network's bridge (empty if `no_network`)    |
+| `rootfs_path` | the VM's disk (rootfs clone) on the host                                    |
+| `log_path`    | the file with this VM's serial console + Jailer/Firecracker logs            |
+| `created_at`  | RFC3339 timestamp                                                            |
 
-Nota: `VMResponse` no incluye hoy `socket_path` ni `vsock_path` (existen en el
-tipo interno `types.VM` pero no se serializan) — pendiente decidir si exponerlos.
+Note: `VMResponse` doesn't currently include `socket_path` or `vsock_path` (they
+exist in the internal `types.VM` type but aren't serialized) — pending a decision
+on whether to expose them.
 
 ---
 
-### `DELETE /v1/vms/{id}` — destruir
+### `DELETE /v1/vms/{id}` — destroy
 
 ```bash
 curl -X DELETE localhost:8080/v1/vms/a1b2c3d4
 ```
 
-**Respuesta 204** · **404** si no existe o si falla al parar/limpiar (el
-detalle del error queda en el body).
+**204 response** · **404** if it doesn't exist or if stop/cleanup fails (the error
+detail is in the body).
 
-Para a la máquina (`firecracker.Stop`: ACPI graceful + SIGTERM de respaldo, o
-señal por PID si es una VM adoptada tras un reinicio), borra el TAP, libera la
-IP en su red, borra el clon del rootfs + `.log`, el directorio de chroot de
-Jailer y el registro persistido. La limpieza acumula errores (`errors.Join`):
-un fallo en un paso no salta los demás.
+Stops the machine (`firecracker.Stop`: ACPI graceful + SIGTERM backup, or a signal
+by PID if it's a VM adopted after a restart), deletes the TAP, frees the IP in its
+network, deletes the rootfs clone + `.log`, the Jailer chroot directory, and the
+persisted record. Cleanup accumulates errors (`errors.Join`): a failure in one
+step doesn't skip the others.
 
-**Destruir (`DELETE`) vs. apagar (`stop`)**: `DELETE` borra *todo*, incluido el
-ext4 de la microVM (el disco). Si solo quieres liberar CPU/RAM y conservar el
-disco, usa `stop` (abajo).
+**Destroy (`DELETE`) vs. power off (`stop`)**: `DELETE` deletes *everything*,
+including the microVM's ext4 (the disk). If you only want to free CPU/RAM and keep
+the disk, use `stop` (below).
 
 ---
 
-### `POST /v1/vms/{id}/stop` — apagar (poweroff, conserva el disco)
+### `POST /v1/vms/{id}/stop` — power off (poweroff, keeps the disk)
 
 ```bash
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/stop
 ```
 
-**Respuesta 200** con el `VMResponse` (ahora `state: "stopped"`, `pid` omitido) ·
-**404** si no existe · **409** si ya estaba parada.
+**200 response** with the `VMResponse` (now `state: "stopped"`, `pid` omitted) ·
+**404** if it doesn't exist · **409** if it was already stopped.
 
-Apaga el proceso Firecracker (libera CPU/RAM) y suelta el TAP y el directorio de
-chroot de Jailer, pero **conserva el clon del rootfs** (el disco, con todo lo que
-el guest haya escrito) y **mantiene la IP reservada** en su red. Sobrevive a un
-reinicio del daemon: `Reconcile` no la barre, la deja parada y re-reserva su IP.
-No se puede hacer `exec` sobre una VM parada (**409**).
+Powers off the Firecracker process (frees CPU/RAM) and releases the TAP and the
+Jailer chroot directory, but **keeps the rootfs clone** (the disk, with everything
+the guest wrote) and **keeps the IP reserved** in its network. It survives a daemon
+restart: `Reconcile` doesn't sweep it, it leaves it stopped and re-reserves its IP.
+You can't `exec` on a stopped VM (**409**).
 
-### `POST /v1/vms/{id}/start` — arrancar una VM parada
+### `POST /v1/vms/{id}/start` — start a stopped VM
 
 ```bash
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/start
 ```
 
-**Respuesta 200** con el `VMResponse` (`state: "running"`, nuevo `pid`) ·
-**404** si no existe · **409** si no está parada.
+**200 response** with the `VMResponse` (`state: "running"`, new `pid`) · **404** if
+it doesn't exist · **409** if it isn't stopped.
 
-Recrea el TAP (que se soltó al parar) y relanza Firecracker sobre el **mismo**
-ext4 y la **misma** IP que tenía. El bridge de la red sigue en pie (parar no lo
-toca), así que arranca en frío con el disco y el direccionamiento intactos.
+Recreates the TAP (which was released on stop) and relaunches Firecracker on the
+**same** ext4 and the **same** IP it had. The network's bridge is still up (stop
+doesn't touch it), so it cold-boots with the disk and addressing intact.
 
 ---
 
-### `DELETE /v1/vms` — borrar todas las VMs
+### `DELETE /v1/vms` — delete all VMs
 
-Resetea el entorno (útil entre tandas de pruebas) sin ir una a una.
+Resets the environment (useful between test batches) without going one by one.
 
 ```bash
 curl -X DELETE localhost:8080/v1/vms
 ```
 
-**Respuesta 200** siempre — destruir muchas VMs independientes no es
-todo-o-nada; el resultado va en el body, no en el código HTTP.
+**200 response** always — destroying many independent VMs isn't all-or-nothing; the
+result is in the body, not the HTTP code.
 
-**Forma de `BulkDeleteResponse`** (también la usa `DELETE /v1/networks/{name}/vms`):
+**Shape of `BulkDeleteResponse`** (also used by `DELETE /v1/networks/{name}/vms`):
 
-| campo     | descripción                                                        |
+| field     | description                                                        |
 |-----------|----------------------------------------------------------------------|
-| `deleted` | array de IDs destruidos con éxito                                   |
-| `failed`  | objeto `{id: mensaje de error}` — solo presente si algo falló       |
+| `deleted` | array of IDs destroyed successfully                                 |
+| `failed`  | object `{id: error message}` — only present if something failed     |
 
 ```json
 {"deleted": ["a1b2c3d4", "e5f6a7b8"], "failed": {"c9d0e1f2": "vm not found"}}
@@ -320,208 +320,206 @@ todo-o-nada; el resultado va en el body, no en el código HTTP.
 
 ---
 
-## Snapshots y bifurcación
+## Snapshots and forking
 
-Un snapshot congela una VM **en marcha** como punto restaurable: memoria del
-guest + estado de dispositivos (vmstate/mem de Firecracker) + un clon
-copy-on-write de su disco, capturado todo en el mismo instante (la VM se pausa
-<1s y se reanuda sola). El snapshot es una entidad independiente: **sobrevive
-a que su VM de origen se pare o destruya** — ese es el punto: "detonar y
-volver a limpio" exige que el estado limpio viva más que lo que pase después.
+A snapshot freezes a **running** VM as a restorable point: guest memory + device
+state (Firecracker's vmstate/mem) + a copy-on-write clone of its disk, all captured
+at the same instant (the VM pauses <1s and resumes on its own). The snapshot is an
+independent entity: **it survives its source VM being stopped or destroyed** —
+that's the point: "detonate and go back to clean" requires the clean state to
+outlive whatever happens afterward.
 
-Dos formas de volver a un snapshot:
+Two ways to return to a snapshot:
 
-- **Restore in-place** (`POST /v1/vms/{id}/restore`): rebobina ESA VM — mismo
-  ID, misma IP, mismo TAP; solo memoria y disco vuelven atrás. El primitivo
-  "reset a limpio entre muestras".
-- **Fork** (`POST /v1/snapshots/{id}/fork`): crea una VM **nueva** desde el
-  snapshot — el guest despierta a mitad de ejecución justo donde se congeló.
+- **In-place restore** (`POST /v1/vms/{id}/restore`): rewinds THAT VM — same ID,
+  same IP, same TAP; only memory and disk go back. The "reset to clean between
+  samples" primitive.
+- **Fork** (`POST /v1/snapshots/{id}/fork`): creates a **new** VM from the snapshot
+  — the guest wakes up mid-execution exactly where it was frozen.
 
-Y un atajo que no requiere gestionar snapshots:
+And a shortcut that doesn't require managing snapshots:
 
-- **Fork directo** (`POST /v1/vms/{id}/fork`): bifurca una VM **en marcha** en
-  una sola llamada — el daemon toma un snapshot efímero, forkea desde él y lo
-  borra. Para "dame una copia de esta máquina tal y como está ahora".
+- **Direct fork** (`POST /v1/vms/{id}/fork`): forks a **running** VM in a single
+  call — the daemon takes an ephemeral snapshot, forks from it, and deletes it. For
+  "give me a copy of this machine as it is right now".
 
-**La identidad de red va congelada en la memoria.** El guest restaurado cree
-tener la IP/MAC del momento del snapshot y eso no se puede cambiar al
-restaurar. De ahí los dos modos de fork:
+**The network identity is frozen in memory.** The restored guest thinks it has the
+IP/MAC from the moment of the snapshot, and that can't be changed on restore. Hence
+the two fork modes:
 
-| modo | qué hace | cuándo |
+| mode | what it does | when |
 |---|---|---|
-| normal (por defecto) | el fork se une a la red de origen con la IP del snapshot; **409** si esa IP está ocupada (p. ej. la VM original sigue viva) | recuperar un estado conocido como VM plena |
-| `quarantine: true` | TAP creado pero enslavado a **nada**: el guest cree tener red pero cada paquete muere en el host; solo accesible por vsock (`/exec`) | bifurcar el punto de infección y examinarlo sin que hable con nadie; permite **N forks simultáneos** del mismo snapshot |
+| normal (default) | the fork joins the origin network with the snapshot's IP; **409** if that IP is taken (e.g. the original VM is still alive) | recover a known state as a full VM |
+| `quarantine: true` | a TAP is created but enslaved to **nothing**: the guest thinks it has a network but every packet dies at the host; only reachable over vsock (`/exec`) | fork the point of infection and examine it without letting it talk to anyone; allows **N simultaneous forks** of the same snapshot |
 
-### `POST /v1/vms/{id}/snapshot` — crear snapshot
+### `POST /v1/vms/{id}/snapshot` — create a snapshot
 
-**Body** (opcional): `{"name": "clean"}` — etiqueta libre.
+**Body** (optional): `{"name": "clean"}` — a free label.
 
 ```bash
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/snapshot -d '{"name":"clean"}'
 ```
 
-**Respuesta 201** (`SnapshotResponse`) · **404** si la VM no existe · **409**
-si no está en marcha (solo se puede snapshotear una VM `running`).
+**201 response** (`SnapshotResponse`) · **404** if the VM doesn't exist · **409**
+if it isn't running (you can only snapshot a `running` VM).
 
-**Forma de `SnapshotResponse`:**
+**Shape of `SnapshotResponse`:**
 
-| campo | descripción |
+| field | description |
 |---|---|
-| `id` | ID corto del snapshot |
-| `name` | etiqueta opcional |
-| `source_vm` | VM de la que se tomó |
-| `template` | plantilla de la VM de origen |
-| `vcpus` / `mem_mb` / `disk_mb` | forma de la máquina congelada (fija: la restauración vuelve exactamente así) |
-| `network` / `guest_ip` | identidad de red congelada en la memoria del guest |
-| `created_at` | timestamp RFC3339 |
+| `id` | short ID of the snapshot |
+| `name` | optional label |
+| `source_vm` | the VM it was taken from |
+| `template` | the source VM's template |
+| `vcpus` / `mem_mb` / `disk_mb` | shape of the frozen machine (fixed: restore comes back exactly like this) |
+| `network` / `guest_ip` | network identity frozen in the guest's memory |
+| `created_at` | RFC3339 timestamp |
 
 ### `GET /v1/snapshots` · `GET /v1/snapshots/{id}` · `DELETE /v1/snapshots/{id}`
 
-Listado, detalle y borrado. Borrar un snapshot es seguro aunque haya VMs
-restauradas desde él corriendo (tienen copias/hardlinks propios). **204** al
-borrar · **404** si no existe.
+List, detail, and delete. Deleting a snapshot is safe even if there are VMs
+restored from it running (they have their own copies/hardlinks). **204** on delete
+· **404** if it doesn't exist.
 
-### `POST /v1/snapshots/{id}/fork` — bifurcar (fork)
+### `POST /v1/snapshots/{id}/fork` — fork
 
-**Body** (`ForkVMRequest`, opcional): `{"quarantine": true}`.
+**Body** (`ForkVMRequest`, optional): `{"quarantine": true}`.
 
 ```bash
-# Fork normal: exige la IP del snapshot libre en su red de origen
+# Normal fork: requires the snapshot's IP free in its origin network
 curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork
 
-# Fork en cuarentena: sin red real, solo vsock
+# Quarantine fork: no real network, vsock only
 curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork -d '{"quarantine":true}'
 ```
 
-**Respuesta 201** (`VMResponse`; los forks llevan `restored_from` y, en su
-caso, `quarantine: true`; en cuarentena `guest_ip` es la IP que el guest
-*cree* tener, no una reserva real) · **404** si el snapshot no existe ·
-**409** si la IP del snapshot está ocupada en la red de origen (destruye la
-VM que la tiene o usa `quarantine`).
+**201 response** (`VMResponse`; forks carry `restored_from` and, where applicable,
+`quarantine: true`; in quarantine `guest_ip` is the IP the guest *thinks* it has,
+not a real reservation) · **404** if the snapshot doesn't exist · **409** if the
+snapshot's IP is taken in the origin network (destroy the VM that has it or use
+`quarantine`).
 
-**Requisito de versión para forks simultáneos**: `network_overrides` (remapear
-la NIC congelada a otro TAP) existe desde **Firecracker v1.12.0**. Con un FC
-anterior (el daemon lo detecta solo), el fork reutiliza el nombre de TAP
-original del snapshot — funciona si la VM de origen está destruida o parada,
-pero **con la original (u otro fork) corriendo cualquier fork da 409**,
-incluido `quarantine`, indicando que hay que actualizar
-(`scripts/install-fc.sh`). Al actualizar FC, los snapshots existentes deben
-recrearse (su formato va ligado a la versión).
+**Version requirement for simultaneous forks**: `network_overrides` (remapping the
+frozen NIC to another TAP) exists from **Firecracker v1.12.0**. With an earlier FC
+(the daemon detects it on its own), the fork reuses the snapshot's original TAP
+name — it works if the source VM is destroyed or stopped, but **with the original
+(or another fork) running, any fork returns 409**, including `quarantine`,
+indicating you need to upgrade (`scripts/install-fc.sh`). When upgrading FC,
+existing snapshots must be recreated (their format is tied to the version).
 
-### `POST /v1/vms/{id}/fork` — fork directo de una VM en marcha
+### `POST /v1/vms/{id}/fork` — direct fork of a running VM
 
-**Body** (`ForkVMRequest`, opcional): `{"quarantine": true}` — el mismo que el
-fork desde snapshot.
+**Body** (`ForkVMRequest`, optional): `{"quarantine": true}` — the same as the fork
+from a snapshot.
 
 ```bash
-# Copia en cuarentena de una VM viva, en una llamada
+# Quarantine copy of a live VM, in one call
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/fork -d '{"quarantine":true}'
 ```
 
-Equivale a snapshot → fork → borrar el snapshot, sin que el snapshot efímero
-quede registrado. La VM de origen solo se pausa <1s (igual que al snapshotear)
-y sigue corriendo. Si quieres conservar el punto congelado para restores
-posteriores, usa el flujo explícito (`/snapshots` + fork).
+Equivalent to snapshot → fork → delete the snapshot, without the ephemeral snapshot
+being registered. The source VM only pauses <1s (same as snapshotting) and keeps
+running. If you want to keep the frozen point for later restores, use the explicit
+flow (`/snapshots` + fork).
 
-**Semántica de red**: la de fork, con una consecuencia práctica — la VM de
-origen sigue viva ocupando su IP, así que el fork directo **sin** `quarantine`
-siempre da 409 en una VM con red (la IP congelada está en uso por definición).
-El modo natural de este endpoint es `quarantine: true` (o VMs `no_network`).
+**Network semantics**: those of fork, with one practical consequence — the source
+VM is still alive occupying its IP, so a direct fork **without** `quarantine`
+always returns 409 on a VM with a network (the frozen IP is in use by definition).
+This endpoint's natural mode is `quarantine: true` (or `no_network` VMs).
 
-**Respuesta 201** (`VMResponse`, como el fork normal) · **404** VM inexistente
-· **409** VM no `running`, o el conflicto de red/TAP correspondiente (en FC
-< 1.12 el TAP original está siempre en uso por la propia VM de origen, así que
-este endpoint requiere en la práctica **Firecracker ≥ 1.12**).
+**201 response** (`VMResponse`, like a normal fork) · **404** nonexistent VM ·
+**409** VM not `running`, or the corresponding network/TAP conflict (on FC < 1.12
+the original TAP is always in use by the source VM itself, so this endpoint in
+practice requires **Firecracker ≥ 1.12**).
 
-### `POST /v1/vms/{id}/restore` — rebobinar in-place
+### `POST /v1/vms/{id}/restore` — rewind in-place
 
-**Body** (`RestoreVMRequest`): `{"snapshot": "f00dcafe"}`. Solo acepta
-snapshots tomados **de esa misma VM** (para restaurar el snapshot de otra VM
-está el fork, que gestiona las colisiones de identidad honestamente).
+**Body** (`RestoreVMRequest`): `{"snapshot": "f00dcafe"}`. Only accepts snapshots
+taken **from that same VM** (to restore another VM's snapshot there's fork, which
+handles identity collisions honestly).
 
 ```bash
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/restore -d '{"snapshot":"f00dcafe"}'
 ```
 
-Vale sobre una VM `running` (se para primero) o `stopped`. **Respuesta 200**
-(`VMResponse`, `state: "running"`) · **404** VM o snapshot inexistentes ·
-**409** si el snapshot es de otra VM o la VM está en un estado incompatible.
+Works on a `running` VM (it's stopped first) or a `stopped` one. **200 response**
+(`VMResponse`, `state: "running"`) · **404** nonexistent VM or snapshot · **409** if
+the snapshot is from another VM or the VM is in an incompatible state.
 
-**Nota (reloj del guest)**: tras cualquier restauración el reloj del guest
-sigue en la hora del snapshot; para análisis donde importe el timestamp,
-resincroniza vía `/exec` (p. ej. `date -s` o chrony). Es el comportamiento
-documentado de Firecracker.
+**Note (guest clock)**: after any restore the guest's clock stays at the snapshot's
+time; for analysis where the timestamp matters, resync via `/exec` (e.g. `date -s`
+or chrony). It's Firecracker's documented behavior.
 
 ---
 
-### `POST /v1/vms/{id}/exec` — ejecutar un comando (vsock)
+### `POST /v1/vms/{id}/exec` — run a command (vsock)
 
 **Body** (`ExecRequest`):
 
-| campo | tipo   | requerido | descripción                          |
-|-------|--------|-----------|----------------------------------------|
-| `cmd` | string | sí        | comando a ejecutar con `sh -c` en el guest |
+| field | type   | required | description                          |
+|-------|--------|----------|----------------------------------------|
+| `cmd` | string | yes      | command to run with `sh -c` in the guest |
 
 ```bash
 curl -X POST localhost:8080/v1/vms/a1b2c3d4/exec -d '{"cmd":"whoami && uname -a"}'
 ```
 
-**Respuesta 200** (`ExecResponse`):
+**200 response** (`ExecResponse`):
 
 ```json
 {"output": "root\nLinux ubuntu-fc-uvm 6.1.102 ...\n", "exit_code": 0}
 ```
 
-`output` es stdout+stderr combinados. Funciona con o sin red (`no_network`
-no afecta a este endpoint) — requiere que la plantilla se haya preparado con
-`scripts/prepare-image.sh` (instala el listener `socat`+vsock en el rootfs
-dorado). Si la plantilla no está preparada, o si la clonaste antes de
-prepararla, da **500** con un error indicando que falta el marcador de salida
-del agente.
+`output` is stdout+stderr combined. It works with or without a network
+(`no_network` doesn't affect this endpoint) — it requires the template to have been
+prepared with `scripts/prepare-image.sh` (which installs the `socat`+vsock listener
+in the golden rootfs). If the template isn't prepared, or if you cloned it before
+preparing it, it returns **500** with an error indicating the agent's exit marker is
+missing.
 
-**400** si falta `cmd` · **404**/**500** si la VM no existe o el vsock no
-responde.
+**400** if `cmd` is missing · **404**/**500** if the VM doesn't exist or the vsock
+doesn't respond.
 
 ---
 
-## Volúmenes
+## Volumes
 
-Discos ext4 persistentes que viven aparte de las VMs y sobreviven a su
-destrucción — el plano de datos: una muestra montada de solo lectura, o un
-disco escribible que recoge artefactos y se lee después. Detalle completo (canal
-vsock vs `debugfs`, streaming, seguridad) en `docs/volumes.md`.
+Persistent ext4 disks that live apart from the VMs and survive their destruction —
+the data plane: a read-only mounted sample, or a writable disk that collects
+artifacts and is read afterward. Full detail (vsock vs `debugfs` channel, streaming,
+security) in `docs/volumes.md`.
 
-**Regla de seguridad**: el host **nunca monta** el filesystem del guest;
-todo el I/O host-side va por `debugfs` (espacio de usuario, sin `mount`).
+**Security rule**: the host **never mounts** the guest's filesystem; all host-side
+I/O goes through `debugfs` (userspace, no `mount`).
 
-### `POST /v1/volumes` — crear
+### `POST /v1/volumes` — create
 
 **Body** (`CreateVolumeRequest`):
 
-| campo     | tipo   | requerido | descripción                          |
-|-----------|--------|-----------|----------------------------------------|
-| `name`    | string | sí        | nombre único del volumen              |
-| `size_mb` | int    | sí        | tamaño del ext4 en MiB (fijo al crear) |
+| field     | type   | required | description                          |
+|-----------|--------|----------|----------------------------------------|
+| `name`    | string | yes      | unique volume name                    |
+| `size_mb` | int    | yes      | ext4 size in MiB (fixed at creation)  |
 
 ```bash
-curl -X POST localhost:8080/v1/volumes -d '{"name":"muestra","size_mb":64}'
+curl -X POST localhost:8080/v1/volumes -d '{"name":"sample","size_mb":64}'
 curl -X POST localhost:8080/v1/volumes -d '{"name":"dataset","size_mb":8192}'
 ```
 
-**Respuesta 201** (`VolumeResponse`) · **400** si falta `name`/`size_mb` ≤ 0 ·
-**409** si ya existe un volumen con ese nombre.
+**201 response** (`VolumeResponse`) · **400** if `name` is missing / `size_mb` ≤ 0 ·
+**409** if a volume with that name already exists.
 
 ### `GET /v1/volumes` · `GET /v1/volumes/{id}`
 
-Lista todos / detalle de uno. **Forma de `VolumeResponse`:**
+List all / detail of one. **Shape of `VolumeResponse`:**
 
-| campo         | descripción                                             |
+| field         | description                                             |
 |---------------|----------------------------------------------------------|
-| `id`          | id del volumen                                          |
-| `name`        | nombre                                                  |
-| `size_mb`     | tamaño en MiB                                           |
-| `attached_to` | id de la VM que lo tiene adjunto, o ausente si libre    |
-| `created_at`  | timestamp RFC3339                                       |
+| `id`          | the volume's id                                         |
+| `name`        | name                                                    |
+| `size_mb`     | size in MiB                                             |
+| `attached_to` | id of the VM that has it attached, or absent if free    |
+| `created_at`  | RFC3339 timestamp                                       |
 
 ### `DELETE /v1/volumes/{id}`
 
@@ -529,165 +527,161 @@ Lista todos / detalle de uno. **Forma de `VolumeResponse`:**
 curl -X DELETE localhost:8080/v1/volumes/VOLID
 ```
 
-**Respuesta 204** · **404** si no existe · **409** si está adjunto a una VM
-(destruye esa VM primero — el volumen persiste al destruirla).
+**204 response** · **404** if it doesn't exist · **409** if it's attached to a VM
+(destroy that VM first — the volume survives its destruction).
 
-### Adjuntar un volumen a una VM
+### Attach a volume to a VM
 
-**No hay endpoint de "attach"**: Firecracker no permite enchufar un disco a una
-VM ya arrancada (no hay hot-plug). Un volumen se adjunta **al crear la VM**, en
-el campo `volumes[]` de `POST /v1/vms`. Cada elemento:
+**There's no "attach" endpoint**: Firecracker doesn't allow plugging a disk into an
+already-booted VM (no hot-plug). A volume is attached **when creating the VM**, in
+the `volumes[]` field of `POST /v1/vms`. Each element:
 
-| campo        | tipo   | requerido | descripción                                                        |
-|--------------|--------|-----------|---------------------------------------------------------------------|
-| `name`       | string | sí        | nombre de un volumen existente (creado con `POST /v1/volumes`)      |
-| `read_only`  | bool   | no        | adjuntar como dispositivo de solo lectura (una muestra que el guest no debe alterar) |
-| `guest_path` | string | no        | dónde montarlo dentro del guest; por defecto `/vol/<name>`          |
+| field        | type   | required | description                                                        |
+|--------------|--------|----------|---------------------------------------------------------------------|
+| `name`       | string | yes      | name of an existing volume (created with `POST /v1/volumes`)        |
+| `read_only`  | bool   | no       | attach as a read-only device (a sample the guest must not alter)    |
+| `guest_path` | string | no       | where to mount it inside the guest; defaults to `/vol/<name>`       |
 
-Tras arrancar, el daemon monta cada volumen en su `guest_path` por vsock (con
-`-o ro` si es `read_only`). Firecracker los expone como `/dev/vdb`, `/dev/vdc`…
-en el orden del array.
+After booting, the daemon mounts each volume at its `guest_path` over vsock (with
+`-o ro` if `read_only`). Firecracker exposes them as `/dev/vdb`, `/dev/vdc`… in the
+array's order.
 
 ```bash
-# 1) crear el volumen
-curl -X POST localhost:8080/v1/volumes -d '{"name":"salida","size_mb":512}'
+# 1) create the volume
+curl -X POST localhost:8080/v1/volumes -d '{"name":"output","size_mb":512}'
 
-# 2) (opcional) prellenarlo offline sin arrancar nada
-curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/muestra.bin" --data-binary @muestra.bin
+# 2) (optional) pre-fill it offline without booting anything
+curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
 
-# 3) crear la VM con el volumen adjunto
+# 3) create the VM with the volume attached
 curl -X POST localhost:8080/v1/vms -d '{
   "template":"base-ubuntu","no_network":true,
-  "volumes":[{"name":"salida","guest_path":"/mnt/out"}]}'
+  "volumes":[{"name":"output","guest_path":"/mnt/out"}]}'
 ```
 
-Un volumen está adjunto **a lo sumo a una VM a la vez** — adjuntarlo a una
-segunda mientras la primera lo tiene da **409**. Al destruir la VM el volumen se
-suelta (queda libre) pero **no se borra**. Si necesitas escribir en un volumen
-ya adjunto a una VM viva, hazlo por el canal de la VM
-(`PUT /v1/vms/{id}/files`, más abajo), no por el endpoint offline del volumen.
+A volume is attached **to at most one VM at a time** — attaching it to a second one
+while the first has it returns **409**. When the VM is destroyed the volume is
+detached (becomes free) but **not deleted**. If you need to write to a volume
+already attached to a live VM, do it through the VM's channel
+(`PUT /v1/vms/{id}/files`, below), not through the volume's offline endpoint.
 
-### `PUT`/`GET /v1/volumes/{id}/files?path=…` — meter/sacar datos offline
+### `PUT`/`GET /v1/volumes/{id}/files?path=…` — put/get data offline
 
-Escribe o lee un fichero dentro del volumen **sin arrancar ninguna VM**, con
-`debugfs` (sin montar). Es la vía para **preparar** un volumen: lo llenas y
-luego lo adjuntas al crear la VM. En streaming — memoria constante sea cual sea
-el tamaño (un dataset de varios GB no carga la RAM del host).
+Writes or reads a file inside the volume **without booting any VM**, with `debugfs`
+(no mounting). It's the way to **prepare** a volume: you fill it and then attach it
+when creating the VM. Streamed — constant memory whatever the size (a several-GB
+dataset doesn't load the host's RAM).
 
-Solo válido con el volumen **libre** (`attached_to` vacío): escribir por debajo
-de un guest que lo tiene montado lo corrompería.
+Only valid with the volume **free** (`attached_to` empty): writing underneath a
+guest that has it mounted would corrupt it.
 
 ```bash
-# meter una muestra en el volumen (el cuerpo es el fichero crudo)
-curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/muestra.bin" --data-binary @muestra.bin
-# sacar un artefacto
-curl "localhost:8080/v1/volumes/VOLID/files?path=/salida/resultado.txt" -o resultado.txt
+# put a sample into the volume (the body is the raw file)
+curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
+# get an artifact
+curl "localhost:8080/v1/volumes/VOLID/files?path=/output/result.txt" -o result.txt
 ```
 
-**Respuesta 204** (PUT) / **200** con el fichero (GET) · **400** si falta
-`path` o no es una ruta absoluta válida · **404** si el volumen o el fichero no
-existe · **409** si el volumen está adjunto a una VM.
+**204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing
+or isn't a valid absolute path · **404** if the volume or the file doesn't exist ·
+**409** if the volume is attached to a VM.
 
-> **Datos grandes**: Firecracker no tiene hot-plug de discos, así que no se
-> adjunta un volumen a una VM ya arrancada. El modelo es **preparar y adjuntar**:
-> creas el volumen del tamaño que necesites, lo llenas aquí (offline, streaming)
-> y creas la VM con él en `volumes[]`.
+> **Large data**: Firecracker has no disk hot-plug, so you don't attach a volume to
+> an already-booted VM. The model is **prepare and attach**: create the volume of the
+> size you need, fill it here (offline, streamed), and create the VM with it in
+> `volumes[]`.
 
 ---
 
-## Ficheros de una VM
+## VM files
 
-### `PUT`/`GET /v1/vms/{id}/files?path=…` — subir/bajar un fichero
+### `PUT`/`GET /v1/vms/{id}/files?path=…` — upload/download a file
 
-Transfiere un fichero a/desde una VM. **Transparente al estado**: si la VM está
-**running** va por vsock (funciona incluso sin red); si está **stopped** lee/
-escribe su disco offline con `debugfs` (ruta *post-mortem*: sacar evidencias sin
-arrancar). En streaming de punta a punta — memoria constante a cualquier tamaño.
+Transfers a file to/from a VM. **Transparent to state**: if the VM is **running** it
+goes over vsock (works even with no network); if it's **stopped** it reads/writes
+its disk offline with `debugfs` (the *post-mortem* path: pull evidence without
+booting). Streamed end-to-end — constant memory at any size.
 
 ```bash
-# subir (Content-Length automático con --data-binary @fichero)
-curl -X PUT "localhost:8080/v1/vms/VMID/files?path=/root/entrada.bin" --data-binary @entrada.bin
-# bajar
-curl "localhost:8080/v1/vms/VMID/files?path=/root/salida.bin" -o salida.bin
+# upload (automatic Content-Length with --data-binary @file)
+curl -X PUT "localhost:8080/v1/vms/VMID/files?path=/root/input.bin" --data-binary @input.bin
+# download
+curl "localhost:8080/v1/vms/VMID/files?path=/root/output.bin" -o output.bin
 ```
 
-**Respuesta 204** (PUT) / **200** con el fichero (GET) · **400** si falta
-`path` · **404** si la VM no existe · **409** si la VM no está `running` ni
+**204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing ·
+**404** if the VM doesn't exist · **409** if the VM is neither `running` nor
 `stopped`.
 
-Ojo con el tamaño del disco raíz (`disk_mb`) si subes un fichero grande ahí;
-para datos grandes usa un **volumen** dimensionado, no el rootfs.
+Watch the root disk's size (`disk_mb`) if you upload a large file there; for large
+data use a sized **volume**, not the rootfs.
 
 ---
 
-## Observabilidad
+## Observability
 
-Dos singletons de solo lectura, pensados para dos consumidores distintos:
+Two read-only singletons, meant for two different consumers:
 
-- **`GET /v1/health`** — para un **monitor** (systemd, uptime-checker, load
-  balancer): barato, responde por código HTTP (**200** `ok` / **503**
-  `degraded`), sin necesidad de parsear el body.
-- **`GET /v1/system`** — para un **panel/operador**: el informe completo en
-  una llamada (siempre **200**; la salud va dentro). Todo se calcula en el
-  momento de la petición desde `/proc`, `statfs` y el estado en memoria del
-  manager — sin recolectores de fondo ni histórico (el histórico es del
-  cliente: sondea y diferencia).
+- **`GET /v1/health`** — for a **monitor** (systemd, uptime-checker, load balancer):
+  cheap, responds via HTTP code (**200** `ok` / **503** `degraded`), no need to
+  parse the body.
+- **`GET /v1/system`** — for a **dashboard/operator**: the full report in one call
+  (always **200**; health is inside). Everything is computed at request time from
+  `/proc`, `statfs`, and the manager's in-memory state — no background collectors or
+  history (history is the client's: poll and difference).
 
-### `GET /v1/health` — sonda de salud
+### `GET /v1/health` — health probe
 
 ```bash
 curl -s localhost:8080/v1/health
 ```
 
-**Respuesta 200/503** (`HealthResponse`): `{"status": "ok"|"degraded", "checks": [...]}`.
-`status` es `degraded` en cuanto falla UN check. Cada check lleva `name`,
-`ok` y `detail` (el motivo en fallo; en `disk_space`, las cifras siempre):
+**200/503 response** (`HealthResponse`): `{"status": "ok"|"degraded", "checks": [...]}`.
+`status` is `degraded` as soon as ONE check fails. Each check carries `name`, `ok`,
+and `detail` (the reason on failure; on `disk_space`, the figures always):
 
-| check            | qué verifica                                                              |
+| check            | what it verifies                                                          |
 |------------------|----------------------------------------------------------------------------|
-| `kvm`            | `/dev/kvm` presente — sin él no arranca ninguna VM                        |
-| `database`       | la SQLite de estado responde (query real, no solo ping)                   |
-| `store_writable` | se puede crear un fichero en el store (donde van clones/volúmenes)        |
-| `disk_space`     | espacio libre del store ≥ max(5% del total, 1 GiB) — un store lleno hace fallar cada create/snapshot/upload de formas peores |
-| `store_cow`      | el store soporta reflink; sin CoW cada VM es una copia completa del rootfs (mismo aviso que el daemon loguea al arrancar, hecho sondeable) |
-| `firecracker`    | el binario de Firecracker existe y responde a `--version`                 |
+| `kvm`            | `/dev/kvm` present — without it no VM boots                                |
+| `database`       | the state SQLite responds (a real query, not just a ping)                 |
+| `store_writable` | a file can be created in the store (where clones/volumes go)              |
+| `disk_space`     | store free space ≥ max(5% of the total, 1 GiB) — a full store fails every create/snapshot/upload in worse ways |
+| `store_cow`      | the store supports reflink; without CoW each VM is a full copy of the rootfs (the same warning the daemon logs on startup, made probeable) |
+| `firecracker`    | the Firecracker binary exists and responds to `--version`                 |
 
-### `GET /v1/system` — informe completo
+### `GET /v1/system` — full report
 
 ```bash
 curl -s localhost:8080/v1/system | jq .
 ```
 
-**Respuesta 200** (`SystemResponse`), cinco bloques:
+**200 response** (`SystemResponse`), five blocks:
 
-- **`status` + `checks`** — lo mismo que `/v1/health`, embebido para que un
-  panel necesite una sola llamada.
-- **`daemon`** — el proceso y el mapa de "dónde está todo": `pid`,
-  `started_at`, `uptime_seconds`, `firecracker_version`,
-  `network_overrides` (FC ≥ 1.12: forks simultáneos posibles — su ausencia
-  explica los 409 de fork) y `paths` con TODAS las rutas del host que un
-  operador puede necesitar inspeccionar o respaldar: `store` (clones + logs
-  de consola en su raíz), `goldens`, `kernels`, `snapshots`, `volumes`,
-  `chroot_base` (jaulas de Jailer), `database`, `catalog`, `firecracker`,
-  `jailer`.
-- **`host`** — recursos vivos del host físico: `hostname`, `kernel`, `cpus`,
-  `load1/5/15` (júzgalas contra `cpus`) y `memory{total_mb, used_mb,
-  available_mb}` (`used` = total−available: la caché reclamable no cuenta
-  como usada; `available_mb` es lo que las VMs nuevas pueden reclamar).
-- **`storage`** — capacidad del store: `path`, `fs_type`, `cow`,
-  `total_mb/used_mb/free_mb` (statfs del filesystem) y `breakdown` por
-  categoría (`vm_disks_and_logs`, `goldens`, `kernels`, `snapshots`,
-  `volumes`, `jailer_chroots`), cada una con su ruta y tamaño ASIGNADO
-  (estilo `du`, bloques reales — los ficheros sparse no engañan). **Ojo en
-  CoW**: los extents compartidos por reflink se cuentan una vez por fichero,
-  así que las categorías pueden sumar más que `used_mb` — cada cifra
-  responde "cuánto liberaría borrar esto como máximo", no "cuánto posee en
-  exclusiva" (`btrfs filesystem du` es la referencia exacta).
-- **`fleet`** — lo que gestiona el daemon: `vms{total,running,stopped}`,
-  `allocated{vcpus,mem_mb}` (lo PROMETIDO en agregado a las VMs `running` —
-  visibilidad de overcommit contra `host`; el consumo real por VM va en
-  `mem_rss_mb` de cada `VMResponse`), `networks`, `snapshots`,
-  `volumes{total,attached}`, `templates`.
+- **`status` + `checks`** — the same as `/v1/health`, embedded so a dashboard needs a
+  single call.
+- **`daemon`** — the process and the "where everything is" map: `pid`, `started_at`,
+  `uptime_seconds`, `firecracker_version`, `network_overrides` (FC ≥ 1.12:
+  simultaneous forks possible — its absence explains the fork 409s), and `paths` with
+  ALL the host paths an operator may need to inspect or back up: `store` (clones +
+  console logs at its root), `goldens`, `kernels`, `snapshots`, `volumes`,
+  `chroot_base` (Jailer jails), `database`, `catalog`, `firecracker`, `jailer`.
+- **`host`** — live resources of the physical host: `hostname`, `kernel`, `cpus`,
+  `load1/5/15` (judge them against `cpus`), and `memory{total_mb, used_mb,
+  available_mb}` (`used` = total−available: reclaimable cache doesn't count as used;
+  `available_mb` is what new VMs can claim).
+- **`storage`** — store capacity: `path`, `fs_type`, `cow`,
+  `total_mb/used_mb/free_mb` (filesystem statfs) and `breakdown` by category
+  (`vm_disks_and_logs`, `goldens`, `kernels`, `snapshots`, `volumes`,
+  `jailer_chroots`), each with its path and ALLOCATED size (`du`-style, real blocks —
+  sparse files don't fool it). **Note in CoW**: extents shared by reflink are counted
+  once per file, so the categories may add up to more than `used_mb` — each figure
+  answers "how much would deleting this free at most", not "how much it owns
+  exclusively" (`btrfs filesystem du` is the exact reference).
+- **`fleet`** — what the daemon manages: `vms{total,running,stopped}`,
+  `allocated{vcpus,mem_mb}` (what's PROMISED in aggregate to the `running` VMs —
+  overcommit visibility against `host`; real per-VM consumption is in each
+  `VMResponse`'s `mem_rss_mb`), `networks`, `snapshots`, `volumes{total,attached}`,
+  `templates`.
 
 ```json
 {
@@ -703,8 +697,8 @@ curl -s localhost:8080/v1/system | jq .
       "snapshots": "/var/lib/microhosted/store/snapshots",
       "volumes": "/var/lib/microhosted/store/volumes",
       "chroot_base": "/var/lib/microhosted/store/jailer",
-      "database": "/home/manu/own/MicroHosted/images/microhosted.db",
-      "catalog": "/home/manu/own/MicroHosted/images/catalog.json",
+      "database": "/home/user/MicroHosted/images/microhosted.db",
+      "catalog": "/home/user/MicroHosted/images/catalog.json",
       "firecracker": "/usr/local/bin/firecracker",
       "jailer": "/usr/local/bin/jailer"
     }
@@ -732,16 +726,16 @@ curl -s localhost:8080/v1/system | jq .
 }
 ```
 
-El consumo **por VM** (RAM residente real, CPU acumulada, uptime) no vive
-aquí sino en cada `VMResponse` de `GET /v1/vms` — ver su tabla arriba. Con
-eso `GET /v1/vms` ya es el "`docker ps`" de microVMs: estado, forma, consumo
-real, red y rutas de cada una.
+Per-VM consumption (real resident RAM, accumulated CPU, uptime) doesn't live here
+but in each `VMResponse` of `GET /v1/vms` — see its table above. With that,
+`GET /v1/vms` is already the "`docker ps`" of microVMs: each one's state, shape, real
+consumption, network, and paths.
 
 ---
 
-## Lo que falta (ver `SESSIONS.md` → "Próxima sesión")
+## What's missing
 
-- Poder crear a partir de un disco ya usado (no solo de la plantilla dorada).
-- `GET /v1/vms`: filtros/orden para paneles (uptime/consumo/rutas ya están
-  en `VMResponse` desde la sesión de observabilidad).
-- Auditoría de que `DELETE` no deja huérfanos en ningún camino de fallo.
+- Being able to create from an already-used disk (not only from the golden template).
+- `GET /v1/vms`: filters/sorting for dashboards (uptime/consumption/paths are already
+  in `VMResponse` since the observability work).
+- An audit that `DELETE` leaves no orphans on any failure path.

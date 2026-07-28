@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
-# Test de densidad: ¿cuántos dispositivos aguanta este host, y dónde deja de
-# ser razonable desplegar más?
+# Density test: how many devices can this host handle, and where does it stop
+# being reasonable to deploy more?
 #
-# Dos modos:
+# Two modes:
 #
-#   --mode fleet (DEFAULT): simula una FLOTA REAL con la topología
-#     red-por-VM — por cada "dispositivo" crea su red con egress fino hacia
-#     su sensor (allowed_egress), levanta una VM de la plantilla en ella y
-#     verifica que el agente vsock responde. Ejercita el camino entero de
-#     despliegue: subnet pool, bridge, regla nftables agregada, boot, agente.
-#     El número que sale es la capacidad de producción.
+#   --mode fleet (DEFAULT): simulates a REAL FLEET with the network-per-VM
+#     topology — for each "device" it creates its network with fine-grained
+#     egress toward its sensor (allowed_egress), boots a VM from the template on
+#     it, and verifies the vsock agent responds. It exercises the whole deploy
+#     path: subnet pool, bridge, aggregate nftables rule, boot, agent. The number
+#     it produces is the production capacity.
 #
-#   --mode fork: techo teórico de RAM — forks en cuarentena de un snapshot
-#     (comparten páginas limpias CoW, sin red). Más rápido y más optimista.
+#   --mode fork: theoretical RAM ceiling — quarantined forks of a snapshot
+#     (they share clean CoW pages, no network). Faster and more optimistic.
 #
-# Criterios de parada (el primero que se cumpla, y el resumen dice cuál):
-#   - un despliegue FALLA (API, boot o agente mudo) → eso es un hallazgo
-#   - RAM disponible < --ram-floor-mb (default 500)
-#   - un despliegue tarda > --slow-sec (default 15 s): ya no es óptimo seguir
-#   - --max alcanzado (default 200)
+# Stop criteria (the first one met, and the summary says which):
+#   - a deploy FAILS (API, boot, or mute agent) → that's a finding
+#   - available RAM < --ram-floor-mb (default 500)
+#   - a deploy takes > --slow-sec (default 15 s): it's no longer optimal to go on
+#   - --max reached (default 200)
 #
-# Limpia todo lo que creó al salir (también con Ctrl-C); --keep lo deja vivo.
-# Como root mide además el PSS real por VM. Duración típica en modo fleet:
-# ~2-4 s por dispositivo.
+# It cleans up everything it created on exit (including on Ctrl-C); --keep leaves
+# it alive. As root it also measures the real PSS per VM. Typical duration in
+# fleet mode: ~2-4 s per device.
 #
-# Uso: ./scripts/density-test.sh [--mode fleet|fork] [--template alpine-py]
+# Usage: ./scripts/density-test.sh [--mode fleet|fork] [--template alpine-py]
 #        [--max 200] [--ram-floor-mb 500] [--slow-sec 15]
 #        [--sensor-ip 192.168.0.15] [--keep]
 
@@ -48,17 +48,17 @@ while [[ $# -gt 0 ]]; do
     --slow-sec)     SLOW_SEC="$2"; shift 2 ;;
     --sensor-ip)    SENSOR_IP="$2"; shift 2 ;;
     --keep)         KEEP=1; shift ;;
-    *) echo "uso: $0 [--mode fleet|fork] [--template T] [--max N] [--ram-floor-mb MB] [--slow-sec S] [--sensor-ip IP] [--keep]" >&2; exit 1 ;;
+    *) echo "usage: $0 [--mode fleet|fork] [--template T] [--max N] [--ram-floor-mb MB] [--slow-sec S] [--sensor-ip IP] [--keep]" >&2; exit 1 ;;
   esac
 done
 [[ "$MODE" == "fleet" || "$MODE" == "fork" ]] \
-  || { echo "ERROR: --mode debe ser fleet o fork" >&2; exit 1; }
+  || { echo "ERROR: --mode must be fleet or fork" >&2; exit 1; }
 
-command -v jq >/dev/null || { echo "ERROR: hace falta jq" >&2; exit 1; }
+command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
 curl -sf "http://$API/v1/health" >/dev/null \
-  || { echo "ERROR: la API no responde en $API" >&2; exit 1; }
+  || { echo "ERROR: the API isn't responding at $API" >&2; exit 1; }
 
-# Registro de lo creado, una línea por dispositivo: "<vm-id> <red|->".
+# Record of what was created, one line per device: "<vm-id> <net|->".
 CREATED_FILE="$(mktemp /tmp/mh-density-XXXXXX.txt)"
 BASE_ID=""
 SNAP_ID=""
@@ -66,7 +66,7 @@ SNAP_ID=""
 avail_mb() { free -m | awk '/^Mem/{print $7}'; }
 now_ms()   { date +%s%3N; }
 
-# Espera al agente vsock de una VM (el boot devuelve antes de que escuche).
+# Wait for a VM's vsock agent (boot returns before it's listening).
 agent_ok() { # $1=vm-id $2=timeout-s
   local out=""
   for _ in $(seq 1 "$2"); do
@@ -78,9 +78,9 @@ agent_ok() { # $1=vm-id $2=timeout-s
 }
 
 cleanup() {
-  [[ "$KEEP" -eq 1 ]] && { echo ""; echo "--keep: flota viva. Registro en $CREATED_FILE"; return; }
+  [[ "$KEEP" -eq 1 ]] && { echo ""; echo "--keep: fleet left alive. Record in $CREATED_FILE"; return; }
   echo ""
-  echo "==> Limpiando..."
+  echo "==> Cleaning up..."
   local fails=0 vm net code
   while read -r vm net; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://$API/v1/vms/$vm")
@@ -93,32 +93,32 @@ cleanup() {
   [[ -n "$SNAP_ID" ]] && curl -s -o /dev/null -X DELETE "http://$API/v1/snapshots/$SNAP_ID"
   [[ -n "$BASE_ID" ]] && curl -s -o /dev/null -X DELETE "http://$API/v1/vms/$BASE_ID"
   if [[ "$fails" -gt 0 ]]; then
-    echo "    OJO: $fails borrados fallaron — reintenta con $CREATED_FILE"
+    echo "    NOTE: $fails deletions failed — retry with $CREATED_FILE"
   else
     rm -f "$CREATED_FILE"
-    echo "    OK: todo lo creado por el test está borrado."
+    echo "    OK: everything the test created is deleted."
   fi
 }
 trap cleanup EXIT
 
-# --- Preparación del modo fork: VM base + snapshot -------------------------
+# --- Fork mode preparation: base VM + snapshot -----------------------------
 if [[ "$MODE" == "fork" ]]; then
-  echo "==> [fork] VM base de '$TEMPLATE' + snapshot..."
+  echo "==> [fork] base VM from '$TEMPLATE' + snapshot..."
   BASE_ID=$(curl -s -X POST "http://$API/v1/vms" -d "{\"template\":\"$TEMPLATE\"}" | jq -r '.id // empty')
-  [[ -n "$BASE_ID" ]] || { echo "ERROR creando la VM base" >&2; exit 1; }
-  agent_ok "$BASE_ID" 30 || { echo "ERROR: agente de la base mudo" >&2; exit 1; }
+  [[ -n "$BASE_ID" ]] || { echo "ERROR creating the base VM" >&2; exit 1; }
+  agent_ok "$BASE_ID" 30 || { echo "ERROR: base agent is mute" >&2; exit 1; }
   SNAP_ID=$(curl -s -X POST "http://$API/v1/vms/$BASE_ID/snapshot" -d '{"name":"density-test"}' | jq -r '.id // empty')
-  [[ -n "$SNAP_ID" ]] || { echo "ERROR creando el snapshot" >&2; exit 1; }
+  [[ -n "$SNAP_ID" ]] || { echo "ERROR creating the snapshot" >&2; exit 1; }
 fi
 
-# --- Bucle de despliegue ----------------------------------------------------
+# --- Deploy loop ------------------------------------------------------------
 RAM_START=$(avail_mb)
-echo "==> Desplegando (modo $MODE, máx $MAX, suelo ${RAM_FLOOR_MB} MB, lento >${SLOW_SEC}s; RAM: ${RAM_START} MB)"
+echo "==> Deploying (mode $MODE, max $MAX, floor ${RAM_FLOOR_MB} MB, slow >${SLOW_SEC}s; RAM: ${RAM_START} MB)"
 N=0
 FIRST_MS=0
 LAST_MS=0
 LAST_VM=""
-STOP="máximo alcanzado ($MAX)"
+STOP="max reached ($MAX)"
 while [[ "$N" -lt "$MAX" ]]; do
   i=$((N + 1))
   t0=$(now_ms)
@@ -128,23 +128,23 @@ while [[ "$N" -lt "$MAX" ]]; do
     resp=$(curl -s -X POST "http://$API/v1/networks" \
       -d "{\"name\":\"$net\",\"allowed_egress\":[{\"ip\":\"$SENSOR_IP\",\"protocol\":\"tcp\",\"port\":1883}]}")
     if [[ -z "$(echo "$resp" | jq -r '.name // empty')" ]]; then
-      STOP="red $i rechazada: $(echo "$resp" | head -c 200)"; break
+      STOP="network $i rejected: $(echo "$resp" | head -c 200)"; break
     fi
     resp=$(curl -s -X POST "http://$API/v1/vms" -d "{\"template\":\"$TEMPLATE\",\"network\":\"$net\"}")
     vm=$(echo "$resp" | jq -r '.id // empty')
     if [[ -z "$vm" ]]; then
       curl -s -o /dev/null -X DELETE "http://$API/v1/networks/$net"
-      STOP="VM $i rechazada: $(echo "$resp" | head -c 200)"; break
+      STOP="VM $i rejected: $(echo "$resp" | head -c 200)"; break
     fi
     echo "$vm $net" >> "$CREATED_FILE"
     if ! agent_ok "$vm" 20; then
-      STOP="VM $i ($vm) arrancó pero el agente no responde"; break
+      STOP="VM $i ($vm) booted but the agent doesn't respond"; break
     fi
   else
     resp=$(curl -s -X POST "http://$API/v1/snapshots/$SNAP_ID/fork" -d '{"quarantine":true}')
     vm=$(echo "$resp" | jq -r '.id // empty')
     if [[ -z "$vm" ]]; then
-      STOP="fork $i rechazado: $(echo "$resp" | head -c 200)"; break
+      STOP="fork $i rejected: $(echo "$resp" | head -c 200)"; break
     fi
     echo "$vm -" >> "$CREATED_FILE"
   fi
@@ -155,32 +155,32 @@ while [[ "$N" -lt "$MAX" ]]; do
   [[ "$N" -eq 1 ]] && FIRST_MS=$LAST_MS
   avail=$(avail_mb)
   printf '%s %3d → %s | %5d ms | RAM: %5d MB\n' \
-    "$([[ "$MODE" == fleet ]] && echo dispositivo || echo fork)" "$N" "$vm" "$LAST_MS" "$avail"
+    "$([[ "$MODE" == fleet ]] && echo device || echo fork)" "$N" "$vm" "$LAST_MS" "$avail"
 
   if [[ "$avail" -lt "$RAM_FLOOR_MB" ]]; then
-    STOP="suelo de RAM (${avail} MB < ${RAM_FLOOR_MB} MB)"; break
+    STOP="RAM floor (${avail} MB < ${RAM_FLOOR_MB} MB)"; break
   fi
   if [[ "$LAST_MS" -gt $((SLOW_SEC * 1000)) ]]; then
-    STOP="despliegue $N tardó ${LAST_MS} ms (> ${SLOW_SEC}s): dejar de desplegar aquí"; break
+    STOP="deploy $N took ${LAST_MS} ms (> ${SLOW_SEC}s): stop deploying here"; break
   fi
 done
 
-# --- Verificación final: la flota entera sigue viva? Muestreo 1º/medio/último
+# --- Final check: is the whole fleet still alive? Sample 1st/middle/last
 ALIVE="n/a"
 if [[ "$N" -gt 0 && "$MODE" == "fleet" ]]; then
-  ALIVE="sí"
+  ALIVE="yes"
   mid=$(( (N + 1) / 2 ))
   for vm in $(awk -v m="$mid" 'NR==1||NR==m{print $1}' "$CREATED_FILE") "$LAST_VM"; do
-    agent_ok "$vm" 5 || ALIVE="NO ($vm no responde)"
+    agent_ok "$vm" 5 || ALIVE="NO ($vm doesn't respond)"
   done
 elif [[ "$N" -gt 0 ]]; then
-  ALIVE="sí"
+  ALIVE="yes"
   for vm in "$(awk 'NR==1{print $1}' "$CREATED_FILE")" "$LAST_VM"; do
-    agent_ok "$vm" 5 || ALIVE="NO ($vm no responde)"
+    agent_ok "$vm" 5 || ALIVE="NO ($vm doesn't respond)"
   done
 fi
 
-PSS="(ejecuta como root para medir PSS)"
+PSS="(run as root to measure PSS)"
 if [[ "$N" -gt 0 ]]; then
   pid=$(curl -s "http://$API/v1/vms/$LAST_VM" | jq -r '.pid // empty')
   [[ -n "$pid" && -r "/proc/$pid/smaps_rollup" ]] \
@@ -191,13 +191,13 @@ RAM_END=$(avail_mb)
 HEALTH=$(curl -s "http://$API/v1/health" | jq -c '.')
 
 echo ""
-echo "================== RESULTADO ($MODE) =================="
-echo "Desplegados:            $N"
-echo "Motivo de parada:       $STOP"
-echo "Vivos (muestra):        $ALIVE"
-echo "Despliegue 1º vs último: ${FIRST_MS} ms → ${LAST_MS} ms"
-echo "PSS última VM:          $PSS"
+echo "================== RESULT ($MODE) =================="
+echo "Deployed:               $N"
+echo "Stop reason:            $STOP"
+echo "Alive (sample):         $ALIVE"
+echo "Deploy 1st vs last:     ${FIRST_MS} ms → ${LAST_MS} ms"
+echo "Last VM PSS:            $PSS"
 echo "RAM: ${RAM_START} MB → ${RAM_END} MB"
-[[ "$N" -gt 0 ]] && echo "Coste medio por unidad:  $(( (RAM_START - RAM_END) / N )) MB"
+[[ "$N" -gt 0 ]] && echo "Average cost per unit:  $(( (RAM_START - RAM_END) / N )) MB"
 echo "Health: $HEALTH"
-echo "======================================================="
+echo "==================================================="

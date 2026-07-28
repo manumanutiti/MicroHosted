@@ -1,29 +1,30 @@
-/* parser.c — parser Modbus TCP maestro, LADO A (dentro de la microVM).
+/* parser.c — Modbus TCP master parser, SIDE A (inside the microVM).
  *
- * Lo mínimo indispensable del patrón pull (docs/iot-edge.md): la VM arranca,
- * pregunta a SU sensor (slave Modbus TCP), y escribe un JSON por stdout. El
- * host lo recoge por vsock (Exec); el guest nunca inicia nada hacia el host.
+ * The bare minimum of the pull pattern (docs/iot-edge.md): the VM boots, queries
+ * ITS sensor (a Modbus TCP slave), and writes a JSON to stdout. The host
+ * collects it over vsock (Exec); the guest never initiates anything toward the
+ * host.
  *
- * Sin dependencias: solo POSIX/libc. FC 0x03 (read holding registers) es una
- * sola trama. Compila a un binario estático diminuto — no hace falta python en
- * el golden (objetivo IoT-4: imagen ultra-mínima), y deja el camino a bajarlo
- * aún más si hiciera falta.
+ * No dependencies: only POSIX/libc. FC 0x03 (read holding registers) is a single
+ * frame. It compiles to a tiny static binary — no python needed in the golden
+ * (IoT-4 goal: an ultra-minimal image), and it leaves room to shrink it further
+ * if needed.
  *
- *   Compilar (estático, para meter en el guest Alpine/musl):
- *     musl-gcc -static -O2 -o parser parser.c        # o dentro de Alpine:
+ *   Build (static, to drop into the Alpine/musl guest):
+ *     musl-gcc -static -O2 -o parser parser.c        # or inside Alpine:
  *     apk add gcc musl-dev && gcc -static -O2 -o parser parser.c
- *   Probar en el host:
+ *   Test on the host:
  *     gcc -O2 -o parser parser.c
  *
- *   Uso:  ./parser <ip> <puerto> [count]
+ *   Usage:  ./parser <ip> <port> [count]
  *
- * Salida: SIEMPRE un JSON en stdout. exit 0 en éxito, !=0 en fallo. Ningún
- * fallo del sensor (conexión, timeout, excepción Modbus, trama corta) tumba la
- * VM: todo se traduce a un JSON de error limpio.
+ * Output: ALWAYS a JSON on stdout. exit 0 on success, !=0 on failure. No sensor
+ * failure (connection, timeout, Modbus exception, short frame) takes down the
+ * VM: everything is translated to a clean error JSON.
  *
- * Mapa de registros (acordado con simulator.py):
- *   0: temperatura (int16 con signo, x10 -> C)   2: presion (uint16, hPa)
- *   1: humedad     (uint16, x10 -> %)            3: contador de lecturas
+ * Register map (agreed with simulator.py):
+ *   0: temperature (signed int16, x10 -> C)   2: pressure (uint16, hPa)
+ *   1: humidity    (uint16, x10 -> %)         3: reading counter
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,16 +41,16 @@
 #define FC_READ_HOLDING 0x03
 #define TIMEOUT_SECS    5
 
-/* Imprime un JSON de error y sale con !=0. kind es una etiqueta estable
- * (conn_refused, timeout, modbus_exception, bad_frame...) para el orquestador. */
+/* Prints an error JSON and exits with !=0. kind is a stable tag
+ * (conn_refused, timeout, modbus_exception, bad_frame...) for the orchestrator. */
 static int fail(const char *sensor, const char *kind, const char *msg) {
     printf("{\"status\":\"error\",\"sensor\":\"%s\",\"error_kind\":\"%s\","
            "\"error\":\"%s\"}\n", sensor, kind, msg);
     return 1;
 }
 
-/* connect() con timeout: no-bloqueante + select, para que un sensor en un
- * agujero negro (IP muerta, egress bloqueado) no cuelgue la VM. */
+/* connect() with a timeout: non-blocking + select, so a sensor in a black hole
+ * (dead IP, blocked egress) doesn't hang the VM. */
 static int connect_timeout(int fd, struct sockaddr_in *addr, int secs) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -69,13 +70,13 @@ static int connect_timeout(int fd, struct sockaddr_in *addr, int secs) {
     return 0;
 }
 
-/* Lee exactamente n bytes o falla: recv() puede devolver menos, y un slave que
- * corta a media trama no debe colgarnos (el SO_RCVTIMEO acota la espera). */
+/* Reads exactly n bytes or fails: recv() may return fewer, and a slave that cuts
+ * mid-frame must not hang us (SO_RCVTIMEO bounds the wait). */
 static int recv_exact(int fd, unsigned char *buf, int n) {
     int got = 0;
     while (got < n) {
         int r = recv(fd, buf + got, n - got, 0);
-        if (r == 0) return -1;            /* conexión cerrada */
+        if (r == 0) return -1;            /* connection closed */
         if (r < 0) return -2;             /* error/timeout */
         got += r;
     }
@@ -84,9 +85,9 @@ static int recv_exact(int fd, unsigned char *buf, int n) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "uso: %s <ip> <puerto> [count]\n", argv[0]);
+        fprintf(stderr, "usage: %s <ip> <port> [count]\n", argv[0]);
         printf("{\"status\":\"error\",\"error_kind\":\"usage\","
-               "\"error\":\"uso: parser <ip> <puerto> [count]\"}\n");
+               "\"error\":\"usage: parser <ip> <port> [count]\"}\n");
         return 2;
     }
     const char *ip = argv[1];
@@ -102,10 +103,10 @@ int main(int argc, char **argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1)
-        return fail(sensor, "bad_addr", "IP invalida (se espera IPv4 numerica)");
+        return fail(sensor, "bad_addr", "invalid IP (numeric IPv4 expected)");
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return fail(sensor, "socket", "no se pudo crear el socket");
+    if (fd < 0) return fail(sensor, "socket", "could not create the socket");
 
     struct timeval tv = { TIMEOUT_SECS, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -115,13 +116,13 @@ int main(int argc, char **argv) {
         int e = errno; close(fd);
         if (e == ECONNREFUSED)
             return fail(sensor, "conn_refused",
-                        "conexion rechazada (slave caido o egress bloqueado)");
+                        "connection refused (slave down or egress blocked)");
         if (e == ETIMEDOUT)
-            return fail(sensor, "timeout", "timeout conectando al slave");
+            return fail(sensor, "timeout", "timeout connecting to the slave");
         return fail(sensor, "network", strerror(e));
     }
 
-    /* Petición FC03: MBAP(txid,proto=0,len=6,unit=1) + PDU(func,start=0,count) */
+    /* FC03 request: MBAP(txid,proto=0,len=6,unit=1) + PDU(func,start=0,count) */
     unsigned char req[12] = {
         0x00, 0x01,  0x00, 0x00,  0x00, 0x06,  0x01,
         FC_READ_HOLDING, 0x00, 0x00,
@@ -129,51 +130,51 @@ int main(int argc, char **argv) {
     };
     if (send(fd, req, sizeof(req), 0) != (int)sizeof(req)) {
         close(fd);
-        return fail(sensor, "network", "fallo enviando la peticion");
+        return fail(sensor, "network", "failed sending the request");
     }
 
-    /* Respuesta: MBAP(7) + PDU. Leemos la cabecera, sacamos la longitud. */
+    /* Response: MBAP(7) + PDU. Read the header, extract the length. */
     unsigned char hdr[7];
     if (recv_exact(fd, hdr, 7) < 0) {
         close(fd);
-        return fail(sensor, "timeout", "sin respuesta del slave (timeout)");
+        return fail(sensor, "timeout", "no response from the slave (timeout)");
     }
     int proto = (hdr[2] << 8) | hdr[3];
-    int rlen  = (hdr[4] << 8) | hdr[5];   /* incluye unit(1) + PDU */
+    int rlen  = (hdr[4] << 8) | hdr[5];   /* includes unit(1) + PDU */
     if (proto != 0 || rlen < 2 || rlen > 260) {
         close(fd);
-        return fail(sensor, "bad_frame", "cabecera MBAP invalida");
+        return fail(sensor, "bad_frame", "invalid MBAP header");
     }
 
     unsigned char body[260];
-    if (recv_exact(fd, body, rlen - 1) < 0) {   /* -1: unit ya leido en hdr */
+    if (recv_exact(fd, body, rlen - 1) < 0) {   /* -1: unit already read in hdr */
         close(fd);
-        return fail(sensor, "bad_frame", "trama corta / conexion cortada");
+        return fail(sensor, "bad_frame", "short frame / connection cut");
     }
     close(fd);
 
     unsigned char func = body[0];
-    if (func & 0x80)   /* respuesta de excepcion Modbus */
-        return fail(sensor, "modbus_exception", "el slave respondio excepcion");
+    if (func & 0x80)   /* Modbus exception response */
+        return fail(sensor, "modbus_exception", "the slave replied with an exception");
     if (func != FC_READ_HOLDING)
-        return fail(sensor, "bad_frame", "funcion inesperada en la respuesta");
+        return fail(sensor, "bad_frame", "unexpected function in the response");
 
     int bytecount = body[1];
     if (bytecount != count * 2 || bytecount > rlen - 2)
-        return fail(sensor, "bad_frame", "byte count no cuadra con count");
+        return fail(sensor, "bad_frame", "byte count doesn't match count");
 
-    /* Registros crudos (uint16 big-endian). */
+    /* Raw registers (uint16 big-endian). */
     unsigned short reg[125];
     for (int i = 0; i < count; i++)
         reg[i] = (body[2 + i * 2] << 8) | body[3 + i * 2];
 
-    /* JSON: registros crudos + valores decodificados segun el mapa. */
+    /* JSON: raw registers + values decoded per the map. */
     printf("{\"status\":\"ok\",\"sensor\":\"%s\",\"registers\":[", sensor);
     for (int i = 0; i < count; i++)
         printf("%s%u", i ? "," : "", reg[i]);
     printf("],\"values\":{");
     int first = 1;
-    if (count > 0) {   /* reg0: temperatura int16 con signo, x10 */
+    if (count > 0) {   /* reg0: temperature signed int16, x10 */
         short t = (short)reg[0];
         printf("\"temperature_c\":%.1f", t / 10.0);
         first = 0;
