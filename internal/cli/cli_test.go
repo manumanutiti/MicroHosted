@@ -175,7 +175,7 @@ func TestNetworkUpdateMergesRules(t *testing.T) {
 	f := newFakeAPI(t, mux)
 
 	code, _, errOut := f.run("", "change", "network", "lab",
-		"--add-allow", "tcp:192.168.50.52:502@wlan0", "--rm-allow", "icmp:203.0.113.7", "--intra")
+		"--out", "tcp:192.168.50.52:502@wlan0", "--rm-out", "icmp:203.0.113.7", "--intra")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
@@ -199,7 +199,7 @@ func TestNetworkUpdateMergesRules(t *testing.T) {
 	}
 
 	// Removing a rule that is not there must fail rather than report success.
-	code, _, errOut = f.run("", "network", "update", "lab", "--rm-allow", "udp:1.1.1.1:53")
+	code, _, errOut = f.run("", "network", "update", "lab", "--rm-out", "udp:1.1.1.1:53")
 	if code == 0 || !strings.Contains(errOut, "not in the network's policy") {
 		t.Errorf("exit %d, stderr %q", code, errOut)
 	}
@@ -309,6 +309,102 @@ func TestParseRule(t *testing.T) {
 		if _, err := parseRule(bad); err == nil {
 			t.Errorf("parseRule(%q) accepted", bad)
 		}
+	}
+}
+
+func TestParseIngressRule(t *testing.T) {
+	good := map[string]types.IngressRule{
+		"tcp:192.168.50.60:1883@wlan0=172.16.9.2":  {Iface: "wlan0", SrcIP: "192.168.50.60", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.2"},
+		"UDP:192.168.60.0/24:5683@eth1=172.16.9.3": {Iface: "eth1", SrcIP: "192.168.60.0/24", Protocol: "udp", Port: 5683, ToIP: "172.16.9.3"},
+	}
+	for in, want := range good {
+		got, err := parseIngressRule(in)
+		if err != nil || got != want {
+			t.Errorf("parseIngressRule(%q) = %+v, %v; want %+v", in, got, err, want)
+		}
+		if back, _ := parseIngressRule(formatIngressRule(got)); back != got {
+			t.Errorf("formatIngressRule(%+v) = %q does not round-trip", got, formatIngressRule(got))
+		}
+	}
+	for _, bad := range []string{
+		"", "tcp:192.168.50.60:1883@wlan0", "tcp:192.168.50.60:1883=172.16.9.2",
+		"tcp:192.168.50.60:1883@=172.16.9.2", "tcp:192.168.50.60:1883@wlan0=",
+		"icmp:192.168.50.60:0@wlan0=172.16.9.2", "tcp:192.168.50.60@wlan0=172.16.9.2",
+		"tcp:192.168.50.60:mqtt@wlan0=172.16.9.2", "tcp::1883@wlan0=172.16.9.2",
+	} {
+		if _, err := parseIngressRule(bad); err == nil {
+			t.Errorf("parseIngressRule(%q) accepted", bad)
+		}
+	}
+}
+
+func TestNetworkUpdateMergesIngress(t *testing.T) {
+	a := types.IngressRule{Iface: "wlan0", SrcIP: "192.168.50.60", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.2"}
+	b := types.IngressRule{Iface: "wlan0", SrcIP: "192.168.50.61", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.3"}
+	cur := types.NetworkResponse{Name: "mqtt", AllowedIngress: []types.IngressRule{a}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/networks/mqtt", reply(cur))
+	mux.HandleFunc("PUT /v1/networks/mqtt/ingress", reply(cur))
+	f := newFakeAPI(t, mux)
+
+	code, _, errOut := f.run("", "network", "update", "mqtt", "--in", formatIngressRule(b))
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	var req types.UpdateNetworkIngressRequest
+	json.Unmarshal(f.last("PUT").body, &req)
+	if want := []types.IngressRule{a, b}; !reflect.DeepEqual(req.AllowedIngress, want) {
+		t.Errorf("merged ingress = %+v\nwant            %+v", req.AllowedIngress, want)
+	}
+
+	// --no-in must send an explicit empty list, not omit the field.
+	if code, _, errOut = f.run("", "network", "update", "mqtt", "--no-in"); code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if body := string(f.last("PUT").body); !strings.Contains(body, `"allowed_ingress":null`) && !strings.Contains(body, `"allowed_ingress":[]`) {
+		t.Errorf("--no-in sent %s", body)
+	}
+
+	if code, _, errOut = f.run("", "network", "update", "mqtt", "--no-in", "--in", formatIngressRule(b)); code == 0 {
+		t.Errorf("--no-in with --in was accepted")
+	}
+}
+
+// The flags were renamed from egress/ingress to OUT/IN. The old spellings must
+// keep working (scripts, muscle memory) but not show in help, where two names
+// for one thing is exactly the confusion the rename removes.
+func TestNetworkLegacyFlagsStillWork(t *testing.T) {
+	cur := types.NetworkResponse{Name: "lab", AllowedEgress: []types.EgressRule{{IP: "203.0.113.7", Protocol: "icmp"}}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/networks/lab", reply(cur))
+	mux.HandleFunc("PUT /v1/networks/lab/egress", reply(cur))
+	mux.HandleFunc("PUT /v1/networks/lab/ingress", reply(cur))
+	f := newFakeAPI(t, mux)
+
+	for _, args := range [][]string{
+		{"--add-allow", "tcp:1.2.3.4:80"},
+		{"--rm-allow", "icmp:203.0.113.7"},
+		{"--allow", "tcp:1.2.3.4:80"},
+		{"--no-egress"},
+		{"--egress"},
+		{"--add-ingress", "tcp:192.168.50.60:1883@wlan0=172.16.9.2"},
+		{"--ingress", "tcp:192.168.50.60:1883@wlan0=172.16.9.2"},
+		{"--no-ingress"},
+	} {
+		if code, _, errOut := f.run("", append([]string{"network", "update", "lab"}, args...)...); code != 0 {
+			t.Errorf("legacy %v: exit %d: %s", args, code, errOut)
+		}
+	}
+
+	_, out, _ := f.run("", "network", "update", "--help")
+	for _, gone := range []string{"--add-allow", "--rm-allow", "--allow", "--egress", "--ingress", "--add-ingress"} {
+		if strings.Contains(out, gone+" ") {
+			t.Errorf("help still lists legacy %s:\n%s", gone, out)
+		}
+	}
+	// Grouped by direction, in definition order — not alphabetical.
+	if strings.Index(out, "--out ") > strings.Index(out, "--in ") || !strings.Contains(out, "Examples:") {
+		t.Errorf("help lost its OUT-then-IN grouping or its examples:\n%s", out)
 	}
 }
 

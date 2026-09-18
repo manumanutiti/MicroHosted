@@ -122,12 +122,13 @@ func TestForwardChainMatchesStatelessly(t *testing.T) {
 	// let a connection opened under a looser policy survive an UpdateEgress
 	// tightening (stale conntrack entry riding past the new drop). The input
 	// chain keeps its established accept (host→guest replies need it).
-	nets := []types.Network{
-		{Name: "iot", Bridge: "mhbrcccc", Subnet: "172.18.0.0/24", AllowedEgress: []types.EgressRule{
+	// Ingress legs carry conntrack matches (direction, DNAT status), but only
+	// on top of their stateless tuple — never a `ct state` accept.
+	nets := append(mqttNet(), types.Network{
+		Name: "iot", Bridge: "mhbrcccc", Subnet: "172.18.0.0/24", AllowedEgress: []types.EgressRule{
 			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
-		}},
-	}
-	got := renderNftables(nets, nil)
+		}})
+	got := renderNftables(nets, managedWlan())
 
 	fwdStart := strings.Index(got, "chain forward {")
 	fwdEnd := strings.Index(got[fwdStart:], "}")
@@ -240,7 +241,7 @@ func TestRenderNftablesIfaceRuleOrdering(t *testing.T) {
 	got := renderNftables(nets, managedWlan())
 
 	out := mustIndex(t, got, `iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.52 tcp dport 502 accept`)
-	back := mustIndex(t, got, `iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.52 ip daddr 172.16.9.0/24 tcp sport 502 accept`)
+	back := mustIndex(t, got, `iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.52 ip daddr 172.16.9.0/24 tcp sport 502 ct direction reply accept`)
 	egressDrop := mustIndex(t, got, `iifname "mhbrcccc" oifname != @mhbridges drop`)
 	blanketIn := strings.LastIndex(got, `iifname "wlan0" drop`)
 	blanketOut := strings.LastIndex(got, `oifname "wlan0" drop`)
@@ -258,6 +259,61 @@ func TestRenderNftablesIfaceRuleOrdering(t *testing.T) {
 	}
 }
 
+// TestRenderNftablesIfaceReturnLegIsReplyOnly: every device→guest accept of an
+// egress rule must be restricted to replies. The stateless tuple alone lets the
+// device open connections into the guest on any port by using the rule's port
+// as its source port, or ping it through an icmp rule.
+func TestRenderNftablesIfaceReturnLegIsReplyOnly(t *testing.T) {
+	nets := []types.Network{{
+		Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24",
+		AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+			{Iface: "wlan0", IP: "192.168.50.53", Protocol: "udp", Port: 47808},
+			{Iface: "wlan0", IP: "192.168.50.0/24", Protocol: "icmp"},
+		},
+	}}
+	got := renderNftables(nets, managedWlan())
+	n := 0
+	for _, line := range strings.Split(got, "\n") {
+		if !strings.Contains(line, `iifname "wlan0" oifname "mhbrcccc"`) {
+			continue
+		}
+		n++
+		if !strings.Contains(line, "ct direction reply accept") {
+			t.Errorf("a device→guest accept is not restricted to replies: %q", line)
+		}
+	}
+	if n != 3 {
+		t.Fatalf("want 3 return legs, got %d:\n%s", n, got)
+	}
+}
+
+// TestRenderNftablesWANRuleCannotReachManagedSegment: a rule WITHOUT an iface
+// means the WAN. If its destination happens to sit on a managed segment, the
+// WAN accept must not carry the packet out through that interface — the
+// blanket drop has to come first. (Found on hardware: `icmp:192.168.50.52`
+// without @wlan0 sent the echo request out wlan0; only the reply died.)
+func TestRenderNftablesWANRuleCannotReachManagedSegment(t *testing.T) {
+	nets := []types.Network{
+		{Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24", AllowedEgress: []types.EgressRule{
+			{IP: "192.168.50.52", Protocol: "icmp"},
+			{IP: "192.168.50.0/24", Protocol: "tcp", Port: 502},
+		}},
+		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true},
+	}
+	got := renderNftables(nets, managedWlan())
+	blanketOut := mustIndex(t, got, `oifname "wlan0" drop`)
+	blanketIn := mustIndex(t, got, `iifname "wlan0" drop`+"\n\t\toifname")
+	for _, wan := range []string{
+		`iifname "mhbrcccc" oifname != @mhbridges ip daddr 192.168.50.52 meta l4proto icmp accept`,
+		`iifname "mhbrcccc" oifname != @mhbridges ip daddr 192.168.50.0/24 tcp dport 502 accept`,
+	} {
+		if i := mustIndex(t, got, wan); i < blanketOut || i < blanketIn {
+			t.Errorf("WAN accept %q comes before the managed interface's drops:\n%s", wan, got)
+		}
+	}
+}
+
 // TestRenderNftablesWholeRangeOnManagedIface: a range is a legitimate
 // destination — "this network polls that whole segment" is a real deployment,
 // and the engine must be able to say it.
@@ -271,7 +327,7 @@ func TestRenderNftablesWholeRangeOnManagedIface(t *testing.T) {
 	got := renderNftables(nets, managedWlan())
 	for _, want := range []string{
 		`iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.0/24 meta l4proto icmp accept`,
-		`iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.0/24 ip daddr 172.16.9.0/24 meta l4proto icmp accept`,
+		`iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.0/24 ip daddr 172.16.9.0/24 meta l4proto icmp ct direction reply accept`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q:\n%s", want, got)
@@ -374,6 +430,161 @@ func TestValidateIfaceName(t *testing.T) {
 	for _, bad := range []string{"", "this-name-is-far-too-long", "wlan0\naccept", "wlan 0", `wlan0"`} {
 		if err := ValidateIfaceName(bad); err == nil {
 			t.Errorf("accepted invalid interface %q", bad)
+		}
+	}
+}
+
+// mqttNet is the push-mode shape: one sensor behind wlan0 publishes to the
+// host's port 1883 and lands on the network's broker VM.
+func mqttNet() []types.Network {
+	return []types.Network{{
+		Name: "mqtt-60", Bridge: "mhbrdddd", Subnet: "172.16.9.0/24",
+		AllowedIngress: []types.IngressRule{
+			{Iface: "wlan0", SrcIP: "192.168.50.60", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.2"},
+		},
+	}}
+}
+
+// TestRenderNftablesIngress: the DNAT and both forward legs are there, and the
+// host itself never opens the port — the flow is routed to the guest, it never
+// reaches `input`.
+func TestRenderNftablesIngress(t *testing.T) {
+	got := renderNftables(mqttNet(), managedWlan())
+
+	pre := mustIndex(t, got, "chain prerouting {")
+	mustIndex(t, got, "type nat hook prerouting priority -100; policy accept;")
+	dnat := mustIndex(t, got, `iifname "wlan0" ip saddr 192.168.50.60 fib daddr type local tcp dport 1883 dnat ip to 172.16.9.2:1883`)
+	if dnat < pre || dnat > mustIndex(t, got, "chain forward {") {
+		t.Fatalf("the DNAT is not inside the prerouting chain:\n%s", got)
+	}
+
+	in := mustIndex(t, got, `iifname "wlan0" oifname "mhbrdddd" ip saddr 192.168.50.60 ip daddr 172.16.9.2 tcp dport 1883 ct status dnat ct direction original accept`)
+	back := mustIndex(t, got, `iifname "mhbrdddd" oifname "wlan0" ip saddr 172.16.9.2 tcp sport 1883 ip daddr 192.168.50.60 ct status dnat ct direction reply accept`)
+	egressDrop := mustIndex(t, got, `iifname "mhbrdddd" oifname != @mhbridges drop`)
+	blanketIn := strings.LastIndex(got, `iifname "wlan0" drop`)
+	blanketOut := strings.LastIndex(got, `oifname "wlan0" drop`)
+	if back > egressDrop {
+		t.Fatalf("the return leg is after the network's egress drop — replies never leave:\n%s", got)
+	}
+	if in > blanketIn || in > blanketOut || back > blanketIn || back > blanketOut {
+		t.Fatalf("an ingress leg is after the managed interface's blanket drops:\n%s", got)
+	}
+
+	inputChain := got[mustIndex(t, got, "chain input"):pre]
+	if strings.Contains(inputChain, "1883") {
+		t.Fatalf("the host opened the ingress port itself:\n%s", inputChain)
+	}
+	// Ingress is not egress: the VM gains no outbound flow towards the device.
+	if strings.Contains(got, `oifname "wlan0" ip daddr 192.168.50.60 tcp dport`) {
+		t.Fatalf("an ingress rule leaked an outbound accept:\n%s", got)
+	}
+	// The DNATed flow keeps the device's real source (the VM sees who it is):
+	// this network has no egress, so nothing masquerades it.
+	if strings.Contains(got, "masquerade") {
+		t.Fatalf("ingress alone must not masquerade:\n%s", got)
+	}
+}
+
+// TestRenderNftablesIngressReturnLegIsReplyOnly: without the conntrack
+// direction on the return leg, a compromised VM could bind the ingress port as
+// its SOURCE port and open connections to any port on the device.
+func TestRenderNftablesIngressReturnLegIsReplyOnly(t *testing.T) {
+	got := renderNftables(mqttNet(), managedWlan())
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, `iifname "mhbrdddd" oifname "wlan0"`) && !strings.Contains(line, "ct direction reply") {
+			t.Fatalf("a bridge→device accept is not restricted to replies: %q", line)
+		}
+	}
+}
+
+// TestRenderNftablesNoIngressNoPrerouting: networks without ingress rules get
+// exactly the ruleset they had before the feature existed.
+func TestRenderNftablesNoIngressNoPrerouting(t *testing.T) {
+	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
+	if got := renderNftables(nets, managedWlan()); strings.Contains(got, "prerouting") || strings.Contains(got, "dnat") {
+		t.Fatalf("a prerouting chain appeared with no ingress rules:\n%s", got)
+	}
+}
+
+// TestRenderNftablesSkipsIngressForUnmanagedIface: the restart-without-the-flag
+// case again. A DNAT through an interface with no deny-both-ways around it is
+// a hole with no policy, so none of the rule's three lines may appear.
+func TestRenderNftablesSkipsIngressForUnmanagedIface(t *testing.T) {
+	for name, managed := range map[string][]ManagedIface{
+		"no managed interface":    nil,
+		"a different one managed": {{Name: "eth1"}},
+	} {
+		got := renderNftables(mqttNet(), managed)
+		if strings.Contains(got, "1883") || strings.Contains(got, "prerouting") {
+			t.Errorf("%s: an ingress rule for unmanaged wlan0 was rendered:\n%s", name, got)
+		}
+	}
+}
+
+func TestValidateIngressRules(t *testing.T) {
+	managed := []string{"wlan0"}
+	ok := types.IngressRule{Iface: "wlan0", SrcIP: "192.168.50.60", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.2"}
+	valid := []types.IngressRule{
+		ok,
+		{Iface: "wlan0", SrcIP: "192.168.50.61", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.3"},
+		{Iface: "wlan0", SrcIP: "192.168.60.0/24", Protocol: "udp", Port: 5683, ToIP: "172.16.9.4"},
+	}
+	if err := ValidateIngressRules(valid, managed); err != nil {
+		t.Fatalf("valid rules rejected: %v", err)
+	}
+
+	with := func(f func(*types.IngressRule)) types.IngressRule { r := ok; f(&r); return r }
+	bad := map[string]types.IngressRule{
+		"no iface":             with(func(r *types.IngressRule) { r.Iface = "" }),
+		"unmanaged iface":      with(func(r *types.IngressRule) { r.Iface = "eth0" }),
+		"hostname source":      with(func(r *types.IngressRule) { r.SrcIP = "sensor.local" }),
+		"source injection":     with(func(r *types.IngressRule) { r.SrcIP = "1.2.3.4 accept; ip saddr 0.0.0.0/0" }),
+		"non-canonical source": with(func(r *types.IngressRule) { r.SrcIP = "192.168.50.60/24" }),
+		"ipv6 source":          with(func(r *types.IngressRule) { r.SrcIP = "2001:db8::1" }),
+		"cidr target":          with(func(r *types.IngressRule) { r.ToIP = "172.16.9.0/24" }),
+		"target injection":     with(func(r *types.IngressRule) { r.ToIP = "172.16.9.2:22 accept" }),
+		"icmp":                 with(func(r *types.IngressRule) { r.Protocol = "icmp"; r.Port = 0 }),
+		"protocol case":        with(func(r *types.IngressRule) { r.Protocol = "TCP" }),
+		"no port":              with(func(r *types.IngressRule) { r.Port = 0 }),
+		"port out of range":    with(func(r *types.IngressRule) { r.Port = 70000 }),
+	}
+	for name, r := range bad {
+		if err := ValidateIngressRules([]types.IngressRule{r}, managed); err == nil {
+			t.Errorf("%s: rule %+v should have been rejected", name, r)
+		}
+	}
+	if err := ValidateIngressRules([]types.IngressRule{ok}, nil); err == nil {
+		t.Error("accepted an ingress rule on a daemon that manages no interface")
+	}
+	// Two DNATs one packet could match: the second would never be in force.
+	clash := []types.IngressRule{ok, with(func(r *types.IngressRule) { r.SrcIP = "192.168.50.0/24"; r.ToIP = "172.16.9.3" })}
+	if err := ValidateIngressRules(clash, managed); err == nil {
+		t.Error("accepted two rules whose sources overlap on the same port")
+	}
+}
+
+func TestIngressClash(t *testing.T) {
+	base := types.IngressRule{Iface: "wlan0", SrcIP: "192.168.50.60", Protocol: "tcp", Port: 1883, ToIP: "172.16.9.2"}
+	with := func(f func(*types.IngressRule)) types.IngressRule { r := base; f(&r); return r }
+	cases := map[string]struct {
+		other types.IngressRule
+		want  bool
+	}{
+		"identical":         {base, true},
+		"other target only": {with(func(r *types.IngressRule) { r.ToIP = "172.16.10.2" }), true},
+		"range holds it":    {with(func(r *types.IngressRule) { r.SrcIP = "192.168.50.0/24" }), true},
+		"other source":      {with(func(r *types.IngressRule) { r.SrcIP = "192.168.50.61" }), false},
+		"disjoint range":    {with(func(r *types.IngressRule) { r.SrcIP = "192.168.51.0/24" }), false},
+		"other port":        {with(func(r *types.IngressRule) { r.Port = 8883 }), false},
+		"other protocol":    {with(func(r *types.IngressRule) { r.Protocol = "udp" }), false},
+		"other interface":   {with(func(r *types.IngressRule) { r.Iface = "eth1" }), false},
+	}
+	for name, c := range cases {
+		if got := IngressClash(base, c.other); got != c.want {
+			t.Errorf("%s: IngressClash = %v, want %v", name, got, c.want)
+		}
+		if got := IngressClash(c.other, base); got != c.want {
+			t.Errorf("%s (swapped): IngressClash = %v, want %v", name, got, c.want)
 		}
 	}
 }

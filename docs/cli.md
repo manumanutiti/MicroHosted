@@ -111,12 +111,23 @@ file may need `sudo`.
 
 ### Networks
 
+A network's policy is named by **who opens the connection**:
+
+| | who opens it | where to |
+|---|---|---|
+| **OUT** | the VM | the internet, or a device behind a managed interface (`@IFACE`) |
+| **IN** | a device behind a managed interface | one VM of the network |
+
+Everything not listed is dropped, both ways. (The API calls these
+`allowed_egress` and `allowed_ingress`.)
+
 ```bash
-mh network create lab                       # isolated: no egress, VMs can't see each other
-mh network create build --egress            # full internet (NAT)
+mh network create lab                       # isolated: nothing in or out, VMs can't see each other
+mh network create build --internet          # ALL outbound to the internet (NAT)
 mh network create lab2 --intra --subnet 10.10.0.0/24
-mh network create iot --allow tcp:203.0.113.7:8883 --allow icmp:203.0.113.7
-mh network create ot-52 --allow tcp:192.168.50.52:502@wlan0
+mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
+mh network create ot-52 --out tcp:192.168.50.52:502@wlan0
+mh network create mqtt-60 --subnet 172.16.9.0/24 --in tcp:192.168.50.60:1883@wlan0=172.16.9.2
 
 mh network ls
 mh network inspect lab
@@ -124,31 +135,50 @@ mh network inspect lab
 # Change a live network (VMs stay up)
 mh network update lab --intra                         # VM↔VM on
 mh network update lab --no-intra
-mh network update lab --egress                        # full internet
-mh network update lab --no-egress                     # cut everything
-mh network update lab --allow tcp:1.2.3.4:443         # REPLACE the rules with these
-mh network update lab --add-allow udp:10.0.0.53:53    # add to the current rules
-mh network update lab --rm-allow icmp:203.0.113.7     # remove one
-mh network update lab --add-allow tcp:1.2.3.4:80 --no-intra   # egress + intra in one go
+mh network update lab --out udp:10.0.0.53:53          # add an OUT rule
+mh network update lab --rm-out icmp:203.0.113.7       # remove one
+mh network update lab --set-out tcp:1.2.3.4:443       # REPLACE all OUT rules with these
+mh network update lab --internet                      # ALL outbound to the internet
+mh network update lab --no-out                        # close all outbound
+mh network update mqtt-60 --in tcp:192.168.50.61:1883@wlan0=172.16.9.3      # add an IN rule
+mh network update mqtt-60 --rm-in tcp:192.168.50.61:1883@wlan0=172.16.9.3   # remove one
+mh network update mqtt-60 --no-in                     # close all inbound
+mh network update lab --out tcp:1.2.3.4:80 --no-intra # OUT + intra in one go
 
 mh network rm lab                           # refuses while VMs are attached
 mh network rm -f lab                        # destroys its VMs first
 ```
 
-**Egress rules** are `PROTO:IP[:PORT][@IFACE]`:
+**OUT rules** are `PROTO:DEST[:PORT][@IFACE]`:
 
 | rule | meaning |
 |---|---|
-| `tcp:203.0.113.7:8883` | TCP to that host and port, out to the WAN |
+| `tcp:203.0.113.7:8883` | TCP to that host and port, on the **internet** (no `@IFACE`) |
 | `udp:10.0.0.0/24:53` | UDP to a whole CIDR, port 53 |
 | `icmp:203.0.113.7` | ping (no port) |
-| `tcp:192.168.50.52:502@wlan0` | through a **managed interface** (see [networking.md](networking.md)) |
+| `tcp:192.168.50.52:502@wlan0` | to a device behind the **managed interface** `wlan0` (see [networking.md](networking.md)) |
 
-The API replaces the whole egress policy on every update. `--add-allow` and
-`--rm-allow` are the client reading the current rules and sending the merged
-list. `--rm-allow` of a rule that isn't there is an error, so a typo can't
-look like a closed hole. The daemon validates each rule (canonical CIDR, port
-range, managed interface) and its message comes back as is.
+Without `@IFACE` a rule means the internet, even if the address happens to sit
+on a managed segment: `icmp:192.168.50.52` does **not** reach the device behind
+`wlan0`, `icmp:192.168.50.52@wlan0` does.
+
+**IN rules** are `PROTO:SRC:PORT@IFACE=VM_IP`, e.g.
+`tcp:192.168.50.60:1883@wlan0=172.16.9.2`. The device `192.168.50.60` connects
+to **this host's address** on `wlan0`, port 1883, and lands on the VM
+`172.16.9.2`, same port. The host itself listens on nothing (see
+[networking.md](networking.md) § Ingress). `@IFACE` is required, and at create
+time `--in` needs `--subnet`.
+
+The API replaces the whole policy on every update. `--out`/`--rm-out` and
+`--in`/`--rm-in` are the client reading the current rules and sending the
+merged list. Removing a rule that isn't there is an error, so a typo can't look
+like a closed hole. The daemon validates each rule (canonical CIDR, port range,
+managed interface, VM_IP inside the subnet) and its message comes back as is.
+
+The old spellings (`--allow`, `--add-allow`, `--rm-allow`, `--egress`,
+`--no-egress`, `--ingress`, `--add-ingress`, `--rm-ingress`, `--no-ingress`)
+still work but are no longer shown in `--help`. In `update`, `--allow` and
+`--ingress` REPLACE (like `--set-out`/`--set-in`); `--add-*` add.
 
 ### Volumes
 

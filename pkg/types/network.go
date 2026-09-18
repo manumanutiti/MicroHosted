@@ -30,6 +30,12 @@ type Network struct {
 	// egress at all. Mutually exclusive with Egress (which already allows all).
 	AllowedEgress []EgressRule
 
+	// AllowedIngress lets specific devices on a managed interface open
+	// connections INTO one of this network's VMs: each rule DNATs a
+	// (source, protocol, port) arriving at the host to a guest address. The
+	// host never listens on the port. Independent of the egress fields.
+	AllowedIngress []IngressRule
+
 	// Intra controls VM↔VM reachability WITHIN the network. False (default,
 	// deny-by-default): every VM's TAP is enslaved as an ISOLATED bridge port,
 	// so VMs reach the gateway (and whatever the egress policy allows) but
@@ -74,6 +80,34 @@ type EgressRule struct {
 	Port int `json:"port,omitempty"`
 }
 
+// IngressRule lets one device on a managed interface open connections into
+// one VM of the network — the push case, where a sensor is the client (MQTT,
+// HTTP) and cannot be polled. The device addresses the HOST on that interface
+// (e.g. gateway:1883); the kernel rewrites the destination to ToIP in
+// prerouting, so the host has no listener and never touches the payload.
+// Only replies of that DNATed flow come back out; the VM still cannot open
+// anything towards the device.
+type IngressRule struct {
+	// Iface is the managed interface the device sits behind. Required: the
+	// deny-both-ways policy of a managed interface is what makes a hole in
+	// it safe, and there is no such policy on any other interface.
+	Iface string `json:"iface"`
+	// SrcIP is the device allowed in: an IPv4 address or CIDR. It is spoofable
+	// on a flat segment, so pair it with per-device credentials inside the VM
+	// and port isolation at the access layer (see docs/iot-edge.md).
+	SrcIP string `json:"src_ip"`
+	// Protocol is "tcp" or "udp".
+	Protocol string `json:"protocol"`
+	// Port is both the port the device connects to on the host and the port
+	// the VM listens on (no remapping).
+	Port int `json:"port"`
+	// ToIP is the guest address inside this network's subnet that receives
+	// the flow. An address, not a VM name, so the rule survives a VM being
+	// reset from its snapshot (the restored guest keeps the snapshot's IP).
+	// If no VM holds it, the flow goes nowhere.
+	ToIP string `json:"to_ip"`
+}
+
 // CreateNetworkRequest is the payload accepted by POST /v1/networks.
 type CreateNetworkRequest struct {
 	Name string `json:"name"`
@@ -83,6 +117,9 @@ type CreateNetworkRequest struct {
 	// AllowedEgress lists the only WAN flows this network may open. Requires
 	// Egress to be false/omitted.
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
+	// AllowedIngress lists the only inbound flows from managed interfaces.
+	// Needs an explicit Subnet: every rule's to_ip must fall inside it.
+	AllowedIngress []IngressRule `json:"allowed_ingress,omitempty"`
 	// Intra opts in to VM↔VM connectivity within the network (off by default).
 	Intra bool `json:"intra,omitempty"`
 }
@@ -97,6 +134,13 @@ type UpdateNetworkEgressRequest struct {
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
 }
 
+// UpdateNetworkIngressRequest is the payload accepted by
+// PUT /v1/networks/{name}/ingress: it REPLACES the network's whole ingress
+// policy. An empty list closes every inbound hole.
+type UpdateNetworkIngressRequest struct {
+	AllowedIngress []IngressRule `json:"allowed_ingress"`
+}
+
 // UpdateNetworkIntraRequest is the payload accepted by
 // PUT /v1/networks/{name}/intra: flips VM↔VM reachability on a live network.
 type UpdateNetworkIntraRequest struct {
@@ -105,26 +149,28 @@ type UpdateNetworkIntraRequest struct {
 
 // NetworkResponse is the JSON representation of a Network returned by the API.
 type NetworkResponse struct {
-	Name          string       `json:"name"`
-	Bridge        string       `json:"bridge"`
-	Subnet        string       `json:"subnet"`
-	Gateway       string       `json:"gateway"`
-	Egress        bool         `json:"egress"`
-	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
-	Intra         bool         `json:"intra"`
-	CreatedAt     string       `json:"created_at"`
+	Name           string        `json:"name"`
+	Bridge         string        `json:"bridge"`
+	Subnet         string        `json:"subnet"`
+	Gateway        string        `json:"gateway"`
+	Egress         bool          `json:"egress"`
+	AllowedEgress  []EgressRule  `json:"allowed_egress,omitempty"`
+	AllowedIngress []IngressRule `json:"allowed_ingress,omitempty"`
+	Intra          bool          `json:"intra"`
+	CreatedAt      string        `json:"created_at"`
 }
 
 // NewNetworkResponse builds the API DTO from an internal Network record.
 func NewNetworkResponse(n *Network) NetworkResponse {
 	return NetworkResponse{
-		Name:          n.Name,
-		Bridge:        n.Bridge,
-		Subnet:        n.Subnet,
-		Gateway:       n.Gateway,
-		Egress:        n.Egress,
-		AllowedEgress: n.AllowedEgress,
-		Intra:         n.Intra,
-		CreatedAt:     n.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		Name:           n.Name,
+		Bridge:         n.Bridge,
+		Subnet:         n.Subnet,
+		Gateway:        n.Gateway,
+		Egress:         n.Egress,
+		AllowedEgress:  n.AllowedEgress,
+		AllowedIngress: n.AllowedIngress,
+		Intra:          n.Intra,
+		CreatedAt:      n.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 }

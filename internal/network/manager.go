@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -20,6 +21,11 @@ const DefaultNetworkName = "default"
 
 // defaultSubnet is the CIDR of the auto-created default network.
 const defaultSubnet = "172.16.0.0/24"
+
+// ErrInvalidIngress marks an ingress policy the caller got wrong — to_ip
+// outside the subnet, a clash with another network's rule — as opposed to a
+// failure of the host. The API turns it into a 400.
+var ErrInvalidIngress = errors.New("invalid ingress policy")
 
 // managedNet couples a persisted Network with its live IPAM and the set of VMs
 // currently attached (so Delete can refuse a network still in use).
@@ -71,14 +77,15 @@ func (m *Manager) ManagedIfaceNames() []string {
 	return names
 }
 
-// UnenforcedRules lists the stored egress rules that name an interface this
-// daemon does not manage — typically because it was restarted without the
+// UnenforcedRules lists the stored egress and ingress rules that name an
+// interface this daemon does not manage — typically because it was restarted without the
 // --managed-iface it had when the rules were created. They are NOT rendered
 // (see renderNftables): a hole through an interface is only safe inside the
 // deny-both-ways policy that declaring it installs, and that policy is gone.
 // So the API reports a rule that is not in force. The health check surfaces
 // the mismatch instead of leaving an operator to find out from a dead flow.
-// Each entry reads "network ot: tcp:192.168.50.52:502@wlan0".
+// Each entry reads "network ot: tcp:192.168.50.52:502@wlan0" (egress) or
+// "network ot: ingress tcp:192.168.50.60:1883@wlan0=172.16.9.2".
 func (m *Manager) UnenforcedRules() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -87,6 +94,11 @@ func (m *Manager) UnenforcedRules() []string {
 		for _, r := range mn.net.AllowedEgress {
 			if r.Iface != "" && !isManaged(m.managed, r.Iface) {
 				out = append(out, fmt.Sprintf("network %s: %s", mn.net.Name, describeRule(r)))
+			}
+		}
+		for _, r := range mn.net.AllowedIngress {
+			if !isManaged(m.managed, r.Iface) {
+				out = append(out, fmt.Sprintf("network %s: ingress %s", mn.net.Name, describeIngressRule(r)))
 			}
 		}
 	}
@@ -113,6 +125,36 @@ func describeRule(r types.EgressRule) string {
 		s += "@" + r.Iface
 	}
 	return s
+}
+
+// describeIngressRule renders a rule in the CLI's PROTO:SRC:PORT@IFACE=TO_IP form.
+func describeIngressRule(r types.IngressRule) string {
+	return fmt.Sprintf("%s:%s:%d@%s=%s", r.Protocol, r.SrcIP, r.Port, r.Iface, r.ToIP)
+}
+
+// checkIngress vets rules against what only the Manager knows: the target
+// network's subnet (every to_ip must be a guest address in it) and the other
+// networks' ingress rules (the prerouting chain is shared, so a clash with any
+// of them would leave one rule silently dead). Call with m.mu held; `self` is
+// the network being changed, skipped so a replace doesn't clash with itself.
+func (m *Manager) checkIngress(self string, subnet *Subnet, rules []types.IngressRule) error {
+	for i, r := range rules {
+		if err := subnet.CheckGuestIP(r.ToIP); err != nil {
+			return fmt.Errorf("%w: rule %d: to_ip %s", ErrInvalidIngress, i, err)
+		}
+		for _, other := range m.nets {
+			if other.net.Name == self {
+				continue
+			}
+			for _, o := range other.net.AllowedIngress {
+				if IngressClash(r, o) {
+					return fmt.Errorf("%w: rule %d (%s) clashes with network %s's %s",
+						ErrInvalidIngress, i, describeIngressRule(r), other.net.Name, describeIngressRule(o))
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Reconcile rebuilds network state from the store at startup: recreates any
@@ -155,7 +197,7 @@ func (m *Manager) Reconcile() error {
 	for _, r := range m.UnenforcedRules() {
 		log.Printf("WARNING: egress rule NOT applied — %s names an interface this daemon does not manage. "+
 			"Restart it with --managed-iface for that interface (make install-service MANAGED_IFACE=...) "+
-			"or remove the rule (mh network update ... --rm-allow ...)", r)
+			"or remove the rule (mh network update ... --rm-out/--rm-in ...)", r)
 	}
 	return m.applyRules()
 }
@@ -172,6 +214,15 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 	}
 	if err := ValidateEgressRules(req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
+	}
+	if err := ValidateIngressRules(req.AllowedIngress, m.ManagedIfaceNames()); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidIngress, err)
+	}
+	// An auto-allocated subnet is unknown to the caller, so no to_ip could
+	// have been chosen inside it on purpose.
+	if len(req.AllowedIngress) > 0 && req.Subnet == "" {
+		return nil, fmt.Errorf("%w: allowed_ingress needs an explicit subnet (every to_ip must fall inside it); "+
+			"or create the network first and add the rules with PUT /v1/networks/{name}/ingress", ErrInvalidIngress)
 	}
 
 	m.mu.Lock()
@@ -194,18 +245,23 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 		m.mu.Unlock()
 		return nil, err
 	}
+	if err := m.checkIngress(req.Name, subnet, req.AllowedIngress); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 
 	id := uuid.NewString()[:8]
 	n := &types.Network{
-		ID:            id,
-		Name:          req.Name,
-		Bridge:        "mhbr" + id,
-		Subnet:        cidr,
-		Gateway:       subnet.Gateway(),
-		Egress:        req.Egress,
-		AllowedEgress: req.AllowedEgress,
-		Intra:         req.Intra,
-		CreatedAt:     time.Now(),
+		ID:             id,
+		Name:           req.Name,
+		Bridge:         "mhbr" + id,
+		Subnet:         cidr,
+		Gateway:        subnet.Gateway(),
+		Egress:         req.Egress,
+		AllowedEgress:  req.AllowedEgress,
+		AllowedIngress: req.AllowedIngress,
+		Intra:          req.Intra,
+		CreatedAt:      time.Now(),
 	}
 
 	if err := CreateBridge(n.Bridge, subnet.GatewayCIDR()); err != nil {
@@ -252,6 +308,40 @@ func (m *Manager) UpdateEgress(name string, req types.UpdateNetworkEgressRequest
 	updated := *mn.net
 	updated.Egress = req.Egress
 	updated.AllowedEgress = req.AllowedEgress
+	if err := m.store.SaveNetwork(&updated); err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persisting network %s: %w", name, err)
+	}
+	mn.net = &updated
+	m.mu.Unlock()
+
+	if err := m.applyRules(); err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// UpdateIngress replaces a live network's ingress policy and reinstalls the
+// ruleset, like UpdateEgress: attached VMs are untouched, and a removed rule
+// cuts its live flows on their next packet (the forward legs are the only
+// accept; the DNAT binding a flow keeps in conntrack leads into the drop).
+func (m *Manager) UpdateIngress(name string, rules []types.IngressRule) (*types.Network, error) {
+	if err := ValidateIngressRules(rules, m.ManagedIfaceNames()); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidIngress, err)
+	}
+
+	m.mu.Lock()
+	mn, ok := m.nets[name]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("network %q not found", name)
+	}
+	if err := m.checkIngress(name, mn.subnet, rules); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	updated := *mn.net
+	updated.AllowedIngress = rules
 	if err := m.store.SaveNetwork(&updated); err != nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("persisting network %s: %w", name, err)
@@ -424,8 +514,9 @@ func (m *Manager) applyRules() error {
 	for _, mn := range m.nets {
 		snapshot = append(snapshot, *mn.net)
 		// Restricted networks (AllowedEgress) need forwarding + NAT plumbing
-		// just like full-egress ones; only the ruleset differs.
-		if mn.net.Egress || len(mn.net.AllowedEgress) > 0 {
+		// just like full-egress ones; only the ruleset differs. So does
+		// ingress: a DNATed flow is routed, not delivered to the host.
+		if mn.net.Egress || len(mn.net.AllowedEgress) > 0 || len(mn.net.AllowedIngress) > 0 {
 			anyEgress = true
 		}
 	}

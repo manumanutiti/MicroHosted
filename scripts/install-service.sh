@@ -19,7 +19,8 @@
 #                                              policy the daemon owns, comma-
 #                                              separated: denied both ways
 #                                              except each network's egress
-#                                              rules that name it. Remove any
+#                                              and ingress rules that name
+#                                              it. Remove any
 #                                              OTHER ruleset covering it first —
 #                                              two authors on one hook means a
 #                                              drop you cannot see wins.

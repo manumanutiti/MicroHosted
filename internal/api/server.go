@@ -56,7 +56,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, sysCfg SystemConfig) *h
 		}
 		n, err := netmgr.Create(req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, networkErrStatus(err), err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, types.NewNetworkResponse(n))
@@ -104,6 +104,31 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, sysCfg SystemConfig) *h
 		n, err := netmgr.UpdateEgress(r.PathValue("name"), req)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
+	})
+
+	// Live ingress-policy update: replaces the network's whole ingress policy
+	// (the inbound DNAT holes from managed interfaces). Like egress, removing
+	// a rule cuts its live flows on their next packet.
+	mux.HandleFunc("PUT /v1/networks/{name}/ingress", func(w http.ResponseWriter, r *http.Request) {
+		var req types.UpdateNetworkIngressRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := network.ValidateIngressRules(req.AllowedIngress, netmgr.ManagedIfaceNames()); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, ok := netmgr.Get(r.PathValue("name")); !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("network %q not found", r.PathValue("name")))
+			return
+		}
+		n, err := netmgr.UpdateIngress(r.PathValue("name"), req.AllowedIngress)
+		if err != nil {
+			writeError(w, networkErrStatus(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
@@ -552,4 +577,14 @@ func bulkDeleteResponse(deleted []string, failedErrs map[string]error) types.Bul
 		}
 	}
 	return resp
+}
+
+// networkErrStatus maps a network-manager error to its status: an ingress
+// policy the caller got wrong (to_ip outside the subnet, a clash with another
+// network) is only detectable inside the manager, but it is still a 400.
+func networkErrStatus(err error) int {
+	if errors.Is(err, network.ErrInvalidIngress) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }

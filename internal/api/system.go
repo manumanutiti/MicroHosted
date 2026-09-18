@@ -143,7 +143,7 @@ func runHealthChecks(mgr *vm.Manager, netmgr *network.Manager, facts vm.Facts) [
 	if bad := netmgr.UnenforcedRules(); len(bad) > 0 {
 		egress.OK = false
 		egress.Detail = fmt.Sprintf("%d rule(s) NOT applied, their interface is not managed by this daemon: %s — "+
-			"reinstall with MANAGED_IFACE=<iface> or remove them with --rm-allow",
+			"reinstall with MANAGED_IFACE=<iface> or remove them with mh network update --rm-out / --rm-in",
 			len(bad), strings.Join(bad, "; "))
 	}
 	checks = append(checks, egress)

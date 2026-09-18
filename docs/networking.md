@@ -15,6 +15,8 @@ A **Network** is a named L2 segment:
 - a **gateway** = the host's IP on the bridge (`.1` of the subnet),
 - an **egress** flag (internet access yes/no) and optionally **allowed_egress**
   (fine-grained egress),
+- optionally **allowed_ingress**: devices on a managed interface allowed to open
+  connections *into* one of its VMs (push protocols: MQTT, HTTP),
 - an **intra** flag (VM↔VM connectivity within the network; **off by default**).
 
 Every VM that joins a network gets a **TAP enslaved to that bridge** (the TAP
@@ -93,6 +95,7 @@ chain input {
 }
 chain forward {
     <both legs of every egress rule that names this interface>
+    <both legs of every ingress rule on this interface>
     iifname "wlan0" drop
     oifname "wlan0" drop
 }
@@ -138,9 +141,14 @@ true. `GET /v1/system` lists the managed interfaces for the same reason.
 ### Deliberate properties
 
 - **Both legs are pinned to the same destination**, and the return leg is matched
-  statelessly like the rest of `forward` — by the destination's own address and
-  source port — so tightening the policy cuts a live flow on its next packet
-  instead of letting a conntrack entry ride through it.
+  on the stateless tuple like the rest of `forward` — by the destination's own
+  address and source port — so tightening the policy cuts a live flow on its next
+  packet instead of letting a conntrack entry ride through it.
+- **The return leg only carries replies** (`ct direction reply`). The tuple
+  alone would let the *device* open connections into the guest, on any port,
+  just by using the rule's port as its source port (`sport 502` → the guest's
+  22), or ping it through an icmp rule. The direction match only narrows the
+  tuple, so the previous point still holds: drop the rule and the flow dies.
 - **The reply arrives already un-masqueraded.** Conntrack reverses the source NAT
   in `prerouting`, which runs before `forward`, so `ip daddr` in the return rule
   is the guest's real address.
@@ -150,9 +158,15 @@ true. `GET /v1/system` lists the managed interfaces for the same reason.
   interface is not one of our bridges either. It also means the device sees the
   *gateway*, not the VM — per-VM attribution would need a distinct host address
   per VM on that segment, which is worth doing and not done.
-- **`egress: true` cannot leak into it.** `oifname "wlan0" drop` closes the
-  outbound side, which a WAN-oriented rule would otherwise leave wide open: a
-  managed interface is simply "not one of our bridges".
+- **Nothing WAN-scoped can leak into it.** `iifname/oifname "wlan0" drop` sits
+  right after the interface's own holes and **before** every WAN rule. To those
+  rules a managed interface is simply "not one of our bridges": an
+  `egress: true` network, or an `allowed_egress` rule *without* `@wlan0` whose
+  destination happens to be on that segment (`icmp:192.168.50.52`), would
+  otherwise send packets out through it. Only the reply would die, so the leak
+  is one-way, but it is still a VM putting packets on the segment through a rule
+  that never named it. To reach a device on the segment, name the interface:
+  `icmp:192.168.50.52@wlan0`.
 
 ### What this cannot do
 
@@ -162,6 +176,76 @@ at all — on a switch that is switching, on Wi-Fi the AP relays the frames insi
 cannot separate two VMs on one bridge (hence `intra: false` isolating ports at
 L2). That isolation belongs to the access layer: `ap_isolate=1` on an AP,
 private VLANs or port isolation on a switch.
+
+### Ingress through a managed interface (`allowed_ingress`)
+
+In push protocols the device is the **client**: an MQTT sensor opens the
+connection towards a broker and listens on nothing, so it can't be polled.
+`allowed_ingress` lets such a device in **without the host listening or parsing
+a byte**. Each rule is `{iface, src_ip, protocol, port, to_ip}`:
+
+```json
+{"allowed_ingress":[
+  {"iface":"wlan0","src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"172.16.9.2"}
+]}
+```
+
+The device connects to **the host's address on that interface**, port `port`.
+The kernel rewrites the destination to `to_ip:port` before routing, so the flow
+goes through `forward` and never reaches `input`:
+
+```
+chain prerouting {
+    type nat hook prerouting priority -100; policy accept;
+    iifname "wlan0" ip saddr 192.168.50.60 fib daddr type local tcp dport 1883 dnat ip to 172.16.9.2:1883
+}
+chain forward {
+    iifname "wlan0" oifname "mhbr…" ip saddr 192.168.50.60 ip daddr 172.16.9.2 tcp dport 1883 ct status dnat ct direction original accept
+    iifname "mhbr…" oifname "wlan0" ip saddr 172.16.9.2 tcp sport 1883 ip daddr 192.168.50.60 ct status dnat ct direction reply accept
+    ...
+}
+```
+
+`ss -ltn` on the host shows nothing on 1883.
+
+- **`iface` is required and must be managed.** A DNAT hole only makes sense
+  inside the deny-both-ways policy of a managed interface. A stored rule whose
+  interface stops being managed is not rendered and shows up in the
+  `egress_policy` health check, same as an egress rule.
+- **The target is an address (`to_ip`), not a VM name.** It must be a guest
+  address of the network's subnet (not the network, gateway or broadcast). The
+  rule doesn't care which VM holds it. That is what lets it survive a reset: a
+  VM restored from its snapshot comes back with the snapshot's IP. The other side
+  of it: if the address is later handed to a *different* VM on the same network,
+  the traffic follows the address. With one broker-VM per network that can't
+  happen; on shared networks, keeping addresses and VMs paired is the
+  orchestrator's job.
+- **An explicit subnet is required at create time.** With an auto-allocated one
+  the caller couldn't have picked `to_ip` inside it. Or create the network first
+  and add the rules with `PUT /v1/networks/{name}/ingress`.
+- **Rules can't clash.** Two rules that one packet could match (same interface,
+  protocol and port, overlapping `src_ip`) are rejected, **across networks** too,
+  because the prerouting chain is shared and the first DNAT would silently win.
+- **The return leg only carries replies.** The legs match the stateless tuple
+  like every other `forward` rule, plus conntrack's direction. `ct status dnat`
+  admits only flows that went through the DNAT, not a device that routes
+  straight at the guest subnet. `ct direction reply` on the return leg means the
+  VM can only answer. Without it a compromised VM could bind 1883 as its
+  *source* port and open connections to any port on the device.
+- **Tightening still cuts live flows.** The conntrack matches only narrow the
+  tuple, so removing a rule removes the accept. The flow's DNAT binding survives
+  in conntrack, but it leads into `iifname "wlan0" drop`.
+- **The VM sees the device's real address.** Nothing masquerades a DNATed flow.
+  In the other direction, the reply is un-DNATed on the way out, so the device
+  sees the gateway's address, which is the one it connected to.
+- **`src_ip` is spoofable** on a flat segment. Pair it with per-device
+  credentials inside the VM and port isolation at the access layer
+  (`docs/iot-edge.md`, Push mode).
+- `ip_forward` is turned on as soon as any network has ingress rules, as for
+  egress.
+
+Independent of the egress fields: a broker-VM network usually has
+`allowed_ingress` and **no egress at all**.
 
 ### Hot update of intra (`PUT /v1/networks/{name}/intra`)
 

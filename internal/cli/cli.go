@@ -51,7 +51,13 @@ type command struct {
 	aliases []string
 	args    string // positional-argument synopsis for the usage line
 	summary string
-	run     func(e *env, cmd *command, path string, args []string) error
+	// help, when set, is printed under the summary in --help: the concepts a
+	// flag list alone doesn't explain. examples closes the help. Both are
+	// optional; flags of a command with help are listed in definition order,
+	// so they can be grouped by concept instead of alphabetically.
+	help     string
+	examples string
+	run      func(e *env, cmd *command, path string, args []string) error
 }
 
 // group is a management object ("vm", "network"...) holding its verbs.
@@ -283,6 +289,10 @@ type flagSet struct {
 	path string
 	// shortOf maps a long flag name to its one-letter alias, for help output.
 	shortOf map[string]string
+	// defined lists the visible flags in definition order; inOrder makes help
+	// use it instead of sorting.
+	defined []string
+	inOrder bool
 }
 
 func newFlags(path string) *flagSet {
@@ -296,13 +306,20 @@ func newCmdFlags(e *env, path string, c *command) *flagSet {
 	f := newFlags(path)
 	f.Usage = func() {
 		fmt.Fprintf(e.stdout, "Usage:  %s %s\n\n%s\n", path, strings.TrimSpace(c.args+" [FLAGS]"), c.summary)
+		if c.help != "" {
+			fmt.Fprintf(e.stdout, "\n%s\n", strings.Trim(c.help, "\n"))
+		}
 		hasFlags := false
 		f.VisitAll(func(fl *flag.Flag) { hasFlags = hasFlags || fl.Usage != "" })
 		if hasFlags {
 			fmt.Fprint(e.stdout, "\nFlags:\n")
 			f.printDefaults(e.stdout)
 		}
+		if c.examples != "" {
+			fmt.Fprintf(e.stdout, "\nExamples:\n%s\n", strings.Trim(c.examples, "\n"))
+		}
 	}
+	f.inOrder = c.help != ""
 	return f
 }
 
@@ -317,25 +334,38 @@ func (f *flagSet) alias(long, short string) {
 	f.shortOf[long] = short
 }
 
+// hidden registers an old spelling of an already-defined flag that keeps
+// working but no longer shows in help — renames must not break scripts.
+func (f *flagSet) hidden(long string, old ...string) {
+	fl := f.Lookup(long)
+	for _, o := range old {
+		f.Var(fl.Value, o, "")
+	}
+}
+
 func (f *flagSet) boolVar(p *bool, long, short, usage string) {
 	f.BoolVar(p, long, false, usage)
 	f.alias(long, short)
+	f.defined = append(f.defined, long)
 }
 
 func (f *flagSet) stringVar(p *string, long, short, def, usage string) {
 	f.StringVar(p, long, def, usage)
 	f.alias(long, short)
+	f.defined = append(f.defined, long)
 }
 
 func (f *flagSet) int64Var(p *int64, long, short string, usage string) {
 	f.Int64Var(p, long, 0, usage)
 	f.alias(long, short)
+	f.defined = append(f.defined, long)
 }
 
-// listVar is a repeatable string flag: --allow A --allow B.
+// listVar is a repeatable string flag: --out A --out B.
 func (f *flagSet) listVar(p *[]string, long, short, usage string) {
 	f.Var((*listValue)(p), long, usage)
 	f.alias(long, short)
+	f.defined = append(f.defined, long)
 }
 
 type listValue []string
@@ -358,12 +388,16 @@ func (f *flagSet) isSet(long string) bool {
 func (f *flagSet) printDefaults(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
 	var names []string
-	f.VisitAll(func(fl *flag.Flag) {
-		if fl.Usage != "" {
-			names = append(names, fl.Name)
-		}
-	})
-	sort.Strings(names)
+	if f.inOrder {
+		names = f.defined
+	} else {
+		f.VisitAll(func(fl *flag.Flag) {
+			if fl.Usage != "" {
+				names = append(names, fl.Name)
+			}
+		})
+		sort.Strings(names)
+	}
 	for _, n := range names {
 		fl := f.Lookup(n)
 		arg, usage := flag.UnquoteUsage(fl)

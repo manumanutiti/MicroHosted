@@ -67,3 +67,42 @@ func TestCreateNetworkEgressValidation(t *testing.T) {
 		}
 	}
 }
+
+// PUT /v1/networks/{name}/ingress: same split as egress. The test daemon
+// manages no interface, so every rule is refused before a bridge or nft is
+// touched; an empty list is valid and reaches the not-found check.
+func TestUpdateNetworkIngressValidation(t *testing.T) {
+	ts := newTestServer(t)
+
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"unknown network", `{"allowed_ingress":[]}`, http.StatusNotFound},
+		{"unmanaged iface", `{"allowed_ingress":[{"iface":"wlan0","src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"172.16.0.2"}]}`, http.StatusBadRequest},
+		{"no iface", `{"allowed_ingress":[{"src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"172.16.0.2"}]}`, http.StatusBadRequest},
+		{"injection attempt", `{"allowed_ingress":[{"iface":"wlan0","src_ip":"1.2.3.4 accept;","protocol":"tcp","port":1883,"to_ip":"172.16.0.2"}]}`, http.StatusBadRequest},
+		{"garbage body", `{not json`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		res := putJSON(t, ts.URL+"/v1/networks/nope/ingress", c.body)
+		res.Body.Close()
+		if res.StatusCode != c.want {
+			t.Errorf("%s: PUT /v1/networks/nope/ingress = %d, want %d", c.name, res.StatusCode, c.want)
+		}
+	}
+}
+
+func TestCreateNetworkIngressValidation(t *testing.T) {
+	ts := newTestServer(t)
+	body := `{"name":"x","subnet":"10.99.0.0/24","allowed_ingress":[{"iface":"wlan0","src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"10.99.0.2"}]}`
+	res, err := http.Post(ts.URL+"/v1/networks", "application/json", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /v1/networks with an unmanaged ingress iface = %d, want 400", res.StatusCode)
+	}
+}

@@ -67,25 +67,101 @@ Cycle: `restore from snapshot → the VM interrogates ITS sensor → validate/pa
   host→guest): the host *collects* the result, the guest can't initiate anything
   toward the host. Consistent with the current security model.
 
-### Push mode (later) — for MQTT/HTTP
+### Push mode (planned, IoT-6) — for MQTT/HTTP
 
-The sensor initiates the connection and the VM must exist to receive it. The
-problem: something has to see the connection arrive before the VM exists,
-**without parsing a single byte**:
+> Status (2026-09-18): the network primitive is built, `allowed_ingress`
+> (`docs/networking.md` § Ingress), unit-tested but **not yet validated on
+> hardware**. The broker-VM template and the collection side are not built. The
+> only flow validated end to end on hardware is Modbus pull from a real
+> ESP32+DHT11 over a managed interface.
 
-1. nftables marks the first SYN toward the ingestion port and hands it to the
-   daemon via NFQUEUE/NFLOG (kernel L3/L4 metadata, zero payload).
-2. The daemon restores the sensor's VM (by source IP) and installs the DNAT.
-3. The sensor's retransmitted SYN (~1s, automatic in TCP) lands inside the VM.
-   The payload bytes never touch the host's userspace.
+In MQTT the sensor is the **client**: it opens the connection toward a broker
+and listens on nothing, so it cannot be polled. The gateway has to accept an
+inbound connection without the host listening or parsing a single byte. A
+managed interface drops everything inbound (`iifname <iface> drop` in `input`
+and `forward`). Its only inbound holes are the return legs of VM-initiated flows
+and the `allowed_ingress` rules below.
 
-Effective latency ~1s when cold — irrelevant for telemetry every 30s. For
-high-frequency sensors: a hot VM per sensor ("per anomaly" mode).
+#### The pattern: a dirty broker per sensor, a clean broker upstream
 
-**Anti-DoS mandatory**: an attacker spamming SYNs triggers a VM storm. A global
-cap on concurrent VMs + per-source-IP rate limit + per-sensor circuit breaker
-(if its VM dies N times in a row, quarantine and alert — that IS the compromise
-detection).
+```
+MQTT sensor 192.168.50.60 ──publish──▶ gateway:1883 on the managed iface
+        prerouting DNAT keyed on source IP (kernel only, L3/L4 headers)
+                    ▼
+  broker-VM-60: Mosquitto + translator, NO egress at all
+                    ▲ vsock (host-initiated, exactly as in pull mode)
+  ingestor: strict validation → topic from the VM's identity → clean broker
+                    ▼
+          dashboards / DB / cloud
+```
+
+- **Push at the sensor edge, pull at the host edge.** From vsock upward the flow
+  is identical to pull mode: same ingestor, same validation, same clean broker.
+  Only who opens the sensor↔VM connection changes.
+- **The VM translates** the vendor payload (custom JSON, Sparkplug B…) into the
+  canonical format. The dangerous parsing stays inside the VM.
+- **One broker-VM per sensor, not a shared one.** A shared broker lets one sensor
+  that exploits Mosquitto forge every other sensor's data. Per-sensor keeps
+  blast radius and identity 1:1, and the measured density (174 devices on a Pi
+  8GB at ~34MB each) makes it affordable.
+- **The broker-VM has no egress.** Compromised, it can't reach the internet,
+  other sensors, or the host (guest→host DROP, vsock is host-initiated only).
+  A reset to snapshot wipes it.
+- **Source IP is spoofable** on Wi-Fi or a flat segment: per-sensor MQTT
+  credentials in each broker-VM, plus `ap_isolate=1` / port isolation at the
+  access layer.
+- **The clean broker never receives sensor bytes**, only the ingestor's
+  re-serialized output. Where it runs is a deployment choice, not a security one.
+
+#### Lifetime depends on how the sensor is powered
+
+| Sensor | Behaviour | Broker-VM lifetime |
+|---|---|---|
+| Mains-powered | Persistent TCP session, PINGREQ every keepalive (e.g. 60s); the broker drops it after 1.5× keepalive of silence | Always on, "per anomaly" mode (scheduled/reactive reset; the sensor's MQTT client reconnects by itself) |
+| Battery (deep sleep) | Wake → connect → publish → disconnect → sleep 5–15 min | Idle ~99% of the time → candidate for on-demand |
+
+Start with **always-on** broker-VMs: an idle Mosquitto costs ~0 CPU and only RAM.
+On-demand is an optimization for when RAM runs short, and only for battery
+sensors.
+
+#### On-demand (later): hold the SYN, don't drop it
+
+1. nftables sends the first SYN toward the ingestion port to the daemon via
+   NFQUEUE (kernel L3/L4 metadata, zero payload).
+2. The daemon restores the sensor's VM from its snapshot (~100ms measured) and
+   installs the DNAT.
+3. The daemon **reinjects the held SYN** with `NF_ACCEPT` instead of letting it
+   drop and waiting for the sensor's TCP retransmission (1–3s depending on the
+   sensor's stack — battery time on an ESP32). If the queue hook sits after
+   conntrack (priority -200) and before NAT (-100), the reinjected packet is
+   still the flow's first packet when it reaches `nat prerouting` and picks up
+   the freshly installed DNAT: cold start ≈ restore latency. **To validate on
+   hardware.** Retransmitted SYNs arriving while held must not trigger a second
+   restore (dedupe per source).
+4. No `bypass` on the queue: if the daemon isn't consuming it, SYNs drop
+   (fail-closed).
+
+Note: ~100ms is **restore from snapshot**, not cold creation (a full
+network+egress+VM create measured ~1.8s in the density test). On-demand only
+works from a snapshot.
+
+**Anti-DoS mandatory** for on-demand: an attacker spamming SYNs triggers a VM
+storm. A global cap on concurrent VMs + per-source-IP rate limit + per-sensor
+circuit breaker (if its VM dies N times in a row, quarantine and alert — that IS
+the compromise detection).
+
+#### Residual risks (stated, not hidden)
+
+- **VM escape** (Firecracker + jailer) is the root risk of the whole product.
+  The adversarial escape tests of Phase 4 are pending; the guarantee is not
+  advertised before they pass.
+- The host kernel's TCP/IP stack and netfilter/conntrack process the headers —
+  the same surface every packet arriving on the managed interface already hits
+  today, not a new one.
+- The **ingestor** becomes the most sensitive host component: small size cap,
+  strict schema, physical ranges, re-serialize; never forward the VM's bytes.
+- A compromised broker-VM can lie about its **own** sensor's data — which that
+  sensor already controlled.
 
 ### Physical wire (RS-485 / Modbus RTU / USB serial)
 
@@ -158,13 +234,12 @@ All the figures in the table are **estimates to be validated on hardware**
 | Disk clones at ~0 cost | ✅ HW-validated | btrfs store + reflink |
 | Persistence + reconcile (VMs survive the daemon) | ✅ HW-validated | `internal/store`, `Manager.Reconcile` |
 | Observability (health, capacity, per-VM RSS) | ✅ code | `/v1/health`, `/v1/system` |
+| Fine-grained egress, incl. through a managed interface | ✅ HW-validated | `allowed_egress`, `ValidateEgressRules` (`internal/network/nftables.go`) |
+| Inbound DNAT to one guest address (push mode) | ✅ code, HW pending | `allowed_ingress`, `ValidateIngressRules` + `Manager.checkIngress` |
 
 ## Gaps (what needs to be built)
 
-1. **Fine-grained egress** — today `egress` is a per-network boolean. Missing: an
-   allowed destination (`IP:port`) per network or per VM, rendered into the
-   `inet microhosted` table (the declarative design of `ApplyNftables` absorbs it
-   cleanly). Prerequisite of pull mode.
+1. ~~**Fine-grained egress**~~ — done: `allowed_egress` (see the table above).
 2. **Transactional orchestrator** — the restore→poll→validate→extract→destroy
    loop with the 3 lifetime modes, watchdog, circuit breaker, and global VM cap.
    It's the product; the engine is primitives.
@@ -177,8 +252,9 @@ All the figures in the table are **estimates to be validated on hardware**
 4. **Ultra-minimal sensor image** — tinyconfig kernel without modules + static
    init + the parser runtime. Target: a functional VM with `mem_mb: 24-32`.
    (Ties into the already-pending ultra-optimized images.)
-5. **Push mode** — a `prerouting` DNAT chain (doesn't exist today) + NFQUEUE/NFLOG
-   trigger + anti-DoS.
+5. **Push mode** — `allowed_ingress` is built (HW validation pending). Still
+   missing: the broker-VM template and the collection side. The NFQUEUE on-demand
+   trigger + anti-DoS is a later optimization, not a prerequisite.
 6. **Blind serial bridge** — a `tty↔vsock` daemon with no parser.
 7. **Mass deployment from snapshot** — "spin up N workers of this template" as a
    first-class operation (today it's N calls to fork).
@@ -245,12 +321,32 @@ measuring real incremental RSS, restore latency under load, and store behavior.
 estimates. Internal goal: ≥100 sensor-VMs on a Pi 5 8GB.
 
 ### IoT-6 — Push mode (MQTT/HTTP)
-A prerouting DNAT chain + NFQUEUE trigger + anti-DoS (per-source rate limit,
-per-sensor circuit breaker).
+Design in "Push mode" above. Prerequisite: the ingestor of IoT-3 (the clean
+side is shared with pull mode). Build order:
 
-**Success criterion**: a real MQTT sensor publishes → the VM materializes and
-receives the connection with no listener on the host; a SYN flood doesn't exhaust
-the host (the cap and rate limit contain it).
+1. **`allowed_ingress`** on a network — **built, HW validation pending.**
+   `{iface, src_ip, protocol, port, to_ip}`, rendered as a `prerouting` DNAT
+   plus both `forward` legs, inside the managed interface's deny-both-ways
+   policy. The return leg only carries replies (`ct direction reply`). Sensors
+   address the gateway's IP on the managed interface; one port (1883) for all,
+   distinguished by source IP. The target is named **by guest address
+   (`to_ip`)**, not by VM. It survives a reset because the restore keeps the IP.
+   Keeping addresses and VMs paired on shared networks (reassignment) is left
+   to the orchestrator. Detail in `docs/networking.md` § Ingress.
+2. **Broker-VM template** — Alpine + Mosquitto + translator to the canonical
+   format, per-sensor credentials, no egress.
+3. **Collection** — the ingestor reads the broker-VM over vsock (retained last
+   message, or a local spool file fetched with GET), same validation as pull.
+4. **Later: on-demand** — NFQUEUE hold-and-reinject + anti-DoS, only for battery
+   sensors and only if RAM runs short.
+
+**Success criterion (also the blast-radius demo)**: a real ESP32 publishes MQTT
+→ the data reaches the clean broker with nothing listening on 1883 on the host
+(`ss -ltn`); a simulated compromise of broker-VM A (exec a payload inside it)
+can't reach the internet, the host, or sensor B (attempts verified to fail),
+sensor B's data keeps flowing, and A is reset from snapshot in ~100ms. For
+on-demand: a SYN flood doesn't exhaust the host (the cap and rate limit contain
+it).
 
 ### IoT-7 — Blind serial bridge
 A `tty↔vsock` daemon with no parser (RS-485/Modbus RTU/USB).

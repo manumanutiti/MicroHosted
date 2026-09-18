@@ -20,8 +20,8 @@ SOCKET ?= /run/microhosted.sock
 # root-only: make install-service SOCKET_GROUP=microhosted
 SOCKET_GROUP ?=
 # Interfaces whose whole nftables policy the daemon owns (comma-separated).
-# Declaring one denies it in both directions except for the egress rules that
-# name it — see docs/networking.md § Managed interfaces — so remove any other
+# Declaring one denies it in both directions except for the egress and ingress
+# rules that name it — see docs/networking.md § Managed interfaces — so remove any other
 # ruleset covering it first. MANAGED_HOST_ALLOW picks which host services stay
 # reachable from them (default udp/67 for DHCP; "none" denies every one).
 MANAGED_IFACE ?=

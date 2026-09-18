@@ -18,7 +18,7 @@ const nftTable = "inet microhosted"
 
 // ManagedIface is a host interface whose ENTIRE nftables policy this daemon
 // owns: denied in both directions, with each network's interface-scoped egress
-// rules as the only holes.
+// rules and its ingress rules as the only holes.
 //
 // It exists because an interface needs exactly one author. Several base chains
 // on one hook are all evaluated and a `drop` in any of them is final, so a
@@ -60,6 +60,9 @@ type HostService struct {
 //     hand-written table beside us is the whole point — two base chains on one
 //     hook are both evaluated and a drop anywhere wins, so a second author
 //     silently overrides the policy this daemon reports through its API.
+//   - ingress: a managed interface's only inbound holes are the networks'
+//     AllowedIngress rules, each a prerouting DNAT to one guest address plus
+//     the two forward legs of that DNATed flow. The host never listens.
 func ApplyNftables(networks []types.Network, managed []ManagedIface) error {
 	script := renderNftables(networks, managed)
 	cmd := exec.Command("nft", "-f", "-")
@@ -126,6 +129,32 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	}
 	b.WriteString("\t}\n")
 
+	// Ingress: rewrite the destination of each allowed inbound flow to its
+	// guest, in the kernel, before routing. The packet then goes through
+	// `forward`, never `input` — nothing on the host listens on the port.
+	// `fib daddr type local` limits it to traffic addressed to the host
+	// itself, so transit traffic crossing the interface is never captured.
+	// Only rules whose interface is managed are rendered, for the same
+	// reason as the egress rules below.
+	var dnats []string
+	for _, n := range networks {
+		for _, r := range n.AllowedIngress {
+			if !isManaged(managed, r.Iface) {
+				continue
+			}
+			dnats = append(dnats, fmt.Sprintf("\t\tiifname %q ip saddr %s fib daddr type local %s dport %d dnat ip to %s:%d\n",
+				r.Iface, r.SrcIP, r.Protocol, r.Port, r.ToIP, r.Port))
+		}
+	}
+	if len(dnats) > 0 {
+		b.WriteString("\tchain prerouting {\n")
+		b.WriteString("\t\ttype nat hook prerouting priority -100; policy accept;\n")
+		for _, d := range dnats {
+			b.WriteString(d)
+		}
+		b.WriteString("\t}\n")
+	}
+
 	// The forward chain matches STATELESSLY on purpose: no blanket
 	// `ct state established,related accept` here (unlike input). Every drop
 	// below is scoped by iifname/daddr, so it doesn't touch return traffic
@@ -148,12 +177,16 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// interface is not one of our bridges) and the blanket drops that close the
 	// chain.
 	//
-	// Each emits BOTH legs. The return leg is matched statelessly like the rest
-	// of this chain — by the destination's own address and its source port — so
-	// tightening the policy cuts a live flow on its next packet instead of
-	// letting a conntrack entry ride through. The reply arrives already
-	// un-masqueraded: conntrack reverses the source NAT in prerouting, which
-	// runs before this hook, so `ip daddr` here is the guest's real address.
+	// Each emits BOTH legs. The return leg is matched on the stateless tuple
+	// like the rest of this chain — by the destination's own address and its
+	// source port — so tightening the policy cuts a live flow on its next
+	// packet instead of letting a conntrack entry ride through. On top of the
+	// tuple it requires `ct direction reply`: the tuple alone would let the
+	// DEVICE open connections into the guest, on any port, just by using the
+	// rule's port as its source port (or, for icmp, by pinging it). The reply
+	// arrives already un-masqueraded: conntrack reverses the source NAT in
+	// prerouting, which runs before this hook, so `ip daddr` here is the
+	// guest's real address.
 	for _, n := range networks {
 		for _, r := range n.AllowedEgress {
 			if r.Iface == "" {
@@ -171,12 +204,48 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 			switch r.Protocol {
 			case "tcp", "udp":
 				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip daddr %s %s dport %d accept\n", n.Bridge, r.Iface, r.IP, r.Protocol, r.Port)
-				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s %s sport %d accept\n", r.Iface, n.Bridge, r.IP, n.Subnet, r.Protocol, r.Port)
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s %s sport %d ct direction reply accept\n", r.Iface, n.Bridge, r.IP, n.Subnet, r.Protocol, r.Port)
 			case "icmp":
 				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip daddr %s meta l4proto icmp accept\n", n.Bridge, r.Iface, r.IP)
-				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s meta l4proto icmp accept\n", r.Iface, n.Bridge, r.IP, n.Subnet)
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s meta l4proto icmp ct direction reply accept\n", r.Iface, n.Bridge, r.IP, n.Subnet)
 			}
 		}
+	}
+	// Ingress legs, also ahead of every drop (the return leg leaves the bridge
+	// towards a non-bridge, which the network's egress drop would eat).
+	//
+	// These add conntrack matches on TOP of the stateless tuple — never a
+	// blanket established-accept, so the property above holds: remove the
+	// rule and the next packet of a live flow meets the managed interface's
+	// drop. What conntrack adds is direction. `ct status dnat` admits only
+	// flows that went through the DNAT above (not a device that routes
+	// straight at the guest subnet), and `ct direction reply` on the return
+	// leg means the VM can only answer: without it, a compromised VM could
+	// bind the ingress port as its SOURCE port and open connections to any
+	// port on the device.
+	for _, n := range networks {
+		for _, r := range n.AllowedIngress {
+			if !isManaged(managed, r.Iface) {
+				continue
+			}
+			fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s %s dport %d ct status dnat ct direction original accept\n",
+				r.Iface, n.Bridge, r.SrcIP, r.ToIP, r.Protocol, r.Port)
+			fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s %s sport %d ip daddr %s ct status dnat ct direction reply accept\n",
+				n.Bridge, r.Iface, r.ToIP, r.Protocol, r.Port, r.SrcIP)
+		}
+	}
+	// Everything else crossing a managed interface dies here, both directions,
+	// right after its only holes (above) and BEFORE the WAN rules below. To
+	// those rules a managed interface is simply "not one of our bridges", so
+	// if they ran first a WAN-scoped accept whose destination sits on that
+	// segment (`icmp:192.168.50.52` without @wlan0) would send the packet out
+	// through it — one-way, since the reply dies here, but still a VM putting
+	// packets on the segment through a rule that never named it. Outbound too,
+	// not just inbound: an `egress: true` network would otherwise reach the
+	// whole segment.
+	for _, m := range managed {
+		fmt.Fprintf(&b, "\t\tiifname %q drop\n", m.Name)
+		fmt.Fprintf(&b, "\t\toifname %q drop\n", m.Name)
 	}
 	// No-egress networks: drop anything leaving the bridge towards the WAN
 	// (oifname not one of our bridges). Same-bridge and cross-segment aren't
@@ -199,14 +268,6 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 			}
 		}
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" oifname != @mhbridges drop\n", n.Bridge)
-	}
-	// Everything else crossing a managed interface dies here, both directions.
-	// Outbound too, not just inbound: without it any `egress: true` network
-	// would reach that whole segment, since a managed interface is simply "not
-	// one of our bridges" to the rule above.
-	for _, m := range managed {
-		fmt.Fprintf(&b, "\t\tiifname %q drop\n", m.Name)
-		fmt.Fprintf(&b, "\t\toifname %q drop\n", m.Name)
 	}
 	b.WriteString("\t}\n")
 
@@ -262,6 +323,65 @@ func ValidateEgressRules(rules []types.EgressRule, managed []string) error {
 		}
 	}
 	return nil
+}
+
+// ValidateIngressRules vets user-supplied AllowedIngress rules before they are
+// rendered, for the same reason as ValidateEgressRules: every field lands
+// verbatim in the `nft -f` script. It checks each rule on its own and the list
+// against itself; where to_ip must fall (the network's subnet) and clashes with
+// other networks' rules are the Manager's to check, since only it knows them.
+//
+// Two rules clash when a packet could match both — same interface, protocol
+// and port with overlapping sources. The first DNAT would silently win, so the
+// second rule would be reported by the API and never be in force.
+func ValidateIngressRules(rules []types.IngressRule, managed []string) error {
+	for i, r := range rules {
+		if r.Iface == "" {
+			return fmt.Errorf("ingress rule %d: iface is required (a managed interface the device sits behind)", i)
+		}
+		if !slices.Contains(managed, r.Iface) {
+			if len(managed) == 0 {
+				return fmt.Errorf("ingress rule %d: iface %q — this daemon manages no interface (start it with --managed-iface)", i, r.Iface)
+			}
+			return fmt.Errorf("ingress rule %d: iface %q is not one this daemon manages (declared: %s)", i, r.Iface, strings.Join(managed, ", "))
+		}
+		if !isIPv4OrCIDR(r.SrcIP) {
+			return fmt.Errorf("ingress rule %d: src_ip %q must be an IPv4 address or CIDR", i, r.SrcIP)
+		}
+		if ip := net.ParseIP(r.ToIP); ip == nil || ip.To4() == nil || ip.String() != r.ToIP {
+			return fmt.Errorf("ingress rule %d: to_ip %q must be a single IPv4 address", i, r.ToIP)
+		}
+		if r.Protocol != "tcp" && r.Protocol != "udp" {
+			return fmt.Errorf("ingress rule %d: protocol %q must be tcp or udp", i, r.Protocol)
+		}
+		if r.Port < 1 || r.Port > 65535 {
+			return fmt.Errorf("ingress rule %d: port must be in 1-65535, got %d", i, r.Port)
+		}
+		for j := range i {
+			if IngressClash(rules[j], r) {
+				return fmt.Errorf("ingress rule %d clashes with rule %d: same %s/%d on %s from overlapping sources", i, j, r.Protocol, r.Port, r.Iface)
+			}
+		}
+	}
+	return nil
+}
+
+// IngressClash reports whether one inbound packet could match both rules.
+// Both must already be valid.
+func IngressClash(a, b types.IngressRule) bool {
+	if a.Iface != b.Iface || a.Protocol != b.Protocol || a.Port != b.Port {
+		return false
+	}
+	na, nb := asNet(a.SrcIP), asNet(b.SrcIP)
+	return na.Contains(nb.IP) || nb.Contains(na.IP)
+}
+
+// asNet reads a validated address-or-CIDR as a network (an address is a /32).
+func asNet(s string) *net.IPNet {
+	if _, n, err := net.ParseCIDR(s); err == nil {
+		return n
+	}
+	return &net.IPNet{IP: net.ParseIP(s).To4(), Mask: net.CIDRMask(32, 32)}
 }
 
 // ValidateIfaceName vets an operator-supplied interface name at startup, before

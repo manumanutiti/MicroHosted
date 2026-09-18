@@ -41,7 +41,7 @@ func main() {
 	// policy an operator declares through the API is the policy actually in
 	// force. A second ruleset covering the same interface silently wins any
 	// drop, which is the failure this removes.
-	managedIfaceList := flag.String("managed-iface", "", "comma-separated host interfaces whose whole nftables policy this daemon owns (e.g. \"wlan0\"): denied both ways except each network's interface-scoped egress rules")
+	managedIfaceList := flag.String("managed-iface", "", "comma-separated host interfaces whose whole nftables policy this daemon owns (e.g. \"wlan0\"): denied both ways except each network's interface-scoped egress rules and its ingress rules")
 	// Nothing is assumed about what the host offers that segment: the default
 	// covers the usual case (the host runs its DHCP) and an empty value denies
 	// everything, including DHCP.

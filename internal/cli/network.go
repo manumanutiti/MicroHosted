@@ -15,17 +15,41 @@ import (
 var networkGroup = &group{
 	name:    "network",
 	aliases: []string{"net", "networks"},
-	summary: "Manage networks (bridge + subnet + egress policy)",
+	summary: "Manage networks (bridge + subnet + in/out policy)",
 	cmds: []*command{
-		{name: "create", aliases: []string{"new"}, args: "NAME", summary: "Create a network", run: netCreate},
+		{name: "create", aliases: []string{"new"}, args: "NAME", summary: "Create a network", help: netDirections, examples: netCreateExamples, run: netCreate},
 		{name: "ls", aliases: []string{"list"}, summary: "List networks", run: netList},
 		{name: "inspect", aliases: []string{"show"}, args: "NAME...", summary: "Show a network's full detail as JSON", run: netInspect},
-		{name: "update", aliases: []string{"change", "set"}, args: "NAME", summary: "Change a live network's egress policy and/or VM↔VM reachability", run: netUpdate},
+		{name: "update", aliases: []string{"change", "set"}, args: "NAME", summary: "Change a live network's in/out policy and/or VM↔VM reachability (VMs stay up)", help: netDirections, examples: netUpdateExamples, run: netUpdate},
 		{name: "rm", aliases: []string{"remove", "delete"}, args: "NAME...", summary: "Delete networks (-f destroys their VMs first)", run: netRemove},
 	},
 }
 
-// Egress rules on the command line: PROTO:IP[:PORT][@IFACE]
+// A network's policy is named by WHO OPENS THE CONNECTION, not by the API's
+// egress/ingress: that is the question an operator actually has in mind ("may
+// the VM poll the sensor?" vs "may the sensor push to the VM?"). The API keeps
+// its names; the old flag spellings keep working, hidden.
+const netDirections = `OUT = the VM opens the connection        VM → destination (internet, or a device @IFACE)
+IN  = a device opens it towards a VM      device on a managed IFACE → VM
+Everything not listed is dropped, both ways.`
+
+const netCreateExamples = `  # isolated: nothing in or out
+  mh network create lab
+  # the VM may poll the Modbus sensor .52 behind wlan0
+  mh network create ot --out tcp:192.168.50.52:502@wlan0
+  # the sensor .60 behind wlan0 may publish to the VM 172.16.9.2 (IN needs --subnet)
+  mh network create mqtt --subnet 172.16.9.0/24 --in tcp:192.168.50.60:1883@wlan0=172.16.9.2`
+
+const netUpdateExamples = `  # the VM may poll the Modbus sensor .52 behind wlan0
+  mh network update ot --out tcp:192.168.50.52:502@wlan0
+  # the VM may reach an MQTT broker on the internet (no @IFACE = internet)
+  mh network update iot --out tcp:203.0.113.7:8883
+  # the sensor .60 behind wlan0 may publish to the VM 172.16.9.2
+  mh network update mqtt --in tcp:192.168.50.60:1883@wlan0=172.16.9.2
+  # take a rule back
+  mh network update ot --rm-out tcp:192.168.50.52:502@wlan0`
+
+// OUT rules on the command line: PROTO:IP[:PORT][@IFACE]
 //
 //	tcp:203.0.113.7:8883      icmp:203.0.113.7
 //	udp:10.0.0.0/24:53        tcp:192.168.50.52:502@wlan0
@@ -33,7 +57,7 @@ var networkGroup = &group{
 // Only the shape is checked here; what makes a rule valid (canonical CIDR,
 // port range, a managed interface) is the daemon's call, and its 400 message
 // comes back verbatim.
-const ruleSyntax = "PROTO:IP[:PORT][@IFACE], e.g. tcp:203.0.113.7:8883, icmp:10.0.0.1, tcp:192.168.50.52:502@wlan0"
+const ruleSyntax = "PROTO:DEST[:PORT][@IFACE]"
 
 func parseRule(s string) (types.EgressRule, error) {
 	var r types.EgressRule
@@ -92,9 +116,73 @@ func parseRules(specs []string) ([]types.EgressRule, error) {
 	return out, nil
 }
 
+// IN rules on the command line: PROTO:SRC:PORT@IFACE=VM_IP
+//
+//	tcp:192.168.50.60:1883@wlan0=172.16.9.2
+//
+// read as "tcp from 192.168.50.60 to port 1883 of this host on wlan0 goes to
+// the guest 172.16.9.2". Same split as egress: the shape here, validity at the
+// daemon.
+const ingressSyntax = "PROTO:SRC:PORT@IFACE=VM_IP"
+
+func parseIngressRule(s string) (types.IngressRule, error) {
+	var r types.IngressRule
+	bad := func(why string) (types.IngressRule, error) {
+		return r, fmt.Errorf("IN rule %q: %s (%s)", s, why, ingressSyntax)
+	}
+	spec, target, ok := strings.Cut(s, "=")
+	if !ok || target == "" {
+		return bad("missing =VM_IP")
+	}
+	spec, iface, ok := strings.Cut(spec, "@")
+	if !ok || iface == "" {
+		return bad("missing @IFACE")
+	}
+	parts := strings.Split(spec, ":")
+	if len(parts) != 3 || parts[1] == "" {
+		return bad("expected PROTO:SRC:PORT before @")
+	}
+	port, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return bad(fmt.Sprintf("port %q is not a number", parts[2]))
+	}
+	r = types.IngressRule{Iface: iface, SrcIP: parts[1], Protocol: strings.ToLower(parts[0]), Port: port, ToIP: target}
+	if r.Protocol != "tcp" && r.Protocol != "udp" {
+		return bad("protocol must be tcp or udp")
+	}
+	return r, nil
+}
+
+func formatIngressRule(r types.IngressRule) string {
+	return fmt.Sprintf("%s:%s:%d@%s=%s", r.Protocol, r.SrcIP, r.Port, r.Iface, r.ToIP)
+}
+
+func parseIngressRules(specs []string) ([]types.IngressRule, error) {
+	var out []types.IngressRule
+	for _, s := range specs {
+		r, err := parseIngressRule(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func describeIngress(n types.NetworkResponse) string {
+	if len(n.AllowedIngress) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(n.AllowedIngress))
+	for i, r := range n.AllowedIngress {
+		parts[i] = formatIngressRule(r)
+	}
+	return strings.Join(parts, " ")
+}
+
 func describeEgress(n types.NetworkResponse) string {
 	if n.Egress {
-		return "all"
+		return "internet"
 	}
 	if len(n.AllowedEgress) == 0 {
 		return "none"
@@ -115,12 +203,16 @@ func onOff(b bool) string {
 
 func netCreate(e *env, cmd *command, p string, args []string) error {
 	var req types.CreateNetworkRequest
-	var allow []string
+	var allow, ingress []string
 	fs := newCmdFlags(e, p, cmd)
+	fs.listVar(&allow, "out", "", "allow an OUT flow: `RULE` = "+ruleSyntax+" (repeatable)")
+	fs.boolVar(&req.Egress, "internet", "", "allow ALL outbound to the internet (NAT) instead of --out rules")
+	fs.listVar(&ingress, "in", "", "allow an IN flow: `RULE` = "+ingressSyntax+" (repeatable; needs --subnet)")
 	fs.stringVar(&req.Subnet, "subnet", "", "", "`CIDR`, e.g. 10.10.0.0/24 (default: a free /24)")
-	fs.boolVar(&req.Egress, "egress", "", "full internet egress (NAT); off by default")
-	fs.listVar(&allow, "allow", "", "only allow this outbound flow: `RULE` = "+ruleSyntax+" (repeatable)")
 	fs.boolVar(&req.Intra, "intra", "", "let the network's VMs reach each other; off by default")
+	fs.hidden("out", "allow")
+	fs.hidden("internet", "egress")
+	fs.hidden("in", "ingress")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -133,7 +225,10 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 		return usagef(p, "%v", err)
 	}
 	if req.Egress && len(req.AllowedEgress) > 0 {
-		return usagef(p, "--egress already allows everything; use either it or --allow")
+		return usagef(p, "--internet already allows every outbound flow; use either it or --out")
+	}
+	if req.AllowedIngress, err = parseIngressRules(ingress); err != nil {
+		return usagef(p, "%v", err)
 	}
 	c, err := e.api()
 	if err != nil {
@@ -150,9 +245,9 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 func printNetworks(e *env, nets []types.NetworkResponse) {
 	rows := make([][]string, 0, len(nets))
 	for _, n := range nets {
-		rows = append(rows, []string{n.Name, n.Subnet, n.Gateway, n.Bridge, onOff(n.Intra), describeEgress(n)})
+		rows = append(rows, []string{n.Name, n.Subnet, n.Gateway, n.Bridge, onOff(n.Intra), describeEgress(n), describeIngress(n)})
 	}
-	table(e.stdout, []string{"NAME", "SUBNET", "GATEWAY", "BRIDGE", "INTRA", "EGRESS"}, rows)
+	table(e.stdout, []string{"NAME", "SUBNET", "GATEWAY", "BRIDGE", "INTRA", "OUT", "IN"}, rows)
 }
 
 func netList(e *env, cmd *command, p string, args []string) error {
@@ -219,16 +314,29 @@ func netInspect(e *env, cmd *command, p string, args []string) error {
 }
 
 func netUpdate(e *env, cmd *command, p string, args []string) error {
-	var egress, noEgress, intra, noIntra bool
-	var allow, addAllow, rmAllow []string
+	var egress, noEgress, intra, noIntra, noIngress bool
+	var allow, addAllow, rmAllow, ingress, addIngress, rmIngress []string
 	fs := newCmdFlags(e, p, cmd)
-	fs.boolVar(&egress, "egress", "", "full internet egress (replaces any --allow rules)")
-	fs.boolVar(&noEgress, "no-egress", "", "cut all egress")
-	fs.listVar(&allow, "allow", "", "REPLACE the rules with these: `RULE` = "+ruleSyntax+" (repeatable)")
-	fs.listVar(&addAllow, "add-allow", "", "add a `RULE` to the current ones (repeatable)")
-	fs.listVar(&rmAllow, "rm-allow", "", "remove a `RULE` from the current ones (repeatable)")
+	fs.listVar(&addAllow, "out", "", "add an OUT `RULE` = "+ruleSyntax+" (repeatable)")
+	fs.listVar(&rmAllow, "rm-out", "", "remove an OUT `RULE` (repeatable)")
+	fs.listVar(&allow, "set-out", "", "REPLACE all OUT rules with these `RULE`s (repeatable)")
+	fs.boolVar(&noEgress, "no-out", "", "close all outbound")
+	fs.boolVar(&egress, "internet", "", "allow ALL outbound to the internet (replaces the OUT rules)")
+	fs.listVar(&addIngress, "in", "", "add an IN `RULE` = "+ingressSyntax+" (repeatable)")
+	fs.listVar(&rmIngress, "rm-in", "", "remove an IN `RULE` (repeatable)")
+	fs.listVar(&ingress, "set-in", "", "REPLACE all IN rules with these `RULE`s (repeatable)")
+	fs.boolVar(&noIngress, "no-in", "", "close all inbound")
 	fs.boolVar(&intra, "intra", "", "let the network's VMs reach each other")
 	fs.boolVar(&noIntra, "no-intra", "", "isolate the network's VMs from each other")
+	fs.hidden("out", "add-allow")
+	fs.hidden("rm-out", "rm-allow")
+	fs.hidden("set-out", "allow")
+	fs.hidden("no-out", "no-egress")
+	fs.hidden("internet", "egress")
+	fs.hidden("in", "add-ingress")
+	fs.hidden("rm-in", "rm-ingress")
+	fs.hidden("set-in", "ingress")
+	fs.hidden("no-in", "no-ingress")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -245,13 +353,22 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 		}
 	}
 	if modes > 1 {
-		return usagef(p, "choose one of --egress, --no-egress, --allow, or --add-allow/--rm-allow")
+		return usagef(p, "choose one of --out/--rm-out, --set-out, --no-out or --internet")
+	}
+	inModes := 0
+	for _, set := range []bool{noIngress, len(ingress) > 0, len(addIngress)+len(rmIngress) > 0} {
+		if set {
+			inModes++
+		}
+	}
+	if inModes > 1 {
+		return usagef(p, "choose one of --in/--rm-in, --set-in or --no-in")
 	}
 	if intra && noIntra {
 		return usagef(p, "--intra and --no-intra are mutually exclusive")
 	}
-	if modes == 0 && !intra && !noIntra {
-		return usagef(p, "nothing to change: give an egress flag and/or --intra/--no-intra")
+	if modes == 0 && inModes == 0 && !intra && !noIntra {
+		return usagef(p, "nothing to change: give an OUT flag, an IN flag and/or --intra/--no-intra")
 	}
 	allowRules, err := parseRules(allow)
 	if err != nil {
@@ -265,6 +382,18 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return usagef(p, "%v", err)
 	}
+	inRules, err := parseIngressRules(ingress)
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
+	addInRules, err := parseIngressRules(addIngress)
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
+	rmInRules, err := parseIngressRules(rmIngress)
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
 
 	c, err := e.api()
 	if err != nil {
@@ -273,8 +402,8 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	path := "/v1/networks/" + url.PathEscape(name)
 	var n types.NetworkResponse
 	if modes == 1 {
-		// The API replaces the whole policy; --add-allow/--rm-allow are the
-		// CLI merging onto what is there now.
+		// The API replaces the whole policy; --out/--rm-out are the CLI
+		// merging onto what is there now.
 		req := types.UpdateNetworkEgressRequest{Egress: egress, AllowedEgress: allowRules}
 		if len(addRules)+len(rmRules) > 0 {
 			cur, err := getNetwork(c, name)
@@ -282,13 +411,28 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 				return err
 			}
 			if cur.Egress {
-				return fmt.Errorf("network %s has full egress: set the exact rules with --allow instead", name)
+				return fmt.Errorf("network %s allows all outbound (--internet): set the exact rules with --set-out instead", name)
 			}
-			if req.AllowedEgress, err = mergeRules(cur.AllowedEgress, addRules, rmRules); err != nil {
+			if req.AllowedEgress, err = mergeRules(cur.AllowedEgress, addRules, rmRules, formatRule); err != nil {
 				return err
 			}
 		}
 		if err := c.Do("PUT", path+"/egress", req, &n); err != nil {
+			return err
+		}
+	}
+	if inModes == 1 {
+		req := types.UpdateNetworkIngressRequest{AllowedIngress: inRules}
+		if len(addInRules)+len(rmInRules) > 0 {
+			cur, err := getNetwork(c, name)
+			if err != nil {
+				return err
+			}
+			if req.AllowedIngress, err = mergeRules(cur.AllowedIngress, addInRules, rmInRules, formatIngressRule); err != nil {
+				return err
+			}
+		}
+		if err := c.Do("PUT", path+"/ingress", req, &n); err != nil {
 			return err
 		}
 	}
@@ -302,17 +446,17 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 }
 
 // mergeRules returns cur minus rm plus add (skipping duplicates). Removing a
-// rule that is not there is an error: a typo in --rm-allow must not look like
+// rule that is not there is an error: a typo in --rm-out must not look like
 // a closed hole.
-func mergeRules(cur, add, rm []types.EgressRule) ([]types.EgressRule, error) {
-	out := make([]types.EgressRule, 0, len(cur)+len(add))
+func mergeRules[R comparable](cur, add, rm []R, format func(R) string) ([]R, error) {
+	out := make([]R, 0, len(cur)+len(add))
 	for _, r := range rm {
 		found := false
 		for _, c := range cur {
 			found = found || c == r
 		}
 		if !found {
-			return nil, fmt.Errorf("rule %s is not in the network's policy", formatRule(r))
+			return nil, fmt.Errorf("rule %s is not in the network's policy", format(r))
 		}
 	}
 next:

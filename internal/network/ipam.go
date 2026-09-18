@@ -74,6 +74,23 @@ func (s *Subnet) GatewayCIDR() string {
 // Prefix returns the subnet prefix length (e.g. 24).
 func (s *Subnet) Prefix() int { return s.prefix }
 
+// CheckGuestIP reports whether ipStr is an address a guest on this subnet can
+// hold: inside it, and neither the network, gateway nor broadcast address.
+// Whether a VM holds it right now is deliberately not asked — a rule naming
+// it must survive that VM being destroyed and restored.
+func (s *Subnet) CheckGuestIP(ipStr string) error {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return fmt.Errorf("%q is not an IPv4 address", ipStr)
+	}
+	v := binary.BigEndian.Uint32(ip)
+	if v <= s.gateway || v >= s.bcast {
+		return fmt.Errorf("%s is not a guest address of %s (first guest is %s)",
+			ipStr, fmt.Sprintf("%s/%d", uint32ToIP(s.base), s.prefix), uint32ToIP(s.gateway+1))
+	}
+	return nil
+}
+
 // Allocate returns the next free guest IP for vmID.
 func (s *Subnet) Allocate(vmID string) (string, error) {
 	s.mu.Lock()

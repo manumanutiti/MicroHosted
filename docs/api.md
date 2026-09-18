@@ -123,6 +123,7 @@ Named L2 segments (bridge + subnet + nftables policy). Model detail in
 | `subnet`         | string | no       | CIDR (e.g. `10.10.0.0/24`); if omitted, a free `/24` is assigned   |
 | `egress`         | bool   | no       | if `true`, the subnet goes to the internet via NAT; `false` by default |
 | `allowed_egress` | array  | no       | fine-grained egress: only these flows reach the WAN; requires `egress` = `false`. See `docs/networking.md` |
+| `allowed_ingress` | array | no       | devices on a managed interface allowed to connect into one guest address (DNAT); requires `subnet`. See `docs/networking.md` § Ingress |
 | `intra`          | bool   | no       | if `true`, the network's VMs see each other (L2); `false` by default: each TAP is an isolated bridge port |
 
 Each element of `allowed_egress` is `{"ip", "protocol", "port"}`: `ip` an IPv4 or
@@ -137,7 +138,6 @@ mhcurl -X POST http://localhost/v1/networks -d '{"name":"iot","allowed_egress":[
   {"ip":"203.0.113.7","protocol":"icmp"}]}'
 ```
 
-**201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
 Each rule also takes an optional **`iface`**. Empty (the usual case) means the
 WAN: anywhere that is not one of our bridges. Set, it must name an interface the
 daemon was told to manage (`--managed-iface`) — one whose whole policy it owns,
@@ -152,8 +152,21 @@ mhcurl -X POST http://localhost/v1/networks -d '{"name":"ot-52","allowed_egress"
 ]}'
 ```
 
-`allowed_egress` rule is invalid, or if `egress: true` and `allowed_egress` are
-combined · **500** if the name already exists, the subnet is invalid, or bridge
+Each element of `allowed_ingress` is `{"iface", "src_ip", "protocol", "port",
+"to_ip"}`: `iface` a managed interface (required), `src_ip` an IPv4 or canonical
+IPv4 CIDR, `protocol` `tcp`/`udp`, `port` 1–65535 (the same on the host and in
+the guest), `to_ip` a guest address of the network's subnet.
+
+```bash
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"mqtt-60","subnet":"172.16.9.0/24","allowed_ingress":[
+  {"iface":"wlan0","src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"172.16.9.2"}
+]}'
+```
+
+**201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
+`allowed_egress` or `allowed_ingress` rule is invalid (including an ingress rule
+without `subnet`, with `to_ip` outside it, or clashing with another network's),
+or if `egress: true` and `allowed_egress` are combined · **500** if the name already exists, the subnet is invalid, or bridge
 creation fails.
 
 ### `GET /v1/networks` · `GET /v1/networks/{name}`
@@ -168,6 +181,7 @@ Lists all networks / detail of one. **Shape of `NetworkResponse`:**
 | `gateway`    | the host's IP on the bridge (the `.1`, the guests' route) |
 | `egress`     | whether it has internet egress                          |
 | `allowed_egress` | fine-grained egress rules, if any (omitted if empty) |
+| `allowed_ingress` | ingress rules, if any (omitted if empty) |
 | `intra`      | whether the network's VMs can see each other           |
 | `created_at` | RFC3339 timestamp                                       |
 
@@ -192,6 +206,25 @@ Flows opened under the previous policy are cut immediately when hardening (see
 **200 response** (updated `NetworkResponse`) · **400** if a rule is invalid or
 `egress: true` and `allowed_egress` are combined · **404** if the network doesn't
 exist.
+
+### `PUT /v1/networks/{name}/ingress` — update the ingress policy live
+
+Replaces the **whole** ingress policy (no merge), same validation as on
+creation. An empty or missing list closes every inbound hole.
+
+```bash
+mhcurl -X PUT http://localhost/v1/networks/mqtt-60/ingress -d '{"allowed_ingress":[
+  {"iface":"wlan0","src_ip":"192.168.50.60","protocol":"tcp","port":1883,"to_ip":"172.16.9.2"}]}'
+
+# close it
+mhcurl -X PUT http://localhost/v1/networks/mqtt-60/ingress -d '{"allowed_ingress":[]}'
+```
+
+A removed rule cuts its live flows on their next packet.
+
+**200 response** (updated `NetworkResponse`) · **400** if a rule is invalid,
+`to_ip` is outside the subnet, or a rule clashes with another network's · **404**
+if the network doesn't exist.
 
 ### `PUT /v1/networks/{name}/intra` — VM↔VM connectivity live
 
