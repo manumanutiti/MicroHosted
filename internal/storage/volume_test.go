@@ -209,16 +209,105 @@ func TestInjectExtractLargeFileStreams(t *testing.T) {
 
 func TestCleanGuestPathRejectsTraversal(t *testing.T) {
 	// "/x/.." cleans to "/" (rejected as root). "/a/../../etc" cleans to "/etc",
-	// a legitimate in-image path — debugfs can't escape the image to the host, so
-	// normalising .. within the image is fine, not a traversal.
+	// a legitimate in-image path — debugfs resolves paths inside the image, so
+	// normalising .. there is fine, not a traversal. (What CAN reach the host is
+	// a smuggled debugfs command — see TestGuestPathRefusesDebugfsInjection.)
 	for _, bad := range []string{"", "relative/path", "/", "/x/.."} {
 		if _, err := cleanGuestPath(bad); err == nil {
 			t.Errorf("cleanGuestPath(%q) = nil error, want rejection", bad)
 		}
 	}
-	for _, good := range []string{"/a", "/a/b/c.bin", "/vol/out/x"} {
+	for _, good := range []string{"/a", "/a/b/c.bin", "/vol/out/x", "/my dir/a file.txt", "/ñandú/x's.bin"} {
 		if _, err := cleanGuestPath(good); err != nil {
 			t.Errorf("cleanGuestPath(%q) = %v, want ok", good, err)
 		}
+	}
+}
+
+// TestGuestPathRefusesDebugfsInjection pins the boundary that keeps a path from
+// becoming debugfs commands: debugfs reads one command per line, so a newline in
+// a path would run a command of the caller's (or the guest's) choosing as the
+// jailer uid — "dump" writes a host file, "write" reads one.
+func TestGuestPathRefusesDebugfsInjection(t *testing.T) {
+	for _, bad := range []string{
+		"/x\ndump /etc/shadow /tmp/out",
+		"/x\rstat /",
+		"/x\x00y",
+		"/tab\there",
+		"/x\x7f",
+		`/a" "/b`,
+	} {
+		if _, err := ValidateGuestPath(bad); err == nil {
+			t.Errorf("ValidateGuestPath(%q) accepted", bad)
+		}
+	}
+	if _, err := debugfsLine("rdump", "/ok", "/host\ndir"); err == nil {
+		t.Error("debugfsLine accepted a host path with a newline")
+	}
+	got, err := debugfsLine("write", "/stage/inject-1", "/my file")
+	if err != nil || got != "write \"/stage/inject-1\" \"/my file\"\n" {
+		t.Errorf("debugfsLine = %q, %v", got, err)
+	}
+}
+
+// TestInjectionAttemptReachesNoHostFile runs the attack against real debugfs:
+// a file planted in the image, then an inject whose path tries to dump it to
+// the host. Nothing may appear on the host, and the call must fail.
+func TestInjectionAttemptReachesNoHostFile(t *testing.T) {
+	requireTool(t, "mkfs.ext4")
+	requireTool(t, "debugfs")
+
+	dir := t.TempDir()
+	img, err := CreateVolume(dir, "vol1", 16, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	oio := OfflineIO{StagingDir: dir}
+	if err := oio.InjectFile(img, "/secret", bytes.NewReader([]byte("in-image secret"))); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	leak := filepath.Join(dir, "leaked")
+	evil := "/x\ndump /secret " + leak
+	if err := oio.InjectFile(img, evil, bytes.NewReader([]byte("p"))); err == nil {
+		t.Error("InjectFile accepted a path carrying a newline")
+	}
+	if _, _, err := oio.ExtractFileStream(img, evil); err == nil {
+		t.Error("ExtractFileStream accepted a path carrying a newline")
+	}
+	if err := oio.ExtractDir(img, evil, filepath.Join(dir, "out")); err == nil {
+		t.Error("ExtractDir accepted a path carrying a newline")
+	}
+	if _, err := os.Stat(leak); !os.IsNotExist(err) {
+		t.Fatalf("a smuggled debugfs command wrote %s on the host (stat: %v)", leak, err)
+	}
+}
+
+// TestPathsWithSpacesRoundTrip checks the quoting against real debugfs: before
+// it, "/my file" reached debugfs as two arguments.
+func TestPathsWithSpacesRoundTrip(t *testing.T) {
+	requireTool(t, "mkfs.ext4")
+	requireTool(t, "debugfs")
+
+	dir := t.TempDir()
+	img, err := CreateVolume(dir, "vol1", 16, os.Getuid(), os.Getgid())
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	oio := OfflineIO{StagingDir: dir}
+	const p = "/out dir/my artifact.bin"
+	if err := oio.InjectFile(img, p, bytes.NewReader([]byte("spaced"))); err != nil {
+		t.Fatalf("InjectFile(%q): %v", p, err)
+	}
+	if got := extractBytes(t, img, p, dir); string(got) != "spaced" {
+		t.Fatalf("extract %q = %q", p, got)
+	}
+
+	dest := filepath.Join(dir, "dest with space")
+	if err := oio.ExtractDir(img, "/out dir", dest); err != nil {
+		t.Fatalf("ExtractDir: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dest, "out dir", "my artifact.bin")); err != nil || string(b) != "spaced" {
+		t.Fatalf("rdump result: %q, %v", b, err)
 	}
 }

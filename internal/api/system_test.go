@@ -47,9 +47,9 @@ func newTestServer(t *testing.T) *httptest.Server {
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mgr := vm.NewManager(catalog, jcfg, storeDir, st, network.NewManager(st))
+	mgr := vm.NewManager(catalog, jcfg, storeDir, st, network.NewManager(st, nil))
 
-	srv := NewServer(mgr, network.NewManager(st), ":0", SystemConfig{
+	srv := NewServer(mgr, network.NewManager(st, nil), SystemConfig{
 		DBPath:      filepath.Join(dir, "state.db"),
 		CatalogPath: catalogPath,
 		StartedAt:   time.Now().Add(-3 * time.Second),

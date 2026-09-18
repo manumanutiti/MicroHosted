@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"microhosted/pkg/types"
@@ -14,6 +15,33 @@ import (
 // with whatever firewall the host already runs — we add rules, we never
 // clobber theirs.
 const nftTable = "inet microhosted"
+
+// ManagedIface is a host interface whose ENTIRE nftables policy this daemon
+// owns: denied in both directions, with each network's interface-scoped egress
+// rules as the only holes.
+//
+// It exists because an interface needs exactly one author. Several base chains
+// on one hook are all evaluated and a `drop` in any of them is final, so a
+// hand-written ruleset beside this one does not conflict with it — it silently
+// wins. The visible result is a policy declared through the API, reported back
+// by the API, and not the policy in force. Declaring the interface here is what
+// makes the API's answer true.
+type ManagedIface struct {
+	Name string
+	// HostAllow are the host's own services that stay reachable from this
+	// interface. Nothing is assumed: the daemon has no way to know whether the
+	// host addresses that segment, serves it time, or offers it nothing at all,
+	// and guessing wrong in either direction is bad (a silent drop bricks the
+	// segment; a silent accept is surface nobody asked for). The operator says.
+	HostAllow []HostService
+}
+
+// HostService is one host-side port left reachable from a managed interface,
+// e.g. udp/67 when the host runs that segment's DHCP.
+type HostService struct {
+	Protocol string // "tcp" or "udp"
+	Port     int
+}
 
 // ApplyNftables re-renders the ENTIRE ruleset for the given networks and
 // installs it atomically. It's declarative on purpose: instead of tracking rule
@@ -27,8 +55,13 @@ const nftTable = "inet microhosted"
 //   - cross-segment: dropped — VMs on different networks can't see each other.
 //   - egress: masqueraded out when the network allows it; dropped otherwise
 //     (default), so a sample can't phone home unless explicitly permitted.
-func ApplyNftables(networks []types.Network) error {
-	script := renderNftables(networks)
+//   - managed interfaces: dropped in BOTH directions, except the egress rules
+//     that name them. Rendering them here rather than leaving them to a
+//     hand-written table beside us is the whole point — two base chains on one
+//     hook are both evaluated and a drop anywhere wins, so a second author
+//     silently overrides the policy this daemon reports through its API.
+func ApplyNftables(networks []types.Network, managed []ManagedIface) error {
+	script := renderNftables(networks, managed)
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -40,7 +73,7 @@ func ApplyNftables(networks []types.Network) error {
 // renderNftables produces the `nft -f` script. The leading
 // `table {}` + `delete table` idiom guarantees the delete never fails on a
 // missing table, so the whole thing is a clean atomic replace.
-func renderNftables(networks []types.Network) string {
+func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	var b strings.Builder
 
 	// Ensure-then-delete so the recreate below is an atomic replace.
@@ -82,6 +115,15 @@ func renderNftables(networks []types.Network) string {
 	b.WriteString("\t\ttype filter hook input priority 0; policy accept;\n")
 	b.WriteString("\t\tct state established,related accept\n")
 	b.WriteString("\t\tiifname @mhbridges drop\n")
+	// A managed interface reaches only the host services the operator listed
+	// (typically udp/67 when the host runs that segment's DHCP), and nothing
+	// else — not the API, not SSH.
+	for _, m := range managed {
+		for _, h := range m.HostAllow {
+			fmt.Fprintf(&b, "\t\tiifname %q %s dport %d accept\n", m.Name, h.Protocol, h.Port)
+		}
+		fmt.Fprintf(&b, "\t\tiifname %q drop\n", m.Name)
+	}
 	b.WriteString("\t}\n")
 
 	// The forward chain matches STATELESSLY on purpose: no blanket
@@ -101,6 +143,41 @@ func renderNftables(networks []types.Network) string {
 	// forwarded packet). The @mhsame exemption keeps same-bridge traffic
 	// reachable even if br_netfilter is on.
 	b.WriteString("\t\tiifname @mhbridges oifname @mhbridges iifname . oifname != @mhsame drop\n")
+	// Rules naming a managed interface come first, ahead of every drop that
+	// would otherwise catch them: the per-network egress drop below (a managed
+	// interface is not one of our bridges) and the blanket drops that close the
+	// chain.
+	//
+	// Each emits BOTH legs. The return leg is matched statelessly like the rest
+	// of this chain — by the destination's own address and its source port — so
+	// tightening the policy cuts a live flow on its next packet instead of
+	// letting a conntrack entry ride through. The reply arrives already
+	// un-masqueraded: conntrack reverses the source NAT in prerouting, which
+	// runs before this hook, so `ip daddr` here is the guest's real address.
+	for _, n := range networks {
+		for _, r := range n.AllowedEgress {
+			if r.Iface == "" {
+				continue // towards the WAN; handled by the loop below
+			}
+			// A stored rule for an interface this daemon no longer manages (it
+			// was restarted without that --managed-iface) is skipped: its accept
+			// was only ever safe inside the deny-both-ways drops rendered for a
+			// managed interface, and those are gone. Enforcing less than the API
+			// reports is the recoverable direction; Manager.UnenforcedRules and
+			// the egress_policy health check say so out loud.
+			if !isManaged(managed, r.Iface) {
+				continue
+			}
+			switch r.Protocol {
+			case "tcp", "udp":
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip daddr %s %s dport %d accept\n", n.Bridge, r.Iface, r.IP, r.Protocol, r.Port)
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s %s sport %d accept\n", r.Iface, n.Bridge, r.IP, n.Subnet, r.Protocol, r.Port)
+			case "icmp":
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip daddr %s meta l4proto icmp accept\n", n.Bridge, r.Iface, r.IP)
+				fmt.Fprintf(&b, "\t\tiifname %q oifname %q ip saddr %s ip daddr %s meta l4proto icmp accept\n", r.Iface, n.Bridge, r.IP, n.Subnet)
+			}
+		}
+	}
 	// No-egress networks: drop anything leaving the bridge towards the WAN
 	// (oifname not one of our bridges). Same-bridge and cross-segment aren't
 	// matched here (their oifname IS a bridge); cross-segment is already
@@ -111,6 +188,9 @@ func renderNftables(networks []types.Network) string {
 			continue
 		}
 		for _, r := range n.AllowedEgress {
+			if r.Iface != "" {
+				continue // already emitted above, scoped to its interface
+			}
 			switch r.Protocol {
 			case "tcp", "udp":
 				fmt.Fprintf(&b, "\t\tiifname \"%s\" oifname != @mhbridges ip daddr %s %s dport %d accept\n", n.Bridge, r.IP, r.Protocol, r.Port)
@@ -120,6 +200,14 @@ func renderNftables(networks []types.Network) string {
 		}
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" oifname != @mhbridges drop\n", n.Bridge)
 	}
+	// Everything else crossing a managed interface dies here, both directions.
+	// Outbound too, not just inbound: without it any `egress: true` network
+	// would reach that whole segment, since a managed interface is simply "not
+	// one of our bridges" to the rule above.
+	for _, m := range managed {
+		fmt.Fprintf(&b, "\t\tiifname %q drop\n", m.Name)
+		fmt.Fprintf(&b, "\t\toifname %q drop\n", m.Name)
+	}
 	b.WriteString("\t}\n")
 
 	// NAT: masquerade towards the WAN for full-egress networks and for
@@ -128,6 +216,11 @@ func renderNftables(networks []types.Network) string {
 	// sees packets the forward chain already accepted.
 	b.WriteString("\tchain postrouting {\n")
 	b.WriteString("\t\ttype nat hook postrouting priority 100; policy accept;\n")
+	// One rule per network covers both destinations: a managed interface is not
+	// one of our bridges either, so `oifname != @mhbridges` already masquerades
+	// towards it. That NAT is not a convenience there — devices on such a
+	// segment are typically handed no default route at all, so a reply addressed
+	// to 172.16.x.y would have nowhere to go.
 	for _, n := range networks {
 		if n.Egress || len(n.AllowedEgress) > 0 {
 			fmt.Fprintf(&b, "\t\tip saddr %s oifname != @mhbridges masquerade\n", n.Subnet)
@@ -144,8 +237,14 @@ func renderNftables(networks []types.Network) string {
 // fields are interpolated verbatim into the `nft -f` script, so anything that
 // isn't strictly an IPv4 address/CIDR + known protocol + numeric port must be
 // rejected here or it becomes ruleset injection.
-func ValidateEgressRules(rules []types.EgressRule) error {
+func ValidateEgressRules(rules []types.EgressRule, managed []string) error {
 	for i, r := range rules {
+		if r.Iface != "" && !slices.Contains(managed, r.Iface) {
+			if len(managed) == 0 {
+				return fmt.Errorf("egress rule %d: iface %q — this daemon manages no interface (start it with --managed-iface)", i, r.Iface)
+			}
+			return fmt.Errorf("egress rule %d: iface %q is not one this daemon manages (declared: %s)", i, r.Iface, strings.Join(managed, ", "))
+		}
 		if !isIPv4OrCIDR(r.IP) {
 			return fmt.Errorf("egress rule %d: ip %q must be an IPv4 address or CIDR", i, r.IP)
 		}
@@ -160,6 +259,24 @@ func ValidateEgressRules(rules []types.EgressRule) error {
 			}
 		default:
 			return fmt.Errorf("egress rule %d: protocol %q must be tcp, udp or icmp", i, r.Protocol)
+		}
+	}
+	return nil
+}
+
+// ValidateIfaceName vets an operator-supplied interface name at startup, before
+// it can reach the nft script. The operator is trusted; a typo that happens to
+// contain a newline is not.
+func ValidateIfaceName(name string) error {
+	if name == "" || len(name) > 15 { // IFNAMSIZ - 1
+		return fmt.Errorf("interface name %q must be 1-15 characters", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("interface name %q may only contain letters, digits, '-', '_' and '.'", name)
 		}
 	}
 	return nil

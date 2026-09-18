@@ -40,13 +40,32 @@ type Network struct {
 	CreatedAt time.Time
 }
 
-// EgressRule permits one outbound flow from a network whose WAN egress is
-// otherwise dropped: a destination (IP or CIDR), a protocol, and — for TCP and
-// UDP — a destination port. The typical IoT case: a parser VM allowed to reach
-// only its MQTT broker at 203.0.113.7:8883/tcp.
+// EgressRule permits one outbound flow from a network whose egress is otherwise
+// dropped: a destination (IP or CIDR), a protocol, and — for TCP and UDP — a
+// destination port. The typical IoT case: a parser VM allowed to reach only its
+// MQTT broker at 203.0.113.7:8883/tcp.
 type EgressRule struct {
+	// Iface picks WHERE the destination is, and it changes the rule's meaning:
+	//
+	//   - empty (the usual case): out towards the WAN, i.e. anywhere that is not
+	//     one of our own bridges. Replies return on their own — nothing in the
+	//     ruleset drops them.
+	//
+	//   - a MANAGED interface (see the daemon's --managed-iface): a host
+	//     interface whose whole policy this daemon owns, denied in both
+	//     directions by default. A rule naming one also emits the matching
+	//     return rule, because otherwise that blanket deny would eat the reply.
+	//
+	// Naming an interface the daemon was not told to manage is rejected: the
+	// deny-by-default that makes such a rule meaningful only exists for declared
+	// interfaces, so a hole through an undeclared one would be a hole with no
+	// policy around it.
+	Iface string `json:"iface,omitempty"`
 	// IP is the destination: a single IPv4 address ("203.0.113.7") or an IPv4
-	// CIDR ("203.0.113.0/28").
+	// CIDR ("203.0.113.0/28"). A range is legitimate — "this network may poll
+	// that whole segment" is a real deployment. Narrowing it to one device per
+	// network is a policy an orchestrator imposes, not something the engine
+	// decides.
 	IP string `json:"ip"`
 	// Protocol is "tcp", "udp" or "icmp".
 	Protocol string `json:"protocol"`

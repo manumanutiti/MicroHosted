@@ -112,14 +112,18 @@ func (o OfflineIO) InjectFile(imagePath, guestPath string, data io.Reader) error
 	// already exists), drop any existing file, then write. debugfs keeps going
 	// past a failed command, so the mkdir/rm lines are best-effort by design and
 	// the write is what matters; success is confirmed by the stat check below.
-	var script strings.Builder
+	var s debugfsScript
 	for _, dir := range parentDirs(clean) {
-		fmt.Fprintf(&script, "mkdir %s\n", dir)
+		s.add("mkdir", dir)
 	}
-	fmt.Fprintf(&script, "rm %s\n", clean)
-	fmt.Fprintf(&script, "write %s %s\n", tmp.Name(), clean)
+	s.add("rm", clean)
+	s.add("write", tmp.Name(), clean)
+	script, err := s.script()
+	if err != nil {
+		return err
+	}
 
-	if _, err := o.runDebugfs(imagePath, true, script.String()); err != nil {
+	if _, err := o.runDebugfs(imagePath, true, script); err != nil {
 		return err
 	}
 
@@ -156,7 +160,11 @@ func (o OfflineIO) ExtractFileStream(imagePath, guestPath string) (*os.File, int
 	tmpName := tmp.Name()
 	_ = tmp.Close()
 
-	if _, err := o.runDebugfs(imagePath, false, fmt.Sprintf("dump %s %s\n", clean, tmpName)); err != nil {
+	script, err := debugfsLine("dump", clean, tmpName)
+	if err == nil {
+		_, err = o.runDebugfs(imagePath, false, script)
+	}
+	if err != nil {
 		_ = os.Remove(tmpName)
 		return nil, 0, err
 	}
@@ -199,10 +207,12 @@ func (o OfflineIO) ExtractDir(imagePath, guestPath, destDir string) error {
 	if err := o.statInImage(imagePath, clean); err != nil {
 		return fmt.Errorf("extracting dir %s: %w", guestPath, err)
 	}
-	if _, err := o.runDebugfs(imagePath, false, fmt.Sprintf("rdump %s %s\n", clean, destDir)); err != nil {
+	script, err := debugfsLine("rdump", clean, destDir)
+	if err != nil {
 		return err
 	}
-	return nil
+	_, err = o.runDebugfs(imagePath, false, script)
+	return err
 }
 
 // stageFile creates a temp file under StagingDir (rooted on the store by the
@@ -282,7 +292,11 @@ func (o OfflineIO) runDebugfs(image string, write bool, script string) (string, 
 // debugfs's "File not found" output into an error. debugfs exits 0 whether or
 // not the file exists, so the output string is the only signal.
 func (o OfflineIO) statInImage(image, guestPath string) error {
-	out, err := o.runDebugfs(image, false, fmt.Sprintf("stat %s\n", guestPath))
+	script, err := debugfsLine("stat", guestPath)
+	if err != nil {
+		return err
+	}
+	out, err := o.runDebugfs(image, false, script)
 	if err != nil {
 		return err
 	}
@@ -292,12 +306,25 @@ func (o OfflineIO) statInImage(image, guestPath string) error {
 	return nil
 }
 
-// cleanGuestPath validates and normalises an in-image path: it must be absolute
-// and free of "." / ".." components, so a caller can't walk outside the intended
-// target or feed debugfs a surprising relative path.
-func cleanGuestPath(p string) (string, error) {
+// ValidateGuestPath checks and normalises a path inside a guest filesystem, for
+// every file channel (vsock and debugfs alike, so both accept the same paths):
+// it must be absolute, free of ".." components, and free of control characters
+// and double quotes.
+//
+// The last rule is a security boundary, not tidiness. debugfs reads one command
+// per line and splits arguments on whitespace, so a path carrying a newline
+// would smuggle in commands of its own — "dump" writes a host file, "write"
+// reads one — running as the jailer uid, which owns every VM's disk and every
+// volume. Paths often come from the guest itself (an automation listing a
+// sample's output dir and downloading each file), so the guest would pick
+// them. Double quotes are refused because they are how debugfsLine delimits
+// arguments; spaces are fine.
+func ValidateGuestPath(p string) (string, error) {
 	if p == "" {
 		return "", fmt.Errorf("guest path is required")
+	}
+	if err := checkDebugfsArg(p); err != nil {
+		return "", fmt.Errorf("guest path %q: %w", p, err)
 	}
 	if !strings.HasPrefix(p, "/") {
 		return "", fmt.Errorf("guest path %q must be absolute", p)
@@ -311,6 +338,64 @@ func cleanGuestPath(p string) (string, error) {
 	}
 	return clean, nil
 }
+
+// cleanGuestPath is the in-package name offline operations use.
+func cleanGuestPath(p string) (string, error) { return ValidateGuestPath(p) }
+
+// checkDebugfsArg refuses what cannot be passed safely as one debugfs argument:
+// control characters (a newline ends the command and starts another) and the
+// double quote (which would close debugfsLine's quoting early).
+func checkDebugfsArg(s string) error {
+	for _, r := range s {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return fmt.Errorf("must not contain control characters")
+		case r == '"':
+			return fmt.Errorf(`must not contain '"'`)
+		}
+	}
+	return nil
+}
+
+// debugfsLine renders one debugfs command with every argument double-quoted,
+// refusing any argument checkDebugfsArg rejects. Every line of every script
+// goes through here, host paths included: quoting only some arguments is how
+// the one unquoted path ends up being the injection.
+func debugfsLine(verb string, args ...string) (string, error) {
+	var b strings.Builder
+	b.WriteString(verb)
+	for _, a := range args {
+		if err := checkDebugfsArg(a); err != nil {
+			return "", fmt.Errorf("debugfs %s argument %q: %w", verb, a, err)
+		}
+		b.WriteString(` "`)
+		b.WriteString(a)
+		b.WriteString(`"`)
+	}
+	b.WriteString("\n")
+	return b.String(), nil
+}
+
+// debugfsScript accumulates debugfsLine commands; the first refused argument
+// sticks and is returned by script.
+type debugfsScript struct {
+	b   strings.Builder
+	err error
+}
+
+func (s *debugfsScript) add(verb string, args ...string) {
+	if s.err != nil {
+		return
+	}
+	l, err := debugfsLine(verb, args...)
+	if err != nil {
+		s.err = err
+		return
+	}
+	s.b.WriteString(l)
+}
+
+func (s *debugfsScript) script() (string, error) { return s.b.String(), s.err }
 
 // parentDirs returns the ancestor directories of an absolute file path, shallow
 // to deep (e.g. /a/b/c → /a, /a/b), so they can be created in order.

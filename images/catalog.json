@@ -25,5 +25,14 @@
     "vcpus": 1,
     "mem_mb": 128,
     "disk_mb": 1024
+  },
+  {
+    "name": "base-alpine",
+    "description": "Ultra-minimal Alpine, busybox init + vsock exec (make prepare-image)",
+    "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
+    "rootfs_path": "/var/lib/microhosted/store/rootfs/base-alpine.ext4",
+    "vcpus": 1,
+    "mem_mb": 128,
+    "disk_mb": 512
   }
 ]

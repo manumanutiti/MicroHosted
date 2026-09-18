@@ -44,10 +44,10 @@ simulator listening on `$SENSOR_IP:5020`:
 
 ```sh
 # put the binary into the VM (host→guest vsock channel)
-curl -s -X PUT "localhost:8080/v1/vms/$VM/files?path=/parser" --data-binary @parser
+sudo curl -s --unix-socket /run/microhosted.sock -X PUT "http://localhost/v1/vms/$VM/files?path=/parser" --data-binary @parser
 
 # the VM interrogates the sensor and returns the JSON over vsock (the guest starts nothing)
-curl -s -X POST "localhost:8080/v1/vms/$VM/exec" \
+sudo curl -s --unix-socket /run/microhosted.sock -X POST "http://localhost/v1/vms/$VM/exec" \
   -H 'content-type: application/json' \
   -d "{\"cmd\":\"chmod +x /parser && /parser $SENSOR_IP 5020\"}"
 ```

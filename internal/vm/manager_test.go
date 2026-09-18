@@ -23,7 +23,7 @@ func newTestManager(t *testing.T) *Manager {
 		t.Fatalf("opening store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return NewManager(nil, jailer.Defaults{}, "", st, network.NewManager(st))
+	return NewManager(nil, jailer.Defaults{}, "", st, network.NewManager(st, nil))
 }
 
 // A VM stopped on purpose (poweroff) has no live process by design. Reconcile

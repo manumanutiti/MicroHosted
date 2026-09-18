@@ -35,7 +35,21 @@ if [[ "$ARCH" != "$NATIVE" ]]; then
 fi
 
 FC_VERSION="${FC_VERSION:-latest}"
-ADDR="${ADDR:-:8080}"
+# No ADDR by default: the API serves on a Unix socket whose permissions are its
+# authorization. Set ADDR=host:port to put it on an unauthenticated port instead.
+ADDR="${ADDR:-}"
+SOCKET="${SOCKET:-/run/microhosted.sock}"
+SOCKET_GROUP="${SOCKET_GROUP:-}"
+MANAGED_IFACE="${MANAGED_IFACE:-}"
+MANAGED_HOST_ALLOW="${MANAGED_HOST_ALLOW:-}"
+if [[ -n "$ADDR" ]]; then
+  API_URL="http://${ADDR}"
+  [[ "$ADDR" == :* ]] && API_URL="http://localhost${ADDR}"
+  API_CURL=(curl -fsS)
+else
+  API_URL="http://localhost"
+  API_CURL=(sudo curl -fsS --unix-socket "$SOCKET")
+fi
 
 echo "=============================================="
 echo " MicroHosted — full installation (${ARCH})"
@@ -86,23 +100,22 @@ echo ""
 echo "==> [4/6] Building microhosted..."
 mkdir -p build
 CGO_ENABLED=0 go build -o build/microhosted ./cmd/microhosted
-echo "  build/microhosted: OK"
+CGO_ENABLED=0 go build -o build/mh ./cmd/mh
+echo "  build/microhosted, build/mh: OK"
 
 # --- [5/6] systemd service ---------------------------------------------------
 echo ""
 echo "==> [5/6] Installing the systemd service..."
-sudo ./scripts/install-service.sh "$ADDR"
+sudo SOCKET="$SOCKET" SOCKET_GROUP="$SOCKET_GROUP" MANAGED_IFACE="$MANAGED_IFACE" MANAGED_HOST_ALLOW="$MANAGED_HOST_ALLOW" ./scripts/install-service.sh "$ADDR"
 sudo systemctl enable --now microhosted
 sudo systemctl restart microhosted   # if it was already running, pick up the new binary
 
 # --- [6/6] Verification ------------------------------------------------------
 echo ""
 echo "==> [6/6] Checking API health..."
-HEALTH_HOST="${ADDR}"
-[[ "$HEALTH_HOST" == :* ]] && HEALTH_HOST="localhost${HEALTH_HOST}"
 HEALTH_OK=0
 for _ in $(seq 1 15); do
-  if curl -fsS "http://${HEALTH_HOST}/v1/health" >/dev/null 2>&1; then
+  if "${API_CURL[@]}" "${API_URL}/v1/health" >/dev/null 2>&1; then
     HEALTH_OK=1
     break
   fi
@@ -110,10 +123,10 @@ for _ in $(seq 1 15); do
 done
 if [[ "$HEALTH_OK" -eq 1 ]]; then
   echo "  GET /v1/health: OK"
-  curl -fsS "http://${HEALTH_HOST}/v1/health" 2>/dev/null || true
+  "${API_CURL[@]}" "${API_URL}/v1/health" 2>/dev/null || true
   echo ""
 else
-  echo "  WARN: the API isn't responding yet at http://${HEALTH_HOST}/v1/health" >&2
+  echo "  WARN: the API isn't responding yet at ${API_URL}/v1/health" >&2
   echo "        check the log: journalctl -u microhosted -n 50" >&2
 fi
 
@@ -134,9 +147,14 @@ echo ""
 echo "=============================================="
 echo " Installation complete (${ARCH})"
 echo "=============================================="
-echo "  API:      http://${HEALTH_HOST}"
+if [[ -n "$ADDR" ]]; then
+  echo "  API:      ${API_URL}  (tcp, UNAUTHENTICATED — root-equivalent)"
+  echo "  status:   curl -s ${API_URL}/v1/system | python3 -m json.tool"
+else
+  echo "  API:      unix ${SOCKET}  (file permissions are the authorization)"
+  echo "  status:   sudo curl -s --unix-socket ${SOCKET} ${API_URL}/v1/system | python3 -m json.tool"
+fi
 echo "  logs:     journalctl -u microhosted -f"
-echo "  status:   curl -s http://${HEALTH_HOST}/v1/system | python3 -m json.tool"
 if [[ "$MISSING" != "ok" ]]; then
   echo ""
   echo "  NEXT STEP — there's no template ready yet:"

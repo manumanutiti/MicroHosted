@@ -167,6 +167,6 @@ echo " Image ready"
 echo "=============================================="
 if [[ "$ARCH" == "$(uname -m)" ]]; then
   echo "  Test it:"
-  echo "    curl -s -X POST localhost:8080/v1/vms -d '{\"template\":\"${IMAGE_NAME}\"}'"
-  echo "    curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{\"cmd\":\"uname -a\"}'"
+  echo "    sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms -d '{\"template\":\"${IMAGE_NAME}\"}'"
+  echo "    sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms/<id>/exec -d '{\"cmd\":\"uname -a\"}'"
 fi

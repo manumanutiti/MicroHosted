@@ -152,6 +152,65 @@ func TestExecMissingMarker(t *testing.T) {
 	}
 }
 
+// flood writes past the response ceiling and stops. A real compromised guest
+// streams forever; a test goroutine must not, so it gives up once the client has
+// had more than enough to refuse — or as soon as the client closes on it.
+func flood(w net.Conn, unit string) {
+	for sent := 0; sent < maxAgentResponse+(1<<20); sent += len(unit) {
+		if _, err := io.WriteString(w, unit); err != nil {
+			return
+		}
+	}
+}
+
+// TestExecFloodIsCapped is the containment test for a compromised guest: the
+// agent answers an exec with an endless stream and never sends an exit marker.
+// The host must refuse at maxAgentResponse instead of buffering it into its own
+// heap — the daemon runs as root and holds every other VM on the machine, so an
+// unbounded read here turns one compromised parser into a gateway outage.
+func TestExecFloodIsCapped(t *testing.T) {
+	sock := serveOne(t, false, func(r *bufio.Reader, w net.Conn) {
+		if _, err := r.ReadString('\n'); err != nil {
+			return
+		}
+		flood(w, strings.Repeat("A", 1023)+"\n")
+	})
+
+	out, _, err := Exec(sock, "cat /dev/urandom")
+	if err == nil {
+		t.Fatal("Exec accepted an unbounded agent response")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("got %v, want the response-ceiling error", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("Exec returned %d bytes of the response it had just refused", len(out))
+	}
+}
+
+// TestExecFloodWithoutNewlinesIsCapped covers the shape a line-oriented read
+// would still have grown an unbounded buffer for: one endless "line" the guest
+// never terminates. The ceiling has to hold without any delimiter arriving.
+func TestExecFloodWithoutNewlinesIsCapped(t *testing.T) {
+	sock := serveOne(t, false, func(r *bufio.Reader, w net.Conn) {
+		if _, err := r.ReadString('\n'); err != nil {
+			return
+		}
+		flood(w, strings.Repeat("A", 64<<10))
+	})
+
+	out, _, err := Exec(sock, "yes | tr -d '\\n'")
+	if err == nil {
+		t.Fatal("Exec accepted an unterminated agent response")
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("got %v, want the response-ceiling error", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("Exec returned %d bytes of the response it had just refused", len(out))
+	}
+}
+
 // TestPutFileNoEOF: PUT must also complete from the marker alone on a
 // connection that never closes.
 func TestPutFileNoEOF(t *testing.T) {

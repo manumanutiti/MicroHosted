@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"microhosted/internal/network"
+	"microhosted/internal/storage"
 	"microhosted/internal/vm"
 	"microhosted/pkg/types"
 )
@@ -19,7 +20,7 @@ import (
 // integration point Stage 7 originally planned for — it exists from the
 // start here so a panel can be built against it without reshaping the
 // manager underneath.
-func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg SystemConfig) *http.Server {
+func NewServer(mgr *vm.Manager, netmgr *network.Manager, sysCfg SystemConfig) *http.Server {
 	mux := http.NewServeMux()
 
 	// Observability: GET /v1/system (full report) + GET /v1/health (cheap
@@ -46,7 +47,10 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 			writeError(w, http.StatusBadRequest, errors.New("egress and allowed_egress are mutually exclusive"))
 			return
 		}
-		if err := network.ValidateEgressRules(req.AllowedEgress); err != nil {
+		// Includes rules naming a managed interface: one this daemon was not
+		// told to manage is the caller's mistake, not a server fault, so it
+		// is a 400 carrying the declared list to make it actionable.
+		if err := network.ValidateEgressRules(req.AllowedEgress, netmgr.ManagedIfaceNames()); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -89,7 +93,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 			writeError(w, http.StatusBadRequest, errors.New("egress and allowed_egress are mutually exclusive"))
 			return
 		}
-		if err := network.ValidateEgressRules(req.AllowedEgress); err != nil {
+		if err := network.ValidateEgressRules(req.AllowedEgress, netmgr.ManagedIfaceNames()); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -208,9 +212,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 	// after the VM that wrote them is gone. Refused while the volume is attached —
 	// use the VM's live channel then (see /v1/vms/{id}/files).
 	mux.HandleFunc("PUT /v1/volumes/{id}/files", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+		path, ok := guestPathParam(w, r)
+		if !ok {
 			return
 		}
 		defer r.Body.Close()
@@ -222,9 +225,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 	})
 
 	mux.HandleFunc("GET /v1/volumes/{id}/files", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+		path, ok := guestPathParam(w, r)
+		if !ok {
 			return
 		}
 		rc, size, err := mgr.ExtractFromVolumeStream(r.PathValue("id"), path)
@@ -442,9 +444,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 	// offline with debugfs straight on the disk. The bulk data channel and the
 	// post-mortem artifact path in one endpoint.
 	mux.HandleFunc("PUT /v1/vms/{id}/files", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+		path, ok := guestPathParam(w, r)
+		if !ok {
 			return
 		}
 		// Stream the body straight through: no io.ReadAll, so a multi-GB upload
@@ -459,9 +460,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 	})
 
 	mux.HandleFunc("GET /v1/vms/{id}/files", func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Query().Get("path")
-		if path == "" {
-			writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+		path, ok := guestPathParam(w, r)
+		if !ok {
 			return
 		}
 		rc, size, err := mgr.GetFileStream(r.PathValue("id"), path)
@@ -472,7 +472,29 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, addr string, sysCfg Sys
 		streamFile(w, rc, size)
 	})
 
-	return &http.Server{Addr: addr, Handler: logRequests(mux)}
+	// No Addr: the caller owns the listener (see cmd/microhosted's apiListener),
+	// because whether this is a Unix socket or a port is an access-control
+	// decision, not an HTTP one.
+	return &http.Server{Handler: logRequests(mux)}
+}
+
+// guestPathParam reads and validates the ?path= of a file endpoint, answering
+// 400 itself when it is missing or unsafe. Validated here, for both channels,
+// so a path is accepted or refused the same way whether the VM is running
+// (vsock) or stopped (debugfs) — see storage.ValidateGuestPath for why a
+// newline in it is a security matter, not a typo.
+func guestPathParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("path query parameter is required"))
+		return "", false
+	}
+	clean, err := storage.ValidateGuestPath(path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return "", false
+	}
+	return clean, true
 }
 
 // streamFile copies an extracted file to the response in constant memory,

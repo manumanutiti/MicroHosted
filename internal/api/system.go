@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"microhosted/internal/firecracker"
@@ -17,7 +18,8 @@ import (
 // Observability endpoints.
 //
 //   - GET /v1/health — cheap probe: can the platform do its job right now
-//     (KVM, database, store writable+CoW, disk space, firecracker binary).
+//     (KVM, database, store writable+CoW, disk space, firecracker binary,
+//     every stored egress rule actually enforceable).
 //     Answers 200/503 by status so monitors don't need to parse the body.
 //   - GET /v1/system — the full report a panel renders in one call: the
 //     health above, plus daemon identity and every important host path, host
@@ -48,7 +50,7 @@ func registerSystemRoutes(mux *http.ServeMux, mgr *vm.Manager, netmgr *network.M
 	fcVersion := firecracker.Version(facts.FirecrackerBin)
 
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
-		resp := types.HealthResponse{Checks: runHealthChecks(mgr, facts)}
+		resp := types.HealthResponse{Checks: runHealthChecks(mgr, netmgr, facts)}
 		resp.Status = healthStatus(resp.Checks)
 		code := http.StatusOK
 		if resp.Status != "ok" {
@@ -58,7 +60,7 @@ func registerSystemRoutes(mux *http.ServeMux, mgr *vm.Manager, netmgr *network.M
 	})
 
 	mux.HandleFunc("GET /v1/system", func(w http.ResponseWriter, r *http.Request) {
-		checks := runHealthChecks(mgr, facts)
+		checks := runHealthChecks(mgr, netmgr, facts)
 		resp := types.SystemResponse{
 			Status:  healthStatus(checks),
 			Checks:  checks,
@@ -83,9 +85,10 @@ func healthStatus(checks []types.HealthCheck) string {
 // runHealthChecks probes, in order of how fatal a failure is: no KVM means no
 // VMs at all; a dead database loses state on restart; an unwritable or full
 // store fails every create; a CoW-less store still works but fills the disk
-// (same warning the daemon logs at startup, made pollable).
-func runHealthChecks(mgr *vm.Manager, facts vm.Facts) []types.HealthCheck {
-	checks := make([]types.HealthCheck, 0, 6)
+// (same warning the daemon logs at startup, made pollable); egress rules the
+// daemon cannot enforce mean the policy the API reports is not the one in force.
+func runHealthChecks(mgr *vm.Manager, netmgr *network.Manager, facts vm.Facts) []types.HealthCheck {
+	checks := make([]types.HealthCheck, 0, 7)
 
 	kvm := types.HealthCheck{Name: "kvm", OK: true}
 	if _, err := os.Stat("/dev/kvm"); err != nil {
@@ -135,6 +138,15 @@ func runHealthChecks(mgr *vm.Manager, facts vm.Facts) []types.HealthCheck {
 		fc.OK, fc.Detail = false, "cannot run "+facts.FirecrackerBin+" --version"
 	}
 	checks = append(checks, fc)
+
+	egress := types.HealthCheck{Name: "egress_policy", OK: true}
+	if bad := netmgr.UnenforcedRules(); len(bad) > 0 {
+		egress.OK = false
+		egress.Detail = fmt.Sprintf("%d rule(s) NOT applied, their interface is not managed by this daemon: %s — "+
+			"reinstall with MANAGED_IFACE=<iface> or remove them with --rm-allow",
+			len(bad), strings.Join(bad, "; "))
+	}
+	checks = append(checks, egress)
 
 	return checks
 }
@@ -205,6 +217,7 @@ func storageReport(mgr *vm.Manager, facts vm.Facts) types.StorageInfo {
 func fleetReport(mgr *vm.Manager, netmgr *network.Manager) types.FleetInfo {
 	info := mgr.FleetStats()
 	info.Networks = len(netmgr.List())
+	info.ManagedIfaces = netmgr.ManagedIfaceNames()
 	return info
 }
 

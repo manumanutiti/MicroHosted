@@ -27,12 +27,29 @@
 # Usage: ./scripts/density-test.sh [--mode fleet|fork] [--template alpine-py]
 #        [--max 200] [--ram-floor-mb 500] [--slow-sec 15]
 #        [--sensor-ip 192.168.0.15] [--keep]
+#
+# Env:   SOCKET=/run/microhosted.sock   the daemon's socket (root-only by
+#                                       default, so run this under sudo)
+#        API=host:port                  drive a TCP listener instead
 
 set -euo pipefail
 
-API="${API:-localhost:8080}"
+# The daemon serves on a Unix socket by default (its file permissions are the
+# API's authorization), so curl needs --unix-socket and a dummy host. Set
+# API=host:port to drive a TCP listener instead.
+SOCKET="${SOCKET:-/run/microhosted.sock}"
+API="${API:-}"
+if [[ -n "$API" ]]; then
+  CURL=(curl)
+  BASE="http://${API}"
+  API_DESC="${API}"
+else
+  CURL=(curl --unix-socket "$SOCKET")
+  BASE="http://localhost"
+  API_DESC="unix ${SOCKET}"
+fi
 MODE="fleet"
-TEMPLATE="alpine-py"
+TEMPLATE="base-alpine"
 MAX=200
 RAM_FLOOR_MB=500
 SLOW_SEC=15
@@ -55,8 +72,8 @@ done
   || { echo "ERROR: --mode must be fleet or fork" >&2; exit 1; }
 
 command -v jq >/dev/null || { echo "ERROR: jq is required" >&2; exit 1; }
-curl -sf "http://$API/v1/health" >/dev/null \
-  || { echo "ERROR: the API isn't responding at $API" >&2; exit 1; }
+"${CURL[@]}" -sf "$BASE/v1/health" >/dev/null \
+  || { echo "ERROR: the API isn't responding at $API_DESC" >&2; exit 1; }
 
 # Record of what was created, one line per device: "<vm-id> <net|->".
 CREATED_FILE="$(mktemp /tmp/mh-density-XXXXXX.txt)"
@@ -70,7 +87,7 @@ now_ms()   { date +%s%3N; }
 agent_ok() { # $1=vm-id $2=timeout-s
   local out=""
   for _ in $(seq 1 "$2"); do
-    out=$(curl -s -X POST "http://$API/v1/vms/$1/exec" -d '{"cmd":"echo ok"}' | jq -r '.output // empty')
+    out=$("${CURL[@]}" -s -X POST "$BASE/v1/vms/$1/exec" -d '{"cmd":"echo ok"}' | jq -r '.output // empty')
     [[ "$out" == ok* ]] && return 0
     sleep 1
   done
@@ -83,15 +100,15 @@ cleanup() {
   echo "==> Cleaning up..."
   local fails=0 vm net code
   while read -r vm net; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://$API/v1/vms/$vm")
+    code=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/v1/vms/$vm")
     [[ "$code" == 2* ]] || fails=$((fails + 1))
     if [[ "$net" != "-" ]]; then
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "http://$API/v1/networks/$net")
+      code=$("${CURL[@]}" -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/v1/networks/$net")
       [[ "$code" == 2* ]] || fails=$((fails + 1))
     fi
   done < "$CREATED_FILE"
-  [[ -n "$SNAP_ID" ]] && curl -s -o /dev/null -X DELETE "http://$API/v1/snapshots/$SNAP_ID"
-  [[ -n "$BASE_ID" ]] && curl -s -o /dev/null -X DELETE "http://$API/v1/vms/$BASE_ID"
+  [[ -n "$SNAP_ID" ]] && "${CURL[@]}" -s -o /dev/null -X DELETE "$BASE/v1/snapshots/$SNAP_ID"
+  [[ -n "$BASE_ID" ]] && "${CURL[@]}" -s -o /dev/null -X DELETE "$BASE/v1/vms/$BASE_ID"
   if [[ "$fails" -gt 0 ]]; then
     echo "    NOTE: $fails deletions failed — retry with $CREATED_FILE"
   else
@@ -104,10 +121,10 @@ trap cleanup EXIT
 # --- Fork mode preparation: base VM + snapshot -----------------------------
 if [[ "$MODE" == "fork" ]]; then
   echo "==> [fork] base VM from '$TEMPLATE' + snapshot..."
-  BASE_ID=$(curl -s -X POST "http://$API/v1/vms" -d "{\"template\":\"$TEMPLATE\"}" | jq -r '.id // empty')
+  BASE_ID=$("${CURL[@]}" -s -X POST "$BASE/v1/vms" -d "{\"template\":\"$TEMPLATE\"}" | jq -r '.id // empty')
   [[ -n "$BASE_ID" ]] || { echo "ERROR creating the base VM" >&2; exit 1; }
   agent_ok "$BASE_ID" 30 || { echo "ERROR: base agent is mute" >&2; exit 1; }
-  SNAP_ID=$(curl -s -X POST "http://$API/v1/vms/$BASE_ID/snapshot" -d '{"name":"density-test"}' | jq -r '.id // empty')
+  SNAP_ID=$("${CURL[@]}" -s -X POST "$BASE/v1/vms/$BASE_ID/snapshot" -d '{"name":"density-test"}' | jq -r '.id // empty')
   [[ -n "$SNAP_ID" ]] || { echo "ERROR creating the snapshot" >&2; exit 1; }
 fi
 
@@ -125,15 +142,15 @@ while [[ "$N" -lt "$MAX" ]]; do
 
   if [[ "$MODE" == "fleet" ]]; then
     net="fleet-$i"
-    resp=$(curl -s -X POST "http://$API/v1/networks" \
+    resp=$("${CURL[@]}" -s -X POST "$BASE/v1/networks" \
       -d "{\"name\":\"$net\",\"allowed_egress\":[{\"ip\":\"$SENSOR_IP\",\"protocol\":\"tcp\",\"port\":1883}]}")
     if [[ -z "$(echo "$resp" | jq -r '.name // empty')" ]]; then
       STOP="network $i rejected: $(echo "$resp" | head -c 200)"; break
     fi
-    resp=$(curl -s -X POST "http://$API/v1/vms" -d "{\"template\":\"$TEMPLATE\",\"network\":\"$net\"}")
+    resp=$("${CURL[@]}" -s -X POST "$BASE/v1/vms" -d "{\"template\":\"$TEMPLATE\",\"network\":\"$net\"}")
     vm=$(echo "$resp" | jq -r '.id // empty')
     if [[ -z "$vm" ]]; then
-      curl -s -o /dev/null -X DELETE "http://$API/v1/networks/$net"
+      "${CURL[@]}" -s -o /dev/null -X DELETE "$BASE/v1/networks/$net"
       STOP="VM $i rejected: $(echo "$resp" | head -c 200)"; break
     fi
     echo "$vm $net" >> "$CREATED_FILE"
@@ -141,7 +158,7 @@ while [[ "$N" -lt "$MAX" ]]; do
       STOP="VM $i ($vm) booted but the agent doesn't respond"; break
     fi
   else
-    resp=$(curl -s -X POST "http://$API/v1/snapshots/$SNAP_ID/fork" -d '{"quarantine":true}')
+    resp=$("${CURL[@]}" -s -X POST "$BASE/v1/snapshots/$SNAP_ID/fork" -d '{"quarantine":true}')
     vm=$(echo "$resp" | jq -r '.id // empty')
     if [[ -z "$vm" ]]; then
       STOP="fork $i rejected: $(echo "$resp" | head -c 200)"; break
@@ -182,13 +199,13 @@ fi
 
 PSS="(run as root to measure PSS)"
 if [[ "$N" -gt 0 ]]; then
-  pid=$(curl -s "http://$API/v1/vms/$LAST_VM" | jq -r '.pid // empty')
+  pid=$("${CURL[@]}" -s "$BASE/v1/vms/$LAST_VM" | jq -r '.pid // empty')
   [[ -n "$pid" && -r "/proc/$pid/smaps_rollup" ]] \
     && PSS="$(awk '/^Pss:/{print $2 " kB"}' "/proc/$pid/smaps_rollup")"
 fi
 
 RAM_END=$(avail_mb)
-HEALTH=$(curl -s "http://$API/v1/health" | jq -c '.')
+HEALTH=$("${CURL[@]}" -s "$BASE/v1/health" | jq -c '.')
 
 echo ""
 echo "================== RESULT ($MODE) =================="

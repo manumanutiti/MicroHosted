@@ -70,6 +70,99 @@ accepts → drop toward the WAN. In `postrouting`, the restricted subnet is
 masqueraded as a whole — it's safe because postrouting only sees packets the
 `forward` chain already accepted.
 
+## Managed interfaces (`--managed-iface`)
+
+An egress rule normally means "out towards the WAN": anywhere that is not one of
+our bridges, masqueraded, with replies returning on their own because nothing
+drops them.
+
+A **managed interface** is a host interface whose *entire* nftables policy this
+daemon owns — typically the one facing a segment of devices the host did not
+choose (sensors, PLCs, cameras). Declare it at startup:
+
+```
+--managed-iface wlan0 --managed-host-allow udp/67
+```
+
+and the daemon renders, for it:
+
+```
+chain input {
+    iifname "wlan0" udp dport 67 accept   # only the host services you listed
+    iifname "wlan0" drop                  # not the API, not SSH, nothing else
+}
+chain forward {
+    <both legs of every egress rule that names this interface>
+    iifname "wlan0" drop
+    oifname "wlan0" drop
+}
+```
+
+Nothing is assumed about what the host offers that segment: `--managed-host-allow`
+defaults to `udp/67` because the host usually runs its DHCP, and an empty value
+denies every host service. Declare no interface and none of this is rendered —
+the ruleset is exactly what it was before this existed.
+
+### Pointing a rule at one
+
+An egress rule gains an optional `iface`. Empty means the WAN, as always; set, it
+means that managed interface:
+
+```json
+{"name":"ot-52","allowed_egress":[
+  {"iface":"wlan0","ip":"192.168.50.52","protocol":"tcp","port":502},
+  {"iface":"wlan0","ip":"192.168.50.0/24","protocol":"icmp"},
+  {"ip":"203.0.113.7","protocol":"tcp","port":8883}
+]}
+```
+
+One list, one concept, two kinds of destination. The first two render as pairs
+against `wlan0`; the third keeps the WAN shape it always had. Because this lives
+in `allowed_egress`, `PUT /v1/networks/{name}/egress` changes it live like any
+other policy.
+
+`ip` accepts a host or a CIDR. A whole range is a legitimate destination — "this
+network polls that segment" is a real deployment. Narrowing it to one device per
+network is a policy an *orchestrator* imposes; the engine only has to be able to
+express both.
+
+### Why the interface is declared here and not in a file beside the daemon
+
+**Several base chains on one hook are all evaluated, and a `drop` in any of them
+is final.** A hand-written table covering the same interface therefore does not
+*conflict* with this one — it silently wins. The observable result is a policy
+you declared through the API, that the API reports back to you, and that is not
+the policy in force. Declaring the interface here is what makes the API's answer
+true. `GET /v1/system` lists the managed interfaces for the same reason.
+
+### Deliberate properties
+
+- **Both legs are pinned to the same destination**, and the return leg is matched
+  statelessly like the rest of `forward` — by the destination's own address and
+  source port — so tightening the policy cuts a live flow on its next packet
+  instead of letting a conntrack entry ride through it.
+- **The reply arrives already un-masqueraded.** Conntrack reverses the source NAT
+  in `prerouting`, which runs before `forward`, so `ip daddr` in the return rule
+  is the guest's real address.
+- **NAT is not optional there.** Devices on such a segment are often handed no
+  default route at all, so a reply addressed to `172.16.x.y` would have nowhere
+  to go. The existing per-network masquerade already covers it: a managed
+  interface is not one of our bridges either. It also means the device sees the
+  *gateway*, not the VM — per-VM attribution would need a distinct host address
+  per VM on that segment, which is worth doing and not done.
+- **`egress: true` cannot leak into it.** `oifname "wlan0" drop` closes the
+  outbound side, which a WAN-oriented rule would otherwise leave wide open: a
+  managed interface is simply "not one of our bridges".
+
+### What this cannot do
+
+Two devices on the same segment reaching **each other** never traverses the host
+at all — on a switch that is switching, on Wi-Fi the AP relays the frames inside
+`mac80211`. No rule here can see it, for exactly the reason a `forward` rule
+cannot separate two VMs on one bridge (hence `intra: false` isolating ports at
+L2). That isolation belongs to the access layer: `ap_isolate=1` on an AP,
+private VLANs or port isolation on a switch.
+
 ### Hot update of intra (`PUT /v1/networks/{name}/intra`)
 
 The `intra` flag can also be changed live: it's persisted and then
@@ -209,7 +302,7 @@ sudo nft list table inet microhosted              # is your subnet's 'masquerade
 sudo nft list ruleset | grep -iB1 -A4 'hook forward'  # is there ANOTHER forward chain with 'policy drop'? (Docker/ufw/firewalld)
 sudo iptables -t filter -S DOCKER-USER 2>/dev/null    # with Docker: the 2 'mhbr+ ACCEPT' rules must be there
 # from the guest: default route + gateway ARP
-curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"ip route; ip neigh"}'
+sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms/<id>/exec -d '{"cmd":"ip route; ip neigh"}'
 ```
 
 Mental rule: **broken egress is almost always = another `forward` chain with
@@ -288,9 +381,9 @@ mounted rootfs.
 
 ```bash
 # did the kernel receive and apply the nameservers?
-curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"cat /proc/net/pnp"}'
+sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms/<id>/exec -d '{"cmd":"cat /proc/net/pnp"}'
 # does resolv.conf point there?
-curl -s -X POST localhost:8080/v1/vms/<id>/exec -d '{"cmd":"ls -la /etc/resolv.conf; cat /etc/resolv.conf"}'
+sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms/<id>/exec -d '{"cmd":"ls -la /etc/resolv.conf; cat /etc/resolv.conf"}'
 # if /proc/net/pnp has the nameservers but resolv.conf isn't the symlink:
 # the image didn't go through prepare-image.sh (or something overwrote it at boot,
 # e.g. systemd-resolved) — re-run scripts/prepare-image.sh over the golden rootfs

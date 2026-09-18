@@ -142,7 +142,7 @@ lifecycle.
   `/usr/local/bin`, a **systemd** unit, and a **SQLite** state file
   (`images/microhosted.db`). The unit uses `KillMode=process` so restarting the
   daemon does **not** kill running VMs — on restart, `Reconcile` re-adopts them.
-- **Running after:** the API is live (`:8080`). It loads the catalog, opens the
+- **Running after:** the API is live (`unix /run/microhosted.sock`). It loads the catalog, opens the
   state DB, warns if the store isn't CoW-capable, and derives the Jailer chroot
   from the store directory (so the L3 same-filesystem rule holds automatically).
 

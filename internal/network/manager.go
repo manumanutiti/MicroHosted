@@ -3,6 +3,8 @@ package network
 import (
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,18 +35,84 @@ type managedNet struct {
 type Manager struct {
 	store *store.Store
 
+	// managed are the host interfaces this daemon owns the whole nftables
+	// policy for (see ManagedIface). Declared once at startup and never
+	// mutated, so they need no lock. Empty means the daemon renders policy
+	// for no external interface and rejects every egress rule that names
+	// one — taking over an interface the operator did not hand us is not
+	// ours to decide.
+	managed []ManagedIface
+
 	mu   sync.Mutex
 	nets map[string]*managedNet // by name
 	pool *subnetPool
 }
 
-// NewManager wires a network Manager to the store it persists networks in.
-func NewManager(st *store.Store) *Manager {
+// NewManager wires a network Manager to the store it persists networks in,
+// and to the interfaces whose nftables policy it was told to own.
+func NewManager(st *store.Store, managed []ManagedIface) *Manager {
 	return &Manager{
-		store: st,
-		nets:  make(map[string]*managedNet),
-		pool:  newSubnetPool(),
+		store:   st,
+		managed: managed,
+		nets:    make(map[string]*managedNet),
+		pool:    newSubnetPool(),
 	}
+}
+
+// ManagedIfaceNames returns the interfaces this daemon owns the policy for.
+// The observability report shows them because "which interfaces am I
+// responsible for" should be answerable from the API, not only from the
+// unit file.
+func (m *Manager) ManagedIfaceNames() []string {
+	names := make([]string, 0, len(m.managed))
+	for _, i := range m.managed {
+		names = append(names, i.Name)
+	}
+	return names
+}
+
+// UnenforcedRules lists the stored egress rules that name an interface this
+// daemon does not manage — typically because it was restarted without the
+// --managed-iface it had when the rules were created. They are NOT rendered
+// (see renderNftables): a hole through an interface is only safe inside the
+// deny-both-ways policy that declaring it installs, and that policy is gone.
+// So the API reports a rule that is not in force. The health check surfaces
+// the mismatch instead of leaving an operator to find out from a dead flow.
+// Each entry reads "network ot: tcp:192.168.50.52:502@wlan0".
+func (m *Manager) UnenforcedRules() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, mn := range m.nets {
+		for _, r := range mn.net.AllowedEgress {
+			if r.Iface != "" && !isManaged(m.managed, r.Iface) {
+				out = append(out, fmt.Sprintf("network %s: %s", mn.net.Name, describeRule(r)))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func isManaged(managed []ManagedIface, name string) bool {
+	for _, mi := range managed {
+		if mi.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// describeRule renders a rule in the CLI's PROTO:IP[:PORT][@IFACE] form.
+func describeRule(r types.EgressRule) string {
+	s := r.Protocol + ":" + r.IP
+	if r.Port != 0 {
+		s += ":" + strconv.Itoa(r.Port)
+	}
+	if r.Iface != "" {
+		s += "@" + r.Iface
+	}
+	return s
 }
 
 // Reconcile rebuilds network state from the store at startup: recreates any
@@ -84,6 +152,11 @@ func (m *Manager) Reconcile() error {
 		}
 	}
 
+	for _, r := range m.UnenforcedRules() {
+		log.Printf("WARNING: egress rule NOT applied — %s names an interface this daemon does not manage. "+
+			"Restart it with --managed-iface for that interface (make install-service MANAGED_IFACE=...) "+
+			"or remove the rule (mh network update ... --rm-allow ...)", r)
+	}
 	return m.applyRules()
 }
 
@@ -97,7 +170,7 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 	if req.Egress && len(req.AllowedEgress) > 0 {
 		return nil, fmt.Errorf("egress and allowed_egress are mutually exclusive: allowed_egress restricts a network whose egress is otherwise blocked")
 	}
-	if err := ValidateEgressRules(req.AllowedEgress); err != nil {
+	if err := ValidateEgressRules(req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
 	}
 
@@ -164,7 +237,7 @@ func (m *Manager) UpdateEgress(name string, req types.UpdateNetworkEgressRequest
 	if req.Egress && len(req.AllowedEgress) > 0 {
 		return nil, fmt.Errorf("egress and allowed_egress are mutually exclusive: allowed_egress restricts a network whose egress is otherwise blocked")
 	}
-	if err := ValidateEgressRules(req.AllowedEgress); err != nil {
+	if err := ValidateEgressRules(req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
 	}
 
@@ -372,5 +445,5 @@ func (m *Manager) applyRules() error {
 			log.Printf("network: DOCKER-USER coexistence failed (egress may not work under Docker): %v", err)
 		}
 	}
-	return ApplyNftables(snapshot)
+	return ApplyNftables(snapshot, m.managed)
 }

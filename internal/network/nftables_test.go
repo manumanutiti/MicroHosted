@@ -10,7 +10,7 @@ import (
 
 func TestRenderNftablesEmpty(t *testing.T) {
 	// No networks → the table is deleted, not left with dangling rules.
-	got := renderNftables(nil)
+	got := renderNftables(nil, nil)
 	if !strings.Contains(got, "delete table inet microhosted") {
 		t.Fatalf("empty render should delete the table, got:\n%s", got)
 	}
@@ -24,7 +24,7 @@ func TestRenderNftablesIsolationAndEgress(t *testing.T) {
 		{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24", Egress: false},
 		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true},
 	}
-	got := renderNftables(nets)
+	got := renderNftables(nets, nil)
 
 	// guest → host is always dropped.
 	if !strings.Contains(got, "iifname @mhbridges drop") {
@@ -68,7 +68,7 @@ func TestRenderNftablesAllowedEgress(t *testing.T) {
 			{IP: "203.0.113.7", Protocol: "icmp"},
 		}},
 	}
-	got := renderNftables(nets)
+	got := renderNftables(nets, nil)
 
 	// Each allowed flow gets an accept scoped to the bridge and the WAN.
 	for _, want := range []string{
@@ -106,7 +106,7 @@ func TestRenderNftablesScalesLinearly(t *testing.T) {
 			Subnet: fmt.Sprintf("172.16.%d.0/24", i%256),
 		}
 	}
-	got := renderNftables(nets)
+	got := renderNftables(nets, nil)
 
 	if n := strings.Count(got, "oifname @mhbridges iifname . oifname != @mhsame drop"); n != 1 {
 		t.Fatalf("want exactly 1 aggregate cross-segment drop, got %d", n)
@@ -127,7 +127,7 @@ func TestForwardChainMatchesStatelessly(t *testing.T) {
 			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
 		}},
 	}
-	got := renderNftables(nets)
+	got := renderNftables(nets, nil)
 
 	fwdStart := strings.Index(got, "chain forward {")
 	fwdEnd := strings.Index(got[fwdStart:], "}")
@@ -150,7 +150,7 @@ func TestValidateEgressRules(t *testing.T) {
 		{IP: "198.51.100.0/28", Protocol: "udp", Port: 123},
 		{IP: "203.0.113.7", Protocol: "icmp"},
 	}
-	if err := ValidateEgressRules(valid); err != nil {
+	if err := ValidateEgressRules(valid, nil); err != nil {
 		t.Fatalf("valid rules rejected: %v", err)
 	}
 
@@ -166,8 +166,214 @@ func TestValidateEgressRules(t *testing.T) {
 		"icmp with port":     {IP: "1.2.3.4", Protocol: "icmp", Port: 80},
 	}
 	for name, r := range bad {
-		if err := ValidateEgressRules([]types.EgressRule{r}); err == nil {
+		if err := ValidateEgressRules([]types.EgressRule{r}, nil); err == nil {
 			t.Errorf("%s: rule %+v should have been rejected", name, r)
+		}
+	}
+}
+
+// wlan0 stands in for any managed interface; nothing in the engine knows or
+// cares what kind of link it is.
+func managedWlan() []ManagedIface {
+	return []ManagedIface{{Name: "wlan0", HostAllow: []HostService{{Protocol: "udp", Port: 67}}}}
+}
+
+// mustIndex returns where needle appears, failing the test if it doesn't. Rule
+// ORDER is the whole correctness argument in a chain where the first match
+// wins, so the tests below assert positions, not just presence.
+func mustIndex(t *testing.T, script, needle string) int {
+	t.Helper()
+	i := strings.Index(script, needle)
+	if i < 0 {
+		t.Fatalf("missing rule %q in:\n%s", needle, script)
+	}
+	return i
+}
+
+// TestRenderNftablesManagedIfaceDeniedByDefault: declaring an interface hands
+// the daemon its whole policy. With no network claiming anything on it, nothing
+// crosses it in either direction and nothing reaches the host through it beyond
+// the services the operator listed.
+func TestRenderNftablesManagedIfaceDeniedByDefault(t *testing.T) {
+	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
+	got := renderNftables(nets, managedWlan())
+
+	for _, want := range []string{
+		`iifname "wlan0" udp dport 67 accept`,
+		`iifname "wlan0" drop`,
+		`oifname "wlan0" drop`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+	// A host service has to precede the input drop or it is never reachable.
+	inputChain := got[mustIndex(t, got, "chain input"):mustIndex(t, got, "chain forward")]
+	if strings.Index(inputChain, "udp dport 67 accept") > strings.Index(inputChain, `iifname "wlan0" drop`) {
+		t.Fatalf("the host-service accept comes after the input drop:\n%s", inputChain)
+	}
+	if strings.Contains(got, `oifname "wlan0" ip daddr`) {
+		t.Fatalf("an accept appeared for a network that declared none:\n%s", got)
+	}
+}
+
+// TestRenderNftablesManagedHostAllowIsNotAssumed: an operator whose segment is
+// addressed by something else denies every host service, DHCP included.
+func TestRenderNftablesManagedHostAllowIsNotAssumed(t *testing.T) {
+	got := renderNftables(nil, []ManagedIface{{Name: "eth1"}})
+	if strings.Contains(got, "dport 67") {
+		t.Fatalf("DHCP was opened on an interface that asked for no host service:\n%s", got)
+	}
+}
+
+// TestRenderNftablesIfaceRuleOrdering is the core correctness test: both legs of
+// an interface-scoped rule must be accepted BEFORE every drop that would
+// otherwise catch them — the network's own egress drop (a managed interface is
+// not one of our bridges) and the blanket drops that close the chain.
+func TestRenderNftablesIfaceRuleOrdering(t *testing.T) {
+	nets := []types.Network{{
+		Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24",
+		AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+		},
+	}}
+	got := renderNftables(nets, managedWlan())
+
+	out := mustIndex(t, got, `iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.52 tcp dport 502 accept`)
+	back := mustIndex(t, got, `iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.52 ip daddr 172.16.9.0/24 tcp sport 502 accept`)
+	egressDrop := mustIndex(t, got, `iifname "mhbrcccc" oifname != @mhbridges drop`)
+	blanketIn := strings.LastIndex(got, `iifname "wlan0" drop`)
+	blanketOut := strings.LastIndex(got, `oifname "wlan0" drop`)
+
+	if out > egressDrop {
+		t.Fatalf("the outbound accept is after the network's egress drop — it never leaves:\n%s", got)
+	}
+	if out > blanketIn || out > blanketOut || back > blanketIn || back > blanketOut {
+		t.Fatalf("an interface-scoped accept is after the blanket drops:\n%s", got)
+	}
+	// An interface-scoped rule must NOT also be emitted as a WAN rule, or the
+	// flow would be allowed towards anything that is not one of our bridges.
+	if strings.Contains(got, `oifname != @mhbridges ip daddr 192.168.50.52`) {
+		t.Fatalf("an interface-scoped rule leaked into the WAN rules:\n%s", got)
+	}
+}
+
+// TestRenderNftablesWholeRangeOnManagedIface: a range is a legitimate
+// destination — "this network polls that whole segment" is a real deployment,
+// and the engine must be able to say it.
+func TestRenderNftablesWholeRangeOnManagedIface(t *testing.T) {
+	nets := []types.Network{{
+		Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24",
+		AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.0/24", Protocol: "icmp"},
+		},
+	}}
+	got := renderNftables(nets, managedWlan())
+	for _, want := range []string{
+		`iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.0/24 meta l4proto icmp accept`,
+		`iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.0/24 ip daddr 172.16.9.0/24 meta l4proto icmp accept`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderNftablesMixedDestinations: one list, two kinds of destination — the
+// WAN broker keeps its old rule, the local device gets an interface-scoped pair.
+func TestRenderNftablesMixedDestinations(t *testing.T) {
+	nets := []types.Network{{
+		Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24",
+		AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
+		},
+	}}
+	got := renderNftables(nets, managedWlan())
+
+	if !strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges ip daddr 203.0.113.7 tcp dport 8883 accept`) {
+		t.Fatalf("the WAN rule lost its old shape:\n%s", got)
+	}
+	if !strings.Contains(got, `iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.52 tcp dport 502 accept`) {
+		t.Fatalf("the interface-scoped rule is missing:\n%s", got)
+	}
+	// One masquerade covers both: a managed interface is not one of our bridges.
+	if n := strings.Count(got, "ip saddr 172.16.9.0/24"); n != 1 {
+		t.Fatalf("expected exactly one masquerade for the subnet, got %d:\n%s", n, got)
+	}
+}
+
+// TestRenderNftablesSkipsRulesForUnmanagedIface is the restart-without-the-flag
+// case: a stored rule names wlan0, but the daemon came back without
+// --managed-iface wlan0. Rendering its accept would open a hole with no
+// deny-both-ways policy around it — every egress network could reach that
+// segment and nothing would stop it coming back in — so it must not appear,
+// while the rest of the network's policy still does.
+func TestRenderNftablesSkipsRulesForUnmanagedIface(t *testing.T) {
+	nets := []types.Network{{
+		Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24",
+		AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
+		},
+	}}
+	for name, managed := range map[string][]ManagedIface{
+		"no managed interface":    nil,
+		"a different one managed": {{Name: "eth1"}},
+	} {
+		got := renderNftables(nets, managed)
+		if strings.Contains(got, `"wlan0"`) {
+			t.Errorf("%s: a rule for unmanaged wlan0 was rendered:\n%s", name, got)
+		}
+		if !strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges ip daddr 203.0.113.7 tcp dport 8883 accept`) {
+			t.Errorf("%s: the network's WAN rule went missing too:\n%s", name, got)
+		}
+		if !strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges drop`) {
+			t.Errorf("%s: the network's egress drop went missing:\n%s", name, got)
+		}
+	}
+}
+
+// TestRenderNftablesNoManagedIfaceNoPolicy: an operator who declared nothing
+// gets exactly the ruleset they had before this feature existed.
+func TestRenderNftablesNoManagedIfaceNoPolicy(t *testing.T) {
+	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
+	if strings.Contains(renderNftables(nets, nil), "wlan0") {
+		t.Fatal("rules rendered for an interface nobody declared")
+	}
+}
+
+func TestValidateEgressRulesIface(t *testing.T) {
+	managed := []string{"wlan0"}
+	ok := []types.EgressRule{{Iface: "wlan0", IP: "192.168.50.0/24", Protocol: "tcp", Port: 502}}
+	if err := ValidateEgressRules(ok, managed); err != nil {
+		t.Fatalf("rejected a valid interface-scoped rule: %v", err)
+	}
+	// An interface the daemon was not told to manage has no deny-by-default
+	// around it, so a hole through it would be a hole with no policy.
+	bad := []types.EgressRule{{Iface: "eth0", IP: "192.168.0.15", Protocol: "tcp", Port: 502}}
+	if err := ValidateEgressRules(bad, managed); err == nil {
+		t.Fatal("accepted a rule naming an unmanaged interface")
+	}
+	if err := ValidateEgressRules(ok, nil); err == nil {
+		t.Fatal("accepted an interface-scoped rule on a daemon that manages none")
+	}
+	// Without an iface the rule is a plain WAN rule and needs no declaration.
+	wan := []types.EgressRule{{IP: "203.0.113.7", Protocol: "tcp", Port: 8883}}
+	if err := ValidateEgressRules(wan, nil); err != nil {
+		t.Fatalf("a WAN rule must not require a managed interface: %v", err)
+	}
+}
+
+func TestValidateIfaceName(t *testing.T) {
+	for _, ok := range []string{"wlan0", "eth0", "br-lan", "en_p1", "veth.1"} {
+		if err := ValidateIfaceName(ok); err != nil {
+			t.Errorf("rejected valid interface %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "this-name-is-far-too-long", "wlan0\naccept", "wlan 0", `wlan0"`} {
+		if err := ValidateIfaceName(bad); err == nil {
+			t.Errorf("accepted invalid interface %q", bad)
 		}
 	}
 }

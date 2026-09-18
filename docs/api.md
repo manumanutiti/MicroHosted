@@ -1,8 +1,66 @@
 # HTTP API — reference
 
-Served by `internal/api` (`cmd/microhosted`, flag `--addr`, default `:8080`).
-All bodies are JSON. There's no authentication yet — it's meant to run behind
-your own dashboard/backend, not exposed directly.
+Served by `internal/api` (`cmd/microhosted`). It listens on a **Unix socket**,
+`/run/microhosted.sock` by default (`--socket`). All bodies are JSON.
+
+## Calling the API, and who may
+
+The socket's file permissions **are** the authorization. That is the whole
+access-control story, and it is deliberate: this API creates VMs, runs commands
+inside them and rewrites each network's egress policy, from a daemon running as
+root — so "who may call it" is the same question as "who may open this file",
+which the host already knows how to express, audit with `ls`, and revoke. There
+is no token to distribute, rotate or leak into a shell history.
+
+The socket is root-only unless it was installed with an owning group
+(`sudo SOCKET_GROUP=microhosted ./scripts/install-service.sh`, mode 0660). To
+use it without `sudo`, join that group and **start a new login session** —
+`usermod` does not touch sessions that are already open:
+
+```bash
+sudo usermod -aG microhosted $USER
+# log out and back in, then confirm:
+id -nG | tr ' ' '\n' | grep microhosted
+```
+
+### Day to day: the `mh` CLI
+
+For operating the platform by hand, use **[`mh`](cli.md)**, the docker-style
+client installed with the daemon (`mh ps`, `mh run base-alpine`,
+`mh network update lab --intra`). This page is the raw HTTP reference: what a
+panel, a script in another language, or `mh` itself sends.
+
+### The `mhcurl` helper used by every example below
+
+`mhcurl` is **a shell function you define yourself**, nothing in this repo
+installs it. Define it once (or drop it in `~/.bashrc`). It used to be called
+`mh`, which is now the CLI binary, so a leftover `mh()` function in your shell
+would hide the binary. Rename it.
+
+```bash
+mhcurl() { curl -sS --unix-socket "${MICROHOSTED_SOCKET:-/run/microhosted.sock}" "$@"; }
+
+mhcurl http://localhost/v1/health
+```
+
+Being a shell function, it does **not** survive `sudo`. If you are not in the
+socket's group yet, spell the call out instead:
+
+```bash
+sudo curl -sS --unix-socket /run/microhosted.sock http://localhost/v1/health
+```
+
+> Two traps worth knowing, because curl hides both. `curl -s` silences transport
+> errors, so a daemon that is down or a socket you may not open both come back as
+> empty output rather than a message — use `-sS`, as the helper does. And curl
+> reports "permission denied" on a Unix socket as `Could not connect to server`,
+> which reads like the daemon is dead when it is only that you are not in the
+> group. (`mh` tells the two apart.)
+
+`--addr host:port` serves on a TCP port **instead** of the socket. There is no
+authentication in front of that port, so anyone who can reach it has
+root-equivalent control of the host: it is for a loopback-only dashboard or a
+tunnel, never for a segment where the workloads themselves live.
 
 Status: covers create/read/delete + stop/start + exec + snapshots/fork +
 volumes/files + observability (`/v1/system`, `/v1/health`). The full CRUD
@@ -72,14 +130,28 @@ canonical IPv4 CIDR, `protocol` ∈ `tcp`/`udp`/`icmp` (lowercase), `port` requi
 for tcp/udp and forbidden for icmp.
 
 ```bash
-curl -X POST localhost:8080/v1/networks -d '{"name":"lab"}'
-curl -X POST localhost:8080/v1/networks -d '{"name":"build","egress":true}'
-curl -X POST localhost:8080/v1/networks -d '{"name":"iot","allowed_egress":[
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"lab"}'
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"build","egress":true}'
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"iot","allowed_egress":[
   {"ip":"203.0.113.7","protocol":"tcp","port":8883},
   {"ip":"203.0.113.7","protocol":"icmp"}]}'
 ```
 
 **201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
+Each rule also takes an optional **`iface`**. Empty (the usual case) means the
+WAN: anywhere that is not one of our bridges. Set, it must name an interface the
+daemon was told to manage (`--managed-iface`) — one whose whole policy it owns,
+denied in both directions by default — and the rule then also emits the matching
+return rule. `ip` may be a host or a CIDR in either case. See
+`docs/networking.md` § Managed interfaces.
+
+```bash
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"ot-52","allowed_egress":[
+  {"iface":"wlan0","ip":"192.168.50.52","protocol":"tcp","port":502},
+  {"ip":"203.0.113.7","protocol":"tcp","port":8883}
+]}'
+```
+
 `allowed_egress` rule is invalid, or if `egress: true` and `allowed_egress` are
 combined · **500** if the name already exists, the subnet is invalid, or bridge
 creation fails.
@@ -106,12 +178,12 @@ VMs. Same fields and validation as on creation: `egress` (bool) and
 `allowed_egress` (array), mutually exclusive.
 
 ```bash
-curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{"allowed_egress":[
+mhcurl -X PUT http://localhost/v1/networks/pingtest/egress -d '{"allowed_egress":[
   {"ip":"192.168.0.15","protocol":"icmp"},
   {"ip":"192.168.0.15","protocol":"tcp","port":6565}]}'
 
 # remove all egress: empty body
-curl -X PUT localhost:8080/v1/networks/pingtest/egress -d '{}'
+mhcurl -X PUT http://localhost/v1/networks/pingtest/egress -d '{}'
 ```
 
 Flows opened under the previous policy are cut immediately when hardening (see
@@ -128,8 +200,8 @@ persists the flag and re-applies port isolation to all the network's live TAPs.
 Stopped VMs pick it up on boot.
 
 ```bash
-curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":true}'
-curl -X PUT localhost:8080/v1/networks/pingtest/intra -d '{"intra":false}'
+mhcurl -X PUT http://localhost/v1/networks/pingtest/intra -d '{"intra":true}'
+mhcurl -X PUT http://localhost/v1/networks/pingtest/intra -d '{"intra":false}'
 ```
 
 **200 response** (updated `NetworkResponse`) · **400** invalid body · **404** if
@@ -139,7 +211,7 @@ converge (the message says which — re-issue the PUT).
 ### `DELETE /v1/networks/{name}`
 
 ```bash
-curl -X DELETE localhost:8080/v1/networks/lab
+mhcurl -X DELETE http://localhost/v1/networks/lab
 ```
 
 **204 response** · **404** if it doesn't exist · **409** if it still has connected
@@ -150,7 +222,7 @@ VMs (destroy them first, with the endpoint below).
 The typical step before `DELETE /v1/networks/{name}` when it still has VMs.
 
 ```bash
-curl -X DELETE localhost:8080/v1/networks/lab/vms
+mhcurl -X DELETE http://localhost/v1/networks/lab/vms
 ```
 
 **200 response** (`BulkDeleteResponse`, shape further below) · **404** if the
@@ -175,11 +247,11 @@ network doesn't exist.
 | `volumes`     | array  | no       | volumes to attach at boot (see `## Volumes`); each one `{name, read_only?, guest_path?}` |
 
 ```bash
-curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu"}'
-curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","network":"lab"}'
-curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true}'
+mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu"}'
+mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu","network":"lab"}'
+mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu","no_network":true}'
 # read-only mounted sample + writable output volume
-curl -X POST localhost:8080/v1/vms -d '{"template":"base-ubuntu","no_network":true,
+mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu","no_network":true,
   "volumes":[{"name":"sample","read_only":true,"guest_path":"/mnt/sample"},
              {"name":"output"}]}'
 ```
@@ -203,7 +275,7 @@ part of the pending work.
 ### `GET /v1/vms` — list
 
 ```bash
-curl localhost:8080/v1/vms
+mhcurl http://localhost/v1/vms
 ```
 
 **200 response** — an array of `VMResponse`. Intended as the basis of the future
@@ -215,7 +287,7 @@ columns beyond `state`.
 ### `GET /v1/vms/{id}` — detail
 
 ```bash
-curl localhost:8080/v1/vms/a1b2c3d4
+mhcurl http://localhost/v1/vms/a1b2c3d4
 ```
 
 **200 response** (`VMResponse`) · **404** if it doesn't exist.
@@ -248,7 +320,7 @@ on whether to expose them.
 ### `DELETE /v1/vms/{id}` — destroy
 
 ```bash
-curl -X DELETE localhost:8080/v1/vms/a1b2c3d4
+mhcurl -X DELETE http://localhost/v1/vms/a1b2c3d4
 ```
 
 **204 response** · **404** if it doesn't exist or if stop/cleanup fails (the error
@@ -269,7 +341,7 @@ the disk, use `stop` (below).
 ### `POST /v1/vms/{id}/stop` — power off (poweroff, keeps the disk)
 
 ```bash
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/stop
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/stop
 ```
 
 **200 response** with the `VMResponse` (now `state: "stopped"`, `pid` omitted) ·
@@ -284,7 +356,7 @@ You can't `exec` on a stopped VM (**409**).
 ### `POST /v1/vms/{id}/start` — start a stopped VM
 
 ```bash
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/start
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/start
 ```
 
 **200 response** with the `VMResponse` (`state: "running"`, new `pid`) · **404** if
@@ -301,7 +373,7 @@ doesn't touch it), so it cold-boots with the disk and addressing intact.
 Resets the environment (useful between test batches) without going one by one.
 
 ```bash
-curl -X DELETE localhost:8080/v1/vms
+mhcurl -X DELETE http://localhost/v1/vms
 ```
 
 **200 response** always — destroying many independent VMs isn't all-or-nothing; the
@@ -357,7 +429,7 @@ the two fork modes:
 **Body** (optional): `{"name": "clean"}` — a free label.
 
 ```bash
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/snapshot -d '{"name":"clean"}'
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/snapshot -d '{"name":"clean"}'
 ```
 
 **201 response** (`SnapshotResponse`) · **404** if the VM doesn't exist · **409**
@@ -387,10 +459,10 @@ restored from it running (they have their own copies/hardlinks). **204** on dele
 
 ```bash
 # Normal fork: requires the snapshot's IP free in its origin network
-curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork
+mhcurl -X POST http://localhost/v1/snapshots/f00dcafe/fork
 
 # Quarantine fork: no real network, vsock only
-curl -X POST localhost:8080/v1/snapshots/f00dcafe/fork -d '{"quarantine":true}'
+mhcurl -X POST http://localhost/v1/snapshots/f00dcafe/fork -d '{"quarantine":true}'
 ```
 
 **201 response** (`VMResponse`; forks carry `restored_from` and, where applicable,
@@ -414,7 +486,7 @@ from a snapshot.
 
 ```bash
 # Quarantine copy of a live VM, in one call
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/fork -d '{"quarantine":true}'
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/fork -d '{"quarantine":true}'
 ```
 
 Equivalent to snapshot → fork → delete the snapshot, without the ephemeral snapshot
@@ -439,7 +511,7 @@ taken **from that same VM** (to restore another VM's snapshot there's fork, whic
 handles identity collisions honestly).
 
 ```bash
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/restore -d '{"snapshot":"f00dcafe"}'
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/restore -d '{"snapshot":"f00dcafe"}'
 ```
 
 Works on a `running` VM (it's stopped first) or a `stopped` one. **200 response**
@@ -461,7 +533,7 @@ or chrony). It's Firecracker's documented behavior.
 | `cmd` | string | yes      | command to run with `sh -c` in the guest |
 
 ```bash
-curl -X POST localhost:8080/v1/vms/a1b2c3d4/exec -d '{"cmd":"whoami && uname -a"}'
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/exec -d '{"cmd":"whoami && uname -a"}'
 ```
 
 **200 response** (`ExecResponse`):
@@ -502,8 +574,8 @@ I/O goes through `debugfs` (userspace, no `mount`).
 | `size_mb` | int    | yes      | ext4 size in MiB (fixed at creation)  |
 
 ```bash
-curl -X POST localhost:8080/v1/volumes -d '{"name":"sample","size_mb":64}'
-curl -X POST localhost:8080/v1/volumes -d '{"name":"dataset","size_mb":8192}'
+mhcurl -X POST http://localhost/v1/volumes -d '{"name":"sample","size_mb":64}'
+mhcurl -X POST http://localhost/v1/volumes -d '{"name":"dataset","size_mb":8192}'
 ```
 
 **201 response** (`VolumeResponse`) · **400** if `name` is missing / `size_mb` ≤ 0 ·
@@ -524,7 +596,7 @@ List all / detail of one. **Shape of `VolumeResponse`:**
 ### `DELETE /v1/volumes/{id}`
 
 ```bash
-curl -X DELETE localhost:8080/v1/volumes/VOLID
+mhcurl -X DELETE http://localhost/v1/volumes/VOLID
 ```
 
 **204 response** · **404** if it doesn't exist · **409** if it's attached to a VM
@@ -548,13 +620,13 @@ array's order.
 
 ```bash
 # 1) create the volume
-curl -X POST localhost:8080/v1/volumes -d '{"name":"output","size_mb":512}'
+mhcurl -X POST http://localhost/v1/volumes -d '{"name":"output","size_mb":512}'
 
 # 2) (optional) pre-fill it offline without booting anything
-curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
+mhcurl -X PUT "http://localhost/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
 
 # 3) create the VM with the volume attached
-curl -X POST localhost:8080/v1/vms -d '{
+mhcurl -X POST http://localhost/v1/vms -d '{
   "template":"base-ubuntu","no_network":true,
   "volumes":[{"name":"output","guest_path":"/mnt/out"}]}'
 ```
@@ -577,14 +649,14 @@ guest that has it mounted would corrupt it.
 
 ```bash
 # put a sample into the volume (the body is the raw file)
-curl -X PUT "localhost:8080/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
+mhcurl -X PUT "http://localhost/v1/volumes/VOLID/files?path=/sample.bin" --data-binary @sample.bin
 # get an artifact
-curl "localhost:8080/v1/volumes/VOLID/files?path=/output/result.txt" -o result.txt
+mhcurl "http://localhost/v1/volumes/VOLID/files?path=/output/result.txt" -o result.txt
 ```
 
 **204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing
-or isn't a valid absolute path · **404** if the volume or the file doesn't exist ·
-**409** if the volume is attached to a VM.
+or invalid (see [path rules](#path-rules)) · **404** if the volume or the file
+doesn't exist · **409** if the volume is attached to a VM.
 
 > **Large data**: Firecracker has no disk hot-plug, so you don't attach a volume to
 > an already-booted VM. The model is **prepare and attach**: create the volume of the
@@ -604,17 +676,36 @@ booting). Streamed end-to-end — constant memory at any size.
 
 ```bash
 # upload (automatic Content-Length with --data-binary @file)
-curl -X PUT "localhost:8080/v1/vms/VMID/files?path=/root/input.bin" --data-binary @input.bin
+mhcurl -X PUT "http://localhost/v1/vms/VMID/files?path=/root/input.bin" --data-binary @input.bin
 # download
-curl "localhost:8080/v1/vms/VMID/files?path=/root/output.bin" -o output.bin
+mhcurl "http://localhost/v1/vms/VMID/files?path=/root/output.bin" -o output.bin
 ```
 
-**204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing ·
-**404** if the VM doesn't exist · **409** if the VM is neither `running` nor
-`stopped`.
+**204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing
+or invalid (see below) · **404** if the VM doesn't exist · **409** if the VM is
+neither `running` nor `stopped`.
 
 Watch the root disk's size (`disk_mb`) if you upload a large file there; for large
 data use a sized **volume**, not the rootfs.
+
+### Path rules
+
+The same for every file endpoint (VM and volume, running or stopped), so a path
+never works on one channel and fails on the other:
+
+- absolute (`/root/x.bin`), not the root itself, no `..` components;
+- **no control characters** (newline, CR, tab, NUL…) **and no `"`**. Spaces and
+  any other character are fine (`/out dir/my file.txt`).
+
+The control-character rule is a security boundary. The offline channel drives
+`debugfs` with a script of one command per line, so a newline in a path would
+add a command of its own, such as `dump` (write a host file) or `write` (read
+one), running as the jailer uid, which owns every VM's disk and every volume.
+Paths often come from the guest itself (listing a sample's output and
+downloading each file), so it is the guest that would choose them.
+`storage.ValidateGuestPath` refuses them at the API, again in the manager, and
+every `debugfs` argument is also double-quoted and checked when the script is
+built.
 
 ---
 
@@ -633,7 +724,7 @@ Two read-only singletons, meant for two different consumers:
 ### `GET /v1/health` — health probe
 
 ```bash
-curl -s localhost:8080/v1/health
+mhcurl http://localhost/v1/health
 ```
 
 **200/503 response** (`HealthResponse`): `{"status": "ok"|"degraded", "checks": [...]}`.
@@ -648,11 +739,12 @@ and `detail` (the reason on failure; on `disk_space`, the figures always):
 | `disk_space`     | store free space ≥ max(5% of the total, 1 GiB) — a full store fails every create/snapshot/upload in worse ways |
 | `store_cow`      | the store supports reflink; without CoW each VM is a full copy of the rootfs (the same warning the daemon logs on startup, made probeable) |
 | `firecracker`    | the Firecracker binary exists and responds to `--version`                 |
+| `egress_policy`  | every stored egress rule is enforceable. A rule naming an interface the daemon does not manage (restarted without the `--managed-iface` it had) is **not applied**, because its hole is only safe inside that interface's deny-both-ways policy. This check lists those rules, so the policy the API reports is never silently different from the one in force |
 
 ### `GET /v1/system` — full report
 
 ```bash
-curl -s localhost:8080/v1/system | jq .
+mhcurl http://localhost/v1/system | jq .
 ```
 
 **200 response** (`SystemResponse`), five blocks:

@@ -16,7 +16,7 @@ Type=simple
 
 # The daemon launches Firecracker via Jailer (chroot, cgroups v2, tap devices,
 # /dev/kvm): it needs root. System units already run as root.
-ExecStart=@BINARY@ --addr @ADDR@ --catalog @WORKDIR@/images/catalog.json --instances-dir /var/lib/microhosted/store --db @WORKDIR@/images/microhosted.db
+ExecStart=@BINARY@ @ARGS@ --catalog @WORKDIR@/images/catalog.json --instances-dir /var/lib/microhosted/store --db @WORKDIR@/images/microhosted.db
 WorkingDirectory=@WORKDIR@
 
 # KEY to letting the microVMs survive a daemon restart: systemd signals ONLY

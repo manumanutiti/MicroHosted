@@ -35,7 +35,9 @@ building the daemon, registration as a systemd service (`enable --now`), and a
 health check through the API.
 
 Useful variables: `make full-install ADDR=127.0.0.1:9000` (API address,
-default `:8080`) and `FC_VERSION=vX.Y.Z` (changing the Firecracker version is a
+no `ADDR` means the API serves on a Unix socket, whose
+permissions are its authorization; `SOCKET_GROUP=microhosted` lets that group
+drive it without `sudo`) and `FC_VERSION=vX.Y.Z` (changing the Firecracker version is a
 conscious decision: snapshots are tied to the version that created them).
 
 It is **idempotent**: re-running it updates the binary/service without touching
@@ -77,19 +79,21 @@ shared).
 
 ## 3. Your first microVM
 
+`full-install` also installs `mh`, the docker-style CLI. Use `sudo mh …`
+until you are in the socket's group (see [docs/api.md](docs/api.md#calling-the-api-and-who-may)).
+
 ```bash
-# Daemon health
-curl -s localhost:8080/v1/health
-
-# Create a VM from the template
-curl -X POST localhost:8080/v1/vms -d '{"template":"base-alpine"}'
-
-# List
-curl -s localhost:8080/v1/vms
+mh health                          # daemon health
+mh images                          # available templates
+VM=$(mh run base-alpine)           # create a VM from the template
+mh ps                              # list
+mh exec $VM uname -a               # run a command inside it (vsock)
+mh rm $VM
 ```
 
-The complete API reference (networks, exec over vsock, snapshots/forks,
-volumes, quarantine) is in [docs/api.md](docs/api.md).
+Every command is in [docs/cli.md](docs/cli.md) (networks, egress rules,
+volumes, snapshots/forks, quarantine). The raw HTTP API is in
+[docs/api.md](docs/api.md).
 
 ## Day-to-day operation
 

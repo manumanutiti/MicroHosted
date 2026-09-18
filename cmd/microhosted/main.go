@@ -3,11 +3,16 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,7 +27,26 @@ import (
 func main() {
 	def := jailer.DefaultDefaults()
 
-	addr := flag.String("addr", ":8080", "address the HTTP API listens on")
+	// A Unix socket by default, not a port. The daemon runs as root and its API
+	// is the platform's trust anchor: whoever reaches it can create a VM, exec
+	// inside it and define a network's egress policy. On a socket that
+	// authorization is the file's mode and owner — something the host already
+	// audits and revokes. Putting it on a port instead is an explicit operator
+	// decision, not what happens when you say nothing.
+	socketPath := flag.String("socket", "/run/microhosted.sock", "Unix socket the HTTP API listens on; its file permissions are the API's authorization")
+	socketGroup := flag.String("socket-group", "", "group allowed to use the API socket (mode 0660); empty keeps it root-only")
+	// Interfaces this daemon takes responsibility for. Declaring one hands it
+	// that interface's whole policy — denied in both directions, with each
+	// network's interface-scoped egress rules as the only holes — so that the
+	// policy an operator declares through the API is the policy actually in
+	// force. A second ruleset covering the same interface silently wins any
+	// drop, which is the failure this removes.
+	managedIfaceList := flag.String("managed-iface", "", "comma-separated host interfaces whose whole nftables policy this daemon owns (e.g. \"wlan0\"): denied both ways except each network's interface-scoped egress rules")
+	// Nothing is assumed about what the host offers that segment: the default
+	// covers the usual case (the host runs its DHCP) and an empty value denies
+	// everything, including DHCP.
+	hostAllowList := flag.String("managed-host-allow", "udp/67", "host services reachable from a managed interface, e.g. \"udp/67,udp/123\"; empty denies every host service")
+	addr := flag.String("addr", "", "serve on this TCP address INSTEAD of the socket — unauthenticated, exposes root-equivalent control of the host")
 	catalogPath := flag.String("catalog", "images/catalog.json", "path to the template catalog (JSON)")
 	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "disk store (btrfs CoW): clones, goldens, kernels, and the Jailer chroot. Outside the repo on purpose: it's root-owned runtime data, not sources")
 	dbPath := flag.String("db", "images/microhosted.db", "path to the SQLite state database")
@@ -78,7 +102,14 @@ func main() {
 	// Networks come up before VMs: recreate bridges wiped by a host reboot,
 	// ensure the default network exists, and install the nftables ruleset —
 	// so VMs adopted just below can re-reserve their IPs on live networks.
-	netmgr := network.NewManager(st)
+	managed, err := parseManagedIfaces(*managedIfaceList, *hostAllowList)
+	if err != nil {
+		log.Fatalf("--managed-iface: %v", err)
+	}
+	for _, mi := range managed {
+		log.Printf("managing the nftables policy of %s (host services allowed: %s)", mi.Name, describeHostAllow(mi.HostAllow))
+	}
+	netmgr := network.NewManager(st, managed)
 	if err := netmgr.Reconcile(); err != nil {
 		log.Fatalf("reconciling networks: %v", err)
 	}
@@ -140,15 +171,20 @@ func main() {
 		}
 		return p
 	}
-	srv := api.NewServer(mgr, netmgr, *addr, api.SystemConfig{
+	srv := api.NewServer(mgr, netmgr, api.SystemConfig{
 		DBPath:      absOr(*dbPath),
 		CatalogPath: absOr(*catalogPath),
 		StartedAt:   time.Now(),
 	})
 
+	ln, listeningOn, err := apiListener(*addr, *socketPath, *socketGroup)
+	if err != nil {
+		log.Fatalf("opening the API listener: %v", err)
+	}
+
 	go func() {
-		log.Printf("microhosted listening on %s", *addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("microhosted listening on %s", listeningOn)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server: %v", err)
 		}
 	}()
@@ -163,4 +199,91 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("error shutting down the server: %v", err)
 	}
+}
+
+// apiListener opens the socket the API serves on: the Unix socket by default,
+// or a TCP address when the operator asked for one. The TCP path warns every
+// time rather than once in the docs — there is no authentication in front of
+// this API, so the only thing standing between a reachable port and root on
+// this host is whoever is reading the journal.
+func apiListener(addr, socketPath, socketGroup string) (net.Listener, string, error) {
+	if addr != "" {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, "", err
+		}
+		log.Printf("WARNING: serving the API on tcp %s with no authentication — anyone who can reach it has root-equivalent control of this host", addr)
+		return ln, "tcp " + addr, nil
+	}
+	ln, err := api.ListenUnix(socketPath, socketGroup)
+	if err != nil {
+		return nil, "", err
+	}
+	return ln, "unix " + socketPath, nil
+}
+
+// parseManagedIfaces builds the managed-interface list from the two flags. A
+// bad name fails the start instead of being skipped: an operator who declared
+// an interface and got silence would believe it is governed while nothing is
+// rendered for it, which is the exact failure this feature exists to remove.
+func parseManagedIfaces(ifaces, hostAllow string) ([]network.ManagedIface, error) {
+	if strings.TrimSpace(ifaces) == "" {
+		return nil, nil
+	}
+	services, err := parseHostServices(hostAllow)
+	if err != nil {
+		return nil, err
+	}
+	var out []network.ManagedIface
+	for _, raw := range strings.Split(ifaces, ",") {
+		name := strings.TrimSpace(raw)
+		if err := network.ValidateIfaceName(name); err != nil {
+			return nil, err
+		}
+		if slices.ContainsFunc(out, func(m network.ManagedIface) bool { return m.Name == name }) {
+			return nil, fmt.Errorf("interface %q listed twice", name)
+		}
+		out = append(out, network.ManagedIface{Name: name, HostAllow: services})
+	}
+	return out, nil
+}
+
+// parseHostServices reads "udp/67,tcp/8883". Empty means no host service at all
+// is reachable from a managed interface — a legitimate choice when something
+// else addresses that segment.
+func parseHostServices(list string) ([]network.HostService, error) {
+	if strings.TrimSpace(list) == "" {
+		return nil, nil
+	}
+	var out []network.HostService
+	for _, raw := range strings.Split(list, ",") {
+		spec := strings.TrimSpace(raw)
+		proto, portStr, ok := strings.Cut(spec, "/")
+		if !ok {
+			return nil, fmt.Errorf("host service %q must look like udp/67 or tcp/8883", spec)
+		}
+		if proto != "tcp" && proto != "udp" {
+			return nil, fmt.Errorf("host service %q: protocol must be tcp or udp", spec)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("host service %q: port must be 1-65535", spec)
+		}
+		out = append(out, network.HostService{Protocol: proto, Port: port})
+	}
+	return out, nil
+}
+
+// describeHostAllow renders the allowed host services for the startup log, so
+// "nothing" is stated rather than shown as an empty space an operator has to
+// interpret.
+func describeHostAllow(services []network.HostService) string {
+	if len(services) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(services))
+	for _, s := range services {
+		parts = append(parts, fmt.Sprintf("%s/%d", s.Protocol, s.Port))
+	}
+	return strings.Join(parts, ", ")
 }

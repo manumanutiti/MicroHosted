@@ -1,5 +1,8 @@
 BINARY   := microhosted
 CMD_DIR  := ./cmd/microhosted
+# mh: the docker-style CLI client (internal/cli, docs/cli.md).
+CLI      := mh
+CLI_DIR  := ./cmd/mh
 BUILD_DIR := ./build
 
 # PINNED Firecracker/Jailer version: the one validated on hardware with this
@@ -7,7 +10,22 @@ BUILD_DIR := ./build
 # needed for network_overrides / simultaneous forks). Changing it is a conscious
 # decision: make full-install FC_VERSION=vX.Y.Z (or =latest).
 FC_VERSION ?= v1.16.1
-ADDR ?= :8080
+# Empty ADDR: the API serves on a Unix socket (SOCKET), whose file permissions
+# ARE its authorization — the API grants root-equivalent control of the host
+# (create a VM, exec in it, set a network's egress), so putting it on a port is
+# a conscious decision: make install-service ADDR=127.0.0.1:8080
+ADDR ?=
+SOCKET ?= /run/microhosted.sock
+# Group allowed to drive the daemon without sudo; empty keeps the socket
+# root-only: make install-service SOCKET_GROUP=microhosted
+SOCKET_GROUP ?=
+# Interfaces whose whole nftables policy the daemon owns (comma-separated).
+# Declaring one denies it in both directions except for the egress rules that
+# name it — see docs/networking.md § Managed interfaces — so remove any other
+# ruleset covering it first. MANAGED_HOST_ALLOW picks which host services stay
+# reachable from them (default udp/67 for DHCP; "none" denies every one).
+MANAGED_IFACE ?=
+MANAGED_HOST_ALLOW ?=
 
 # ---------------------------------------------------------------------------
 # Target architecture. Defaults to this machine's; can be forced with
@@ -47,7 +65,7 @@ IMAGE_SIZE_MB  ?=
 KERNEL_VERSION ?= 6.1.102
 EXTRA_PKGS     ?=
 
-.PHONY: all build clean install-fc setup-host kernel rootfs lint test \
+.PHONY: all build clean install-cli install-fc setup-host kernel rootfs lint test \
         install-service uninstall-service service-logs full-install \
         uninstall prepare-image check
 
@@ -58,20 +76,26 @@ all: build
 build:
 	mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(BINARY) $(CMD_DIR)
+	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(CLI) $(CLI_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Installs only the mh client (install-service already does it too).
+install-cli: build
+	sudo install -o root -g root -m 0755 $(BUILD_DIR)/$(CLI) /usr/local/bin/$(CLI)
 
 # ---------------------------------------------------------------------------
 # One-step full installation (x86_64 or aarch64, auto-detected):
 #   make full-install                      # everything: host + firecracker + daemon
 #   make full-install FC_VERSION=v1.16.1   # pin the Firecracker version
-#   make full-install ADDR=127.0.0.1:9000  # a different API address
+#   make full-install SOCKET_GROUP=microhosted  # let a group use the socket
+#   make full-install ADDR=127.0.0.1:8080      # serve on a port instead
 # Afterward, to get a template ready: make prepare-image
 # ---------------------------------------------------------------------------
 full-install:
 	chmod +x scripts/*.sh
-	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) ./scripts/full-install.sh
+	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) SOCKET=$(SOCKET) SOCKET_GROUP=$(SOCKET_GROUP) MANAGED_IFACE=$(MANAGED_IFACE) MANAGED_HOST_ALLOW=$(MANAGED_HOST_ALLOW) ./scripts/full-install.sh
 
 # ---------------------------------------------------------------------------
 # Full uninstallation: the inverse of full-install. Kills the live VMs, removes
@@ -121,7 +145,7 @@ rootfs:
 # Installs/updates microhosted as a systemd service. Builds as your user (build)
 # and only the install step asks for sudo, so as not to build as root.
 install-service: build
-	sudo ./scripts/install-service.sh $(ADDR)
+	sudo SOCKET=$(SOCKET) SOCKET_GROUP=$(SOCKET_GROUP) MANAGED_IFACE=$(MANAGED_IFACE) MANAGED_HOST_ALLOW=$(MANAGED_HOST_ALLOW) ./scripts/install-service.sh $(ADDR)
 
 # Uninstalls the service. Live VMs aren't touched (KillMode=process); if you want
 # to power them off, destroy them via the API first.

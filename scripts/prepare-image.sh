@@ -162,7 +162,7 @@ echo ""
 echo "OK: ${ROOTFS} prepared."
 echo "    Create a NEW VM (existing ones were cloned before this change) and:"
 if [[ "$DO_VSOCK" -eq 1 ]]; then
-  echo "    - run commands with: curl -X POST localhost:8080/v1/vms/<id>/exec -d '{\"cmd\":\"...\"}'"
+  echo "    - run commands with: sudo curl -s --unix-socket /run/microhosted.sock -X POST http://localhost/v1/vms/<id>/exec -d '{\"cmd\":\"...\"}'"
 fi
 if [[ "$DO_SSH" -eq 1 ]]; then
   echo "    - get a shell with: ssh -i ${DEFAULT_PRIVATE_KEY} root@<guest_ip>"

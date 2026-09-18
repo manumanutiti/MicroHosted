@@ -115,12 +115,17 @@ type StorageEntry struct {
 // resources the running VMs have been promised (overcommit visibility: judge
 // Allocated against HostInfo).
 type FleetInfo struct {
-	VMs       VMCounts     `json:"vms"`
-	Allocated Allocated    `json:"allocated"`
-	Networks  int          `json:"networks"`
-	Snapshots int          `json:"snapshots"`
-	Volumes   VolumeCounts `json:"volumes"`
-	Templates int          `json:"templates"`
+	VMs       VMCounts  `json:"vms"`
+	Allocated Allocated `json:"allocated"`
+	Networks  int       `json:"networks"`
+	// ManagedIfaces are the host interfaces this daemon owns the whole
+	// nftables policy for. Reported because "which interfaces am I
+	// responsible for" should be answerable from the API, not only from
+	// the unit file.
+	ManagedIfaces []string     `json:"managed_ifaces,omitempty"`
+	Snapshots     int          `json:"snapshots"`
+	Volumes       VolumeCounts `json:"volumes"`
+	Templates     int          `json:"templates"`
 }
 
 // VMCounts breaks the fleet down by state.

@@ -1527,6 +1527,12 @@ func (m *Manager) offlineIO() storage.OfflineIO {
 // then streamed — still constant memory, just via disk. The debugfs path stages
 // regardless (debugfs can't read a stream), so size is irrelevant there.
 func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) error {
+	// Same rules for both channels (see storage.ValidateGuestPath): the vsock
+	// agent would take a newline as the end of its header line.
+	guestPath, err := storage.ValidateGuestPath(guestPath)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	if !ok {
@@ -1609,6 +1615,10 @@ func (m *Manager) stageReader(data io.Reader) (string, int64, error) {
 // detonation VM and pull files straight off its disk. The caller must Close the
 // returned reader.
 func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, error) {
+	guestPath, err := storage.ValidateGuestPath(guestPath)
+	if err != nil {
+		return nil, 0, err
+	}
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	if !ok {

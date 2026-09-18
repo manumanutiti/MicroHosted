@@ -119,7 +119,7 @@ the goldens/kernels come along for free).
 processes remain. Before migrating you have to shut them down:
 
 ```bash
-curl -s -X DELETE localhost:8080/v1/vms   # destroys the VMs (with the daemon alive)
+sudo mh rm --all                          # destroys the VMs (with the daemon alive)
 sudo systemctl stop microhosted
 sudo pkill -9 -f '/firecracker --id'      # kills any orphaned VM that survives
 sudo ./scripts/setup-host.sh              # remounts the store at the new path

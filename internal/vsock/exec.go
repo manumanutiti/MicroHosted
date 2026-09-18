@@ -42,6 +42,17 @@ const execTimeout = 30 * time.Second
 // artifact (a memory dump, a pcap) can be big and slow to stream over vsock.
 const transferTimeout = 10 * time.Minute
 
+// maxAgentResponse bounds how much of a single agent response the host will
+// buffer (an exec's combined output, or a PUT's ack). The guest is untrusted by
+// design — containing it is the entire point of the microVM — so reading its
+// reply without a ceiling is a path from a compromised guest straight into the
+// daemon's heap: it answers with an endless stream and the host OOMs while
+// holding every other VM on the machine. 8 MiB is orders of magnitude above any
+// real command's output; bulk data belongs in a file and travels through
+// GetFileStream, which streams instead of buffering and is deliberately not
+// subject to this cap.
+const maxAgentResponse = 8 << 20
+
 // dial opens the Firecracker vsock UDS and performs the CONNECT handshake,
 // returning a live duplex stream to the guest's AgentPort plus a buffered
 // reader positioned right after the "OK <port>" ack. deadline is applied to the
@@ -84,14 +95,30 @@ func dial(sockPath string, deadline time.Duration) (net.Conn, *bufio.Reader, err
 // emits last is the protocol's own explicit terminator; stopping there behaves
 // identically on fresh-booted and restored VMs (and also unhangs execs whose
 // command leaked the connection fd to a background process). EOF before a
-// marker is still an error: agent missing, or it died mid-response.
+// marker is still an error: agent missing, or it died mid-response. So is a
+// response that never terminates — see maxAgentResponse.
 func readToMarker(reader *bufio.Reader) (output string, exitCode int, err error) {
 	var buf strings.Builder
 	for {
-		chunk, rerr := reader.ReadString('\n')
-		buf.WriteString(chunk)
+		// ReadSlice, not ReadString: it reads into bufio's fixed buffer and
+		// reports ErrBufferFull rather than growing one, so a guest that simply
+		// never sends a newline cannot make a single read allocate without
+		// bound. The bytes are copied out immediately (the slice is only valid
+		// until the next read) and a partial line just continues next pass.
+		chunk, rerr := reader.ReadSlice('\n')
+		if rerr == bufio.ErrBufferFull {
+			rerr = nil
+		}
+		buf.Write(chunk)
 		if out, code, ok := parseMarkerTail(buf.String()); ok {
 			return out, code, nil
+		}
+		// Checked after the marker so a response that ends exactly at the
+		// ceiling still parses, and the output is dropped rather than returned:
+		// handing the caller the 8 MiB we just refused to accept would defeat
+		// the point.
+		if buf.Len() > maxAgentResponse {
+			return "", 0, fmt.Errorf("guest agent response exceeded %d bytes with no exit marker — output that large belongs in a file, fetched with GetFile", maxAgentResponse)
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
