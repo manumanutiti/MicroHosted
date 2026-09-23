@@ -148,3 +148,23 @@ type VolumeCounts struct {
 	Total    int `json:"total"`
 	Attached int `json:"attached"`
 }
+
+// DoctorReport is the answer of GET /v1/doctor: every disagreement between
+// what the daemon believes exists and what the host actually has. Clean means
+// none. It is read-only — it changes nothing.
+type DoctorReport struct {
+	Clean bool `json:"clean"`
+	// InFlight lists operations running while the report was taken, as
+	// "vm-id: op". Their resources are skipped: they are mid-change.
+	InFlight []string        `json:"in_flight,omitempty"`
+	Findings []DoctorFinding `json:"findings"`
+}
+
+// DoctorFinding is one disagreement. Kind is stable and machine-readable
+// (e.g. "process_orphan", "tap_missing"); Object names the resource (a VM id,
+// a device, a path); Detail says what is wrong in words.
+type DoctorFinding struct {
+	Kind   string `json:"kind"`
+	Object string `json:"object"`
+	Detail string `json:"detail"`
+}

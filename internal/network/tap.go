@@ -19,18 +19,12 @@ var tapNameRe = regexp.MustCompile(`^tap[0-9a-f]{8}$`)
 // vm.Manager.Reconcile). Those are live, not orphans, so they must survive the
 // sweep or reconnecting to a persisted VM would tear down its networking.
 func SweepOrphans(keep map[string]bool) error {
-	out, err := exec.Command("ip", "-o", "link", "show").CombinedOutput()
+	taps, err := ListTaps()
 	if err != nil {
-		return fmt.Errorf("listing links: %w (%s)", err, out)
+		return err
 	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		name := strings.TrimSuffix(fields[1], ":")
-		if tapNameRe.MatchString(name) && !keep[name] {
+	for _, name := range taps {
+		if !keep[name] {
 			if err := DeleteTap(name); err != nil {
 				return fmt.Errorf("sweeping orphaned tap %s: %w", name, err)
 			}

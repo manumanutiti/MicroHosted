@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,8 +23,8 @@ import (
 // — deliberately NOT under Jailer's parent cgroup (<mount>/firecracker).
 // Jailer's cgroup behaviour depends on the flags the SDK gives it, and the
 // SDK only emits its cpuset --cgroup pair when the host exposes NUMA sysfs
-// (/sys/devices/system/node). On hosts without it (e.g. Raspberry Pi
-// kernels), Jailer gets no --cgroup flags and attaches the Firecracker
+// (/sys/devices/system/node). On hosts without it (common on ARM64
+// single-board kernels), Jailer gets no --cgroup flags and attaches the Firecracker
 // process directly to <mount>/firecracker itself. If ApplyLimits enabled
 // controllers in that cgroup's subtree_control — as it must for any child
 // under it to have limit files — cgroup v2's no-internal-process rule makes
@@ -199,4 +200,125 @@ func writeCgroupFile(path, value string) error {
 		return fmt.Errorf("writing %q to %s: %w", value, path, err)
 	}
 	return nil
+}
+
+// OOMEvents reads a VM's memory.events counters: how many times it hit its
+// memory.max (oom) and how many of its processes an OOM killer took
+// (oom_kill — any OOM killer, the host's included). Zeros when the group is
+// gone or the host has no cgroup v2.
+func OOMEvents(d Defaults, vmID string) (oom, oomKill int) {
+	data, err := os.ReadFile(filepath.Join(CgroupDir(d, vmID), "memory.events"))
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, val, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(val))
+		switch key {
+		case "oom":
+			oom = n
+		case "oom_kill":
+			oomKill = n
+		}
+	}
+	return oom, oomKill
+}
+
+// CgroupIDs lists the VM IDs that have a per-VM cgroup on this host, in the
+// daemon's limits tree or in Jailer's — the residue startup and the doctor
+// compare against the VMs actually running.
+func CgroupIDs(d Defaults) []string {
+	if d.CgroupVersion != "2" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	for _, parent := range []string{filepath.Dir(CgroupDir(d, "x")), filepath.Dir(jailerCgroupDir(d, "x"))} {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() && IsVMID(e.Name()) && !seen[e.Name()] {
+				seen[e.Name()] = true
+				ids = append(ids, e.Name())
+			}
+		}
+	}
+	return ids
+}
+
+// CgroupOwner says whose per-VM cgroup a process sits in.
+type CgroupOwner int
+
+const (
+	CgroupNone   CgroupOwner = iota
+	CgroupLimits             // <mount>/microhosted/<id>: only ApplyLimits attaches here
+	CgroupJailer             // Jailer's parent, shared with any other Jailer on the host
+)
+
+// ProcessCgroupOwner classifies the cgroup v2 path of a process — the "0::"
+// line of /proc/<pid>/cgroup, e.g. "0::/microhosted/1a2b3c4d" — against the
+// cgroups this daemon and Jailer create for vmID. It is how a running
+// Firecracker is recognised as ours: once Jailer has pivot_root'ed into its own
+// mount namespace, /proc/<pid>/root no longer reads as the chroot path from the
+// host, and after the exec the command line no longer names the chroot base.
+func ProcessCgroupOwner(d Defaults, procCgroup []byte, vmID string) CgroupOwner {
+	if d.CgroupVersion != "2" {
+		return CgroupNone
+	}
+	var path string
+	for _, line := range strings.Split(string(procCgroup), "\n") {
+		if rest, ok := strings.CutPrefix(line, "0::"); ok {
+			path = rest
+			break
+		}
+	}
+	if path == "" {
+		return CgroupNone
+	}
+	rel := func(dir string) string { return strings.TrimPrefix(dir, cgroupMountPoint) }
+	switch path {
+	case rel(CgroupDir(d, vmID)):
+		return CgroupLimits
+	case rel(jailerCgroupDir(d, vmID)), rel(filepath.Dir(jailerCgroupDir(d, vmID))):
+		// Without --cgroup flags (no NUMA sysfs, common on ARM64 boards) Jailer attaches
+		// straight to its parent, with no per-VM child.
+		return CgroupJailer
+	}
+	return CgroupNone
+}
+
+// InstanceIDs lists the VM IDs that have a jail directory under the chroot
+// base.
+func InstanceIDs(d Defaults) []string {
+	entries, err := os.ReadDir(filepath.Dir(InstanceDir(d, "x")))
+	if err != nil {
+		return nil
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && IsVMID(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids
+}
+
+// IsVMID reports whether s has the shape of a VM ID this daemon hands out
+// (8 lowercase hex characters). Residue sweeps only ever touch names of that
+// shape, so nothing else that happens to live beside them is at risk.
+func IsVMID(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }

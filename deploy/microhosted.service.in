@@ -11,6 +11,13 @@ After=network.target
 # startup instead of later with an obscure Firecracker error.
 AssertPathExists=/dev/kvm
 
+# Never give up restarting. systemd's default start limit (5 starts in 10 s)
+# leaves the unit dead after a crash loop until someone logs in and runs
+# `systemctl reset-failed` — on an unattended gateway that means the VMs run
+# with nobody to reap, restart or reconcile them. The back-off below
+# (RestartSteps) keeps a persistent crash loop from spinning instead.
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 
@@ -31,9 +38,23 @@ KillMode=process
 # the service prevents it from clashing with systemd's management.
 Delegate=yes
 
+# Under host memory pressure the kernel must kill a VM, never the daemon that
+# holds all of them. Children inherit this score, so the daemon resets each
+# Firecracker to 0 right after launch (vm.Manager.applyLimits); the monitor then
+# reports the dead VM as stopped with last_exit set.
+OOMScoreAdjust=-900
+
 # If the daemon crashes, restart it: reconcile re-adopts the VMs still alive.
+# Each automatic restart waits longer, from RestartSec to RestartMaxDelaySec in
+# RestartSteps geometric steps (2 s, ~4 s, ~8 s, ~15 s, ~30 s, then 60 s). The
+# count only goes back to zero on a manual start/restart or `reset-failed`, not
+# after a long healthy run — so a daemon that has crashed 5 times since it was
+# last started by hand waits 60 s before each further restart. The VMs keep
+# running meanwhile (KillMode=process). Needs systemd >= 254.
 Restart=on-failure
 RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=60
 
 # The daemon's graceful shutdown (srv.Shutdown) waits up to 10s; give it room.
 TimeoutStopSec=15

@@ -81,6 +81,12 @@ type ForkVMRequest struct {
 	// the same in-memory IP/MAC, so at most one of them may rejoin the origin
 	// network).
 	Quarantine bool `json:"quarantine,omitempty"`
+
+	// Name and Labels of the new VM (see VMConfig). Nothing is inherited from
+	// the source: a quarantined fork of a sensor's VM taken for forensics must
+	// not claim that sensor, so whoever forks says what the fork is.
+	Name   string            `json:"name,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // RestoreVMRequest is the payload accepted by POST /v1/vms/{id}/restore.

@@ -43,9 +43,13 @@ VM, was retired in Phase 1 — see `docs/networking.md`.)
 ## VM state
 
 ```
-creating → running → paused → running
-                  └──────────────────→ stopped
+creating → running ⇄ stopped        (quarantine is a flag, not a state)
 ```
+
+`creating` is internal (undone if the daemon dies mid-create); a snapshot pauses a
+VM for a fraction of a second without surfacing a state. The full lifecycle — what
+each operation keeps and frees, quarantine, replace — is in
+[engine.md](engine.md#2-a-vms-life).
 
 ## Storage: copy-on-write store
 

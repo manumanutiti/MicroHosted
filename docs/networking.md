@@ -43,9 +43,20 @@ subnet** (per-network IPAM). The guest's gateway is the bridge's.
   exemption for intra-bridge traffic under br_netfilter), not one rule per bridge
   pair: the ruleset stays O(N) with N networks, key for the network-per-VM
   topology.
+- **unknown bridges**: DROP, both ways, first rule of `forward` — and guest →
+  host matches every `mhbr*`, not only the listed ones. Every chain is `policy
+  accept` with drops keyed on the bridges the ruleset lists, so a bridge it does
+  not list would otherwise be the one place with no policy at all: a network
+  mid-create, one whose `nft -f` failed, a bridge a crash left behind. A network
+  is not attachable until the ruleset listing it is in force, and one whose
+  ruleset fails to apply is rolled back entirely.
 - **egress**:
-  - `egress: true`  → `MASQUERADE` of the subnet through the default outbound
-    interface + FORWARD allowed toward the WAN.
+  - `egress: true` + **`egress_iface`** (required) → `MASQUERADE` of the subnet
+    out that interface, and FORWARD allowed through it **only**: anything else
+    that is not one of our bridges (the LAN behind a second NIC, a VPN, a
+    Docker network) is dropped. A network stored before `egress_iface` existed
+    is pinned at startup to the default route's interface; with none usable it
+    is rendered closed and listed by the `egress_policy` health check.
   - `egress: false` → no NAT and FORWARD toward the WAN dropped. **Default**, for
     security (malware-safe): a sample doesn't call home unless explicitly asked.
   - `egress: false` + **`allowed_egress`** → fine-grained egress: only the listed
@@ -217,9 +228,12 @@ chain forward {
   rule doesn't care which VM holds it. That is what lets it survive a reset: a
   VM restored from its snapshot comes back with the snapshot's IP. The other side
   of it: if the address is later handed to a *different* VM on the same network,
-  the traffic follows the address. With one broker-VM per network that can't
-  happen; on shared networks, keeping addresses and VMs paired is the
-  orchestrator's job.
+  the traffic follows the address. So a `to_ip` is **pinned**: automatic
+  allocation (`mh run` without `--ip`) never hands it out, even while it is
+  free — after its VM is destroyed or quarantined, an unrelated new VM cannot
+  pick up the traffic meant for it. Only an explicit claim takes it: a create
+  with `guest_ip` (`mh run --ip`), or a fork of a snapshot taken at that
+  address. That is how a replacement takes over the function.
 - **An explicit subnet is required at create time.** With an auto-allocated one
   the caller couldn't have picked `to_ip` inside it. Or create the network first
   and add the rules with `PUT /v1/networks/{name}/ingress`.

@@ -105,7 +105,7 @@ func TestCreateVMBuildsRequest(t *testing.T) {
 	// Verb-first spelling, flags after the positional, short and long flags,
 	// size suffixes: all the ways a person actually types it.
 	code, out, errOut := f.run("", "create", "vm", "base-alpine", "--net", "lab", "-c", "2", "-m", "1G", "--disk", "2g",
-		"-v", "sample:/mnt/s:ro", "-v", "output")
+		"-v", "sample:/mnt/s:ro", "-v", "output", "--autostart")
 	if code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}
@@ -121,7 +121,8 @@ func TestCreateVMBuildsRequest(t *testing.T) {
 	}
 	want := types.CreateVMRequest{
 		Template: "base-alpine", Network: "lab", VCPUs: 2, MemMB: 1024, DiskMB: 2048,
-		Volumes: []types.VolumeAttachRequest{{Name: "sample", GuestPath: "/mnt/s", ReadOnly: true}, {Name: "output"}},
+		Volumes:   []types.VolumeAttachRequest{{Name: "sample", GuestPath: "/mnt/s", ReadOnly: true}, {Name: "output"}},
+		Autostart: true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("request = %+v\nwant      %+v", got, want)
@@ -144,6 +145,38 @@ func TestPsHidesStoppedUnlessAll(t *testing.T) {
 	_, out, _ = f.run("", "vm", "ls", "-a")
 	if !strings.Contains(out, "VM ID") || !strings.Contains(out, "172.16.0.2") {
 		t.Errorf("table output missing header or rows:\n%s", out)
+	}
+}
+
+func TestVMUpdateAutostart(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply(twoVMs))
+	mux.HandleFunc("PUT /v1/vms/{id}/autostart", reply(twoVMs[0]))
+	f := newFakeAPI(t, mux)
+
+	for _, tc := range []struct {
+		flag string
+		want bool
+	}{{"--autostart", true}, {"--no-autostart", false}} {
+		code, out, errOut := f.run("", "vm", "update", "a1b", tc.flag)
+		if code != 0 || out != "a1b2c3d4\n" {
+			t.Fatalf("%s: exit %d, out %q, stderr %q", tc.flag, code, out, errOut)
+		}
+		req := f.last("PUT")
+		var got types.UpdateVMAutostartRequest
+		if err := json.Unmarshal(req.body, &got); err != nil {
+			t.Fatal(err)
+		}
+		if req.path != "/v1/vms/a1b2c3d4/autostart" || got.Autostart != tc.want {
+			t.Errorf("%s: PUT %s %+v, want autostart=%v", tc.flag, req.path, got, tc.want)
+		}
+	}
+
+	if code, _, _ := f.run("", "vm", "update", "a1b"); code == 0 {
+		t.Error("vm update with no flag must refuse")
+	}
+	if code, _, _ := f.run("", "vm", "update", "a1b", "--autostart", "--no-autostart"); code == 0 {
+		t.Error("--autostart with --no-autostart must refuse")
 	}
 }
 
@@ -386,7 +419,7 @@ func TestNetworkLegacyFlagsStillWork(t *testing.T) {
 		{"--rm-allow", "icmp:203.0.113.7"},
 		{"--allow", "tcp:1.2.3.4:80"},
 		{"--no-egress"},
-		{"--egress"},
+		{"--egress", "eth0"},
 		{"--add-ingress", "tcp:192.168.50.60:1883@wlan0=172.16.9.2"},
 		{"--ingress", "tcp:192.168.50.60:1883@wlan0=172.16.9.2"},
 		{"--no-ingress"},
@@ -476,5 +509,73 @@ func TestResolveHost(t *testing.T) {
 	}
 	if _, err := NewClient("nonsense"); err == nil {
 		t.Error("NewClient accepted a host with no scheme, path or port")
+	}
+}
+
+func TestVMNamesAndLabels(t *testing.T) {
+	named := []types.VMResponse{
+		{ID: "a1b2c3d4", Name: "ts01-a", Labels: map[string]string{"sensor": "ts-01"}, Template: "alpine-py", State: types.VMStateRunning, CreatedAt: "2026-09-23T10:00:00Z"},
+		{ID: "b1b2c3d4", Template: "alpine-py", State: types.VMStateRunning, CreatedAt: "2026-09-23T09:00:00Z"},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply(named))
+	mux.HandleFunc("POST /v1/vms", replyStatus(http.StatusCreated, named[0]))
+	mux.HandleFunc("PATCH /v1/vms/{id}/labels", reply(named[0]))
+	mux.HandleFunc("DELETE /v1/vms/{id}", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	f := newFakeAPI(t, mux)
+
+	code, _, errOut := f.run("", "run", "alpine-py", "--name", "ts01-a", "-l", "sensor=ts-01", "--label", "managed-by=ot")
+	if code != 0 {
+		t.Fatalf("run: exit %d, stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "a1b2c3d4 (ts01-a)") {
+		t.Errorf("stderr %q should name the new VM", errOut)
+	}
+	var req types.CreateVMRequest
+	if err := json.Unmarshal(f.last("POST").body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Name != "ts01-a" || !reflect.DeepEqual(req.Labels, map[string]string{"sensor": "ts-01", "managed-by": "ot"}) {
+		t.Errorf("request name %q labels %v", req.Name, req.Labels)
+	}
+	if code, _, _ := f.run("", "run", "alpine-py", "-l", "novalue"); code == 0 {
+		t.Error("a label without = must be refused before calling the daemon")
+	}
+
+	// The selector travels as ?label=, one per term; the daemon filters.
+	f.run("", "ps", "-l", "sensor=ts-01", "-l", "managed-by=ot")
+	if q := f.last("GET").query; q != "label=sensor%3Dts-01&label=managed-by%3Dot" {
+		t.Errorf("ps -l query = %q", q)
+	}
+	_, out, _ := f.run("", "ps")
+	if !strings.Contains(out, "NAME") || !strings.Contains(out, "ts01-a") {
+		t.Errorf("ps table should show the NAME column:\n%s", out)
+	}
+	if strings.Contains(out, "LABELS") {
+		t.Errorf("labels are opt-in (--show-labels):\n%s", out)
+	}
+	_, out, _ = f.run("", "ps", "-L")
+	if !strings.Contains(out, "LABELS") || !strings.Contains(out, "sensor=ts-01") {
+		t.Errorf("ps -L should show the LABELS column:\n%s", out)
+	}
+
+	// A name is a reference like an ID.
+	if code, out, _ := f.run("", "rm", "ts01-a"); code != 0 || out != "a1b2c3d4\n" || f.last("DELETE").path != "/v1/vms/a1b2c3d4" {
+		t.Errorf("rm by name: exit %d, out %q, DELETE %s", code, out, f.last("DELETE").path)
+	}
+
+	// label: KEY=VALUE sets, KEY- removes, as a merge patch.
+	if code, _, errOut := f.run("", "label", "ts01-a", "sensor=ts-02", "role-"); code != 0 {
+		t.Fatalf("label: exit %d, stderr %q", code, errOut)
+	}
+	patch := f.last("PATCH")
+	if patch.path != "/v1/vms/a1b2c3d4/labels" {
+		t.Errorf("PATCH %s", patch.path)
+	}
+	if strings.TrimSpace(string(patch.body)) != `{"labels":{"role":null,"sensor":"ts-02"}}` {
+		t.Errorf("PATCH body = %s", patch.body)
+	}
+	if code, _, _ := f.run("", "label", "ts01-a", "oops"); code == 0 {
+		t.Error("label with neither = nor a trailing - must refuse")
 	}
 }

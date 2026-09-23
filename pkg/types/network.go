@@ -20,9 +20,18 @@ type Network struct {
 	Gateway string
 
 	// Egress controls internet reachability: true → the subnet is MASQUERADEd
-	// out the host's default route; false (default, malware-safe) → no NAT and
-	// forwarding to the WAN is dropped.
+	// out EgressIface and may leave through that interface only; false
+	// (default, malware-safe) → no NAT and forwarding to the WAN is dropped.
 	Egress bool
+
+	// EgressIface is the one host interface an Egress network leaves through
+	// (e.g. "eth0"). Required with Egress: "everything that is not one of our
+	// bridges" would include the plant LAN behind a second NIC, the VPN and
+	// the Docker networks — in an OT gateway, the pivot to the trusted side.
+	// Never a managed interface (those take allowed_egress rules with @iface).
+	// An Egress network without one (a record from before this field) is
+	// rendered as no egress at all until it gets one.
+	EgressIface string
 
 	// AllowedEgress punches specific holes in a non-egress network's WAN drop:
 	// only the listed destination/protocol/port flows are forwarded (and
@@ -114,6 +123,9 @@ type CreateNetworkRequest struct {
 	// Subnet is optional: if empty, a free /24 is auto-allocated from the pool.
 	Subnet string `json:"subnet,omitempty"`
 	Egress bool   `json:"egress,omitempty"`
+	// EgressIface is required with Egress: the host interface it leaves
+	// through (see Network.EgressIface).
+	EgressIface string `json:"egress_iface,omitempty"`
 	// AllowedEgress lists the only WAN flows this network may open. Requires
 	// Egress to be false/omitted.
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
@@ -131,6 +143,7 @@ type CreateNetworkRequest struct {
 // exclusive, omitting both means "no egress at all".
 type UpdateNetworkEgressRequest struct {
 	Egress        bool         `json:"egress,omitempty"`
+	EgressIface   string       `json:"egress_iface,omitempty"`
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
 }
 
@@ -154,6 +167,7 @@ type NetworkResponse struct {
 	Subnet         string        `json:"subnet"`
 	Gateway        string        `json:"gateway"`
 	Egress         bool          `json:"egress"`
+	EgressIface    string        `json:"egress_iface,omitempty"`
 	AllowedEgress  []EgressRule  `json:"allowed_egress,omitempty"`
 	AllowedIngress []IngressRule `json:"allowed_ingress,omitempty"`
 	Intra          bool          `json:"intra"`
@@ -168,6 +182,7 @@ func NewNetworkResponse(n *Network) NetworkResponse {
 		Subnet:         n.Subnet,
 		Gateway:        n.Gateway,
 		Egress:         n.Egress,
+		EgressIface:    n.EgressIface,
 		AllowedEgress:  n.AllowedEgress,
 		AllowedIngress: n.AllowedIngress,
 		Intra:          n.Intra,

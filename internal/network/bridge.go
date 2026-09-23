@@ -2,7 +2,9 @@ package network
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -120,4 +122,107 @@ func CreateTapEnslaved(tap, bridge string, isolated bool) error {
 		}
 	}
 	return nil
+}
+
+// DetachTap takes a live TAP off its bridge, leaving it up and enslaved to
+// nothing — the state CreateTapQuarantined builds, reached without touching
+// the VM behind it. Idempotent: detaching a TAP with no master succeeds.
+func DetachTap(tap string) error {
+	if out, err := exec.Command("ip", "link", "set", "dev", tap, "nomaster").CombinedOutput(); err != nil {
+		return fmt.Errorf("detaching %s from its bridge: %w (%s)", tap, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// EnslaveTap puts a live TAP on bridge with the given port isolation — the
+// converse of DetachTap. Idempotent: re-enslaving to the same bridge is a no-op
+// for the kernel, so it also converges a TAP that may or may not be detached.
+func EnslaveTap(tap, bridge string, isolated bool) error {
+	if out, err := exec.Command("ip", "link", "set", "dev", tap, "master", bridge).CombinedOutput(); err != nil {
+		return fmt.Errorf("enslaving %s to %s: %w (%s)", tap, bridge, err, strings.TrimSpace(string(out)))
+	}
+	return SetTapIsolation(tap, isolated)
+}
+
+// listLinks returns the names of the host's network devices starting with
+// prefix — how startup and the doctor find this daemon's own devices by their
+// naming convention.
+func listLinks(prefix string) ([]string, error) {
+	out, err := exec.Command("ip", "-o", "link", "show").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("listing links: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return parseLinkNames(string(out), prefix), nil
+}
+
+// parseLinkNames extracts device names from `ip -o link show` output. A device
+// with a parent prints as "name@parent:", so only the part before '@' counts.
+func parseLinkNames(out, prefix string) []string {
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimSuffix(fields[1], ":")
+		name, _, _ = strings.Cut(name, "@")
+		if strings.HasPrefix(name, prefix) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// ListTaps returns the TAP devices on the host that follow this daemon's
+// naming ("tap" + 8 hex chars).
+func ListTaps() ([]string, error) {
+	all, err := listLinks("tap")
+	if err != nil {
+		return nil, err
+	}
+	var taps []string
+	for _, n := range all {
+		if tapNameRe.MatchString(n) {
+			taps = append(taps, n)
+		}
+	}
+	return taps, nil
+}
+
+// ListBridges returns the bridges on the host that follow this daemon's naming
+// (BridgePrefix + id).
+func ListBridges() ([]string, error) {
+	return listLinks(BridgePrefix)
+}
+
+// defaultRouteIface returns the interface of the host's IPv4 default route
+// with the lowest metric, read from /proc/net/route.
+func defaultRouteIface() (string, error) {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return "", err
+	}
+	return parseDefaultRoute(string(data))
+}
+
+func parseDefaultRoute(table string) (string, error) {
+	best, bestMetric := "", -1
+	for i, line := range strings.Split(table, "\n") {
+		f := strings.Fields(line)
+		// Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+		if i == 0 || len(f) < 8 || f[1] != "00000000" || f[7] != "00000000" {
+			continue
+		}
+		metric, err := strconv.Atoi(f[6])
+		if err != nil {
+			continue
+		}
+		if bestMetric < 0 || metric < bestMetric {
+			best, bestMetric = f[0], metric
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf("no IPv4 default route")
+	}
+	return best, nil
 }

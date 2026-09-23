@@ -30,6 +30,7 @@ var networkGroup = &group{
 // the VM poll the sensor?" vs "may the sensor push to the VM?"). The API keeps
 // its names; the old flag spellings keep working, hidden.
 const netDirections = `OUT = the VM opens the connection        VM → destination (internet, or a device @IFACE)
+      --internet IFACE opens ALL outbound, through that host interface only
 IN  = a device opens it towards a VM      device on a managed IFACE → VM
 Everything not listed is dropped, both ways.`
 
@@ -182,7 +183,10 @@ func describeIngress(n types.NetworkResponse) string {
 
 func describeEgress(n types.NetworkResponse) string {
 	if n.Egress {
-		return "internet"
+		if n.EgressIface == "" {
+			return "CLOSED (internet without an interface: set one with --internet IFACE)"
+		}
+		return "internet@" + n.EgressIface
 	}
 	if len(n.AllowedEgress) == 0 {
 		return "none"
@@ -206,7 +210,7 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	var allow, ingress []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.listVar(&allow, "out", "", "allow an OUT flow: `RULE` = "+ruleSyntax+" (repeatable)")
-	fs.boolVar(&req.Egress, "internet", "", "allow ALL outbound to the internet (NAT) instead of --out rules")
+	fs.stringVar(&req.EgressIface, "internet", "", "", "allow ALL outbound through host interface `IFACE` (NAT), e.g. eth0, instead of --out rules")
 	fs.listVar(&ingress, "in", "", "allow an IN flow: `RULE` = "+ingressSyntax+" (repeatable; needs --subnet)")
 	fs.stringVar(&req.Subnet, "subnet", "", "", "`CIDR`, e.g. 10.10.0.0/24 (default: a free /24)")
 	fs.boolVar(&req.Intra, "intra", "", "let the network's VMs reach each other; off by default")
@@ -221,6 +225,7 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 		return usagef(p, "expected exactly one NAME")
 	}
 	req.Name = pos[0]
+	req.Egress = req.EgressIface != ""
 	if req.AllowedEgress, err = parseRules(allow); err != nil {
 		return usagef(p, "%v", err)
 	}
@@ -314,14 +319,15 @@ func netInspect(e *env, cmd *command, p string, args []string) error {
 }
 
 func netUpdate(e *env, cmd *command, p string, args []string) error {
-	var egress, noEgress, intra, noIntra, noIngress bool
+	var noEgress, intra, noIntra, noIngress bool
+	var egressIface string
 	var allow, addAllow, rmAllow, ingress, addIngress, rmIngress []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.listVar(&addAllow, "out", "", "add an OUT `RULE` = "+ruleSyntax+" (repeatable)")
 	fs.listVar(&rmAllow, "rm-out", "", "remove an OUT `RULE` (repeatable)")
 	fs.listVar(&allow, "set-out", "", "REPLACE all OUT rules with these `RULE`s (repeatable)")
 	fs.boolVar(&noEgress, "no-out", "", "close all outbound")
-	fs.boolVar(&egress, "internet", "", "allow ALL outbound to the internet (replaces the OUT rules)")
+	fs.stringVar(&egressIface, "internet", "", "", "allow ALL outbound through host interface `IFACE`, e.g. eth0 (replaces the OUT rules)")
 	fs.listVar(&addIngress, "in", "", "add an IN `RULE` = "+ingressSyntax+" (repeatable)")
 	fs.listVar(&rmIngress, "rm-in", "", "remove an IN `RULE` (repeatable)")
 	fs.listVar(&ingress, "set-in", "", "REPLACE all IN rules with these `RULE`s (repeatable)")
@@ -346,6 +352,7 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	}
 	name := pos[0]
 
+	egress := egressIface != ""
 	modes := 0
 	for _, set := range []bool{egress, noEgress, len(allow) > 0, len(addAllow)+len(rmAllow) > 0} {
 		if set {
@@ -404,7 +411,7 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	if modes == 1 {
 		// The API replaces the whole policy; --out/--rm-out are the CLI
 		// merging onto what is there now.
-		req := types.UpdateNetworkEgressRequest{Egress: egress, AllowedEgress: allowRules}
+		req := types.UpdateNetworkEgressRequest{Egress: egress, EgressIface: egressIface, AllowedEgress: allowRules}
 		if len(addRules)+len(rmRules) > 0 {
 			cur, err := getNetwork(c, name)
 			if err != nil {

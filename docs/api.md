@@ -121,7 +121,8 @@ Named L2 segments (bridge + subnet + nftables policy). Model detail in
 |------------------|--------|----------|---------------------------------------------------------------------|
 | `name`           | string | yes      | unique network name                                                |
 | `subnet`         | string | no       | CIDR (e.g. `10.10.0.0/24`); if omitted, a free `/24` is assigned   |
-| `egress`         | bool   | no       | if `true`, the subnet goes to the internet via NAT; `false` by default |
+| `egress`         | bool   | no       | if `true`, the subnet goes out via NAT through `egress_iface`, and only through it; `false` by default |
+| `egress_iface`   | string | with `egress` | the host interface full egress leaves through (e.g. `eth0`). Required with `egress: true`, forbidden without it. Never a managed interface, a VPN you did not mean, or one of the daemon's own bridges/taps: "everything that is not a bridge" would include the LAN behind a second NIC, VPNs and Docker networks |
 | `allowed_egress` | array  | no       | fine-grained egress: only these flows reach the WAN; requires `egress` = `false`. See `docs/networking.md` |
 | `allowed_ingress` | array | no       | devices on a managed interface allowed to connect into one guest address (DNAT); requires `subnet`. See `docs/networking.md` § Ingress |
 | `intra`          | bool   | no       | if `true`, the network's VMs see each other (L2); `false` by default: each TAP is an isolated bridge port |
@@ -132,7 +133,7 @@ for tcp/udp and forbidden for icmp.
 
 ```bash
 mhcurl -X POST http://localhost/v1/networks -d '{"name":"lab"}'
-mhcurl -X POST http://localhost/v1/networks -d '{"name":"build","egress":true}'
+mhcurl -X POST http://localhost/v1/networks -d '{"name":"build","egress":true,"egress_iface":"eth0"}'
 mhcurl -X POST http://localhost/v1/networks -d '{"name":"iot","allowed_egress":[
   {"ip":"203.0.113.7","protocol":"tcp","port":8883},
   {"ip":"203.0.113.7","protocol":"icmp"}]}'
@@ -166,8 +167,16 @@ mhcurl -X POST http://localhost/v1/networks -d '{"name":"mqtt-60","subnet":"172.
 **201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
 `allowed_egress` or `allowed_ingress` rule is invalid (including an ingress rule
 without `subnet`, with `to_ip` outside it, or clashing with another network's),
-or if `egress: true` and `allowed_egress` are combined · **500** if the name already exists, the subnet is invalid, or bridge
-creation fails.
+if `egress: true` comes without `egress_iface` (or `egress_iface` without
+`egress`), or if `egress: true` and `allowed_egress` are combined · **500** if the
+name already exists, the subnet is invalid or overlaps another network's, bridge
+creation fails, or the firewall ruleset cannot be applied.
+
+**The network is all or nothing.** Its bridge comes up dark — the ruleset drops
+any `mhbr*` bridge it does not list — and no VM can attach to it until the
+ruleset that covers it is in force. If `nft` fails, the network is rolled back
+entirely (bridge, subnet, record) and the call returns 500: a network outside
+the policy never exists.
 
 ### `GET /v1/networks` · `GET /v1/networks/{name}`
 
@@ -179,7 +188,8 @@ Lists all networks / detail of one. **Shape of `NetworkResponse`:**
 | `bridge`     | Linux bridge backing it (`mhbr<id>`)                    |
 | `subnet`     | the network's CIDR                                      |
 | `gateway`    | the host's IP on the bridge (the `.1`, the guests' route) |
-| `egress`     | whether it has internet egress                          |
+| `egress`     | whether it has full egress                              |
+| `egress_iface` | the interface full egress leaves through. A network created before this field existed was pinned at startup to the default route's interface; if there was none usable, it has `egress: true` with no `egress_iface` and its egress is **closed** (the `egress_policy` health check lists it) |
 | `allowed_egress` | fine-grained egress rules, if any (omitted if empty) |
 | `allowed_ingress` | ingress rules, if any (omitted if empty) |
 | `intra`      | whether the network's VMs can see each other           |
@@ -188,8 +198,12 @@ Lists all networks / detail of one. **Shape of `NetworkResponse`:**
 ### `PUT /v1/networks/{name}/egress` — update the egress policy live
 
 Replaces the **whole** egress policy (no merge) without touching the connected
-VMs. Same fields and validation as on creation: `egress` (bool) and
-`allowed_egress` (array), mutually exclusive.
+VMs. Same fields and validation as on creation: `egress` (bool) with its
+`egress_iface`, or `allowed_egress` (array) — mutually exclusive.
+
+The new policy is applied **before** it is saved: if `nft` rejects it, the call
+fails and both the daemon and its database keep the previous policy, so what
+the API reports is always what is in force.
 
 ```bash
 mhcurl -X PUT http://localhost/v1/networks/pingtest/egress -d '{"allowed_egress":[
@@ -272,12 +286,16 @@ network doesn't exist.
 | field         | type   | required | description                                                                 |
 |---------------|--------|----------|------------------------------------------------------------------------------|
 | `template`    | string | yes      | name of a catalog template                                                  |
-| `vcpus`       | int    | no       | overrides the template's `vcpus`                                            |
-| `mem_mb`      | int    | no       | overrides the template's `mem_mb`                                           |
+| `name`        | string | no       | alias for this VM, unique among the VMs the daemon tracks, fixed for its life (see "Names and labels") |
+| `labels`      | object | no       | `{"key": "value", …}` metadata, changeable later (see "Names and labels") |
+| `vcpus`       | int    | no       | overrides the template's `vcpus`; 1–32                                      |
+| `mem_mb`      | int    | no       | overrides the template's `mem_mb`; at least 32                              |
 | `disk_mb`     | int    | no       | overrides the template's `disk_mb`; only grows (never shrinks)             |
 | `network`     | string | no       | segmented network to connect the VM to (see `## Networks`); empty = `default` |
 | `no_network`  | bool   | no       | if `true`, no TAP/IP is created — the VM is only reachable over vsock (`/exec`) |
+| `guest_ip`    | string | no       | take this exact address on `network` instead of the next free one; **409** if someone holds it, **400** if it isn't a guest address of the subnet. The only way to get an address an ingress rule points at (see `docs/networking.md`) |
 | `volumes`     | array  | no       | volumes to attach at boot (see `## Volumes`); each one `{name, read_only?, guest_path?}` |
+| `autostart`   | bool   | no       | if `true`, the daemon boots the VM again when it starts and finds it dead (host reboot) — see "Host reboot" below |
 
 ```bash
 mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu"}'
@@ -289,9 +307,43 @@ mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu","no_network
              {"name":"output"}]}'
 ```
 
-**201 response** (`VMResponse`, see below) · **400** if `template` is missing or
-the JSON is invalid · **500** if clone/network/boot fails (the error message
+**201 response** (`VMResponse`, see below) · **400** if `template` is missing,
+the JSON is invalid, or a name, label or size is malformed (checked before
+anything is touched on the host) · **409** if the name is taken · **503** if the host has no room for it right now (see
+"Admission" below) · **500** if clone/network/boot fails (the error message
 includes which step failed).
+
+**All or nothing.** The VM is recorded as `creating` before its first side
+effect. Any failure undoes everything that step and the previous ones made —
+process, TAP, IP, volume claims, jail dir, cgroup, disk clone, console log,
+record. If the daemon itself dies in the middle, its next start does the same
+undo. A create ends in a running VM or in nothing.
+
+**Resources become host limits.** `vcpus` and `mem_mb` are not only what the
+guest sees: the daemon writes them into the VM's cgroup, so a guest cannot take
+more whatever it runs — `cpu.max` = `vcpus` full cores, `memory.max` = `mem_mb`
++ 64 MiB for Firecracker itself (no swap), `pids.max` = `vcpus` + 16. Neither
+can be changed after the create. Disk and network throughput are not limited
+yet.
+
+**Names and labels.** The ID is what the daemon generates; `name` is an alias
+you choose — a DNS label (`[a-z0-9-]`, at most 63, not shaped like an ID) —
+refused with 409 while another VM holds it and free again once that VM is
+destroyed. It names *this instance*: a VM that replaces another gets a name of
+its own. What survives replacement — the sensor a VM serves, the orchestrator
+that owns it — goes in `labels`: up to 32, keys `[a-z0-9._/-]`, values
+`[A-Za-z0-9._-]`, at most 63 each. Filter by them with `GET /v1/vms?label=k=v`,
+change them with `PATCH /v1/vms/{id}/labels`. A label written wrong is a 400,
+never dropped. The API addresses VMs by ID only; `mh` resolves names.
+
+**Admission.** A create (and a fork, a start, a restore of a stopped VM) waits
+for one of `--max-parallel-boots` launch slots (default 4), then is refused with
+**503** when the host's `MemAvailable`, minus what launches in progress will
+take, minus the new VM's `mem_mb`, would fall under `--mem-reserve-mb` (default
+512), or when running VMs plus launches in progress reach `--max-vms` (off by
+default). It is judged against what the host has *now*, not against the sum of
+`mem_mb`: guest RAM is paged in on demand, so a 128 MB VM costs ~34 MB. A
+request cancelled while waiting for a slot gives up its place.
 
 Each `POST` clones the template's rootfs from scratch
 (`internal/storage.CloneRootfs`, copy-on-write via `cp --reflink=auto`) and grows
@@ -309,11 +361,13 @@ part of the pending work.
 
 ```bash
 mhcurl http://localhost/v1/vms
+mhcurl 'http://localhost/v1/vms?label=sensor=ts-01'
+mhcurl 'http://localhost/v1/vms?label=sensor=ts-01&label=managed-by=ot'   # both must hold
 ```
 
-**200 response** — an array of `VMResponse`. Intended as the basis of the future
-"`docker ps` of microVMs" — today it's a flat list, with no filters or status
-columns beyond `state`.
+**200 response** — an array of `VMResponse`. `label=KEY=VALUE` (repeatable, or
+comma-separated) keeps only the VMs carrying every one of those labels ·
+**400** if a selector term is malformed.
 
 ---
 
@@ -343,6 +397,7 @@ mhcurl http://localhost/v1/vms/a1b2c3d4
 | `rootfs_path` | the VM's disk (rootfs clone) on the host                                    |
 | `log_path`    | the file with this VM's serial console + Jailer/Firecracker logs            |
 | `created_at`  | RFC3339 timestamp                                                            |
+| `last_exit`   | `{at, reason}`: the last time the VM's process died **on its own** (not a stop/destroy/restore). The daemon notices within ~2 s, marks the VM `stopped` (disk, IP and volumes kept, like `stop`) and records why: `killed by the OOM killer (reached its cgroup memory.max)`, `killed by the host's OOM killer (host out of memory)`, or `process exited` (a Firecracker crash, or the guest rebooting — Firecracker exits on a guest reboot). It is **not** restarted: that is policy, the orchestrator's call |
 
 Note: `VMResponse` doesn't currently include `socket_path` or `vsock_path` (they
 exist in the internal `types.VM` type but aren't serialized) — pending a decision
@@ -356,8 +411,14 @@ on whether to expose them.
 mhcurl -X DELETE http://localhost/v1/vms/a1b2c3d4
 ```
 
-**204 response** · **404** if it doesn't exist or if stop/cleanup fails (the error
-detail is in the body).
+**204 response** · **404** if it doesn't exist · **409** if another operation on
+the VM is in progress · **500** if stop/cleanup fails (the error detail is in the
+body).
+
+**One operation per VM at a time.** Destroy, stop, start, snapshot and restore
+each take the VM for their duration; a second one on the same VM gets **409**
+naming the operation in progress, instead of racing it (two starts would launch
+two Firecrackers on one disk).
 
 Stops the machine (`firecracker.Stop`: ACPI graceful + SIGTERM backup, or a signal
 by PID if it's a VM adopted after a restart), deletes the TAP, frees the IP in its
@@ -398,6 +459,115 @@ it doesn't exist · **409** if it isn't stopped.
 Recreates the TAP (which was released on stop) and relaunches Firecracker on the
 **same** ext4 and the **same** IP it had. The network's bridge is still up (stop
 doesn't touch it), so it cold-boots with the disk and addressing intact.
+
+### `PUT /v1/vms/{id}/autostart` — boot again after a host reboot
+
+```bash
+mhcurl -X PUT http://localhost/v1/vms/a1b2c3d4/autostart -d '{"autostart":true}'
+```
+
+**200 response** with the `VMResponse` (`autostart` reflects the new value) ·
+**404** if it doesn't exist. Persisted immediately.
+
+### `PATCH /v1/vms/{id}/labels` — change labels
+
+A merge patch: a key with a value sets it, a key with `null` removes it, and
+every label not mentioned stays as it is.
+
+```bash
+mhcurl -X PATCH http://localhost/v1/vms/a1b2c3d4/labels \
+  -d '{"labels":{"sensor":"ts-02","role":null}}'
+```
+
+**200 response** with the `VMResponse` · **400** if a key or value is malformed
+or the result would exceed 32 labels (nothing is changed) · **404** if it
+doesn't exist. Persisted immediately. The name cannot be changed.
+
+### `POST /v1/vms/{id}/quarantine` — cut a VM off its network in place
+
+Takes the VM out of service **without stopping it**: its TAP leaves the
+network's bridge (still up, enslaved to nothing — the same state a
+`quarantine: true` fork gets), its IP reservation goes back to the network, and
+it is marked `quarantine: true` with the label `lease=quarantined`. The guest
+keeps running and still believes it has its address, but every frame it sends
+dies at the host; `exec` and `files` (vsock) keep working, for investigating
+it. Its `name` and other labels are kept. No body.
+
+```bash
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/quarantine
+```
+
+**200 response** with the `VMResponse` (`network` empty, `guest_ip` = what the
+guest believes) · **404** if it doesn't exist · **409** if it is already
+quarantined or another operation on it is in progress · **400** if it already
+carries 32 labels (no room for `lease`). Persisted before it is reported; on
+failure nothing has changed.
+
+It is one-way: a quarantined VM returns to service only as a new VM. A stopped
+VM can be quarantined too, and `start`/`restore` then bring it back bridge-less.
+The freed IP can be claimed right after the 200 — this is the first half of a
+lease: quarantine the suspect, then fork/restore its replacement onto the same
+address (`ClaimVM` refuses an address still held, so the order is mandatory).
+
+### `POST /v1/vms/{id}/replace` — hand a VM's function to a new VM
+
+A new VM takes over the old one's **function**: its network address (so
+`allowed_ingress` rules keep pointing at it) and its labels. Deciding *that* a VM
+must be replaced — it died, stopped answering, looks compromised — is the
+orchestrator's call; this makes the handover safe.
+
+**Body** (`ReplaceVMRequest`, optional):
+
+| field      | type   | description |
+|------------|--------|-------------|
+| `snapshot` | string | fork the replacement from this snapshot; it must have been taken at the function's address (**409** otherwise) |
+| `template` | string | boot the replacement from this template, with the old VM's vcpus/mem/disk. Neither given: the old VM's template |
+| `old`      | string | `quarantine` (default: left running, cut off, reachable over vsock) · `stop` (quarantined and powered off: disk kept, RAM freed) · `destroy` |
+| `name`     | string | name for the replacement (it does not inherit the old one's) |
+| `labels`   | object | merged over the labels it inherits (all of the old VM's but `lease`) |
+
+```bash
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/replace -d '{"old":"stop"}'
+```
+
+Order: every check first (source exists and serves at the function's address,
+no volumes, **no other VM already serves the function**) → the old VM is cut
+off (as `quarantine`), freeing the address → with `stop`/`destroy` it is powered
+off, so its RAM is free → the replacement boots claiming the address and
+inherits labels and `autostart`, and records `replaces` → only then, with
+`destroy`, the old VM is deleted.
+
+**200 response** (`ReplaceVMResponse`): `{"replacement": VMResponse, "old":
+VMResponse}` (`old` absent when destroyed) · **400** malformed request or
+unknown template (nothing changed) · **404** unknown VM or snapshot · **409**
+another VM already serves the function (replacing the same VM twice cannot
+boot two VMs), the VM serves on no network, has volumes, or is busy · **503** /
+**500** if the replacement could not boot.
+
+If the replacement fails, the old VM **stays quarantined, never reconnected**:
+the function is down, the error says so, and the same replace can be retried
+(a quarantined VM keeps `quarantined_from`, its function's network). Backing off
+between retries and giving up after repeated failures is the orchestrator's job.
+
+### Host reboot
+
+A host reboot kills every Firecracker process; disks, IP reservations and
+volumes survive. On startup `Reconcile` finds each VM dead and **keeps it as
+stopped** — the same state `stop` leaves — so `start` brings it back with its
+data. Then it boots, one at a time and in the background, the ones with
+`autostart: true`. A VM stopped on purpose (`stop`) stays off even with
+`autostart`. Only a VM whose disk is gone too is swept and forgotten.
+
+`autostart` only acts at daemon startup: it is not a crash supervisor, and
+nothing restarts a VM that dies while the daemon is up (it is marked `stopped`
+with `last_exit`, see `VMResponse`). Autostart boots go through admission like
+any start: on a host that no longer fits them all, the rest stay stopped and
+the log says why.
+
+On every start the daemon also undoes creates it died in the middle of, kills
+Firecracker processes nobody adopted, removes jail dirs and cgroups of VMs that
+are not running, and releases volume claims of VMs that no longer exist. It
+never deletes a disk it cannot tie to a record: `GET /v1/doctor` reports those.
 
 ---
 
@@ -488,7 +658,10 @@ restored from it running (they have their own copies/hardlinks). **204** on dele
 
 ### `POST /v1/snapshots/{id}/fork` — fork
 
-**Body** (`ForkVMRequest`, optional): `{"quarantine": true}`.
+**Body** (`ForkVMRequest`, optional): `{"quarantine": true, "name": "…",
+"labels": {…}}`. The fork inherits neither the name nor the labels of the VM
+the snapshot came from: a quarantined copy of a sensor's VM taken for forensics
+must not claim that sensor, so whoever forks says what the fork is.
 
 ```bash
 # Normal fork: requires the snapshot's IP free in its origin network
@@ -514,8 +687,8 @@ existing snapshots must be recreated (their format is tied to the version).
 
 ### `POST /v1/vms/{id}/fork` — direct fork of a running VM
 
-**Body** (`ForkVMRequest`, optional): `{"quarantine": true}` — the same as the fork
-from a snapshot.
+**Body** (`ForkVMRequest`, optional): `{"quarantine": true, "name": "…",
+"labels": {…}}` — the same as the fork from a snapshot, nothing inherited.
 
 ```bash
 # Quarantine copy of a live VM, in one call
@@ -774,6 +947,34 @@ and `detail` (the reason on failure; on `disk_space`, the figures always):
 | `firecracker`    | the Firecracker binary exists and responds to `--version`                 |
 | `egress_policy`  | every stored egress rule is enforceable. A rule naming an interface the daemon does not manage (restarted without the `--managed-iface` it had) is **not applied**, because its hole is only safe inside that interface's deny-both-ways policy. This check lists those rules, so the policy the API reports is never silently different from the one in force |
 
+### `GET /v1/doctor` — drift between the daemon and the host
+
+```bash
+mhcurl http://localhost/v1/doctor | jq .
+```
+
+**200 response** (`DoctorReport`, always 200): `{"clean": bool, "in_flight":
+["id: op", ...], "findings": [{"kind", "object", "detail"}, ...]}`. Compares what
+the daemon believes exists with what the host has, and lists every
+disagreement. Read-only: it changes nothing. Operations in progress are listed in
+`in_flight` and their resources skipped — they are mid-change.
+
+| kind | meaning |
+|---|---|
+| `process_orphan` / `process_missing` | a Firecracker process for a VM that is not running / a `running` VM with no process |
+| `tap_orphan` / `tap_missing` | a `tap<id>` no running VM owns / a running VM's TAP is gone |
+| `bridge_orphan` / `bridge_missing` | an `mhbr*` bridge no network owns / a network's bridge is gone |
+| `jail_orphan` / `cgroup_orphan` | a jail dir / cgroup of a VM that is not running |
+| `clone_orphan` / `log_orphan` / `snapshot_dir_orphan` | a disk, console log or snapshot dir in the store that no record owns |
+| `disk_missing` | a VM whose disk is gone |
+| `lease_orphan` / `volume_claim_orphan` | an IP lease / volume claim held for a VM that does not exist |
+| `record_interrupted` / `record_untracked` | a stored `creating` record (the next start undoes it) / a stored record the daemon does not track |
+| `ruleset_failed` | the last firewall install failed: the policy in force may not be the declared one |
+
+Restarting the daemon cleans everything above except the disks, clones and
+snapshot dirs with no owner, which are data and are only reported. `mh doctor`
+prints the same and exits 1 when not clean.
+
 ### `GET /v1/system` — full report
 
 ```bash
@@ -855,6 +1056,61 @@ Per-VM consumption (real resident RAM, accumulated CPU, uptime) doesn't live her
 but in each `VMResponse` of `GET /v1/vms` — see its table above. With that,
 `GET /v1/vms` is already the "`docker ps`" of microVMs: each one's state, shape, real
 consumption, network, and paths.
+
+---
+
+## Events
+
+### `GET /v1/events` — what happens, pushed
+
+A [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+stream of what happens to VMs and to the host, so an orchestrator reacts instead
+of polling `GET /v1/vms`.
+
+```bash
+mhcurl -N http://localhost/v1/events?since=now
+```
+```
+id: 3f9a61c2:42
+event: vm.died
+data: {"epoch":"3f9a61c2","seq":42,"time":"…","type":"vm.died","vm":"a1b2c3d4","name":"ts01-a","labels":{"sensor":"ts-01"},"network":"plant","reason":"killed by the OOM killer (reached its cgroup memory.max)"}
+```
+
+| type | when | extra |
+|---|---|---|
+| `vm.created` | created or forked, running | `data.template` or `data.snapshot` |
+| `vm.started` | a stopped VM booted again (`start`, autostart) | |
+| `vm.stopped` | powered off on purpose | |
+| `vm.died` | its process died on its own, or while the daemon was down | `reason` |
+| `vm.restored` | rewound in place | `data.snapshot` |
+| `vm.destroyed` | gone, disk included | |
+| `vm.quarantined` | cut off its network in place | `network` = the one it left |
+| `vm.replaced` | its function moved to another VM | `data.replacement`, `data.old` |
+| `vm.replace_failed` | cut off, but the replacement did not boot: **the function is down** | `reason` |
+| `vm.autostart_failed` | could not be booted again at startup | `reason` |
+| `network.ruleset_failed` | `nft -f` refused a ruleset: the policy in force may not be the declared one | `reason` |
+| `reset` | you missed events you can no longer get: **re-read the state** | `reason` |
+
+`vm.*` events describe the VM as it was then (`name`, `labels`, `network` — for a
+quarantined VM, the network it served on).
+
+**Position and resuming.** Every event has the id `<epoch>:<seq>`: `seq` grows by
+one per event, `epoch` changes every time the daemon starts. Hand the last id back
+— as `Last-Event-ID` (an SSE client does it by itself on reconnect) or `?since=` —
+and the stream starts with what you missed. The daemon keeps the last 1024 events;
+if you come back from further back than that, or from another epoch (the daemon
+restarted), the stream starts with a `reset` and then everything it keeps. Without
+a position you get everything it keeps; `?since=now` starts with live events only.
+After the backlog comes an `id:` with no event — your position, even if nothing
+was sent — and a `: live` comment. An idle stream sends `: ping` every 15 s.
+
+**Filters.** `?type=vm.died` (repeatable, or comma-separated) and `?label=k=v`
+(repeatable: all must match) — the label filter applies to `vm.*` events; host
+events and `reset` always pass it.
+
+**Never blocks the engine.** A subscriber that falls 256 events behind is
+disconnected, not waited for; it reconnects with its last id and gets what it
+missed (or a `reset`). **400** for a malformed `since`/`Last-Event-ID` or label.
 
 ---
 

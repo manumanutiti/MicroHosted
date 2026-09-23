@@ -20,8 +20,17 @@ var systemGroup = &group{
 	cmds: []*command{
 		{name: "health", summary: "Run the platform's health checks (exit 1 if degraded)", run: sysHealth},
 		{name: "info", summary: "Host, storage and fleet report", run: sysInfo},
+		{name: "events", summary: "Follow what happens to VMs and the host (died, replaced, ruleset failed…)", run: sysEvents},
+		{name: "doctor", summary: "Find residue and drift between the daemon and the host (exit 1 if any)", run: sysDoctor, help: doctorHelp},
 	},
 }
+
+const doctorHelp = `Compares what the daemon believes exists with what the host actually has:
+Firecracker processes, TAPs, bridges, jail dirs, cgroups, disk clones, console
+logs, snapshot dirs, IP leases, volume claims, and whether the last firewall
+ruleset applied. Read-only: it changes nothing. Residue is cleaned up by
+restarting the daemon (its startup undoes interrupted creates and sweeps
+processes, jail dirs and cgroups); disks it only reports.`
 
 var templateGroup = &group{
 	name:    "template",
@@ -196,5 +205,48 @@ func tplList(e *env, cmd *command, p string, args []string) error {
 		rows = append(rows, []string{t.Name, strconv.FormatInt(t.VCPUs, 10), fmtMB(t.MemMB), disk, t.Description})
 	}
 	table(e.stdout, []string{"TEMPLATE", "VCPU", "MEM", "DISK", "DESCRIPTION"}, rows)
+	return nil
+}
+
+func sysDoctor(e *env, cmd *command, p string, args []string) error {
+	var asJSON bool
+	fs := newCmdFlags(e, p, cmd)
+	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return usagef(p, "unexpected argument %q", pos[0])
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	var rep types.DoctorReport
+	if err := c.Do("GET", "/v1/doctor", nil, &rep); err != nil {
+		return err
+	}
+	if asJSON {
+		if err := printJSON(e.stdout, rep); err != nil {
+			return err
+		}
+	} else {
+		for _, op := range rep.InFlight {
+			fmt.Fprintf(e.stdout, "in flight (skipped): %s\n", op)
+		}
+		if rep.Clean {
+			fmt.Fprintln(e.stdout, "clean: the daemon and the host agree")
+		} else {
+			rows := make([][]string, 0, len(rep.Findings))
+			for _, f := range rep.Findings {
+				rows = append(rows, []string{f.Kind, f.Object, f.Detail})
+			}
+			table(e.stdout, []string{"KIND", "OBJECT", "DETAIL"}, rows)
+		}
+	}
+	if !rep.Clean {
+		return exitError{code: 1}
+	}
 	return nil
 }

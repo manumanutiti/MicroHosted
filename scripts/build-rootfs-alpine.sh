@@ -3,7 +3,7 @@
 # minirootfs (~3 MB downloaded, ~10 MB installed vs ~1 GiB for the Ubuntu of
 # build-rootfs.sh). No systemd: busybox init + inittab. The goal is density —
 # the dirty working set of an idle guest drops from ~100 MB (systemd) to ~10 MB,
-# which is what decides how many microVMs fit on the Pi.
+# which is what decides how many microVMs fit on a host.
 #
 # The image comes out READY to use: it includes what prepare-image.sh adds to
 # the Ubuntu images (vsock listener on port 52, resolv.conf → /proc/net/pnp), so

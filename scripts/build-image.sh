@@ -13,7 +13,7 @@
 # SIZE_MB=, KERNEL_VERSION=, EXTRA_PKGS=). Requires the host already configured
 # (make full-install or make setup-host): the store must exist.
 #
-# Cross-arch (e.g. building the aarch64 image on the x86 PC to carry to a Pi):
+# Cross-arch (e.g. building the aarch64 image on the x86 PC to carry to an ARM64 target):
 # works via qemu-user-static, but the resulting kernel/rootfs have to be copied
 # to the target machine's store by hand.
 set -euo pipefail

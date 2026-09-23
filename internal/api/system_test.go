@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"microhosted/internal/events"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
 	"microhosted/internal/storage"
@@ -49,7 +51,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	}
 	mgr := vm.NewManager(catalog, jcfg, storeDir, st, network.NewManager(st, nil))
 
-	srv := NewServer(mgr, network.NewManager(st, nil), SystemConfig{
+	srv := NewServer(mgr, network.NewManager(st, nil), events.NewBus(0), SystemConfig{
 		DBPath:      filepath.Join(dir, "state.db"),
 		CatalogPath: catalogPath,
 		StartedAt:   time.Now().Add(-3 * time.Second),
@@ -143,6 +145,34 @@ func TestHealthEndpointDegradedIs503(t *testing.T) {
 	for _, want := range []string{"kvm", "database", "store_writable", "disk_space", "store_cow", "firecracker"} {
 		if !seen[want] {
 			t.Errorf("check %q missing from %v", want, h.Checks)
+		}
+	}
+}
+
+// Malformed names, labels and shapes are the caller's mistake: 400, before
+// anything is touched on the host.
+func TestVMIdentityValidationIs400(t *testing.T) {
+	ts := newTestServer(t)
+	for _, tc := range []struct {
+		method, path, body string
+		want               int
+	}{
+		{"POST", "/v1/vms", `{"template":"t1","name":"Bad Name"}`, http.StatusBadRequest},
+		{"POST", "/v1/vms", `{"template":"t1","vcpus":-1}`, http.StatusBadRequest},
+		{"POST", "/v1/vms", `{"template":"t1","labels":{"k":"a b"}}`, http.StatusBadRequest},
+		{"GET", "/v1/vms?label=novalue", ``, http.StatusBadRequest},
+		{"GET", "/v1/vms?label=sensor%3Dts-01", ``, http.StatusOK},
+		{"PATCH", "/v1/vms/deadbeef/labels", `{"labels":{"k":"v"}}`, http.StatusNotFound},
+		{"PATCH", "/v1/vms/deadbeef/labels", `{"labels":{"Bad":"v"}}`, http.StatusBadRequest},
+	} {
+		req, _ := http.NewRequest(tc.method, ts.URL+tc.path, strings.NewReader(tc.body))
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != tc.want {
+			t.Errorf("%s %s %s = %d, want %d", tc.method, tc.path, tc.body, res.StatusCode, tc.want)
 		}
 	}
 }

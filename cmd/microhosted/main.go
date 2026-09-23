@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"microhosted/internal/api"
+	"microhosted/internal/events"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
 	"microhosted/internal/storage"
@@ -56,6 +57,11 @@ func main() {
 	uid := flag.Int("jailer-uid", def.UID, "uid Jailer runs firecracker as")
 	gid := flag.Int("jailer-gid", def.GID, "gid Jailer runs firecracker as")
 	cgroupVersion := flag.String("cgroup-version", def.CgroupVersion, "cgroup version Jailer uses (auto-detected; only force it if needed)")
+	// Admission control (docs/roadmap.md Phase 0b): judged against what the
+	// host has now, since guest memory is allocated lazily.
+	memReserve := flag.Int64("mem-reserve-mb", vm.DefaultMemReserveMB, "refuse a VM launch that would leave less than this much host memory available (MB)")
+	maxVMs := flag.Int("max-vms", 0, "cap on running VMs plus launches in progress (0 = no cap)")
+	maxBoots := flag.Int("max-parallel-boots", vm.DefaultMaxParallelBoots, "launches (create/fork/start) allowed to run at once; the rest wait")
 	flag.Parse()
 
 	// The Jailer chroot MUST live on the same filesystem as the rootfs clones:
@@ -109,7 +115,11 @@ func main() {
 	for _, mi := range managed {
 		log.Printf("managing the nftables policy of %s (host services allowed: %s)", mi.Name, describeHostAllow(mi.HostAllow))
 	}
+	// The event bus comes first so that what startup finds (a ruleset that
+	// fails, VMs that died while the daemon was down) is published too.
+	bus := events.NewBus(events.DefaultCapacity)
 	netmgr := network.NewManager(st, managed)
+	netmgr.SetEvents(bus)
 	if err := netmgr.Reconcile(); err != nil {
 		log.Fatalf("reconciling networks: %v", err)
 	}
@@ -129,6 +139,8 @@ func main() {
 	}
 
 	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)
+	mgr.SetEvents(bus)
+	mgr.SetLimits(vm.Limits{MemReserveMB: *memReserve, MaxVMs: *maxVMs, MaxParallelBoots: *maxBoots})
 
 	// Volumes load before Reconcile: sweeping a dead VM releases its volumes, so
 	// the volume index must already be populated when Reconcile runs.
@@ -139,14 +151,15 @@ func main() {
 	mgr.LoadVolumes(vols)
 
 	// Recover state from a previous run before serving: adopt VMs still
-	// running, sweep those that died while we were down. This also tells us
-	// which tap devices are live so the orphan sweep below doesn't tear down a
-	// healthy adopted VM's networking.
+	// running, keep those that died while we were down (a host reboot) as
+	// stopped. This also tells us which tap devices are live so the orphan
+	// sweep below doesn't tear down a healthy adopted VM's networking, and
+	// which dead VMs asked to be booted again.
 	records, err := st.ListVMs()
 	if err != nil {
 		log.Fatalf("loading persisted state: %v", err)
 	}
-	keepTaps := mgr.Reconcile(records)
+	keepTaps, autostart := mgr.Reconcile(records)
 
 	// Snapshots are inert (files + record, no liveness): just re-index them,
 	// dropping any whose files were removed out-of-band.
@@ -161,6 +174,21 @@ func main() {
 	if err := network.SweepOrphans(keepTaps); err != nil {
 		log.Fatalf("cleaning up orphaned tap devices: %v", err)
 	}
+	// And the rest of what a previous run can leave when it dies mid-operation:
+	// Firecracker processes nobody adopted, jail dirs and cgroups of VMs that
+	// are not running, claims on volumes whose VM is gone.
+	mgr.SweepResidue()
+
+	// From here on, a VM that dies on its own is noticed within seconds and
+	// marked stopped, instead of claiming to run until the next restart.
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	defer stopMonitor()
+	go mgr.Monitor(monitorCtx, 2*time.Second)
+
+	// Boot the autostart VMs only now: the orphan sweep above would delete the
+	// TAPs Start creates. In the background so the API serves meanwhile — a
+	// fleet boots one VM at a time, and each shows as stopped until its turn.
+	go mgr.AutostartVMs(autostart)
 
 	// The observability report shows these paths to an operator working
 	// anywhere on the host — absolute, so they don't depend on the daemon's
@@ -171,7 +199,7 @@ func main() {
 		}
 		return p
 	}
-	srv := api.NewServer(mgr, netmgr, api.SystemConfig{
+	srv := api.NewServer(mgr, netmgr, bus, api.SystemConfig{
 		DBPath:      absOr(*dbPath),
 		CatalogPath: absOr(*catalogPath),
 		StartedAt:   time.Now(),

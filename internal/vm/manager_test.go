@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -28,18 +29,20 @@ func newTestManager(t *testing.T) *Manager {
 
 // A VM stopped on purpose (poweroff) has no live process by design. Reconcile
 // must keep tracking it as stopped — not sweep it like a crashed VM would be —
-// so its disk and IP survive a daemon restart and Start can bring it back.
+// so its disk and IP survive a daemon restart and Start can bring it back. And
+// it stays off: autostart is for involuntary deaths, not for a VM the operator
+// powered off.
 func TestReconcileKeepsStoppedVM(t *testing.T) {
 	m := newTestManager(t)
 
 	rec := &types.VM{
-		Config:    types.VMConfig{ID: "deadbeef", GuestIP: "172.16.0.2", NetworkName: "default"},
+		Config:    types.VMConfig{ID: "deadbeef", GuestIP: "172.16.0.2", NetworkName: "default", Autostart: true},
 		State:     types.VMStateStopped,
 		PID:       0, // powered off — no process
 		CreatedAt: time.Now(),
 	}
 
-	keepTaps := m.Reconcile([]*types.VM{rec})
+	keepTaps, autostart := m.Reconcile([]*types.VM{rec})
 
 	got, ok := m.Get("deadbeef")
 	if !ok {
@@ -52,25 +55,139 @@ func TestReconcileKeepsStoppedVM(t *testing.T) {
 	if len(keepTaps) != 0 {
 		t.Errorf("keepTaps = %v, want empty for a stopped VM", keepTaps)
 	}
+	if len(autostart) != 0 {
+		t.Errorf("autostart = %v, want empty: a VM stopped on purpose stays off", autostart)
+	}
 }
 
-// A VM whose record says running but whose process is gone (crashed / host
-// reboot while the daemon was down) is the opposite case: it must be swept and
-// forgotten, not adopted. Guards the reconcile branch from over-keeping.
-func TestReconcileSweepsDeadRunningVM(t *testing.T) {
-	m := newTestManager(t)
+// deadRunningVM is a record that claims running but has no process behind it —
+// what every VM looks like to the daemon after a host reboot. rootfs is its
+// disk path.
+func deadRunningVM(id, rootfs string, autostart bool) *types.VM {
+	return &types.VM{
+		Config: types.VMConfig{
+			ID: id, Rootfs: rootfs, NetworkName: "default", GuestIP: "172.16.0.9",
+			TapDevice: "tap" + id, Autostart: autostart,
+		},
+		State:      types.VMStateRunning,
+		PID:        0, // no live process backing the "running" claim
+		SocketPath: "/nonexistent/firecracker.socket",
+		VsockPath:  "/nonexistent/v.sock",
+		CreatedAt:  time.Now(),
+	}
+}
 
-	rec := &types.VM{
-		Config:    types.VMConfig{ID: "cafebabe", NetworkName: "default"},
-		State:     types.VMStateRunning,
-		PID:       0, // no live process backing the "running" claim
-		CreatedAt: time.Now(),
+// A host reboot kills every Firecracker process, but the disks survive. A dead
+// VM whose disk is still there must be kept as stopped — tracked, persisted as
+// stopped, runtime fields cleared — so Start brings it back with its data. The
+// old behaviour swept it, disk included, turning every reboot into data loss.
+func TestReconcileKeepsDeadVMWithDisk(t *testing.T) {
+	m := newTestManager(t)
+	disk := filepath.Join(t.TempDir(), "rootfs.ext4")
+	if err := os.WriteFile(disk, []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := deadRunningVM("cafebabe", disk, false)
+	if err := m.store.SaveVM(rec); err != nil {
+		t.Fatal(err)
 	}
 
-	m.Reconcile([]*types.VM{rec})
+	keepTaps, autostart := m.Reconcile([]*types.VM{rec})
+
+	got, ok := m.Get("cafebabe")
+	if !ok {
+		t.Fatal("dead VM with its disk intact was swept; it must be kept as stopped")
+	}
+	if got.State != types.VMStateStopped || got.PID != 0 || got.SocketPath != "" || got.VsockPath != "" {
+		t.Errorf("record = state %q pid %d socket %q vsock %q, want stopped with runtime fields cleared",
+			got.State, got.PID, got.SocketPath, got.VsockPath)
+	}
+	if _, err := os.Stat(disk); err != nil {
+		t.Errorf("disk was removed: %v", err)
+	}
+	// Its TAP died with the process — nothing live to keep from the sweep.
+	if len(keepTaps) != 0 {
+		t.Errorf("keepTaps = %v, want empty for a dead VM", keepTaps)
+	}
+	if len(autostart) != 0 {
+		t.Errorf("autostart = %v, want empty without Autostart", autostart)
+	}
+
+	// Persisted as stopped: the next startup must see it that way too.
+	recs, err := m.store.ListVMs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].State != types.VMStateStopped {
+		t.Errorf("persisted records = %+v, want one stopped VM", recs)
+	}
+}
+
+// A dead VM that asked for autostart is handed back to the caller to boot.
+func TestReconcileAutostartsDeadVM(t *testing.T) {
+	m := newTestManager(t)
+	dir := t.TempDir()
+	disk := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("disk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	_, autostart := m.Reconcile([]*types.VM{
+		deadRunningVM("aaaa1111", disk("a.ext4"), true),
+		deadRunningVM("bbbb2222", disk("b.ext4"), false),
+	})
+
+	if len(autostart) != 1 || autostart[0] != "aaaa1111" {
+		t.Errorf("autostart = %v, want [aaaa1111]", autostart)
+	}
+}
+
+// A dead VM whose disk is gone too has nothing left to boot: it is swept and
+// forgotten, record included. Guards the reconcile branch from over-keeping.
+func TestReconcileSweepsDeadVMWithoutDisk(t *testing.T) {
+	m := newTestManager(t)
+	rec := deadRunningVM("cafebabe", filepath.Join(t.TempDir(), "missing.ext4"), true)
+	if err := m.store.SaveVM(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	_, autostart := m.Reconcile([]*types.VM{rec})
 
 	if _, ok := m.Get("cafebabe"); ok {
-		t.Fatal("dead running VM was kept; it must be swept")
+		t.Fatal("dead VM without a disk was kept; it must be swept")
+	}
+	if len(autostart) != 0 {
+		t.Errorf("autostart = %v, want empty for a swept VM", autostart)
+	}
+	if recs, _ := m.store.ListVMs(); len(recs) != 0 {
+		t.Errorf("persisted records = %d, want the swept VM's record dropped", len(recs))
+	}
+}
+
+// SetAutostart persists the flag, so it survives the restart it exists for.
+func TestSetAutostart(t *testing.T) {
+	m := newTestManager(t)
+	m.Reconcile([]*types.VM{{Config: types.VMConfig{ID: "deadbeef"}, State: types.VMStateStopped}})
+
+	if _, err := m.SetAutostart("nope", true); !errors.Is(err, ErrVMNotFound) {
+		t.Errorf("SetAutostart of unknown vm: err = %v, want ErrVMNotFound", err)
+	}
+	got, err := m.SetAutostart("deadbeef", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Config.Autostart {
+		t.Error("returned record has Autostart = false")
+	}
+	recs, err := m.store.ListVMs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || !recs[0].Config.Autostart {
+		t.Errorf("persisted records = %+v, want Autostart = true", recs)
 	}
 }
 
@@ -99,7 +216,7 @@ func TestSnapshotErrorPaths(t *testing.T) {
 func TestForkVMErrorPaths(t *testing.T) {
 	m := newTestManager(t)
 
-	if _, err := m.ForkVM(context.Background(), "nope", true); !errors.Is(err, ErrVMNotFound) {
+	if _, err := m.ForkVM(context.Background(), "nope", types.ForkVMRequest{Quarantine: true}); !errors.Is(err, ErrVMNotFound) {
 		t.Errorf("ForkVM of unknown vm: err = %v, want ErrVMNotFound", err)
 	}
 
@@ -108,14 +225,14 @@ func TestForkVMErrorPaths(t *testing.T) {
 		State:  types.VMStateStopped,
 	}
 	m.Reconcile([]*types.VM{stopped})
-	if _, err := m.ForkVM(context.Background(), "deadbeef", true); !errors.Is(err, ErrVMState) {
+	if _, err := m.ForkVM(context.Background(), "deadbeef", types.ForkVMRequest{Quarantine: true}); !errors.Is(err, ErrVMState) {
 		t.Errorf("ForkVM of stopped vm: err = %v, want ErrVMState", err)
 	}
 }
 
 func TestForkUnknownSnapshot(t *testing.T) {
 	m := newTestManager(t)
-	if _, err := m.Fork(context.Background(), "nope", false); !errors.Is(err, ErrSnapshotNotFound) {
+	if _, err := m.Fork(context.Background(), "nope", types.ForkVMRequest{}); !errors.Is(err, ErrSnapshotNotFound) {
 		t.Errorf("Fork of unknown snapshot: err = %v, want ErrSnapshotNotFound", err)
 	}
 }

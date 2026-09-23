@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	fc "github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/google/uuid"
 
+	"microhosted/internal/events"
+	"microhosted/internal/faults"
 	"microhosted/internal/firecracker"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
@@ -65,8 +68,12 @@ type Manager struct {
 	// what Fork can do (see there). Probed once at construction.
 	netOverridesOK bool
 
-	mu    sync.Mutex
-	vms   map[string]*types.VM
+	mu  sync.Mutex
+	vms map[string]*types.VM
+	// names indexes VM names to IDs. A name is claimed here before its VM's
+	// record exists (see reserveNameLocked), so it can hold names m.vms does
+	// not have yet.
+	names map[string]string
 	run   map[string]*running
 	snaps map[string]*types.Snapshot
 	vols  map[string]*types.Volume
@@ -77,6 +84,25 @@ type Manager struct {
 	// it. Both are set/cleared under mu.
 	volIO map[string]bool
 	vmIO  map[string]bool
+
+	// busy is the lifecycle operation in progress per VM (see begin); a VM
+	// being created or forked is in it before it is in vms.
+	busy map[string]string
+	// Admission (see admit): the limits, one token per launch allowed to run
+	// at once, and the launches admitted but not finished — their memory is
+	// not visible in MemAvailable yet.
+	limits     Limits
+	bootSlots  chan struct{}
+	inflight   map[string]bool
+	inflightMB int64
+	// memAvailable reads the host's available memory in MB; a variable so
+	// tests can set the host they need.
+	memAvailable func() (int64, error)
+	// replaceLaunch boots Replace's new VM; nil means launchReplacement. A
+	// variable so tests can drive Replace without Firecracker.
+	replaceLaunch func(context.Context, replacement) (*types.VM, error)
+	// events receives the lifecycle events (see SetEvents); nil drops them.
+	events *events.Bus
 }
 
 // NewManager wires a Manager to its template catalog, jailer defaults, the
@@ -98,11 +124,17 @@ func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDi
 		store:          st,
 		netOverridesOK: firecracker.SupportsNetworkOverrides(jailerCfg.ExecFile),
 		vms:            make(map[string]*types.VM),
+		names:          make(map[string]string),
 		run:            make(map[string]*running),
 		snaps:          make(map[string]*types.Snapshot),
 		vols:           make(map[string]*types.Volume),
 		volIO:          make(map[string]bool),
 		vmIO:           make(map[string]bool),
+		busy:           make(map[string]string),
+		inflight:       make(map[string]bool),
+		limits:         Limits{MemReserveMB: DefaultMemReserveMB, MaxParallelBoots: DefaultMaxParallelBoots},
+		bootSlots:      make(chan struct{}, DefaultMaxParallelBoots),
+		memAvailable:   hostMemAvailable,
 	}
 }
 
@@ -148,62 +180,123 @@ func (m *Manager) LoadSnapshots(records []*types.Snapshot) {
 //     listed, exec'd into and destroyed, and its IP block re-reserved — but
 //     without an SDK machine handle, since the SDK can't re-attach to a process
 //     it didn't spawn (Destroy signals it by PID instead).
-//   - a VM whose process is gone died while the daemon was down: its leftover
-//     resources are swept and its record dropped.
+//   - a VM whose process is gone died while the daemon was down — a host
+//     reboot kills every Firecracker process, so after one this is every VM.
+//     Its disk is intact, so it is kept as stopped, exactly as if it had been
+//     powered off: disk, IP reservation and volumes survive and Start brings it
+//     back. Only a VM whose disk is gone too is swept and forgotten.
+//   - a VM stopped on purpose is kept stopped.
 //
 // It returns the set of tap device names belonging to adopted VMs so the
 // caller can exclude them from network.SweepOrphans — they're live, not
-// orphans. Must be called before the API server starts serving.
-func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
-	keepTaps := make(map[string]bool)
+// orphans — and the IDs of dead VMs that asked to come back on their own
+// (VMConfig.Autostart), for AutostartVMs. A VM stopped on purpose is never in
+// that list. Must be called before the API server starts serving.
+func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, autostart []string) {
+	keepTaps = make(map[string]bool)
 
 	for _, rec := range records {
 		id := rec.Config.ID
 
-		// A VM stopped on purpose (poweroff — disk kept, IP reserved) has no
-		// live process by design, so it must NOT be swept like a crashed one.
-		// Keep it tracked as stopped and re-reserve its IP so a freshly created
-		// VM can't grab the address it will reclaim on Start. It has no TAP
-		// (Stop released it), so there's nothing to add to keepTaps.
-		if rec.State == types.VMStateStopped {
-			m.mu.Lock()
-			m.vms[id] = rec
-			m.run[id] = &running{}
-			m.mu.Unlock()
-			// Quarantined forks hold no reservation: their GuestIP is only
-			// what the restored guest believes it has, not an IPAM lease.
-			if rec.Config.GuestIP != "" && rec.Config.NetworkName != "" {
-				m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+		// The daemon died while this VM was being created or forked: it was
+		// never handed to anyone, so it is undone, not recovered.
+		if rec.State == types.VMStateCreating {
+			log.Printf("reconcile: vm %s was being created when the daemon stopped; undoing it", id)
+			m.undoCreate(rec)
+			continue
+		}
+
+		if rec.State != types.VMStateStopped {
+			if m.adoptIfAlive(rec, keepTaps) {
+				m.adoptName(rec)
+				continue
 			}
+			if !m.keepDead(rec) {
+				continue
+			}
+			if rec.Config.Autostart {
+				autostart = append(autostart, id)
+			}
+		} else {
 			log.Printf("reconcile: kept stopped vm %s", id)
-			continue
 		}
 
-		if processAlive(rec.PID, id) {
-			m.mu.Lock()
-			m.vms[id] = rec
-			m.run[id] = &running{} // no SDK handle / log file for adopted VMs
-			m.mu.Unlock()
+		// A stopped VM (on purpose, or dead and just converted) has no live
+		// process by design. Keep it tracked as stopped and re-reserve its IP so
+		// a freshly created VM can't grab the address it will reclaim on Start.
+		// It has no TAP (Stop / keepDead released it), so there's nothing to add
+		// to keepTaps.
+		m.mu.Lock()
+		m.vms[id] = rec
+		m.run[id] = &running{}
+		m.mu.Unlock()
+		m.adoptName(rec)
+		// Quarantined forks hold no reservation: their GuestIP is only what the
+		// restored guest believes it has, not an IPAM lease.
+		if rec.Config.GuestIP != "" && rec.Config.NetworkName != "" {
+			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+		}
+	}
 
-			if tap := rec.Config.TapDevice; tap != "" {
-				keepTaps[tap] = true
-				// See the stopped branch: a quarantined fork's TAP is live and
-				// must be kept, but there is no network to re-reserve on.
-				if rec.Config.NetworkName != "" {
-					m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
-					// The TAP predates this daemon run — converge it to the
-					// network's current intra policy (best-effort: a failure
-					// leaves stale reachability, not a broken VM).
-					if err := network.SetTapIsolation(tap, !m.netmgr.Intra(rec.Config.NetworkName)); err != nil {
-						log.Printf("reconcile: vm %s: %v", id, err)
-					}
-				}
+	return keepTaps, autostart
+}
+
+// adoptIfAlive tracks a VM whose Firecracker process survived the daemon's
+// restart, adding its TAP to keepTaps. Reports false if the process is gone.
+func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
+	id := rec.Config.ID
+	if !processAlive(rec.PID, id) {
+		return false
+	}
+	m.mu.Lock()
+	m.vms[id] = rec
+	m.run[id] = &running{} // no SDK handle / log file for adopted VMs
+	m.mu.Unlock()
+
+	if tap := rec.Config.TapDevice; tap != "" {
+		keepTaps[tap] = true
+		// A quarantined VM's TAP is live and must be kept, but there is no
+		// network to re-reserve on. Detaching again is a no-op for a TAP
+		// already off its bridge, and fail-closed for one that somehow isn't.
+		if rec.Config.Quarantine {
+			if err := network.DetachTap(tap); err != nil {
+				log.Printf("reconcile: vm %s: %v", id, err)
 			}
-			log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
-			continue
 		}
+		if rec.Config.NetworkName != "" {
+			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+			// The TAP predates this daemon run — converge it to the record
+			// (on its bridge: a quarantine the daemon died in the middle of
+			// was never acknowledged, so it is undone) and to the network's
+			// current intra policy. Best-effort: a failure leaves stale
+			// reachability or a VM cut off, logged, not a daemon that won't
+			// start.
+			isolated := !m.netmgr.Intra(rec.Config.NetworkName)
+			var err error
+			if rec.Config.Bridge != "" {
+				err = network.EnslaveTap(tap, rec.Config.Bridge, isolated)
+			} else {
+				err = network.SetTapIsolation(tap, isolated)
+			}
+			if err != nil {
+				log.Printf("reconcile: vm %s: %v", id, err)
+			}
+		}
+	}
+	log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
+	return true
+}
 
-		// Dead while we were down — sweep whatever it left behind and forget it.
+// keepDead turns the record of a VM that died while the daemon was down into a
+// stopped one: it releases what a powered-off VM doesn't hold (the TAP, if it
+// outlived the process, and the jail dir) and persists the new state — the same
+// end state Stop leaves. The IP reservation and volume claims are kept.
+//
+// A VM whose disk is gone has nothing left to boot: that one is swept instead —
+// every leftover released and its record dropped — and keepDead reports false.
+func (m *Manager) keepDead(rec *types.VM) bool {
+	id := rec.Config.ID
+	if _, err := os.Stat(rec.Config.Rootfs); err != nil {
 		m.cleanupNetwork(rec.Config.NetworkName, rec.Config.TapDevice, id)
 		m.releaseVolumes(id, rec.Config.Volumes)
 		_ = storage.DeleteClone(m.instancesDir, id)
@@ -212,10 +305,69 @@ func (m *Manager) Reconcile(records []*types.VM) map[string]bool {
 		if err := m.store.DeleteVM(id); err != nil {
 			log.Printf("reconcile: dropping dead vm record %s: %v", id, err)
 		}
-		log.Printf("reconcile: swept dead vm %s (pid %d no longer running)", id, rec.PID)
+		log.Printf("reconcile: swept dead vm %s (pid %d no longer running, disk %q missing)", id, rec.PID, rec.Config.Rootfs)
+		return false
 	}
 
-	return keepTaps
+	if rec.Config.TapDevice != "" {
+		_ = network.DeleteTap(rec.Config.TapDevice)
+	}
+	_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
+	deadPID := rec.PID
+	rec.State = types.VMStateStopped
+	rec.PID = 0
+	rec.SocketPath = ""
+	rec.VsockPath = ""
+	// Best-effort: if this write fails the record still says running, and the
+	// next startup lands here again with the same outcome.
+	if err := m.store.SaveVM(rec); err != nil {
+		log.Printf("reconcile: persisting vm %s as stopped: %v", id, err)
+	}
+	log.Printf("reconcile: vm %s died while the daemon was down (pid %d); kept as stopped", id, deadPID)
+	m.emit(types.EventVMDied, rec, "died while the daemon was down (host reboot, or killed meanwhile)", nil)
+	return true
+}
+
+// AutostartVMs boots the dead VMs Reconcile found with Autostart set. It must
+// run after network.SweepOrphans — the sweep would delete the TAPs Start
+// creates. One at a time, so a host coming back from a reboot doesn't launch
+// its whole fleet at once; a failure is logged and leaves that VM stopped, to
+// be started by hand.
+func (m *Manager) AutostartVMs(ids []string) {
+	for _, id := range ids {
+		if _, err := m.Start(context.Background(), id); err != nil {
+			log.Printf("autostart: vm %s: %v", id, err)
+			if rec, ok := m.Get(id); ok {
+				m.emit(types.EventVMAutostartFail, rec, err.Error(), nil)
+			}
+			continue
+		}
+		log.Printf("autostart: started vm %s", id)
+	}
+}
+
+// SetAutostart flips whether a VM boots again on its own after a host reboot
+// (see VMConfig.Autostart). Persisted before it is reported: on a store failure
+// the in-memory flag is rolled back.
+func (m *Manager) SetAutostart(id string, on bool) (*types.VM, error) {
+	m.mu.Lock()
+	record, ok := m.vms[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	prev := record.Config.Autostart
+	record.Config.Autostart = on
+	cp := *record
+	m.mu.Unlock()
+
+	if err := m.store.SaveVM(&cp); err != nil {
+		m.mu.Lock()
+		record.Config.Autostart = prev
+		m.mu.Unlock()
+		return nil, fmt.Errorf("persisting vm %s: %w", id, err)
+	}
+	return &cp, nil
 }
 
 // CreateVolume provisions a new persistent volume: a fresh ext4 image on the
@@ -465,9 +617,16 @@ func (m *Manager) waitAgentReady(vsockPath string) error {
 }
 
 // Create clones a template's disk, wires up networking, and launches a new
-// microVM through Jailer. Any failure partway through is rolled back in
-// reverse order so no orphaned tap devices or clones are left behind.
+// microVM through Jailer. The record is written as "creating" before the first
+// side effect, so any failure — here, or the daemon dying in the middle — is
+// undone completely (see undoCreate): the result is a running VM or nothing.
 func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types.VM, error) {
+	if err := errors.Join(validateShape(req.VCPUs, req.MemMB, req.DiskMB), ValidateName(req.Name), ValidateLabels(req.Labels)); err != nil {
+		return nil, err
+	}
+	if req.GuestIP != "" && req.NoNetwork {
+		return nil, fmt.Errorf("%w: guest_ip needs a network, and no_network is set", ErrInvalid)
+	}
 	tpl, err := m.catalog.Get(req.Template)
 	if err != nil {
 		return nil, err
@@ -489,10 +648,54 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	// Kept short (8 hex chars) because it's reused as part of the tap
 	// device name, which Linux caps at 15 characters (IFNAMSIZ).
 	id := uuid.NewString()[:8]
+	if err := m.begin(id, "create"); err != nil {
+		return nil, err
+	}
+	defer m.end(id)
+	release, err := m.admit(ctx, id, memMB)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	record := &types.VM{
+		Config: types.VMConfig{
+			ID:           id,
+			Name:         req.Name,
+			Labels:       maps.Clone(req.Labels),
+			TemplateName: tpl.Name,
+			Kernel:       tpl.KernelPath,
+			VCPUs:        vcpus,
+			MemMB:        memMB,
+			DiskMB:       diskMB,
+			Autostart:    req.Autostart,
+		},
+		State:     types.VMStateCreating,
+		LogPath:   filepath.Join(m.instancesDir, id+".log"),
+		CreatedAt: time.Now(),
+	}
+	if err := m.reserveName(req.Name, id); err != nil {
+		return nil, err
+	}
+	if err := m.store.SaveVM(record); err != nil {
+		m.releaseName(req.Name, id)
+		return nil, fmt.Errorf("recording vm %s before creating it: %w", id, err)
+	}
+	fail := func(err error) (*types.VM, error) {
+		m.undoCreate(record)
+		return nil, err
+	}
+	if err := faults.Check("vm.create.after-record"); err != nil {
+		return fail(err)
+	}
 
 	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID, diskMB)
 	if err != nil {
-		return nil, fmt.Errorf("cloning rootfs: %w", err)
+		return fail(fmt.Errorf("cloning rootfs: %w", err))
+	}
+	record.Config.Rootfs = rootfsPath
+	if err := faults.Check("vm.create.after-clone"); err != nil {
+		return fail(err)
 	}
 
 	// Network is opt-out, not mandatory: sandboxed/ephemeral workloads often
@@ -502,97 +705,82 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	// network's subnet. Isolated across networks always; within a network VMs
 	// see each other only if the network opted in (intra) — otherwise the TAP
 	// is an isolated bridge port.
-	var tapName, networkName, bridge, guestIP, gatewayIP string
-	var prefixLen int
 	if !req.NoNetwork {
-		networkName = req.Network
+		networkName := req.Network
 		if networkName == "" {
 			networkName = network.DefaultNetworkName
 		}
-		ip, gw, br, prefix, err := m.netmgr.AttachVM(networkName, id)
+		var ip, gw, br string
+		var prefix int
+		if req.GuestIP != "" {
+			ip = req.GuestIP
+			gw, br, prefix, err = m.netmgr.ClaimVM(networkName, id, ip)
+			switch {
+			case errors.Is(err, network.ErrAddressInUse):
+				return fail(fmt.Errorf("%w: network %q: %v", ErrConflict, networkName, err))
+			case errors.Is(err, network.ErrBadAddress):
+				return fail(fmt.Errorf("%w: network %q: %v", ErrInvalid, networkName, err))
+			}
+		} else {
+			ip, gw, br, prefix, err = m.netmgr.AttachVM(networkName, id)
+		}
 		if err != nil {
-			_ = storage.DeleteClone(m.instancesDir, id)
-			return nil, fmt.Errorf("attaching to network %q: %w", networkName, err)
+			return fail(fmt.Errorf("attaching to network %q: %w", networkName, err))
 		}
+		record.Config.NetworkName = networkName
+		record.Config.Bridge = br
+		record.Config.GuestIP = ip
+		record.Config.GatewayIP = gw
+		record.Config.PrefixLen = prefix
 
-		tapName = "tap" + id
+		tapName := "tap" + id
 		if err := network.CreateTapEnslaved(tapName, br, !m.netmgr.Intra(networkName)); err != nil {
-			m.netmgr.DetachVM(networkName, id)
-			_ = storage.DeleteClone(m.instancesDir, id)
-			return nil, fmt.Errorf("creating tap device: %w", err)
+			return fail(fmt.Errorf("creating tap device: %w", err))
 		}
-		guestIP, gatewayIP, bridge, prefixLen = ip, gw, br, prefix
+		record.Config.TapDevice = tapName
+	}
+	if err := faults.Check("vm.create.after-network"); err != nil {
+		return fail(err)
 	}
 
 	// Attach any requested volumes before boot: their drives must be in the
-	// Firecracker config (built inside boot), and claiming them here means a
-	// failure rolls back the network/clone above cleanly.
+	// Firecracker config (built inside boot).
 	mounts, err := m.attachVolumes(id, req.Volumes)
 	if err != nil {
-		m.cleanupNetwork(networkName, tapName, id)
-		_ = storage.DeleteClone(m.instancesDir, id)
-		return nil, fmt.Errorf("attaching volumes: %w", err)
+		return fail(fmt.Errorf("attaching volumes: %w", err))
 	}
-
-	vmCfg := types.VMConfig{
-		ID:           id,
-		TemplateName: tpl.Name,
-		Kernel:       tpl.KernelPath,
-		Rootfs:       rootfsPath,
-		VCPUs:        vcpus,
-		MemMB:        memMB,
-		DiskMB:       diskMB,
-		NetworkName:  networkName,
-		Bridge:       bridge,
-		TapDevice:    tapName,
-		GuestIP:      guestIP,
-		GatewayIP:    gatewayIP,
-		PrefixLen:    prefixLen,
-		Volumes:      mounts,
-	}
-
-	record := &types.VM{
-		Config:    vmCfg,
-		LogPath:   filepath.Join(m.instancesDir, id+".log"),
-		CreatedAt: time.Now(),
-	}
+	record.Config.Volumes = mounts
 
 	// boot opens the console log and launches Firecracker, filling in the
-	// runtime fields. Any failure here rolls back the network attachment and
-	// rootfs clone this Create made (boot cleans up only the log it opened).
-	// The jail dir too: the SDK stops the VMM on a failed start but never
-	// removes Jailer's directory, and a leftover would break a retried launch
-	// under the same ID and leak disk otherwise.
+	// runtime fields.
 	if err := m.boot(record); err != nil {
-		m.releaseVolumes(id, mounts)
-		m.cleanupNetwork(networkName, tapName, id)
-		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
-		_ = storage.DeleteClone(m.instancesDir, id)
-		return nil, err
+		return fail(err)
+	}
+	if err := faults.Check("vm.create.after-boot"); err != nil {
+		return fail(err)
 	}
 
 	m.mu.Lock()
 	m.vms[id] = record
 	m.mu.Unlock()
 
-	// Mount attached volumes inside the guest over vsock, now that it's up and
-	// tracked. A mount failure tears the whole VM down (Destroy releases the
-	// volume claims, network, clone and jail dir) — a half-mounted VM isn't what
-	// the caller asked for.
+	// Mount attached volumes inside the guest over vsock, now that it's up. A
+	// half-mounted VM isn't what the caller asked for.
 	if err := m.mountVolumes(record); err != nil {
-		_ = m.Destroy(context.Background(), id)
-		return nil, fmt.Errorf("mounting volumes: %w", err)
+		return fail(fmt.Errorf("mounting volumes: %w", err))
+	}
+	if err := faults.Check("vm.create.before-save"); err != nil {
+		return fail(err)
 	}
 
-	// Persist last, once the VM is fully up and tracked. A record we can't
-	// persist is exactly the orphan the store exists to prevent, so a failure
-	// here rolls the whole VM back rather than leaving it running-but-unknown.
+	// Persisting the running state is what ends the create: until this
+	// write, a restart treats the VM as never having existed.
 	if err := m.store.SaveVM(record); err != nil {
-		_ = m.Destroy(context.Background(), id)
-		return nil, fmt.Errorf("persisting vm record %s: %w", id, err)
+		return fail(fmt.Errorf("persisting vm record %s: %w", id, err))
 	}
 
-	return record, nil
+	m.emit(types.EventVMCreated, record, "", map[string]string{"template": tpl.Name})
+	return m.snapshotVM(record), nil
 }
 
 // boot opens the VM's console log and launches Firecracker+Jailer for the
@@ -636,6 +824,8 @@ func (m *Manager) boot(record *types.VM) error {
 		_ = logFile.Close()
 		return err
 	}
+
+	m.mu.Lock()
 	record.PID = pid
 	// machine.Cfg.SocketPath (not fcCfg.SocketPath) because Jailer rewrites it
 	// to the absolute path inside the chroot once launched.
@@ -645,8 +835,6 @@ func (m *Manager) boot(record *types.VM) error {
 	// convention jailer.WorkspaceRoot encodes.
 	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
 	record.State = types.VMStateRunning
-
-	m.mu.Lock()
 	m.run[id] = &running{machine: machine, logFile: logFile}
 	m.mu.Unlock()
 
@@ -661,6 +849,13 @@ func (m *Manager) boot(record *types.VM) error {
 // limits simply aren't supported — those hosts predate this feature and keep
 // working, with a loud warning per boot.
 func (m *Manager) applyLimits(id string, pid int, cfg types.VMConfig) error {
+	// The daemon runs with a strongly negative oom_score_adj (see
+	// deploy/microhosted.service.in) so that, under host memory pressure, the
+	// kernel kills a VM — which the monitor reports — and never the process
+	// holding every VM. Children inherit it; Firecracker must not.
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), []byte("0"), 0o644); err != nil {
+		log.Printf("vm %s: resetting oom_score_adj of pid %d: %v", id, pid, err)
+	}
 	err := jailer.ApplyLimits(m.jailerCfg, id, pid, cfg.VCPUs, cfg.MemMB)
 	if err == nil {
 		return nil
@@ -700,12 +895,21 @@ func (m *Manager) powerOff(ctx context.Context, record *types.VM, r *running) er
 
 // Destroy stops the machine and releases every resource associated with it.
 func (m *Manager) Destroy(ctx context.Context, id string) error {
+	if err := m.begin(id, "destroy"); err != nil {
+		return err
+	}
+	defer m.end(id)
+	return m.destroy(ctx, id)
+}
+
+// destroy is Destroy for a caller that already holds the VM's busy mark.
+func (m *Manager) destroy(ctx context.Context, id string) error {
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	r := m.run[id]
 	m.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("vm %q not found", id)
+		return fmt.Errorf("%w: %s", ErrVMNotFound, id)
 	}
 
 	var stopErr error
@@ -746,6 +950,8 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 	delete(m.vms, id)
 	delete(m.run, id)
 	m.mu.Unlock()
+	m.releaseName(record.Config.Name, id)
+	m.emit(types.EventVMDestroyed, record, "", nil)
 
 	return errors.Join(
 		wrapErr("stopping vm %s", id, stopErr),
@@ -763,6 +969,15 @@ func (m *Manager) Destroy(ctx context.Context, id string) error {
 // brings the same VM back at the same address, disk intact. This is the whole
 // difference from Destroy, which additionally erases the disk and frees the IP.
 func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
+	if err := m.begin(id, "stop"); err != nil {
+		return nil, err
+	}
+	defer m.end(id)
+	return m.stop(ctx, id)
+}
+
+// stop is Stop for a caller that already holds the VM's busy mark.
+func (m *Manager) stop(ctx context.Context, id string) (*types.VM, error) {
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	r := m.run[id]
@@ -807,8 +1022,9 @@ func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
 	m.mu.Unlock()
 
 	storeErr := m.store.SaveVM(record)
+	m.emit(types.EventVMStopped, record, "", nil)
 
-	return record, errors.Join(
+	return m.snapshotVM(record), errors.Join(
 		wrapErr("stopping vm %s", id, stopErr),
 		wrapErr("removing jail dir for vm %s", id, jailErr),
 		wrapErr("persisting stopped vm %s", id, storeErr),
@@ -820,6 +1036,10 @@ func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
 // rebuilds is the TAP device (released at Stop) and the Firecracker process.
 // The network's bridge is still up — Stop never touched it.
 func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
+	if err := m.begin(id, "start"); err != nil {
+		return nil, err
+	}
+	defer m.end(id)
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	busyIO := m.vmIO[id]
@@ -835,6 +1055,11 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	if record.State != types.VMStateStopped {
 		return nil, fmt.Errorf("%w: vm %s is not stopped (state %s)", ErrVMState, id, record.State)
 	}
+	release, err := m.admit(ctx, id, record.Config.MemMB)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// Recreate the TAP and re-enslave it to its network's bridge. No AttachVM:
 	// the IP is still reserved from before, so we reuse record.Config.GuestIP.
@@ -875,11 +1100,12 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	}
 
 	if err := m.store.SaveVM(record); err != nil {
-		_ = m.Destroy(context.Background(), id)
+		_ = m.destroy(context.Background(), id)
 		return nil, fmt.Errorf("persisting restarted vm %s: %w", id, err)
 	}
 
-	return record, nil
+	m.emit(types.EventVMStarted, record, "", nil)
+	return m.snapshotVM(record), nil
 }
 
 // SyncTapIsolation re-applies the isolated-port flag to every live TAP on the
@@ -928,6 +1154,10 @@ func (m *Manager) recreateTap(cfg types.VMConfig) error {
 // Works on adopted VMs too (no SDK handle after a daemon restart): all three
 // steps speak to Firecracker's API socket directly.
 func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snapshot, error) {
+	if err := m.begin(vmID, "snapshot"); err != nil {
+		return nil, err
+	}
+	defer m.end(vmID)
 	m.mu.Lock()
 	record, ok := m.vms[vmID]
 	m.mu.Unlock()
@@ -1042,7 +1272,11 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 //     believing it's networked while every packet dies on the host. Reachable
 //     via vsock exec only. Any number of quarantined forks of one snapshot
 //     can run simultaneously.
-func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*types.VM, error) {
+func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMRequest) (*types.VM, error) {
+	if err := errors.Join(ValidateName(req.Name), ValidateLabels(req.Labels)); err != nil {
+		return nil, err
+	}
+	quarantine := req.Quarantine
 	m.mu.Lock()
 	snap, ok := m.snaps[snapID]
 	m.mu.Unlock()
@@ -1051,11 +1285,15 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 	}
 
 	id := uuid.NewString()[:8]
-
-	rootfs, err := storage.CloneFromSnapshot(snap.Dir, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	if err := m.begin(id, "fork"); err != nil {
+		return nil, err
+	}
+	defer m.end(id)
+	release, err := m.admit(ctx, id, snap.MemMB)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	// Kernel is irrelevant to the restore itself (the guest's kernel lives in
 	// the snapshotted memory) but is recorded so a later Stop+Start — a cold
@@ -1068,15 +1306,42 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 		}
 	}
 
-	vmCfg := types.VMConfig{
-		ID:           id,
-		TemplateName: snap.TemplateName,
-		Kernel:       kernel,
-		Rootfs:       rootfs,
-		VCPUs:        snap.VCPUs,
-		MemMB:        snap.MemMB,
-		DiskMB:       snap.DiskMB,
-		RestoredFrom: snapID,
+	// Recorded before the first side effect, same contract as Create.
+	record := &types.VM{
+		Config: types.VMConfig{
+			ID:           id,
+			Name:         req.Name,
+			Labels:       maps.Clone(req.Labels),
+			TemplateName: snap.TemplateName,
+			Kernel:       kernel,
+			VCPUs:        snap.VCPUs,
+			MemMB:        snap.MemMB,
+			DiskMB:       snap.DiskMB,
+			RestoredFrom: snapID,
+		},
+		State:     types.VMStateCreating,
+		LogPath:   filepath.Join(m.instancesDir, id+".log"),
+		CreatedAt: time.Now(),
+	}
+	if err := m.reserveName(req.Name, id); err != nil {
+		return nil, err
+	}
+	if err := m.store.SaveVM(record); err != nil {
+		m.releaseName(req.Name, id)
+		return nil, fmt.Errorf("recording vm %s before forking it: %w", id, err)
+	}
+	fail := func(err error) (*types.VM, error) {
+		m.undoCreate(record)
+		return nil, err
+	}
+
+	rootfs, err := storage.CloneFromSnapshot(snap.Dir, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	if err != nil {
+		return fail(err)
+	}
+	record.Config.Rootfs = rootfs
+	if err := faults.Check("vm.fork.after-clone"); err != nil {
+		return fail(err)
 	}
 
 	if snap.HadNetwork {
@@ -1091,68 +1356,57 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 		if !m.netOverridesOK {
 			snapTap := snapshotTapName(snap)
 			if network.TapExists(snapTap) {
-				_ = storage.DeleteClone(m.instancesDir, id)
-				return nil, fmt.Errorf("%w: this host's firecracker predates network_overrides (needs >= 1.12), so the fork must reuse the snapshot's TAP %q, which is in use — destroy/stop the VM holding it, or upgrade firecracker (scripts/install-fc.sh) for simultaneous forks", ErrConflict, snapTap)
+				return fail(fmt.Errorf("%w: this host's firecracker predates network_overrides (needs >= 1.12), so the fork must reuse the snapshot's TAP %q, which is in use — destroy/stop the VM holding it, or upgrade firecracker (scripts/install-fc.sh) for simultaneous forks", ErrConflict, snapTap))
 			}
 			tap = snapTap
 		}
 		if quarantine {
 			if err := network.CreateTapQuarantined(tap); err != nil {
-				_ = storage.DeleteClone(m.instancesDir, id)
-				return nil, fmt.Errorf("creating quarantined tap: %w", err)
+				return fail(fmt.Errorf("creating quarantined tap: %w", err))
 			}
 			// GuestIP/gateway are what the restored guest BELIEVES it has —
 			// kept for visibility. NetworkName stays empty: no reservation.
-			vmCfg.TapDevice = tap
-			vmCfg.GuestIP = snap.GuestIP
-			vmCfg.GatewayIP = snap.GatewayIP
-			vmCfg.PrefixLen = snap.PrefixLen
-			vmCfg.Quarantine = true
+			record.Config.TapDevice = tap
+			record.Config.GuestIP = snap.GuestIP
+			record.Config.GatewayIP = snap.GatewayIP
+			record.Config.PrefixLen = snap.PrefixLen
+			record.Config.Quarantine = true
 		} else {
 			gateway, bridge, prefix, err := m.netmgr.ClaimVM(snap.NetworkName, id, snap.GuestIP)
 			if err != nil {
-				_ = storage.DeleteClone(m.instancesDir, id)
-				return nil, fmt.Errorf("%w: fork needs the snapshot's address on network %q (%s): %v — destroy the VM holding it, or fork with quarantine=true", ErrConflict, snap.NetworkName, snap.GuestIP, err)
+				return fail(fmt.Errorf("%w: fork needs the snapshot's address on network %q (%s): %v — destroy the VM holding it, or fork with quarantine=true", ErrConflict, snap.NetworkName, snap.GuestIP, err))
 			}
+			record.Config.NetworkName = snap.NetworkName
+			record.Config.Bridge = bridge
+			record.Config.GuestIP = snap.GuestIP
+			record.Config.GatewayIP = gateway
+			record.Config.PrefixLen = prefix
 			if err := network.CreateTapEnslaved(tap, bridge, !m.netmgr.Intra(snap.NetworkName)); err != nil {
-				m.netmgr.DetachVM(snap.NetworkName, id)
-				_ = storage.DeleteClone(m.instancesDir, id)
-				return nil, fmt.Errorf("creating tap device: %w", err)
+				return fail(fmt.Errorf("creating tap device: %w", err))
 			}
-			vmCfg.NetworkName = snap.NetworkName
-			vmCfg.Bridge = bridge
-			vmCfg.TapDevice = tap
-			vmCfg.GuestIP = snap.GuestIP
-			vmCfg.GatewayIP = gateway
-			vmCfg.PrefixLen = prefix
+			record.Config.TapDevice = tap
 		}
 	}
 
-	record := &types.VM{
-		Config:    vmCfg,
-		LogPath:   filepath.Join(m.instancesDir, id+".log"),
-		CreatedAt: time.Now(),
-	}
-
 	if err := m.bootFromSnapshot(record, snap); err != nil {
-		m.cleanupNetwork(vmCfg.NetworkName, vmCfg.TapDevice, id)
-		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
-		_ = storage.DeleteClone(m.instancesDir, id)
-		return nil, err
+		return fail(err)
+	}
+	if err := faults.Check("vm.fork.after-boot"); err != nil {
+		return fail(err)
 	}
 
 	m.mu.Lock()
 	m.vms[id] = record
 	m.mu.Unlock()
 
-	// Persist last, same contract as Create: a fork we can't persist is
-	// rolled back rather than left running-but-unknown.
+	// Persist last, same contract as Create: until this write, a restart
+	// treats the fork as never having existed.
 	if err := m.store.SaveVM(record); err != nil {
-		_ = m.Destroy(context.Background(), id)
-		return nil, fmt.Errorf("persisting vm record %s: %w", id, err)
+		return fail(fmt.Errorf("persisting vm record %s: %w", id, err))
 	}
+	m.emit(types.EventVMCreated, record, "", map[string]string{"snapshot": snapID})
 
-	return record, nil
+	return m.snapshotVM(record), nil
 }
 
 // ForkVM forks a RUNNING VM directly, without the caller managing a snapshot:
@@ -1168,7 +1422,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, quarantine bool) (*ty
 // therefore mostly useful with quarantine=true (or on a VM with no network).
 // Callers who want to keep the frozen point for later restores should use
 // Snapshot + Fork instead.
-func (m *Manager) ForkVM(ctx context.Context, vmID string, quarantine bool) (*types.VM, error) {
+func (m *Manager) ForkVM(ctx context.Context, vmID string, req types.ForkVMRequest) (*types.VM, error) {
 	m.mu.Lock()
 	record, ok := m.vms[vmID]
 	m.mu.Unlock()
@@ -1181,7 +1435,7 @@ func (m *Manager) ForkVM(ctx context.Context, vmID string, quarantine bool) (*ty
 		return nil, err
 	}
 
-	record, forkErr := m.Fork(ctx, snap.ID, quarantine)
+	record, forkErr := m.Fork(ctx, snap.ID, req)
 
 	// The ephemeral snapshot goes away whether the fork worked or not; a
 	// deletion failure is a leak to log, not a reason to fail a good fork.
@@ -1202,6 +1456,10 @@ func (m *Manager) ForkVM(ctx context.Context, vmID string, quarantine bool) (*ty
 // VM's snapshot here would silently swap the machine's identity; that
 // operation is Fork, which handles the collisions honestly.
 func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, error) {
+	if err := m.begin(vmID, "restore"); err != nil {
+		return nil, err
+	}
+	defer m.end(vmID)
 	m.mu.Lock()
 	record, okVM := m.vms[vmID]
 	snap, okSnap := m.snaps[snapID]
@@ -1221,6 +1479,15 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	}
 	if len(record.Config.Volumes) > 0 {
 		return nil, errVolumesAttached(vmID)
+	}
+	// A running VM gives its memory back before the restored one takes it; a
+	// stopped one is a new launch and is admitted like one.
+	if record.State == types.VMStateStopped {
+		release, err := m.admit(ctx, vmID, record.Config.MemMB)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 
 	// Tear down the current incarnation the way Stop does — process, jail dir,
@@ -1264,7 +1531,9 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	if err != nil {
 		return nil, err
 	}
+	m.mu.Lock()
 	record.Config.Rootfs = rootfs
+	m.mu.Unlock()
 
 	if record.Config.TapDevice != "" {
 		if err := m.recreateTap(record.Config); err != nil {
@@ -1284,14 +1553,17 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 		_ = m.store.SaveVM(record)
 		return nil, err
 	}
+	m.mu.Lock()
 	record.Config.RestoredFrom = snapID
+	m.mu.Unlock()
 
 	if err := m.store.SaveVM(record); err != nil {
-		_ = m.Destroy(context.Background(), vmID)
+		_ = m.destroy(context.Background(), vmID)
 		return nil, fmt.Errorf("persisting restored vm %s: %w", vmID, err)
 	}
 
-	return record, nil
+	m.emit(types.EventVMRestored, record, "", map[string]string{"snapshot": snapID})
+	return m.snapshotVM(record), nil
 }
 
 // bootFromSnapshot is boot()'s sibling for restores: same log file and jailer
@@ -1332,12 +1604,11 @@ func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error
 		_ = logFile.Close()
 		return err
 	}
+	m.mu.Lock()
 	record.PID = pid
 	record.SocketPath = machine.Cfg.SocketPath
 	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
 	record.State = types.VMStateRunning
-
-	m.mu.Lock()
 	m.run[id] = &running{machine: machine, logFile: logFile}
 	m.mu.Unlock()
 
@@ -1718,20 +1989,27 @@ func (m *Manager) ExtractFromVolumeStream(volID, guestPath string) (io.ReadClose
 }
 
 // Get returns a single VM by ID.
+// The record is a copy: the monitor and in-flight operations write the live
+// one under the lock, and a caller reading fields outside it would race them.
 func (m *Manager) Get(id string) (*types.VM, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.vms[id]
-	return v, ok
+	if !ok {
+		return nil, false
+	}
+	cp := *v
+	return &cp, true
 }
 
-// List returns every VM currently tracked by the manager.
+// List returns every VM currently tracked by the manager, as copies (see Get).
 func (m *Manager) List() []*types.VM {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := make([]*types.VM, 0, len(m.vms))
 	for _, v := range m.vms {
-		list = append(list, v)
+		cp := *v
+		list = append(list, &cp)
 	}
 	return list
 }

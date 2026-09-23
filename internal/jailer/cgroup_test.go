@@ -119,3 +119,24 @@ func TestRemoveCgroup(t *testing.T) {
 		t.Fatalf("RemoveCgroup on missing dirs: %v", err)
 	}
 }
+
+func TestProcessCgroupOwner(t *testing.T) {
+	_, d := withFakeCgroupRoot(t)
+	for cg, want := range map[string]CgroupOwner{
+		"0::/microhosted/82970554\n":      CgroupLimits,
+		"0::/firecracker/82970554\n":      CgroupJailer,
+		"0::/firecracker\n":               CgroupJailer,
+		"0::/microhosted/06364720\n":      CgroupNone, // another VM's
+		"0::/system.slice/foo.service\n":  CgroupNone,
+		"12:pids:/microhosted/82970554\n": CgroupNone, // v1 line
+		"":                                CgroupNone,
+	} {
+		if got := ProcessCgroupOwner(d, []byte(cg), "82970554"); got != want {
+			t.Errorf("ProcessCgroupOwner(%q) = %v, want %v", cg, got, want)
+		}
+	}
+	d.CgroupVersion = "1"
+	if got := ProcessCgroupOwner(d, []byte("0::/microhosted/82970554\n"), "82970554"); got != CgroupNone {
+		t.Errorf("cgroup v1 host: got %v, want CgroupNone", got)
+	}
+}

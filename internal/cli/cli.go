@@ -88,9 +88,14 @@ var shortcuts = []shortcut{
 	{"fork", "vm", "fork"},
 	{"restore", "vm", "restore"},
 	{"inspect", "vm", "inspect"},
+	{"label", "vm", "label"},
+	{"quarantine", "vm", "quarantine"},
+	{"replace", "vm", "replace"},
 	{"images", "template", "ls"},
 	{"health", "system", "health"},
 	{"info", "system", "info"},
+	{"doctor", "system", "doctor"},
+	{"events", "system", "events"},
 }
 
 // exitError ends the process with code without printing anything more: the

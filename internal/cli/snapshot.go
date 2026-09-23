@@ -149,14 +149,19 @@ func snapRemove(e *env, cmd *command, p string, args []string) error {
 
 func snapFork(e *env, cmd *command, p string, args []string) error {
 	var req types.ForkVMRequest
+	var labels []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.boolVar(&req.Quarantine, "quarantine", "", "attach the new VM to no network (vsock only); allows many forks of one snapshot")
+	forkIdentityFlags(fs, &req, &labels)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
 		return usagef(p, "expected exactly one SNAPSHOT")
+	}
+	if req.Labels, err = parseLabels(labels); err != nil {
+		return usagef(p, "%v", err)
 	}
 	c, err := e.api()
 	if err != nil {

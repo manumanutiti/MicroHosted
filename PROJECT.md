@@ -399,7 +399,7 @@ targeted attacks.
   real minimal Linux needs 20-50MB. High density comes from (a) an ultra-minimal
   image and (b) mass restore from a shared snapshot (memory is mapped
   copy-on-write — already implemented): each VM pays only for its dirty pages.
-- Realistic target: **dozens of VMs on a 4GB Pi, 100-300 on an 8/16GB Pi 5 (via
+- Realistic target: **dozens of VMs on a 4GB ARM64 board, 100-300 on an 8/16GB one (via
   snapshot + minimal image), 1000+ on an industrial x86 gateway.** Figures to be
   validated on hardware, not promises.
 
@@ -408,7 +408,7 @@ targeted attacks.
 The full design, gaps with code mapping, and success criteria per session are in
 **`docs/iot-edge.md`**. Priority summary:
 
-1. **ARM64 spike** (existential risk: until a microVM boots on a Raspberry Pi 5,
+1. **ARM64 spike** (existential risk: until a microVM boots on an ARM64 board,
    the target hardware is theory).
 2. **Fine-grained egress** (a VM can only talk to its sensor IP:port) —
    prerequisite of the pull mode.
@@ -416,7 +416,7 @@ The full design, gaps with code mapping, and success criteria per session are in
    with the 3 lifecycle modes) — the product MVP, developable on x86.
 4. **Ultra-minimal sensor image** (tinyconfig kernel + static parser; target
    `mem_mb ≤ 32`).
-5. **Density**: mass pool from snapshot + honest measurement on Pi and x86.
+5. **Density**: mass pool from snapshot + honest measurement on ARM64 and x86.
 6. **Push mode** (DNAT + NFQUEUE trigger + anti-DoS).
 7. **Blind serial bridge** (RS-485/Modbus RTU → vsock, a daemon with no parser).
 

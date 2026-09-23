@@ -8,7 +8,7 @@
 #   5. systemd service (enable --now)
 #   6. health check through the API
 #
-# Supports x86_64 and aarch64 (64-bit Raspberry Pi 4/5, Jetson, ARM gateways).
+# Supports x86_64 and aarch64 (ARM64 boards with a 64-bit kernel, Jetson, ARM gateways).
 # Normal entry point: `make full-install` (accepts ARCH=, FC_VERSION=, ADDR=).
 #
 # Idempotent: re-running it updates the binary/service and doesn't touch live VMs
@@ -62,8 +62,8 @@ echo "==> [1/6] Pre-flight checks..."
 if [[ ! -e /dev/kvm ]]; then
   echo "ERROR: /dev/kvm doesn't exist — no KVM means no microVMs." >&2
   if [[ "$ARCH" == "aarch64" ]]; then
-    echo "  On Raspberry Pi: use a 64-bit OS (Raspberry Pi OS 64-bit or" >&2
-    echo "  Ubuntu Server arm64); on Pi 4/5, KVM ships in the stock kernel." >&2
+    echo "  On ARM64 boards: use a 64-bit OS (e.g. Ubuntu Server arm64) with a" >&2
+    echo "  kernel built with KVM; most vendor arm64 kernels ship it." >&2
     echo "  Check: ls /dev/kvm ; zgrep KVM /proc/config.gz" >&2
   else
     echo "  Enable VT-x/AMD-V in the BIOS (or nested virtualization if it's a VM)." >&2

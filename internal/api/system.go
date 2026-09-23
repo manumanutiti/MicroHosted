@@ -59,6 +59,12 @@ func registerSystemRoutes(mux *http.ServeMux, mgr *vm.Manager, netmgr *network.M
 		writeJSON(w, code, resp)
 	})
 
+	// Read-only drift report; always 200 — "not clean" is an answer, not a
+	// failure of the endpoint.
+	mux.HandleFunc("GET /v1/doctor", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mgr.Doctor())
+	})
+
 	mux.HandleFunc("GET /v1/system", func(w http.ResponseWriter, r *http.Request) {
 		checks := runHealthChecks(mgr, netmgr, facts)
 		resp := types.SystemResponse{

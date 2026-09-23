@@ -16,6 +16,11 @@ import (
 // clobber theirs.
 const nftTable = "inet microhosted"
 
+// BridgePrefix starts the name of every bridge this daemon creates
+// ("mhbr" + network id). The ruleset matches it as a wildcard to keep a bridge
+// it does not know about dark — see renderNftables.
+const BridgePrefix = "mhbr"
+
 // ManagedIface is a host interface whose ENTIRE nftables policy this daemon
 // owns: denied in both directions, with each network's interface-scoped egress
 // rules and its ingress rules as the only holes.
@@ -76,6 +81,11 @@ func ApplyNftables(networks []types.Network, managed []ManagedIface) error {
 // renderNftables produces the `nft -f` script. The leading
 // `table {}` + `delete table` idiom guarantees the delete never fails on a
 // missing table, so the whole thing is a clean atomic replace.
+//
+// The table is rendered even with no networks at all: every chain here is
+// `policy accept` and the drops name bridges, so the rules that keep a bridge
+// this ruleset does not know about dark (see the forward chain) must be in
+// force at all times, not only when there is something to protect.
 func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	var b strings.Builder
 
@@ -83,41 +93,35 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	fmt.Fprintf(&b, "table %s {}\n", nftTable)
 	fmt.Fprintf(&b, "delete table %s\n", nftTable)
 
-	if len(networks) == 0 {
-		return b.String() // nothing to protect; leave the table gone.
-	}
-
 	fmt.Fprintf(&b, "table %s {\n", nftTable)
 
 	// Set of all our bridge ifnames, used to express "to the WAN" as
 	// "oifname != @mhbridges" (anything not one of our own bridges).
-	b.WriteString("\tset mhbridges {\n\t\ttype ifname\n\t\telements = { ")
 	names := make([]string, 0, len(networks))
 	for _, n := range networks {
 		names = append(names, `"`+n.Bridge+`"`)
 	}
-	b.WriteString(strings.Join(names, ", "))
-	b.WriteString(" }\n\t}\n")
+	writeSet(&b, "mhbridges", "ifname", names)
 
 	// Same-bridge pairs, to exempt intra-bridge traffic from the cross-segment
 	// drop below. Needed because br_netfilter (if loaded) pushes same-bridge
 	// traffic through the host's forward hook, and nft cannot express
 	// `iifname != oifname` directly (no expression-vs-expression compare).
-	b.WriteString("\tset mhsame {\n\t\ttype ifname . ifname\n\t\telements = { ")
 	pairs := make([]string, 0, len(networks))
 	for _, n := range networks {
 		pairs = append(pairs, `"`+n.Bridge+`" . "`+n.Bridge+`"`)
 	}
-	b.WriteString(strings.Join(pairs, ", "))
-	b.WriteString(" }\n\t}\n")
+	writeSet(&b, "mhsame", "ifname . ifname", pairs)
 
 	// guest → host: drop new connections coming in from any bridge, but let
 	// established/related through so host-initiated flows (e.g. SSH into a VM)
-	// still get their replies.
+	// still get their replies. Matched by prefix, not by @mhbridges: a bridge
+	// this ruleset does not list yet (a network mid-create) or no longer lists
+	// is exactly as untrusted as one it does.
 	b.WriteString("\tchain input {\n")
 	b.WriteString("\t\ttype filter hook input priority 0; policy accept;\n")
 	b.WriteString("\t\tct state established,related accept\n")
-	b.WriteString("\t\tiifname @mhbridges drop\n")
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", BridgePrefix)
 	// A managed interface reaches only the host services the operator listed
 	// (typically udp/67 when the host runs that segment's DHCP), and nothing
 	// else — not the API, not SSH.
@@ -166,6 +170,14 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// need the conntrack(8) binary to flush anything.
 	b.WriteString("\tchain forward {\n")
 	b.WriteString("\t\ttype filter hook forward priority 0; policy accept;\n")
+	// A bridge of ours that this ruleset does not list is dark, first thing,
+	// in both directions. It exists whenever the bridge and the ruleset
+	// disagree: a network whose rules failed to apply, one whose bridge came
+	// up before its rules, a bridge a crash left behind. Everything below is
+	// drops keyed on known bridges under `policy accept`, so without these two
+	// rules such a bridge would be the one place with no policy at all.
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" iifname != @mhbridges drop\n", BridgePrefix)
+	fmt.Fprintf(&b, "\t\toifname \"%s*\" oifname != @mhbridges drop\n", BridgePrefix)
 	// Cross-segment isolation: drop forwarding between two DIFFERENT bridges.
 	// One aggregate rule instead of a rule per ordered pair (which grows
 	// O(N²) — 150 networks would mean 22350 rules, each traversed by every
@@ -253,7 +265,11 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// dropped above. Fine-grained holes (AllowedEgress) are accepted first, so
 	// only the listed destination/protocol/port flows survive the drop.
 	for _, n := range networks {
-		if n.Egress {
+		if egressOpen(n) {
+			// Full egress, through its one interface only: anything towards
+			// a non-bridge that is not that interface — the LAN behind a
+			// second NIC, a VPN, a Docker bridge — dies here.
+			fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges oifname != %q drop\n", n.Bridge, n.EgressIface)
 			continue
 		}
 		for _, r := range n.AllowedEgress {
@@ -283,7 +299,10 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// segment are typically handed no default route at all, so a reply addressed
 	// to 172.16.x.y would have nowhere to go.
 	for _, n := range networks {
-		if n.Egress || len(n.AllowedEgress) > 0 {
+		switch {
+		case egressOpen(n):
+			fmt.Fprintf(&b, "\t\tip saddr %s oifname %q masquerade\n", n.Subnet, n.EgressIface)
+		case !n.Egress && len(n.AllowedEgress) > 0:
 			fmt.Fprintf(&b, "\t\tip saddr %s oifname != @mhbridges masquerade\n", n.Subnet)
 		}
 	}
@@ -291,6 +310,56 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 
 	b.WriteString("}\n")
 	return b.String()
+}
+
+// egressOpen reports whether a network gets full egress. Egress with no
+// interface named — a record from before EgressIface existed that no default
+// route could be found for — is rendered as no egress at all: the policy it
+// was created under ("everything that is not a bridge") is the one this
+// daemon no longer enforces, and the safe reading of a policy it cannot
+// enforce is closed. Manager.UnenforcedRules reports it.
+func egressOpen(n types.Network) bool {
+	return n.Egress && n.EgressIface != ""
+}
+
+// writeSet emits a named set, leaving out the elements line when there are
+// none (nft rejects an empty `elements = { }`).
+func writeSet(b *strings.Builder, name, typ string, elems []string) {
+	fmt.Fprintf(b, "\tset %s {\n\t\ttype %s\n", name, typ)
+	if len(elems) > 0 {
+		fmt.Fprintf(b, "\t\telements = { %s }\n", strings.Join(elems, ", "))
+	}
+	b.WriteString("\t}\n")
+}
+
+// ValidateEgressPolicy vets a network's whole egress policy: the full-egress
+// flag with the interface it must name, and the fine-grained rules. Egress and
+// AllowedEgress are mutually exclusive (the first already allows everything
+// through its interface).
+func ValidateEgressPolicy(egress bool, iface string, rules []types.EgressRule, managed []string) error {
+	if egress && len(rules) > 0 {
+		return fmt.Errorf("egress and allowed_egress are mutually exclusive: allowed_egress restricts a network whose egress is otherwise blocked")
+	}
+	if !egress {
+		if iface != "" {
+			return fmt.Errorf("egress_iface %q given without egress", iface)
+		}
+		return ValidateEgressRules(rules, managed)
+	}
+	if iface == "" {
+		return fmt.Errorf("egress needs egress_iface, the host interface it leaves through (e.g. eth0): " +
+			"without one, \"everything that is not a bridge\" includes the LAN behind a second NIC, VPNs and Docker networks")
+	}
+	if err := ValidateIfaceName(iface); err != nil {
+		return fmt.Errorf("egress_iface: %w", err)
+	}
+	if slices.Contains(managed, iface) {
+		return fmt.Errorf("egress_iface %q is a managed interface: its only holes are allowed_egress rules naming it (@%s)", iface, iface)
+	}
+	if strings.HasPrefix(iface, BridgePrefix) || tapNameRe.MatchString(iface) {
+		return fmt.Errorf("egress_iface %q is one of this daemon's own devices, not a way out of the host", iface)
+	}
+	return nil
 }
 
 // ValidateEgressRules vets user-supplied AllowedEgress rules BEFORE they are

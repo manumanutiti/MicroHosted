@@ -69,11 +69,12 @@ Cycle: `restore from snapshot → the VM interrogates ITS sensor → validate/pa
 
 ### Push mode (planned, IoT-6) — for MQTT/HTTP
 
-> Status (2026-09-18): the network primitive is built, `allowed_ingress`
-> (`docs/networking.md` § Ingress), unit-tested but **not yet validated on
-> hardware**. The broker-VM template and the collection side are not built. The
-> only flow validated end to end on hardware is Modbus pull from a real
-> ESP32+DHT11 over a managed interface.
+> Status (2026-09-18): the network primitive is built and **validated on
+> hardware**, `allowed_ingress` (`docs/networking.md` § Ingress): a device on
+> `wlan0` reached a VM through the host's address with nothing listening on the
+> host, and the VM saw the device's real source IP. The broker-VM template and
+> the collection side are not built. The only data flow validated end to end is
+> Modbus pull from a real ESP32+DHT11 over a managed interface.
 
 In MQTT the sensor is the **client**: it opens the connection toward a broker
 and listens on nothing, so it cannot be polled. The gateway has to accept an
@@ -102,8 +103,8 @@ MQTT sensor 192.168.50.60 ──publish──▶ gateway:1883 on the managed ifa
   canonical format. The dangerous parsing stays inside the VM.
 - **One broker-VM per sensor, not a shared one.** A shared broker lets one sensor
   that exploits Mosquitto forge every other sensor's data. Per-sensor keeps
-  blast radius and identity 1:1, and the measured density (174 devices on a Pi
-  8GB at ~34MB each) makes it affordable.
+  blast radius and identity 1:1, and the measured density (174 devices on an
+  8 GB ARM64 host at ~34MB each) makes it affordable.
 - **The broker-VM has no egress.** Compromised, it can't reach the internet,
   other sensors, or the host (guest→host DROP, vsock is host-initiated only).
   A reset to snapshot wipes it.
@@ -200,7 +201,7 @@ implemented) or disk (reflink: 236KiB exclusive measured per clone). It's
 **guest RAM**. And note: Firecracker's "<5MB per microVM" is the VMM overhead,
 not the guest RAM.
 
-| Engineering level | Incremental RAM/VM | Pi 5 8GB (~7GB usable) |
+| Engineering level | Incremental RAM/VM | 8 GB ARM64 host (~7GB usable) |
 |---|---|---|
 | Current image (ubuntu, 128MB) | ~130-190MB | ~40-50 |
 | tinyconfig kernel + static init + parser | ~20-32MB | ~200-300 |
@@ -232,27 +233,30 @@ All the figures in the table are **estimates to be validated on hardware**
 | Reset-to-clean in ~100ms + fork | ✅ HW-validated | snapshots (restore 109ms, fork 113ms) |
 | CoW memory shared across restores | ✅ implemented | File backend on restore |
 | Disk clones at ~0 cost | ✅ HW-validated | btrfs store + reflink |
-| Persistence + reconcile (VMs survive the daemon) | ✅ HW-validated | `internal/store`, `Manager.Reconcile` |
+| Persistence + reconcile (VMs survive the daemon) | ✅ HW-validated for daemon restarts; a **host reboot** wiped every VM until 2026-09-19 (fixed: kept as stopped + `autostart`, HW validation pending). Crash-safe creates, residue sweep and `mh doctor`: roadmap Phase 0b | `internal/store`, `Manager.Reconcile`, `internal/vm/lifecycle.go` |
 | Observability (health, capacity, per-VM RSS) | ✅ code | `/v1/health`, `/v1/system` |
 | Fine-grained egress, incl. through a managed interface | ✅ HW-validated | `allowed_egress`, `ValidateEgressRules` (`internal/network/nftables.go`) |
-| Inbound DNAT to one guest address (push mode) | ✅ code, HW pending | `allowed_ingress`, `ValidateIngressRules` + `Manager.checkIngress` |
+| Inbound DNAT to one guest address (push mode) | ✅ HW-validated | `allowed_ingress`, `ValidateIngressRules` + `Manager.checkIngress` |
 
 ## Gaps (what needs to be built)
 
 1. ~~**Fine-grained egress**~~ — done: `allowed_egress` (see the table above).
 2. **Transactional orchestrator** — the restore→poll→validate→extract→destroy
    loop with the 3 lifetime modes, watchdog, circuit breaker, and global VM cap.
-   It's the product; the engine is primitives.
-3. **ARM64** — the install and image pipeline is already multi-arch
+   It's the product; the engine is primitives. Its data path (stream protocol,
+   ingest, journal, registry) is designed in `docs/ingestion.md`.
+3. ~~**ARM64**~~ — done: the daemon runs on ARM64 hardware (see
+   `docs/roadmap.md` § Where we actually are). Original text: the install and image pipeline is already multi-arch
    (`make full-install` / `make prepare-image` detect or accept `ARCH=aarch64`:
    FC binaries, kernel from the CI bucket, arm64 debootstrap with the ports
    mirror, cross-build via qemu-user-static). What's missing is the **real
-   validation**: nothing has been tested on a Pi's KVM. Existential risk of the
+   validation**: nothing had been tested on ARM64 KVM. Existential risk of the
    target hardware.
-4. **Ultra-minimal sensor image** — tinyconfig kernel without modules + static
+4. ~~**Ultra-minimal sensor image**~~ — done as `alpine-py` (42 MB PSS; see
+   `docs/roadmap.md`). Original text: tinyconfig kernel without modules + static
    init + the parser runtime. Target: a functional VM with `mem_mb: 24-32`.
    (Ties into the already-pending ultra-optimized images.)
-5. **Push mode** — `allowed_ingress` is built (HW validation pending). Still
+5. **Push mode** — `allowed_ingress` is built and HW-validated. Still
    missing: the broker-VM template and the collection side. The NFQUEUE on-demand
    trigger + anti-DoS is a later optimization, not a prerequisite.
 6. **Blind serial bridge** — a `tty↔vsock` daemon with no parser.
@@ -261,12 +265,12 @@ All the figures in the table are **estimates to be validated on hardware**
 
 ## Gateway hardware requirements
 
-- A CPU with hardware virtualization: x86_64 or **ARM Cortex-A with KVM** (Pi 4/5
-  with a 64-bit kernel, Jetson, i.MX8). Microcontrollers (ESP32, Cortex-M) don't
+- A CPU with hardware virtualization: x86_64 or **ARM Cortex-A with KVM** (ARM64
+  boards with a 64-bit kernel, Jetson, i.MX8). Microcontrollers (ESP32, Cortex-M) don't
   run microVMs — they're the sensors that talk to the gateway.
 - Kernel 5.10+ with KVM, cgroups v2, and btrfs (or the btrfs loopback that
   `setup-host.sh` provisions — already host-agnostic).
-- For high density on a Pi: NVMe/USB SSD storage, not an SD card (mass restore
+- For high density on a small ARM board: NVMe/USB SSD storage, not an SD card (mass restore
   reads the snapshot; the SD turns it into a bottleneck).
 - Direct GPIO/I2C/SPI: the microVMs don't see them; always via the blind bridge.
 
@@ -278,13 +282,13 @@ they don't wait for the ARM spike.
 
 ### IoT-1 — ARM64 spike (existential risk)
 The tooling is already ready (`make full-install` and `make prepare-image` are
-multi-arch); the spike is actually running it on a Raspberry Pi 5 and hunting the
+multi-arch); the spike is actually running it on an ARM64 board and hunting the
 x86 assumptions that only appear on hardware (aarch64 kernel args, KVM behavior
-on the Pi, store performance on SD/NVMe).
+on ARM64, store performance on SD/NVMe).
 
-**Success criterion**: `make full-install && make prepare-image` on a Pi 5 leave
+**Success criterion**: `make full-install && make prepare-image` on an ARM64 board leave
 the whole system working: `create` + `exec` over vsock + `destroy`, with jailer
-and cgroup limits active. If KVM on the Pi turns out to be unviable, pivot the
+and cgroup limits active. If KVM on the board turns out to be unviable, pivot the
 target hardware to industrial ARM/x86 gateways — a decision, not a defeat.
 
 ### IoT-2 — Fine-grained egress
@@ -314,17 +318,17 @@ snapshot in <200ms.
 
 ### IoT-5 — Density: measure for real
 Mass deployment from snapshot as a first-class operation. A density battery: how
-many idle+polling sensor-VMs fit on (a) the spike's Pi, (b) a reference x86,
+many idle+polling sensor-VMs fit on (a) the spike's ARM64 board, (b) a reference x86,
 measuring real incremental RSS, restore latency under load, and store behavior.
 
 **Success criterion**: a publishable density table with measured numbers, not
-estimates. Internal goal: ≥100 sensor-VMs on a Pi 5 8GB.
+estimates. Internal goal: ≥100 sensor-VMs on an 8 GB ARM64 host.
 
 ### IoT-6 — Push mode (MQTT/HTTP)
 Design in "Push mode" above. Prerequisite: the ingestor of IoT-3 (the clean
 side is shared with pull mode). Build order:
 
-1. **`allowed_ingress`** on a network — **built, HW validation pending.**
+1. **`allowed_ingress`** on a network — **built and HW-validated (2026-09-18).**
    `{iface, src_ip, protocol, port, to_ip}`, rendered as a `prerouting` DNAT
    plus both `forward` legs, inside the managed interface's deny-both-ways
    policy. The return leg only carries replies (`ct direction reply`). Sensors

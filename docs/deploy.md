@@ -20,7 +20,7 @@ create the first VM (`POST /v1/vms {"template":"base-alpine"}`). For the classic
 Ubuntu image (systemd + SSH): `make prepare-image FLAVOR=ubuntu` (template
 `base-ubuntu-noble`).
 
-It works on **x86_64 and aarch64** (64-bit Raspberry Pi 4/5, Jetson, ARM
+It works on **x86_64 and aarch64** (ARM64 boards with a 64-bit kernel, Jetson, ARM
 gateways): the architecture is auto-detected and every step respects it
 (Firecracker binaries, kernel from the CI bucket, Ubuntu mirror — arm64 lives on
 `ports.ubuntu.com`, not `archive.ubuntu.com`). Useful variables:
@@ -39,12 +39,12 @@ reproducible. Updating it is a conscious decision
 (`make full-install FC_VERSION=vX.Y.Z`) — existing snapshots are tied to the
 version that created them and will need to be recreated.
 
-To prepare ARM pieces from an x86 PC (useful before you have the Pi at hand):
+To prepare ARM pieces from an x86 PC (useful before the target board is at hand):
 
 ```bash
 make build ARCH=aarch64          # cross-compiles only the binary (pure Go, static)
 make prepare-image ARCH=aarch64  # arm64 image via qemu-user-static; the files
-                                 # are copied to the Pi's store by hand (they are
+                                 # are copied to the target's store by hand (they are
                                  # not registered in the local catalog)
 ```
 
@@ -73,8 +73,43 @@ sudo systemctl stop microhosted      # stops the daemon; the VMs keep running
 ```
 
 After a `restart` or a boot, the log will show `reconcile: adopted running vm
-<id>` for each VM that was still alive, or `reconcile: swept dead vm <id>` for any
-that had died while the daemon was stopped.
+<id>` for each VM that was still alive, or `reconcile: vm <id> died while the
+daemon was down (pid N); kept as stopped` for any that had died meanwhile — after
+a host reboot, that is every VM. Their disks and IPs survive: `mh start` brings
+them back, and the ones created with `--autostart` (or set with
+`mh vm update --autostart`) are booted on their own, logged as
+`autostart: started vm <id>`. Only a dead VM whose disk is gone too is
+`swept` and forgotten.
+
+Startup also cleans what a previous run left when it died mid-operation:
+`reconcile: vm <id> was being created when the daemon stopped; undoing it`,
+`sweep: killed orphan firecracker ...`, `sweep: removed jail dir ...`,
+`network reconcile: removed orphan bridge ...`. While running, a VM that dies on
+its own is logged as `monitor: vm <id> died (pid N): <reason>; marked stopped`.
+`mh doctor` tells you whether anything is still out of step.
+
+### Admission limits
+
+The daemon refuses a launch (create, fork, start) with a 503 rather than push the
+host into its OOM killer. Defaults, overridable on the daemon's command line:
+
+| flag | default | meaning |
+|---|---|---|
+| `--mem-reserve-mb` | 512 | host memory a launch must leave available (judged on `MemAvailable`, not on the sum of `mem_mb`: guest RAM is lazy) |
+| `--max-vms` | 0 (off) | cap on running VMs plus launches in progress |
+| `--max-parallel-boots` | 4 | launches running at once; the rest wait |
+
+### Fault injection
+
+`sudo scripts/fault-test.sh` restarts the daemon with each failpoint armed
+(`MICROHOSTED_FAULTS`, see `internal/faults`), fires bursts of creates, forks and
+network creates, kills the daemon mid-burst, and requires `mh doctor` to be
+clean after every round; an error-mode round also fails if no operation
+returned the injected error (a failpoint that never fired proves nothing). It
+is disruptive (many restarts, each preceded by `systemctl reset-failed` so the
+restart back-off starts from 2 s again; running VMs survive them) —
+run it on a test host. Validated 21/21 on test hardware on 2026-09-22. The failpoints are inert unless that variable is
+set, and the daemon logs a warning when it is.
 
 ## Why the unit is the way it is
 
@@ -83,6 +118,17 @@ that had died while the daemon was stopped.
   `Manager.Reconcile` re-adopt the VMs by PID on restart.
 - **`Delegate=yes`** — Jailer creates one cgroup per VM; delegating the cgroup
   subtree to the service avoids clashing with systemd's management.
+- **`OOMScoreAdjust=-900`** — under host memory pressure the kernel must kill a
+  VM, never the daemon holding all of them. Children inherit the score, so the
+  daemon resets each Firecracker to 0 right after launching it; the dead VM then
+  shows as `stopped` with `last_exit`.
+- **`StartLimitIntervalSec=0` + `RestartSteps=5` / `RestartMaxDelaySec=60`** —
+  systemd never gives up restarting the daemon. Its default start limit (5
+  starts in 10 s) would leave an unattended gateway with a dead daemon until
+  someone ran `systemctl reset-failed`; instead each automatic restart waits
+  longer (2 s, ~4, ~8, ~15, ~30, then 60 s). The count goes back to zero only on
+  a manual `start`/`restart` or `reset-failed`, not after a long healthy run.
+  The VMs keep running while the daemon is down. Needs systemd ≥ 254.
 - **`AssertPathExists=/dev/kvm`** — without KVM the service fails clearly at
   startup, not later with an obscure error.
 - Runs as **root**: Jailer needs to create chroots/cgroups/tap and open

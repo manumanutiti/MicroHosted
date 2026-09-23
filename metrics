@@ -1,0 +1,6 @@
+# HELP esp32_temperature_celsius Temperatura actual del sensor en grados Celsius
+# TYPE esp32_temperature_celsius gauge
+esp32_temperature_celsius{dispositivo="esp32_principal", sensor="dht11"} 28.2
+# HELP esp32_humidity_percent Humedad relativa en porcentaje
+# TYPE esp32_humidity_percent gauge
+esp32_humidity_percent{dispositivo="esp32_principal", sensor="dht11"} 44.0

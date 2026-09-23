@@ -9,25 +9,34 @@ import (
 )
 
 func TestRenderNftablesEmpty(t *testing.T) {
-	// No networks → the table is deleted, not left with dangling rules.
+	// No networks still installs the table: the rules that keep a bridge the
+	// ruleset does not know dark must be in force at all times.
 	got := renderNftables(nil, nil)
-	if !strings.Contains(got, "delete table inet microhosted") {
-		t.Fatalf("empty render should delete the table, got:\n%s", got)
+	for _, want := range []string{
+		"delete table inet microhosted",
+		`iifname "mhbr*" drop`,
+		`iifname "mhbr*" iifname != @mhbridges drop`,
+		`oifname "mhbr*" oifname != @mhbridges drop`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("empty render is missing %q:\n%s", want, got)
+		}
 	}
-	if strings.Contains(got, "chain forward") {
-		t.Fatalf("empty render should not define chains, got:\n%s", got)
+	// nft rejects `elements = { }`; an empty set is declared without it.
+	if strings.Contains(got, "elements = {  }") || strings.Contains(got, "elements = { }") {
+		t.Fatalf("empty set rendered with an empty elements list:\n%s", got)
 	}
 }
 
 func TestRenderNftablesIsolationAndEgress(t *testing.T) {
 	nets := []types.Network{
 		{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24", Egress: false},
-		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true},
+		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
 	}
 	got := renderNftables(nets, nil)
 
-	// guest → host is always dropped.
-	if !strings.Contains(got, "iifname @mhbridges drop") {
+	// guest → host is always dropped, for any bridge of ours.
+	if !strings.Contains(got, `iifname "mhbr*" drop`) {
 		t.Fatalf("missing guest→host drop:\n%s", got)
 	}
 	// Cross-segment: one aggregate drop covers every bridge pair, with the
@@ -47,16 +56,84 @@ func TestRenderNftablesIsolationAndEgress(t *testing.T) {
 	if !strings.Contains(got, `iifname "mhbraaaa" oifname != @mhbridges drop`) {
 		t.Fatalf("no-egress network should block WAN egress:\n%s", got)
 	}
-	// ...while the egress network does NOT get that drop and DOES get NAT.
-	if strings.Contains(got, `iifname "mhbrbbbb" oifname != @mhbridges drop`) {
-		t.Fatalf("egress network must not have its WAN egress dropped:\n%s", got)
+	// ...while the egress network may leave through its interface only, and
+	// is masqueraded out that interface only.
+	if !strings.Contains(got, `iifname "mhbrbbbb" oifname != @mhbridges oifname != "eth0" drop`) {
+		t.Fatalf("egress network must be dropped towards anything but its interface:\n%s", got)
 	}
-	if !strings.Contains(got, "ip saddr 172.17.0.0/24 oifname != @mhbridges masquerade") {
-		t.Fatalf("egress network should be masqueraded:\n%s", got)
+	if strings.Contains(got, `iifname "mhbrbbbb" oifname != @mhbridges drop`) {
+		t.Fatalf("egress network must not have its egress dropped entirely:\n%s", got)
+	}
+	if !strings.Contains(got, `ip saddr 172.17.0.0/24 oifname "eth0" masquerade`) {
+		t.Fatalf("egress network should be masqueraded out its interface:\n%s", got)
 	}
 	// The no-egress subnet must never be masqueraded.
-	if strings.Contains(got, "172.16.0.0/24 oifname != @mhbridges masquerade") {
+	if strings.Contains(got, "172.16.0.0/24 oifname") {
 		t.Fatalf("no-egress subnet must not be masqueraded:\n%s", got)
+	}
+}
+
+// A bridge of ours that the ruleset does not list — a network mid-create, one
+// whose apply failed, a leftover of a crash — is dark in both directions, and
+// that drop comes before anything else in forward: the chain is `policy
+// accept`, so a bridge no rule names would otherwise have no policy at all.
+func TestRenderNftablesUnknownBridgeIsDark(t *testing.T) {
+	nets := []types.Network{
+		{Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24", AllowedEgress: []types.EgressRule{
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+		}},
+	}
+	got := renderNftables(nets, managedWlan())
+	in := mustIndex(t, got, `iifname "mhbr*" iifname != @mhbridges drop`)
+	out := mustIndex(t, got, `oifname "mhbr*" oifname != @mhbridges drop`)
+	firstAccept := mustIndex(t, got[strings.Index(got, "chain forward"):], "accept\n") + strings.Index(got, "chain forward")
+	if in > firstAccept || out > firstAccept {
+		t.Errorf("unknown-bridge drops must precede every accept in forward:\n%s", got)
+	}
+}
+
+// Egress persisted before EgressIface existed, with no interface resolved for
+// it, is rendered closed: "everything that is not a bridge" is the policy this
+// daemon no longer enforces.
+func TestRenderNftablesEgressWithoutIfaceIsClosed(t *testing.T) {
+	nets := []types.Network{{Name: "old", Bridge: "mhbrdddd", Subnet: "172.18.0.0/24", Egress: true}}
+	got := renderNftables(nets, nil)
+	if !strings.Contains(got, `iifname "mhbrdddd" oifname != @mhbridges drop`) {
+		t.Fatalf("egress without an interface must be dropped:\n%s", got)
+	}
+	if strings.Contains(got, "masquerade") {
+		t.Fatalf("egress without an interface must not be masqueraded:\n%s", got)
+	}
+}
+
+func TestValidateEgressPolicy(t *testing.T) {
+	managed := []string{"wlan0"}
+	rule := []types.EgressRule{{IP: "203.0.113.7", Protocol: "tcp", Port: 8883}}
+	for _, c := range []struct {
+		name    string
+		egress  bool
+		iface   string
+		rules   []types.EgressRule
+		wantErr string
+	}{
+		{"closed", false, "", nil, ""},
+		{"rules", false, "", rule, ""},
+		{"full egress through eth0", true, "eth0", nil, ""},
+		{"full egress needs an iface", true, "", nil, "needs egress_iface"},
+		{"iface without egress", false, "eth0", nil, "without egress"},
+		{"both", true, "eth0", rule, "mutually exclusive"},
+		{"managed iface", true, "wlan0", nil, "managed interface"},
+		{"our own bridge", true, "mhbr1234", nil, "daemon's own"},
+		{"our own tap", true, "tap0123abcd", nil, "daemon's own"},
+		{"injection", true, "eth0\" accept", nil, "may only contain"},
+	} {
+		err := ValidateEgressPolicy(c.egress, c.iface, c.rules, managed)
+		switch {
+		case c.wantErr == "" && err != nil:
+			t.Errorf("%s: unexpected error %v", c.name, err)
+		case c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)):
+			t.Errorf("%s: error = %v, want one containing %q", c.name, err, c.wantErr)
+		}
 	}
 }
 
@@ -299,7 +376,7 @@ func TestRenderNftablesWANRuleCannotReachManagedSegment(t *testing.T) {
 			{IP: "192.168.50.52", Protocol: "icmp"},
 			{IP: "192.168.50.0/24", Protocol: "tcp", Port: 502},
 		}},
-		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true},
+		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
 	}
 	got := renderNftables(nets, managedWlan())
 	blanketOut := mustIndex(t, got, `oifname "wlan0" drop`)

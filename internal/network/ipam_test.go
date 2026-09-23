@@ -1,6 +1,13 @@
 package network
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"testing"
+
+	"microhosted/pkg/types"
+)
 
 func TestSubnetGatewayAndCIDR(t *testing.T) {
 	s, err := ParseSubnet("172.16.0.0/24")
@@ -132,5 +139,38 @@ func TestSubnetReserveExclusiveRejectsOutsideSubnet(t *testing.T) {
 	}
 	if err := s.ReserveExclusive("vm", "not-an-ip"); err == nil {
 		t.Fatal("ReserveExclusive with a bogus IP must fail")
+	}
+}
+
+// A pinned address (an ingress rule's to_ip) is never handed out by Allocate,
+// even when free; an explicit claim still takes it.
+func TestAllocateAvoidsPinned(t *testing.T) {
+	s, err := ParseSubnet("172.16.0.0/29") // guests .2 .. .6
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := pinnedIPs(&types.Network{AllowedIngress: []types.IngressRule{{ToIP: "172.16.0.2"}, {ToIP: "172.16.0.4"}}})
+	var got []string
+	for i := 0; i < 3; i++ {
+		ip, err := s.AllocateAvoiding(fmt.Sprintf("vm%d", i), pinned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, ip)
+	}
+	if want := []string{"172.16.0.3", "172.16.0.5", "172.16.0.6"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("allocated %v, want %v (skipping the pinned .2 and .4)", got, want)
+	}
+	if _, err := s.AllocateAvoiding("vm3", pinned); err == nil {
+		t.Error("only pinned addresses left, yet one was allocated")
+	}
+	if err := s.ReserveExclusive("repl", "172.16.0.2"); err != nil {
+		t.Errorf("claiming a free pinned address: %v", err)
+	}
+	if err := s.ReserveExclusive("other", "172.16.0.2"); !errors.Is(err, ErrAddressInUse) {
+		t.Errorf("claiming a held address = %v, want ErrAddressInUse", err)
+	}
+	if pinnedIPs(&types.Network{}) != nil {
+		t.Error("a network without ingress rules pins nothing")
 	}
 }

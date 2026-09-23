@@ -2,6 +2,7 @@ package network
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -91,8 +92,23 @@ func (s *Subnet) CheckGuestIP(ipStr string) error {
 	return nil
 }
 
+// ErrAddressInUse is a specific address someone else already holds;
+// ErrBadAddress one no guest of the subnet can hold at all.
+var (
+	ErrAddressInUse = errors.New("address already in use")
+	ErrBadAddress   = errors.New("not a guest address")
+)
+
 // Allocate returns the next free guest IP for vmID.
 func (s *Subnet) Allocate(vmID string) (string, error) {
+	return s.AllocateAvoiding(vmID, nil)
+}
+
+// AllocateAvoiding is Allocate that never hands out an address in avoid, even
+// a free one. Those are pinned (the to_ip of an ingress rule): traffic is
+// addressed to them from outside, so only an explicit claim may take one —
+// never whichever VM happens to be created next.
+func (s *Subnet) AllocateAvoiding(vmID string, avoid map[string]bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -100,7 +116,7 @@ func (s *Subnet) Allocate(vmID string) (string, error) {
 	// free address. No high-water-mark shortcut: it would skip addresses freed
 	// by Release that sit below the mark.
 	for ip := s.gateway + 1; ip < s.bcast; ip++ {
-		if s.taken[ip] {
+		if s.taken[ip] || avoid[uint32ToIP(ip).String()] {
 			continue
 		}
 		s.taken[ip] = true
@@ -149,7 +165,7 @@ func (s *Subnet) ReserveExclusive(vmID, ipStr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.taken[v] {
-		return fmt.Errorf("address %s is already in use on this network", ipStr)
+		return fmt.Errorf("%w on this network: %s", ErrAddressInUse, ipStr)
 	}
 	s.taken[v] = true
 	s.used[vmID] = v
@@ -170,4 +186,9 @@ func uint32ToIP(v uint32) net.IP {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, v)
 	return net.IP(b)
+}
+
+// Overlaps reports whether two subnets share any address.
+func (s *Subnet) Overlaps(o *Subnet) bool {
+	return s.base <= o.bcast && o.base <= s.bcast
 }

@@ -44,8 +44,9 @@ everything after the VM is the guest command.
 
 ## Referring to things
 
-- **VMs**: full ID or any **unique prefix** — `mh stop a1b` is enough. An
-  ambiguous prefix is refused with the list of matches rather than guessed.
+- **VMs**: full ID, any **unique prefix** — `mh stop a1b` is enough — **or
+  name** (`mh stop ts01-a`). An ambiguous prefix is refused with the list of
+  matches rather than guessed.
 - **Volumes and snapshots**: ID, unique ID prefix, **or name**
   (`mh volume rm output`, `mh restore a1b2 clean`). On `restore`, a snapshot
   name is looked up among that VM's own snapshots, so every VM can have its
@@ -78,12 +79,16 @@ mh images                                   # templates you can create from
 mh run base-alpine                          # prints the new ID on stdout
 mh run base-alpine --net lab -c 2 -m 512M --disk 2G
 mh run base-alpine --no-net -v sample:/mnt/sample:ro -v output
+mh run alpine-py --name ts01-a -l sensor=ts-01 -l managed-by=ot
+mh run base-alpine --net ing53 --ip 172.16.20.3   # exact address: a replacement's, or an ingress to_ip
 VM=$(mh run base-alpine)                    # ID only on stdout; details go to stderr
 
 mh ps                                       # running VMs
 mh ps -a                                    # all, stopped included
 mh ps -q                                    # IDs only
 mh ps --net lab --json
+mh ps -l sensor=ts-01                       # only VMs with that label (repeat -l: all must match)
+mh ps -L                                    # --show-labels: add a LABELS column
 mh inspect a1b2 | jq .guest_ip
 
 mh exec a1b2 uname -a                       # exit code = the guest command's
@@ -98,9 +103,19 @@ mh logs a1b2 -n 50                          # console log (read from the host's 
 mh logs -f a1b2
 
 mh stop a1b2 && mh start a1b2               # power off keeping disk + IP, boot again
+mh vm update a1b2 --autostart               # boot it again on its own after a host reboot
+mh label ts01-a sensor=ts-02 role-          # set sensor, remove role; the rest untouched
+mh replace ts01-a --old stop                # new VM takes its IP + labels; old cut off and powered off
+mh replace ts01-a -s clean --old destroy    # replacement forked from snapshot "clean"
+mh quarantine ts01-a                        # cut it off its network in place: IP freed, still running, exec/cp work
 mh rm a1b2 e5f6                             # destroy (disk included)
 mh rm --all                                 # destroy EVERY VM
 ```
+
+`--name` is an alias for that one VM (unique, fixed for its life); what should
+survive replacing the VM — the sensor it serves, who owns it — goes in labels
+(see [api.md](api.md#post-v1vms--create)). `-c`/`-m` are also the VM's host limits:
+its cgroup caps it at that many cores and that memory (+64 MiB for Firecracker).
 
 `-v` takes `NAME[:GUEST_PATH][:ro]` — the volume is mounted at `/vol/NAME` unless
 you give a path. Sizes accept MiB (`512`) or a suffix (`512M`, `2G`).
@@ -115,7 +130,7 @@ A network's policy is named by **who opens the connection**:
 
 | | who opens it | where to |
 |---|---|---|
-| **OUT** | the VM | the internet, or a device behind a managed interface (`@IFACE`) |
+| **OUT** | the VM | the internet, or a device behind a managed interface (`@IFACE`); `--internet IFACE` opens ALL outbound through that one host interface |
 | **IN** | a device behind a managed interface | one VM of the network |
 
 Everything not listed is dropped, both ways. (The API calls these
@@ -123,7 +138,7 @@ Everything not listed is dropped, both ways. (The API calls these
 
 ```bash
 mh network create lab                       # isolated: nothing in or out, VMs can't see each other
-mh network create build --internet          # ALL outbound to the internet (NAT)
+mh network create build --internet eth0     # ALL outbound, through eth0 only (NAT)
 mh network create lab2 --intra --subnet 10.10.0.0/24
 mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
 mh network create ot-52 --out tcp:192.168.50.52:502@wlan0
@@ -138,7 +153,7 @@ mh network update lab --no-intra
 mh network update lab --out udp:10.0.0.53:53          # add an OUT rule
 mh network update lab --rm-out icmp:203.0.113.7       # remove one
 mh network update lab --set-out tcp:1.2.3.4:443       # REPLACE all OUT rules with these
-mh network update lab --internet                      # ALL outbound to the internet
+mh network update lab --internet eth0                 # ALL outbound, through eth0 only
 mh network update lab --no-out                        # close all outbound
 mh network update mqtt-60 --in tcp:192.168.50.61:1883@wlan0=172.16.9.3      # add an IN rule
 mh network update mqtt-60 --rm-in tcp:192.168.50.61:1883@wlan0=172.16.9.3   # remove one
@@ -148,6 +163,12 @@ mh network update lab --out tcp:1.2.3.4:80 --no-intra # OUT + intra in one go
 mh network rm lab                           # refuses while VMs are attached
 mh network rm -f lab                        # destroys its VMs first
 ```
+
+`--internet` needs the interface: "all outbound" without one used to mean
+everything that is not one of our bridges — the LAN behind a second NIC, a VPN,
+the Docker networks. A network created before this rule was pinned to the
+default route's interface; `mh network ls` shows `internet@eth0`, or `CLOSED`
+when the daemon found no usable one (set it with `--internet IFACE`).
 
 **OUT rules** are `PROTO:DEST[:PORT][@IFACE]`:
 
@@ -201,6 +222,7 @@ mh vm snapshot a1b2 --name clean            # or: mh snapshot create a1b2 --name
 mh snapshot ls [--vm a1b2]
 mh restore a1b2 clean                       # rewind in place (same ID, IP)
 mh snapshot fork clean --quarantine         # new VM from a snapshot, no network
+mh snapshot fork clean --name ts01-b -l sensor=ts-01   # a fork inherits no name or labels
 mh fork a1b2 --quarantine                   # direct clone of a running VM
 mh snapshot rm clean
 ```
@@ -211,7 +233,24 @@ mh snapshot rm clean
 mh health          # checks table; exit 1 when degraded (usable in scripts/monitors)
 mh info            # host, memory, store, fleet, checks, store usage, paths
 mh info --json     # the raw GET /v1/system
+mh doctor          # drift between the daemon and the host; exit 1 if any
+mh events                         # follow what happens from now on (survives daemon restarts)
+mh events -l sensor=ts-01 -t vm.died -t vm.replace_failed
+mh events --all --no-follow       # every event the daemon still keeps, then exit
+mh events --json                  # one JSON event per line; its epoch:seq resumes with --since
 ```
+
+`mh doctor` lists everything the daemon and the host disagree on: Firecracker
+processes, TAPs, bridges, jail dirs and cgroups nobody owns, disks and logs no
+record owns, running VMs whose process or TAP is gone, IP leases and volume
+claims of VMs that do not exist, interrupted creates, and a firewall ruleset
+that failed to apply. It changes nothing; restarting the daemon cleans all of
+it except disks, which it only reports. `scripts/fault-test.sh` uses it as the
+pass/fail criterion.
+
+A VM whose process dies on its own (OOM killer, crash, guest reboot) shows as
+`stopped` within seconds, and `mh inspect VM` has `last_exit` with when and
+why. It is not restarted.
 
 ## Output and exit codes
 
@@ -220,7 +259,8 @@ mh info --json     # the raw GET /v1/system
 - `inspect` prints JSON: a bare object for one argument (`| jq .field`), an
   array for several.
 - Commands that create something print its ID/name on stdout.
-- Exit codes: `0` ok · `1` the operation failed (or `health` is degraded) ·
+- Exit codes: `0` ok · `1` the operation failed (or `health` is degraded, or
+  `doctor` found something) ·
   `2` bad command line · for `exec`, the guest command's own exit code.
 - Commands over several targets (`rm a b c`, `stop a b`) keep going past a
   failure, report each one, and exit `1` if any failed.

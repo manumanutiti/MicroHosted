@@ -27,6 +27,10 @@ var vmGroup = &group{
 		{name: "rm", aliases: []string{"remove", "delete"}, args: "VM... | --all", summary: "Destroy VMs (disk included)", run: vmRemove},
 		{name: "stop", args: "VM...", summary: "Power a VM off, keeping its disk and IP", run: vmStop},
 		{name: "start", args: "VM...", summary: "Boot a stopped VM again", run: vmStart},
+		{name: "replace", args: "VM", summary: "Hand a VM's function (address, labels) to a new VM; the old one is cut off", run: vmReplace},
+		{name: "quarantine", args: "VM...", summary: "Cut a running VM off its network in place (IP freed, vsock kept)", run: vmQuarantine},
+		{name: "update", aliases: []string{"set"}, args: "VM...", summary: "Change whether a VM boots again after a host reboot", run: vmUpdate},
+		{name: "label", args: "VM KEY=VALUE... | KEY-...", summary: "Set (KEY=VALUE) or remove (KEY-) a VM's labels", run: vmLabel},
 		{name: "exec", args: "VM COMMAND...", summary: "Run a command inside a VM (over vsock)", run: vmExec},
 		{name: "cp", args: "VM:PATH LOCAL | LOCAL VM:PATH", summary: "Copy a file between a VM and the host", run: vmCopy},
 		{name: "logs", args: "VM", summary: "Show a VM's console log (same host only)", run: vmLogs},
@@ -38,15 +42,19 @@ var vmGroup = &group{
 
 func vmCreate(e *env, cmd *command, p string, args []string) error {
 	var req types.CreateVMRequest
-	var volumes []string
+	var volumes, labels []string
 	fs := newCmdFlags(e, p, cmd)
+	fs.stringVar(&req.Name, "name", "", "", "`NAME` for this VM, unique; usable wherever a VM ID is")
+	fs.listVar(&labels, "label", "l", "label `KEY=VALUE` (repeatable)")
 	fs.int64Var(&req.VCPUs, "cpus", "c", "vCPUs (default: the template's)")
 	fs.Var((*mbValue)(&req.MemMB), "mem", "memory `SIZE`, e.g. 256 (MiB) or 1G (default: the template's)")
 	fs.alias("mem", "m")
 	fs.Var((*mbValue)(&req.DiskMB), "disk", "disk `SIZE`, only grows the template's, e.g. 2G")
 	fs.stringVar(&req.Network, "net", "n", "", "`NETWORK` to attach to (default: \"default\")")
 	fs.boolVar(&req.NoNetwork, "no-net", "", "no network at all: reachable over vsock only (exec, cp)")
+	fs.stringVar(&req.GuestIP, "ip", "", "", "take this exact `ADDRESS` on the network (a replacement's; the only way to get an ingress rule's to_ip)")
 	fs.listVar(&volumes, "volume", "v", "attach volume `NAME[:GUEST_PATH][:ro]` (repeatable; default path /vol/NAME)")
+	fs.boolVar(&req.Autostart, "autostart", "", "boot it again when the daemon starts and finds it dead (host reboot)")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -58,6 +66,9 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 		return usagef(p, "--net and --no-net are mutually exclusive")
 	}
 	req.Template = pos[0]
+	if req.Labels, err = parseLabels(labels); err != nil {
+		return usagef(p, "%v", err)
+	}
 	for _, v := range volumes {
 		va, err := parseVolumeSpec(v)
 		if err != nil {
@@ -88,7 +99,11 @@ func announceVM(e *env, verb string, vm types.VMResponse) {
 	case vm.Network != "":
 		where = vm.Network + " " + vm.GuestIP
 	}
-	fmt.Fprintf(e.stderr, "%s %s: %s, %s\n", verb, vm.ID, vm.Template, where)
+	who := vm.ID
+	if vm.Name != "" {
+		who += " (" + vm.Name + ")"
+	}
+	fmt.Fprintf(e.stderr, "%s %s: %s, %s\n", verb, who, vm.Template, where)
 }
 
 // parseVolumeSpec reads docker's -v shape: NAME, NAME:ro, NAME:/mnt/x,
@@ -116,10 +131,13 @@ func parseVolumeSpec(s string) (types.VolumeAttachRequest, error) {
 }
 
 func vmList(e *env, cmd *command, p string, args []string) error {
-	var all, quiet, asJSON bool
+	var all, quiet, asJSON, showLabels bool
 	var network string
+	var selector []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.boolVar(&all, "all", "a", "include stopped and failed VMs")
+	fs.listVar(&selector, "label", "l", "only VMs labelled `KEY=VALUE` (repeatable: all must match)")
+	fs.boolVar(&showLabels, "show-labels", "L", "add a LABELS column")
 	fs.boolVar(&quiet, "quiet", "q", "print IDs only")
 	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
 	fs.stringVar(&network, "net", "n", "", "only VMs on `NETWORK`")
@@ -134,7 +152,7 @@ func vmList(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
-	vms, err := c.listVMs()
+	vms, err := c.listVMs(selector...)
 	if err != nil {
 		return err
 	}
@@ -162,21 +180,34 @@ func vmList(e *env, cmd *command, p string, args []string) error {
 	}
 	rows := make([][]string, 0, len(shown))
 	for _, v := range shown {
-		net := orDash(v.Network)
+		net, ip := orDash(v.Network), orDash(v.GuestIP)
 		if v.Quarantine {
+			// The address the guest still believes it has, not a reservation:
+			// the network may already have handed it to another VM.
 			net = "(quarantine)"
+			if v.GuestIP != "" {
+				ip = "(" + v.GuestIP + ")"
+			}
 		}
 		rss, uptime := "-", "-"
 		if v.State == types.VMStateRunning {
 			rss = fmtMB(v.MemRSSMB)
 			uptime = fmtDuration(v.UptimeSeconds)
 		}
-		rows = append(rows, []string{
-			v.ID, v.Template, string(v.State), net, orDash(v.GuestIP),
+		row := []string{
+			v.ID, orDash(v.Name), v.Template, string(v.State), net, ip,
 			strconv.FormatInt(v.VCPUs, 10), fmtMB(v.MemMB), rss, uptime, fmtAgo(v.CreatedAt),
-		})
+		}
+		if showLabels {
+			row = append(row, fmtLabels(v.Labels))
+		}
+		rows = append(rows, row)
 	}
-	table(e.stdout, []string{"VM ID", "TEMPLATE", "STATE", "NETWORK", "IP", "VCPU", "MEM", "RSS", "UPTIME", "CREATED"}, rows)
+	header := []string{"VM ID", "NAME", "TEMPLATE", "STATE", "NETWORK", "IP", "VCPU", "MEM", "RSS", "UPTIME", "CREATED"}
+	if showLabels {
+		header = append(header, "LABELS")
+	}
+	table(e.stdout, header, rows)
 	return nil
 }
 
@@ -269,6 +300,100 @@ func vmStop(e *env, cmd *command, p string, args []string) error {
 }
 func vmStart(e *env, cmd *command, p string, args []string) error {
 	return vmAction(e, cmd, p, args, "start")
+}
+
+// vmReplace hands a VM's function over to a new VM. The new ID goes to stdout,
+// like run, so NEW=$(mh replace ts01-a) works.
+func vmReplace(e *env, cmd *command, p string, args []string) error {
+	var req types.ReplaceVMRequest
+	var labels []string
+	fs := newCmdFlags(e, p, cmd)
+	fs.stringVar(&req.Snapshot, "snapshot", "s", "", "fork the replacement from `SNAPSHOT` (taken at the function's address)")
+	fs.stringVar(&req.Template, "template", "t", "", "boot the replacement from `TEMPLATE` (default: the old VM's)")
+	fs.stringVar(&req.Old, "old", "", "", "what to do with the old VM: quarantine (default, left running), stop (disk kept, RAM freed) or destroy")
+	fs.stringVar(&req.Name, "name", "", "", "`NAME` for the replacement")
+	fs.listVar(&labels, "label", "l", "extra label `KEY=VALUE` for the replacement (it inherits the old VM's)")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usagef(p, "expected exactly one VM, got %d arguments", len(pos))
+	}
+	if req.Snapshot != "" && req.Template != "" {
+		return usagef(p, "--snapshot and --template are mutually exclusive")
+	}
+	if req.Labels, err = parseLabels(labels); err != nil {
+		return usagef(p, "%v", err)
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	id, err := c.resolveVM(pos[0])
+	if err != nil {
+		return err
+	}
+	if req.Snapshot != "" {
+		if req.Snapshot, err = c.resolveSnapshot(req.Snapshot, ""); err != nil {
+			return err
+		}
+	}
+	var resp types.ReplaceVMResponse
+	if err := c.Do("POST", "/v1/vms/"+id+"/replace", req, &resp); err != nil {
+		return err
+	}
+	announceVM(e, "replaced "+id+" with", resp.Replacement)
+	if resp.Old == nil {
+		fmt.Fprintf(e.stderr, "%s destroyed\n", id)
+	} else {
+		fmt.Fprintf(e.stderr, "%s left %s, quarantined\n", id, resp.Old.State)
+	}
+	return nil
+}
+
+// vmQuarantine cuts VMs off their network without stopping them: TAP off the
+// bridge, IP back to the pool, label lease=quarantined. exec and cp still
+// work. There is no undo.
+func vmQuarantine(e *env, cmd *command, p string, args []string) error {
+	return vmAction(e, cmd, p, args, "quarantine")
+}
+
+// vmUpdate flips autostart: whether the daemon boots the VM again when it
+// starts and finds it dead (host reboot). A VM stopped with `mh stop` stays
+// off either way.
+func vmUpdate(e *env, cmd *command, p string, args []string) error {
+	var on, off bool
+	fs := newCmdFlags(e, p, cmd)
+	fs.boolVar(&on, "autostart", "", "boot it again after a host reboot")
+	fs.boolVar(&off, "no-autostart", "", "leave it stopped after a host reboot")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(pos) == 0:
+		return usagef(p, "expected at least one VM")
+	case on && off:
+		return usagef(p, "--autostart and --no-autostart are mutually exclusive")
+	case !on && !off:
+		return usagef(p, "nothing to change: give --autostart or --no-autostart")
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	return eachArg(e, pos, func(ref string) error {
+		id, err := c.resolveVM(ref)
+		if err != nil {
+			return err
+		}
+		if err := c.Do("PUT", "/v1/vms/"+id+"/autostart", types.UpdateVMAutostartRequest{Autostart: on}, nil); err != nil {
+			return err
+		}
+		fmt.Fprintln(e.stdout, id)
+		return nil
+	})
 }
 
 func vmAction(e *env, cmd *command, p string, args []string, verb string) error {
@@ -574,14 +699,19 @@ func createSnapshot(e *env, vmRef, name string) error {
 
 func vmFork(e *env, cmd *command, p string, args []string) error {
 	var req types.ForkVMRequest
+	var labels []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.boolVar(&req.Quarantine, "quarantine", "", "attach the clone to no network (vsock only) — needed while the source VM holds its IP")
+	forkIdentityFlags(fs, &req, &labels)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
 		return usagef(p, "expected exactly one VM")
+	}
+	if req.Labels, err = parseLabels(labels); err != nil {
+		return usagef(p, "%v", err)
 	}
 	c, err := e.api()
 	if err != nil {
@@ -690,4 +820,83 @@ func fmtAgo(rfc3339 string) string {
 		return rfc3339
 	}
 	return fmtDuration(int64(time.Since(t).Seconds())) + " ago"
+}
+
+// forkIdentityFlags adds --name and --label to a fork command. A fork inherits
+// neither from its source (see types.ForkVMRequest).
+func forkIdentityFlags(fs *flagSet, req *types.ForkVMRequest, labels *[]string) {
+	fs.stringVar(&req.Name, "name", "", "", "`NAME` for the new VM, unique (nothing is inherited from the source)")
+	fs.listVar(labels, "label", "l", "label `KEY=VALUE` for the new VM (repeatable)")
+}
+
+// parseLabels reads KEY=VALUE arguments into a label set. The daemon validates
+// keys and values; this only checks the shape.
+func parseLabels(args []string) (map[string]string, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	labels := make(map[string]string, len(args))
+	for _, a := range args {
+		k, v, ok := strings.Cut(a, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("label %q: expected KEY=VALUE", a)
+		}
+		if prev, dup := labels[k]; dup && prev != v {
+			return nil, fmt.Errorf("label %s given twice (%q and %q)", k, prev, v)
+		}
+		labels[k] = v
+	}
+	return labels, nil
+}
+
+// vmLabel sets and removes labels, kubectl-style: KEY=VALUE sets, KEY- removes.
+// Everything else the VM carries is left as it is.
+func vmLabel(e *env, cmd *command, p string, args []string) error {
+	fs := newCmdFlags(e, p, cmd)
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 2 {
+		return usagef(p, "expected a VM and at least one KEY=VALUE or KEY-")
+	}
+	patch := make(map[string]*string, len(pos)-1)
+	for _, a := range pos[1:] {
+		if k, v, ok := strings.Cut(a, "="); ok && k != "" {
+			patch[k] = &v
+			continue
+		}
+		if k, ok := strings.CutSuffix(a, "-"); ok && k != "" {
+			patch[k] = nil
+			continue
+		}
+		return usagef(p, "%q: expected KEY=VALUE to set or KEY- to remove", a)
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	id, err := c.resolveVM(pos[0])
+	if err != nil {
+		return err
+	}
+	var vm types.VMResponse
+	if err := c.Do("PATCH", "/v1/vms/"+id+"/labels", types.UpdateVMLabelsRequest{Labels: patch}, &vm); err != nil {
+		return err
+	}
+	fmt.Fprintln(e.stdout, id)
+	return nil
+}
+
+// fmtLabels renders labels as "k=v,k2=v2", sorted, or "-" for none.
+func fmtLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "-"
+	}
+	terms := make([]string, 0, len(labels))
+	for k, v := range labels {
+		terms = append(terms, k+"="+v)
+	}
+	sort.Strings(terms)
+	return strings.Join(terms, ",")
 }

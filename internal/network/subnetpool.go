@@ -39,3 +39,11 @@ func (p *subnetPool) reserve(cidr string) {
 	defer p.mu.Unlock()
 	p.used[cidr] = true
 }
+
+// release returns a subnet to the pool when its network is deleted (or its
+// creation rolled back), so churn doesn't exhaust the range until a restart.
+func (p *subnetPool) release(cidr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.used, cidr)
+}

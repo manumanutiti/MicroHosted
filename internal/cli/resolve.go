@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -10,8 +11,8 @@ import (
 
 // The API addresses VMs, volumes and snapshots by ID only. Typing IDs is what
 // makes curl slow, so the CLI resolves what a person naturally types — the
-// full ID, a unique ID prefix, or (volumes, snapshots) the name — against one
-// list call, like docker does.
+// full ID, a unique ID prefix, or the name — against one list call, like
+// docker does.
 
 type candidate struct{ id, name string }
 
@@ -47,9 +48,16 @@ func match(kind, ref string, cands []candidate) (string, error) {
 	return "", fmt.Errorf("%q matches several %ss: %s — use the full ID", ref, kind, strings.Join(hits, ", "))
 }
 
-func (c *Client) listVMs() ([]types.VMResponse, error) {
+// listVMs lists the VMs carrying every label in selector (KEY=VALUE terms),
+// or all of them.
+func (c *Client) listVMs(selector ...string) ([]types.VMResponse, error) {
+	path := "/v1/vms"
+	if len(selector) > 0 {
+		q := url.Values{"label": selector}
+		path += "?" + q.Encode()
+	}
 	var vms []types.VMResponse
-	return vms, c.Do("GET", "/v1/vms", nil, &vms)
+	return vms, c.Do("GET", path, nil, &vms)
 }
 
 func (c *Client) resolveVM(ref string) (string, error) {
@@ -59,7 +67,7 @@ func (c *Client) resolveVM(ref string) (string, error) {
 	}
 	cands := make([]candidate, 0, len(vms))
 	for _, v := range vms {
-		cands = append(cands, candidate{id: v.ID})
+		cands = append(cands, candidate{id: v.ID, name: v.Name})
 	}
 	return match("VM", ref, cands)
 }
