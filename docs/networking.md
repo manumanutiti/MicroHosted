@@ -509,6 +509,102 @@ from the updated template.
   bridges + rules from the persisted state (a network survives a host reboot, not
   just a daemon restart).
 
+## Scaling the ruleset (future work)
+
+Not a problem at today's scale; written down so it is recognised when it
+becomes one.
+
+### How the ruleset is applied today
+
+Every policy change — a network created, updated or deleted — re-renders the
+**whole** table from the declared state and replaces it in one `nft -f -`
+transaction:
+
+```
+table inet microhosted {}          # make sure it exists
+delete table inet microhosted      # drop it
+table inet microhosted { ... }     # recreate it with EVERY network
+```
+
+The kernel applies that as one atomic transaction: the new ruleset is in force
+completely or not at all. This is deliberate, and it is what the fail-closed
+guarantees rest on: the ruleset is a pure function of the declared state (no
+incremental rule can drift from it), a failed apply rolls the change back, and
+`mh doctor` can assert that the policy in force is the declared one. Policy
+changes are serialized (`applyMu`).
+
+### Two costs that grow with the number of networks
+
+**1. Control plane — applying a change.** The rendered text, and the work the
+kernel does to parse and commit it, grows linearly with the number of networks.
+Measured with `scripts/density-test.sh` (one network + one VM per device), the
+time to create a network went from ~40 ms with none to ~70 ms with 164, about
+0.2 ms per existing network (that figure also includes the bridge, IPAM and the
+store write, which are constant). Extrapolated linearly: ~140 ms at 500
+networks, ~250 ms at 1,000. Because changes are serialized, a burst of network
+creates queues behind each other.
+
+**2. Data plane — every forwarded packet.** This one is not visible in a
+deploy benchmark and matters more. The `forward` chain is **stateless on
+purpose** (every packet re-evaluates the policy, so tightening a rule cuts live
+flows), and the per-network rules form a **linear list**:
+
+```
+iifname "mhbr…1" oifname != @mhbridges ip daddr 192.168.0.15 tcp dport 1883 accept
+iifname "mhbr…1" oifname != @mhbridges drop
+iifname "mhbr…2" ...
+... one or more rules per network
+```
+
+A packet from the last network walks past the rules of every network before it.
+The global checks already use sets (`@mhbridges`, `@mhsame`) and cost O(1)
+regardless of N — that is why cross-segment isolation is one aggregate rule and
+not N² pair rules — but the per-network egress rules do not. For low-rate sensor
+traffic this is microseconds per packet and irrelevant; it becomes relevant with
+high per-VM throughput or thousands of networks.
+
+### The planned change
+
+1. **Data plane: dispatch by verdict map.** Give each network its own chain and
+   jump to it in O(1):
+
+   ```
+   chain forward {
+       ...global drops (sets, O(1))...
+       iifname vmap { "mhbr…1" : jump net_1, "mhbr…2" : jump net_2, ... }
+   }
+   chain net_1 {
+       oifname != @mhbridges ip daddr 192.168.0.15 tcp dport 1883 accept
+       oifname != @mhbridges drop
+   }
+   ```
+
+   Each packet evaluates the global rules plus only its own network's rules. The
+   ruleset stays declarative and is still applied as one atomic transaction, so
+   none of the guarantees above change. The same shape applies to the
+   managed-interface legs (keyed by `iifname`/`oifname`) and to `postrouting`
+   (keyed by source subnet). Ordering must be preserved: the managed-interface
+   holes and drops still come before every WAN-scoped rule.
+
+2. **Control plane: incremental transactions — only if needed.** Instead of
+   replacing the table, add or remove just one network's chain and its vmap and
+   set elements, still inside a single `nft -f` transaction. This removes the
+   linear apply cost but gives up part of "the ruleset is a pure function of the
+   state": the daemon would then need to verify, not assume, that the table in
+   force matches the declared state (a periodic full comparison, reported by
+   `mh doctor`). Worth it only in the thousands of networks.
+
+### When to act
+
+- Step 1 when a workload needs sustained throughput per VM, or when a fleet
+  approaches several hundred networks per host.
+- Step 2 only if network create latency or queueing under bursts becomes a
+  measured problem.
+
+Before either, extend `scripts/density-test.sh` to record the `nft -f` apply
+time and the rule count per step, and to measure forwarding latency/throughput
+of one VM as N grows, so the decision is made on data.
+
 ## API
 
 ```
