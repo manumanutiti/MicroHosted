@@ -180,9 +180,10 @@ The top. What actually happens on `POST /v1/vms`.
 - **The daemon then:**
   1. **Clones** the golden rootfs on the store — a CoW reflink (L3), near-zero
      cost.
-  2. **Grows** the clone to `disk_mb` with `resize2fs` so the guest has free
-     space (a golden is near-full; without this, `apt install` fails with
-     *No space left*).
+  2. **Grows** the clone to `disk_mb` so the guest has free space (a golden is
+     near-full; without this, `apt install` fails with *No space left*). The
+     `e2fsck` + `resize2fs` grow runs once per golden and size, into a cached
+     copy under `<store>/sized/`; every later clone reflinks that copy.
   3. **Attaches networking** (L6) unless `no_network` is set: TAP, bridge, IP.
   4. **Jails and boots** (L2): Jailer hard-links the clone + kernel into a
      chroot on the store, drops privileges, and launches Firecracker.

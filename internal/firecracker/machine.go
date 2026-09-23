@@ -14,7 +14,13 @@ import (
 	"microhosted/pkg/types"
 )
 
-const defaultKernelArgs = "console=ttyS0 reboot=k panic=1 pci=off"
+// defaultKernelArgs keeps the serial console (the VM's console log and its
+// getty) but boots it quiet: every character the kernel prints to the emulated
+// UART traps into the VMM, and its ~200 boot lines cost ~80 ms of an ~170 ms
+// boot to agent-ready (measured with scripts/boot-args-bench.py). Warnings and
+// errors still reach the console log; the full boot log stays in the guest's
+// dmesg.
+const defaultKernelArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet"
 
 // defaultNameservers are handed to every networked guest via the SDK's
 // IPConfiguration.Nameservers (see BuildConfig). Public resolvers, not the

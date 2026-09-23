@@ -348,7 +348,9 @@ request cancelled while waiting for a slot gives up its place.
 Each `POST` clones the template's rootfs from scratch
 (`internal/storage.CloneRootfs`, copy-on-write via `cp --reflink=auto`) and grows
 it to `disk_mb` with `resize2fs` so the guest has free space (a golden rootfs
-ships nearly full; without this, an `apt install` runs out of space). The CoW is
+ships nearly full; without this, an `apt install` runs out of space). The grow
+runs once per golden and size: the grown copy is cached under `<store>/sized/`
+and later creates reflink it, which keeps it out of the deploy path. The CoW is
 only real on a filesystem with reflink (btrfs / XFS-reflink); on plain ext4 `cp`
 falls back to a full copy and each VM takes the whole disk — the daemon warns
 about this on startup and `scripts/setup-host.sh` provisions a CoW store. There's

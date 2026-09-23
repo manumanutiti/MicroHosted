@@ -190,13 +190,14 @@ now_ms() { date +%s%3N; }
 deaths() { grep -c '^event: vm.died' "$EVENTS_FILE" 2>/dev/null || true; }
 
 # agent_ok VM TIMEOUT_S: wait up to TIMEOUT_S seconds for the vsock agent
-# (create returns before it listens).
+# (create returns before it listens). Polls every 20 ms: the guest is usually
+# up in ~200 ms, so a coarse interval would dominate the measured agent time.
 agent_ok() {
-  local out
-  for _ in $(seq 1 $(( $2 * 2 ))); do
+  local out deadline=$(( $(now_ms) + $2 * 1000 ))
+  while [[ "$(now_ms)" -lt "$deadline" ]]; do
     out=$("${CURL[@]}" -X POST "$BASE/v1/vms/$1/exec" -d '{"cmd":"echo ok"}' | jq -r '.output // empty' 2>/dev/null)
     [[ "$out" == ok* ]] && return 0
-    sleep 0.5
+    sleep 0.02
   done
   return 1
 }

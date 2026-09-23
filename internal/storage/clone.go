@@ -1,11 +1,18 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 
 	"microhosted/pkg/types"
 )
@@ -34,7 +41,8 @@ const bytesPerMiB = 1024 * 1024
 // left at its size runs out of space the moment the guest apt-installs
 // anything. Growth is additive only: a diskMB of 0, or one no larger than the
 // golden, leaves the clone as-is (CloneRootfs never shrinks a disk). See
-// growRootfs for why an offline resize is all it takes.
+// growRootfs for why an offline resize is all it takes. The grow runs once per
+// golden and size, not once per VM: see sizedGolden.
 func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid int, diskMB int64) (string, error) {
 	if err := os.MkdirAll(instancesDir, 0o755); err != nil {
 		return "", fmt.Errorf("creating instances dir %s: %w", instancesDir, err)
@@ -42,13 +50,26 @@ func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid 
 
 	dst := filepath.Join(instancesDir, vmID+".ext4")
 
-	if err := ReflinkFile(tpl.RootfsPath, dst); err != nil {
+	// Reflink from an already-grown copy of the golden when one can be had:
+	// same bytes as growing this clone, without an e2fsck+resize2fs per VM.
+	// Any trouble preparing it falls back to growing the clone itself.
+	src := tpl.RootfsPath
+	sized, err := sizedGolden(tpl.RootfsPath, instancesDir, diskMB)
+	if err != nil {
+		log.Printf("storage: no pre-grown copy of %s at %dMB, growing the clone instead: %v", tpl.RootfsPath, diskMB, err)
+	} else if sized != "" {
+		src = sized
+	}
+
+	if err := ReflinkFile(src, dst); err != nil {
 		return "", fmt.Errorf("cloning rootfs for %s: %w", vmID, err)
 	}
 
-	if err := growRootfs(dst, diskMB); err != nil {
-		_ = os.Remove(dst)
-		return "", fmt.Errorf("growing clone for %s to %dMB: %w", vmID, diskMB, err)
+	if src == tpl.RootfsPath {
+		if err := growRootfs(dst, diskMB); err != nil {
+			_ = os.Remove(dst)
+			return "", fmt.Errorf("growing clone for %s to %dMB: %w", vmID, diskMB, err)
+		}
 	}
 
 	if err := os.Chown(dst, uid, gid); err != nil {
@@ -57,6 +78,161 @@ func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid 
 	}
 
 	return dst, nil
+}
+
+// sizedDir holds the pre-grown copies of the goldens (see sizedGolden). A
+// subdirectory, so the doctor's scan of the store's top level for orphaned
+// <vm id>.ext4 clones never mistakes one for a VM disk.
+const sizedDir = "sized"
+
+// sizedMu serialises building pre-grown goldens, so concurrent creates of the
+// same template and size grow it once instead of racing to do the same work.
+var sizedMu sync.Mutex
+
+// sizedGolden returns a copy of golden already grown to diskMB, building it on
+// first use, or "" when no growth is needed (diskMB 0 or not above the
+// golden's size). Growing a clone runs e2fsck and resize2fs, tens of
+// milliseconds on every create, and the result depends only on the golden and
+// the size, so it's done once and every VM reflinks the grown copy instead.
+//
+// The file name carries a key derived from the golden's identity (path,
+// inode, size, mtime), so rebuilding a golden yields a new copy rather than
+// serving a stale one; building it prunes the previous copies of that golden
+// at that size. The copy is written under a temporary name and renamed into
+// place, so a reader never sees a half-grown file.
+func sizedGolden(golden, instancesDir string, diskMB int64) (string, error) {
+	if diskMB <= 0 {
+		return "", nil
+	}
+	key, size, err := goldenKey(golden)
+	if err != nil {
+		return "", err
+	}
+	if size >= diskMB*bytesPerMiB {
+		return "", nil
+	}
+
+	prefix := fmt.Sprintf("%s-%dm-", goldenBase(golden), diskMB)
+	dir := filepath.Join(instancesDir, sizedDir)
+	path := filepath.Join(dir, prefix+key+".ext4")
+
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+
+	sizedMu.Lock()
+	defer sizedMu.Unlock()
+	if _, err := os.Stat(path); err == nil {
+		return path, nil // built by a concurrent create while we waited
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	if err := ReflinkFile(golden, tmp); err != nil {
+		return "", err
+	}
+	if err := growRootfs(tmp, diskMB); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+
+	if stale, err := filepath.Glob(filepath.Join(dir, prefix+"*.ext4")); err == nil {
+		for _, s := range stale {
+			if s != path {
+				_ = os.Remove(s)
+			}
+		}
+	}
+	return path, nil
+}
+
+// goldenKey identifies a golden as it is right now (path, inode, size, mtime),
+// so a rebuilt golden gets a different key; it also returns the golden's size.
+func goldenKey(golden string) (key string, size int64, err error) {
+	fi, err := os.Stat(golden)
+	if err != nil {
+		return "", 0, err
+	}
+	abs, err := filepath.Abs(golden)
+	if err != nil {
+		return "", 0, err
+	}
+	var ino uint64
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		ino = st.Ino
+	}
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%d|%d|%d", abs, ino, fi.Size(), fi.ModTime().UnixNano()))
+	return hex.EncodeToString(sum[:6]), fi.Size(), nil
+}
+
+// goldenBase is the golden's file name without .ext4: the leading part of its
+// pre-grown copies' names.
+func goldenBase(golden string) string {
+	return strings.TrimSuffix(filepath.Base(golden), ".ext4")
+}
+
+// PruneSizedGoldens removes the pre-grown copies (see sizedGolden) that match
+// none of goldens as they are now: their template left the catalog, or its
+// golden was rebuilt or deleted. Leftover temporary files from an interrupted
+// build go too. They are a cache, rebuilt by the next create that needs one,
+// so this is safe whenever no create is in flight. Returns what it removed.
+func PruneSizedGoldens(instancesDir string, goldens []string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(instancesDir, sizedDir))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// A copy is named <golden base>-<size>m-<golden key>.ext4.
+	current := make(map[string]bool)
+	for _, g := range goldens {
+		if key, _, err := goldenKey(g); err == nil {
+			current[goldenBase(g)+"|"+key] = true
+		}
+	}
+	keep := func(name string) bool {
+		rest, ok := strings.CutSuffix(name, ".ext4")
+		if !ok {
+			return false
+		}
+		i := strings.LastIndexByte(rest, '-')
+		if i < 0 {
+			return false
+		}
+		rest, key := rest[:i], rest[i+1:]
+		j := strings.LastIndexByte(rest, '-')
+		if j < 0 {
+			return false
+		}
+		base, size := rest[:j], rest[j+1:]
+		if n, ok := strings.CutSuffix(size, "m"); !ok || n == "" || strings.Trim(n, "0123456789") != "" {
+			return false
+		}
+		return current[base+"|"+key]
+	}
+
+	var removed []string
+	var errs []error
+	for _, e := range entries {
+		if e.IsDir() || keep(e.Name()) {
+			continue
+		}
+		path := filepath.Join(instancesDir, sizedDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		removed = append(removed, path)
+	}
+	return removed, errors.Join(errs...)
 }
 
 // growRootfs enlarges an ext4 image file to sizeMB MiB and expands its

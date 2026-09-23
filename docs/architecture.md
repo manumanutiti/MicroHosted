@@ -63,7 +63,12 @@ per 1GB clone, not 300MB).
 with `resize2fs` (offline: goldens are ext4 over the whole device, with no
 partition table, so `truncate` + `resize2fs` is enough), so the guest has free
 space — a golden ships nearly full and, without this, an `apt install` runs out
-of disk.
+of disk. The grow happens once per golden and size: the result is cached as
+`<store>/sized/<golden>-<size>m-<key>.ext4`, where the key identifies the golden
+file as it is now, and every later clone reflinks it. The guest gets the same
+bytes it would from growing its own clone. On startup the daemon removes copies
+that match no current template golden (template removed from the catalog, or
+golden rebuilt or deleted); the next create that needs one rebuilds it.
 
 **Key invariant**: everything the daemon clones or hardlinks shares this same
 filesystem, because neither reflink (`cp --reflink`) nor hardlink cross

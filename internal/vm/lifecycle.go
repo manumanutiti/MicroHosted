@@ -365,6 +365,25 @@ func (m *Manager) SweepResidue() {
 	}
 }
 
+// PruneSizedGoldens removes the pre-grown golden copies no template in the
+// catalog needs any more: its template was removed, or its golden rebuilt or
+// deleted (see storage.PruneSizedGoldens). Unlike SweepResidue's targets these
+// are a disposable cache, not VM data. Call before serving, when no create can
+// be in flight.
+func (m *Manager) PruneSizedGoldens() {
+	var goldens []string
+	for _, tpl := range m.catalog.List() {
+		goldens = append(goldens, tpl.RootfsPath)
+	}
+	removed, err := storage.PruneSizedGoldens(m.instancesDir, goldens)
+	for _, path := range removed {
+		log.Printf("sweep: removed pre-grown golden %s (no current template golden matches it)", path)
+	}
+	if err != nil {
+		log.Printf("sweep: pruning pre-grown goldens: %v", err)
+	}
+}
+
 // findVMProcesses returns the Firecracker (or Jailer, before it execs)
 // processes that belong to this daemon, by VM ID. A process is ours when its
 // command line carries `--id <vm id>` and it sits in that VM's cgroup, runs

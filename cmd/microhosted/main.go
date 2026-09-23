@@ -178,6 +178,9 @@ func main() {
 	// Firecracker processes nobody adopted, jail dirs and cgroups of VMs that
 	// are not running, claims on volumes whose VM is gone.
 	mgr.SweepResidue()
+	// Pre-grown copies of goldens whose template was removed from the catalog,
+	// or whose golden was rebuilt or deleted since the last run.
+	mgr.PruneSizedGoldens()
 
 	// From here on, a VM that dies on its own is noticed within seconds and
 	// marked stopped, instead of claiming to run until the next restart.

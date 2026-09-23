@@ -598,10 +598,12 @@ func (m *Manager) mountVolumes(record *types.VM) error {
 
 // waitAgentReady polls the guest's vsock exec agent until it answers, so an
 // auto-mount issued right after boot doesn't race the guest still coming up.
+// The interval is short because the guest is typically up in ~200 ms and a
+// refused dial costs next to nothing; a coarse one would dominate the create.
 func (m *Manager) waitAgentReady(vsockPath string) error {
 	const (
 		budget   = 30 * time.Second
-		interval = 500 * time.Millisecond
+		interval = 20 * time.Millisecond
 	)
 	deadline := time.Now().Add(budget)
 	var lastErr error
@@ -655,11 +657,24 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		return nil, err
 	}
 	defer m.end(id)
+
+	// Per-phase durations for the single log line a successful create emits:
+	// what tells a slow deploy apart (disk, network, VMM or persistence).
+	start := time.Now()
+	lap := start
+	var phases []string
+	mark := func(phase string) {
+		now := time.Now()
+		phases = append(phases, phase+" "+now.Sub(lap).Round(100*time.Microsecond).String())
+		lap = now
+	}
+
 	release, err := m.admit(ctx, id, memMB)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	mark("admit")
 
 	record := &types.VM{
 		Config: types.VMConfig{
@@ -691,6 +706,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := faults.Check("vm.create.after-record"); err != nil {
 		return fail(err)
 	}
+	mark("record")
 
 	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID, diskMB)
 	if err != nil {
@@ -700,6 +716,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := faults.Check("vm.create.after-clone"); err != nil {
 		return fail(err)
 	}
+	mark("clone")
 
 	// Network is opt-out, not mandatory: sandboxed/ephemeral workloads often
 	// shouldn't have any path to the host at all (see NoNetwork's doc comment).
@@ -745,6 +762,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := faults.Check("vm.create.after-network"); err != nil {
 		return fail(err)
 	}
+	mark("network")
 
 	// Attach any requested volumes before boot: their drives must be in the
 	// Firecracker config (built inside boot).
@@ -762,6 +780,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := faults.Check("vm.create.after-boot"); err != nil {
 		return fail(err)
 	}
+	mark("boot")
 
 	m.mu.Lock()
 	m.vms[id] = record
@@ -772,6 +791,9 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := m.mountVolumes(record); err != nil {
 		return fail(fmt.Errorf("mounting volumes: %w", err))
 	}
+	if len(mounts) > 0 {
+		mark("volumes")
+	}
 	if err := faults.Check("vm.create.before-save"); err != nil {
 		return fail(err)
 	}
@@ -781,6 +803,8 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err := m.store.SaveVM(record); err != nil {
 		return fail(fmt.Errorf("persisting vm record %s: %w", id, err))
 	}
+	mark("save")
+	log.Printf("vm %s created in %s (%s)", id, time.Since(start).Round(100*time.Microsecond), strings.Join(phases, ", "))
 
 	m.emit(types.EventVMCreated, record, "", map[string]string{"template": tpl.Name})
 	return m.snapshotVM(record), nil

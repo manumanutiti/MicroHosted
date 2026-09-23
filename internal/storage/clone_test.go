@@ -163,3 +163,157 @@ func TestCatalog(t *testing.T) {
 		t.Fatalf("expected 1 template in list, got %d", len(cat.List()))
 	}
 }
+
+// Growing clones of one golden to one size must run the grow once: every later
+// clone reflinks the same pre-grown copy, each clone stays private, and a
+// rebuilt golden gets a fresh copy while the stale one is pruned.
+func TestCloneRootfsReusesSizedGolden(t *testing.T) {
+	for _, bin := range []string{"mkfs.ext4", "resize2fs", "e2fsck"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not available: %v", bin, err)
+		}
+	}
+
+	dir := t.TempDir()
+	golden := filepath.Join(dir, "golden.ext4")
+	mkGolden := func() {
+		t.Helper()
+		_ = os.Remove(golden)
+		if err := os.WriteFile(golden, nil, 0o644); err != nil {
+			t.Fatalf("creating golden file: %v", err)
+		}
+		if err := os.Truncate(golden, 16*bytesPerMiB); err != nil {
+			t.Fatalf("sizing golden file: %v", err)
+		}
+		if out, err := exec.Command("mkfs.ext4", "-F", "-q", golden).CombinedOutput(); err != nil {
+			t.Fatalf("mkfs.ext4: %v: %s", err, out)
+		}
+	}
+	sized := func() []string {
+		t.Helper()
+		m, err := filepath.Glob(filepath.Join(dir, "instances", sizedDir, "*.ext4"))
+		if err != nil {
+			t.Fatalf("glob: %v", err)
+		}
+		return m
+	}
+	mkGolden()
+
+	tpl := types.Template{Name: "test", RootfsPath: golden}
+	instancesDir := filepath.Join(dir, "instances")
+	const targetMB = 64
+
+	a, err := CloneRootfs(tpl, "vm-a", instancesDir, os.Getuid(), os.Getgid(), targetMB)
+	if err != nil {
+		t.Fatalf("CloneRootfs a: %v", err)
+	}
+	first := sized()
+	if len(first) != 1 {
+		t.Fatalf("pre-grown copies after first clone = %v, want exactly one", first)
+	}
+	before, err := os.Stat(first[0])
+	if err != nil {
+		t.Fatalf("stat pre-grown copy: %v", err)
+	}
+
+	b, err := CloneRootfs(tpl, "vm-b", instancesDir, os.Getuid(), os.Getgid(), targetMB)
+	if err != nil {
+		t.Fatalf("CloneRootfs b: %v", err)
+	}
+	after, err := os.Stat(first[0])
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("second clone rebuilt the pre-grown copy (err=%v)", err)
+	}
+	for _, p := range []string{a, b} {
+		fi, err := os.Stat(p)
+		if err != nil || fi.Size() != targetMB*bytesPerMiB {
+			t.Fatalf("clone %s: size/err = %v/%v, want %d bytes", p, fi.Size(), err, targetMB*bytesPerMiB)
+		}
+	}
+
+	// A guest writing to its disk must not reach the shared copy or a sibling.
+	sharedSum, bSum := checksum(t, first[0]), checksum(t, b)
+	if err := os.WriteFile(a, []byte("written by guest a"), 0o644); err != nil {
+		t.Fatalf("writing clone a: %v", err)
+	}
+	if checksum(t, first[0]) != sharedSum || checksum(t, b) != bSum {
+		t.Fatalf("writing one clone changed the pre-grown copy or another clone")
+	}
+
+	// Rebuild the golden: the next clone must come from a new copy, and the
+	// stale one must be gone.
+	mkGolden()
+	if _, err := CloneRootfs(tpl, "vm-c", instancesDir, os.Getuid(), os.Getgid(), targetMB); err != nil {
+		t.Fatalf("CloneRootfs c: %v", err)
+	}
+	now := sized()
+	if len(now) != 1 || now[0] == first[0] {
+		t.Fatalf("pre-grown copies after golden rebuild = %v, want one new copy replacing %s", now, first[0])
+	}
+}
+
+// Startup pruning keeps the pre-grown copies of the goldens in the catalog as
+// they are now, and removes the rest: a template no longer listed, a golden
+// rebuilt since its copy was made, and a half-built temporary file.
+func TestPruneSizedGoldens(t *testing.T) {
+	dir := t.TempDir()
+	instancesDir := filepath.Join(dir, "instances")
+	sd := filepath.Join(instancesDir, sizedDir)
+	if err := os.MkdirAll(sd, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Nothing to prune yet, and no sized dir at all, is not an error.
+	if removed, err := PruneSizedGoldens(filepath.Join(dir, "none"), nil); err != nil || len(removed) != 0 {
+		t.Fatalf("prune of a missing dir = %v, %v; want nothing, nil", removed, err)
+	}
+
+	write := func(path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(path), 0o644); err != nil {
+			t.Fatalf("writing %s: %v", path, err)
+		}
+	}
+	kept := filepath.Join(dir, "base-alpine.ext4")
+	gone := filepath.Join(dir, "retired.ext4")
+	write(kept)
+	write(gone)
+	keyOf := func(g string) string {
+		t.Helper()
+		k, _, err := goldenKey(g)
+		if err != nil {
+			t.Fatalf("goldenKey(%s): %v", g, err)
+		}
+		return k
+	}
+
+	keep := filepath.Join(sd, "base-alpine-512m-"+keyOf(kept)+".ext4")
+	keepOtherSize := filepath.Join(sd, "base-alpine-1024m-"+keyOf(kept)+".ext4")
+	retired := filepath.Join(sd, "retired-512m-"+keyOf(gone)+".ext4")
+	stale := filepath.Join(sd, "base-alpine-512m-000000000000.ext4")
+	tmp := keep + ".tmp"
+	for _, p := range []string{keep, keepOtherSize, retired, stale, tmp} {
+		write(p)
+	}
+
+	removed, err := PruneSizedGoldens(instancesDir, []string{kept})
+	if err != nil {
+		t.Fatalf("PruneSizedGoldens: %v", err)
+	}
+	if len(removed) != 3 {
+		t.Fatalf("removed = %v, want the retired, stale and tmp files", removed)
+	}
+	for _, p := range []string{keep, keepOtherSize} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("current copy %s was removed: %v", p, err)
+		}
+	}
+	for _, p := range []string{retired, stale, tmp} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s survived the prune (err=%v)", p, err)
+		}
+	}
+	if _, err := os.Stat(gone); err != nil {
+		t.Fatalf("pruning touched a golden: %v", err)
+	}
+}
