@@ -158,6 +158,22 @@ if [[ -n "$MANAGED_IFACE" ]]; then
   echo "      any table wins — so the policy the API reports would not be the one"
   echo "      in force. Check what else is there, and remove it:"
   echo "        sudo nft list ruleset | grep -n ${MANAGED_IFACE%%,*}"
+
+  # Managing the interface the host routes out through is legitimate (that is the
+  # point on a single-NIC gateway), but it rules out full egress entirely: a
+  # network's --internet IFACE is refused for a managed interface, because a
+  # blanket masquerade would punch straight through the deny-both-ways policy
+  # that declaring it installs. Say so here rather than let an operator discover
+  # it as a network that reports CLOSED and cannot be opened.
+  DEFAULT_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')"
+  if [[ -n "$DEFAULT_IFACE" ]] && [[ ",${MANAGED_IFACE}," == *",${DEFAULT_IFACE},"* ]]; then
+    echo ""
+    echo "NOTE: ${DEFAULT_IFACE} is both managed and the host's default route, so NO network"
+    echo "      can get full egress through it — 'mh network update NAME --internet ${DEFAULT_IFACE}'"
+    echo "      is refused by design. Give guests what they need with per-rule holes:"
+    echo "        mh network update NAME --out tcp:IP:PORT@${DEFAULT_IFACE}"
+    echo "      Full egress needs a SEPARATE, unmanaged exit interface."
+  fi
 fi
 
 if [[ -n "$ADDR" ]]; then

@@ -5,7 +5,14 @@
 [Unit]
 Description=MicroHosted — Firecracker+Jailer microVM orchestrator
 Documentation=file://@WORKDIR@/PROJECT.md
-After=network.target
+# network-online, not just network.target: startup reconciliation reads the
+# host's routing table (an Egress network persisted without an exit interface is
+# pinned to the default route's, once). network.target only means "network
+# management has started" — on a DHCP or wifi host there is no default route yet,
+# reconcile finds none, and those networks stay CLOSED until someone sets the
+# interface by hand, because the migration runs at startup only.
+Wants=network-online.target
+After=network-online.target
 
 # Without /dev/kvm there's nothing to orchestrate: fail clearly at service
 # startup instead of later with an obscure Firecracker error.

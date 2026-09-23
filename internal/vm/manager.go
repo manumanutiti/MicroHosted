@@ -631,6 +631,9 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	if err != nil {
 		return nil, err
 	}
+	if err := checkTemplateGoldens(tpl); err != nil {
+		return nil, err
+	}
 
 	vcpus := req.VCPUs
 	if vcpus == 0 {
@@ -2014,9 +2017,49 @@ func (m *Manager) List() []*types.VM {
 	return list
 }
 
-// Templates exposes the catalog for the API layer.
+// Templates exposes the catalog for the API layer, each entry marked with
+// whether its goldens are on this host (see types.Template.Ready). Listing a
+// template the store cannot boot as if it were usable is what sends an operator
+// into `mh run` only to get a cp error from inside the clone.
 func (m *Manager) Templates() []types.Template {
-	return m.catalog.List()
+	list := m.catalog.List()
+	for i := range list {
+		if missing := missingGolden(list[i]); missing != "" {
+			list[i].Missing = missing
+			continue
+		}
+		list[i].Ready = true
+	}
+	return list
+}
+
+// missingGolden returns the path of the template's first golden file that is not
+// on this host, or "" when both are present.
+func missingGolden(tpl types.Template) string {
+	for _, p := range []string{tpl.RootfsPath, tpl.KernelPath} {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// checkTemplateGoldens rejects a template whose golden files this host does not
+// have, BEFORE any side effect. The catalog advertises every template the
+// project knows, so "in the catalog" is not "bootable here": without this the
+// first sign is a raw `cp`/open error from deep inside CloneRootfs, after the
+// record, the admission and the name reservation were taken and rolled back —
+// an error that names a path but not what to do about it.
+func checkTemplateGoldens(tpl types.Template) error {
+	missing := missingGolden(tpl)
+	if missing == "" {
+		return nil
+	}
+	return fmt.Errorf("%w: template %q is in the catalog but %s is not on this host: build its golden with 'make prepare-image' (see 'mh images' for what is ready)",
+		ErrInvalid, tpl.Name, missing)
 }
 
 func (m *Manager) cleanupNetwork(networkName, tapName, vmID string) {

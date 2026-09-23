@@ -93,22 +93,53 @@ INSTANCES_DIR="${INSTANCES_DIR:-/var/lib/microhosted/store}"
 COW_IMG="${COW_IMG:-/var/lib/microhosted/instances.btrfs}"
 COW_SIZE_GB="${COW_SIZE_GB:-20}"
 
-# Migration: if the store's btrfs is already mounted at ANOTHER point (e.g. the
-# historical images/instances inside the repo), unmount it and remove its fstab
-# line to remount it at INSTANCES_DIR. The service must be stopped with no live
-# VMs (otherwise umount gives "target is busy").
+# fstab_has IMG DST succeeds when /etc/fstab mounts IMG at exactly DST.
+# Everything here keys on the IMAGE (field 1), never on the target: the
+# historical line was written with an unnormalized mountpoint
+# (".../scripts/../images/instances"), which matches neither $INSTANCES_DIR nor
+# what findmnt reports, so a target-based match silently does nothing.
+fstab_has() {
+  awk -v img="$1" -v dst="$2" '$1 == img && $2 == dst { f = 1 } END { exit !f }' /etc/fstab
+}
+
+# ensure_fstab makes /etc/fstab mount COW_IMG at INSTANCES_DIR and NOWHERE else.
+# Both halves matter after a reboot: a leftover line for another mountpoint
+# steals the image back to the old path, and a missing line leaves the store on
+# the host's ext4 — in both cases the daemon comes up with a store that is no
+# longer CoW, and every VM becomes a full rootfs copy again.
+ensure_fstab() {
+  if awk -v img="$COW_IMG" -v dst="$INSTANCES_DIR" \
+       '$1 == img && $2 != dst { f = 1 } END { exit !f }' /etc/fstab; then
+    echo "  removing stale fstab entry for $COW_IMG (it mounted the store elsewhere)..."
+    tmp="$(sudo mktemp /etc/fstab.mh.XXXXXX)"
+    awk -v img="$COW_IMG" -v dst="$INSTANCES_DIR" \
+      '$1 == img && $2 != dst { next } { print }' /etc/fstab | sudo tee "$tmp" >/dev/null
+    sudo chmod 0644 "$tmp"
+    sudo mv "$tmp" /etc/fstab
+  fi
+  if ! fstab_has "$COW_IMG" "$INSTANCES_DIR"; then
+    echo "$COW_IMG $INSTANCES_DIR btrfs loop,compress=zstd 0 0" | sudo tee -a /etc/fstab >/dev/null
+    echo "  fstab: $COW_IMG -> $INSTANCES_DIR (survives reboots)"
+  fi
+}
+
+# Migration: if the store's btrfs is mounted at ANOTHER point (e.g. the
+# historical images/instances inside the repo), unmount it so it can be remounted
+# at INSTANCES_DIR. The service must be stopped with no live VMs (otherwise
+# umount gives "target is busy"). Its fstab line is dropped by ensure_fstab
+# below, which also covers the case this loop cannot see: a stale line whose
+# mount is NOT currently active, invisible until the next boot honours it.
 LOOPDEV="$(sudo losetup -j "$COW_IMG" 2>/dev/null | cut -d: -f1 | head -1 || true)"
 if [[ -n "$LOOPDEV" ]]; then
-  OLD_MNT="$(findmnt -n -o TARGET --source "$LOOPDEV" 2>/dev/null | head -1 || true)"
-  if [[ -n "$OLD_MNT" && "$OLD_MNT" != "$INSTANCES_DIR" ]]; then
+  while read -r OLD_MNT; do
+    [[ -z "$OLD_MNT" || "$OLD_MNT" == "$INSTANCES_DIR" ]] && continue
     echo "  migrating store from $OLD_MNT to $INSTANCES_DIR..."
     if ! sudo umount "$OLD_MNT"; then
       echo "  ERROR: couldn't unmount $OLD_MNT — stop the service and destroy the VMs first:" >&2
       echo "         sudo systemctl stop microhosted" >&2
       exit 1
     fi
-    sudo sed -i "\#[[:space:]]${OLD_MNT}[[:space:]]#d" /etc/fstab
-  fi
+  done < <(findmnt -n -o TARGET --source "$LOOPDEV" 2>/dev/null || true)
 fi
 
 sudo mkdir -p "$INSTANCES_DIR"
@@ -127,6 +158,13 @@ probe_reflink() {
 
 if probe_reflink "$INSTANCES_DIR"; then
   echo "  $INSTANCES_DIR already supports CoW (reflink): OK"
+  # Our loopback already mounted here still needs its fstab line: mounted by
+  # hand, or by a run that migrated it, it would be gone after a reboot and the
+  # store would silently fall back to the host's ext4.
+  if [[ "$(findmnt -n -o SOURCE --target "$INSTANCES_DIR" 2>/dev/null || true)" == "$(sudo losetup -j "$COW_IMG" 2>/dev/null | cut -d: -f1 | head -1)" ]] \
+     && [[ -f "$COW_IMG" ]]; then
+    ensure_fstab
+  fi
 elif mountpoint -q "$INSTANCES_DIR"; then
   echo "  WARN: $INSTANCES_DIR is mounted but without reflink; switch it to btrfs/XFS-reflink"
   echo "        or the clones will be full copies."
@@ -142,11 +180,7 @@ else
     sudo mkfs.btrfs -q "$COW_IMG"
   fi
   sudo mount -o loop,compress=zstd "$COW_IMG" "$INSTANCES_DIR"
-  # Persist it so the mount survives reboots.
-  FSTAB_LINE="$COW_IMG $INSTANCES_DIR btrfs loop,compress=zstd 0 0"
-  if ! grep -qF "$COW_IMG" /etc/fstab; then
-    echo "$FSTAB_LINE" | sudo tee -a /etc/fstab >/dev/null
-  fi
+  ensure_fstab   # persist it so the mount survives reboots
   echo "  btrfs loopback mounted at $INSTANCES_DIR: OK"
 fi
 

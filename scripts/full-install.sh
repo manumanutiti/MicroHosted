@@ -45,10 +45,10 @@ MANAGED_HOST_ALLOW="${MANAGED_HOST_ALLOW:-}"
 if [[ -n "$ADDR" ]]; then
   API_URL="http://${ADDR}"
   [[ "$ADDR" == :* ]] && API_URL="http://localhost${ADDR}"
-  API_CURL=(curl -fsS)
+  API_CURL=(curl -sS)
 else
   API_URL="http://localhost"
-  API_CURL=(sudo curl -fsS --unix-socket "$SOCKET")
+  API_CURL=(sudo curl -sS --unix-socket "$SOCKET")
 fi
 
 echo "=============================================="
@@ -113,22 +113,51 @@ sudo systemctl restart microhosted   # if it was already running, pick up the ne
 # --- [6/6] Verification ------------------------------------------------------
 echo ""
 echo "==> [6/6] Checking API health..."
-HEALTH_OK=0
+# /v1/health answers 503 when any check fails, so this must NOT use curl -f: a
+# degraded daemon is up and its body NAMES what is wrong (a store without CoW, a
+# store below the free-space floor, egress rules it cannot enforce). Reading that
+# as "the API isn't responding" sends an operator to journalctl for a problem
+# already spelled out in the payload — and on a fresh device with a small disk
+# it's the first thing they'd see.
+HEALTH_BODY=""
+HEALTH_CODE="000"
 for _ in $(seq 1 15); do
-  if "${API_CURL[@]}" "${API_URL}/v1/health" >/dev/null 2>&1; then
-    HEALTH_OK=1
+  RAW="$("${API_CURL[@]}" -w '\n%{http_code}' "${API_URL}/v1/health" 2>/dev/null || true)"
+  HEALTH_CODE="$(printf '%s' "$RAW" | tail -n1)"
+  if [[ "$HEALTH_CODE" == "200" || "$HEALTH_CODE" == "503" ]]; then
+    HEALTH_BODY="$(printf '%s' "$RAW" | sed '$d')"
     break
   fi
   sleep 1
 done
-if [[ "$HEALTH_OK" -eq 1 ]]; then
-  echo "  GET /v1/health: OK"
-  "${API_CURL[@]}" "${API_URL}/v1/health" 2>/dev/null || true
-  echo ""
-else
-  echo "  WARN: the API isn't responding yet at ${API_URL}/v1/health" >&2
-  echo "        check the log: journalctl -u microhosted -n 50" >&2
-fi
+
+DEGRADED=0
+case "$HEALTH_CODE" in
+  200)
+    echo "  GET /v1/health: ok (every check passed)"
+    ;;
+  503)
+    DEGRADED=1
+    echo "  GET /v1/health: DEGRADED — the daemon is UP, but these checks failed:" >&2
+    if ! printf '%s' "$HEALTH_BODY" | python3 -c '
+import json, sys
+try:
+    checks = json.load(sys.stdin).get("checks", [])
+except Exception:
+    sys.exit(1)
+for c in checks:
+    if not c.get("ok"):
+        print("    %-16s %s" % (c.get("name", "?"), c.get("detail", "")))
+' 2>/dev/null; then
+      printf '    %s\n' "$HEALTH_BODY"
+    fi
+    ;;
+  *)
+    echo "  WARN: the API isn't responding at ${API_URL}/v1/health" >&2
+    echo "        check the log: journalctl -u microhosted -n 50" >&2
+    ;;
+esac
+echo ""
 
 # Is there any usable template? (a catalog with existing kernel+rootfs)
 MISSING="$(python3 - images/catalog.json <<'PY' 2>/dev/null || true
@@ -155,6 +184,11 @@ else
   echo "  status:   sudo curl -s --unix-socket ${SOCKET} ${API_URL}/v1/system | python3 -m json.tool"
 fi
 echo "  logs:     journalctl -u microhosted -f"
+if [[ "$DEGRADED" -eq 1 ]]; then
+  echo ""
+  echo "  ATTENTION: the daemon is running but health is DEGRADED (detail above)."
+  echo "    mh health                 # re-check at any time"
+fi
 if [[ "$MISSING" != "ok" ]]; then
   echo ""
   echo "  NEXT STEP — there's no template ready yet:"
@@ -162,4 +196,4 @@ if [[ "$MISSING" != "ok" ]]; then
 fi
 echo ""
 echo "  Create the first VM:"
-echo "    curl -s -X POST http://${HEALTH_HOST}/v1/vms -d '{\"template\":\"base-alpine\"}'"
+echo "    mh vm create base-alpine"

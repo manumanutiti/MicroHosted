@@ -197,14 +197,30 @@ func tplList(e *env, cmd *command, p string, args []string) error {
 		return nil
 	}
 	rows := make([][]string, 0, len(tpls))
+	notReady := 0
 	for _, t := range tpls {
 		disk := "-"
 		if t.DiskMB > 0 {
 			disk = fmtMB(t.DiskMB)
 		}
-		rows = append(rows, []string{t.Name, strconv.FormatInt(t.VCPUs, 10), fmtMB(t.MemMB), disk, t.Description})
+		// A template whose golden is absent is listed (the catalog knows how to
+		// build it) but cannot boot, so say so in the row rather than let `mh
+		// run` be the one to find out. Keyed on Missing, not on !Ready: a daemon
+		// older than these fields sends neither, and "no answer" must not read
+		// as "nothing is built" — it would condemn every template on the host.
+		status := "ready"
+		if t.Missing != "" {
+			status = "NOT BUILT"
+			notReady++
+		}
+		rows = append(rows, []string{t.Name, status, strconv.FormatInt(t.VCPUs, 10), fmtMB(t.MemMB), disk, t.Description})
 	}
-	table(e.stdout, []string{"TEMPLATE", "VCPU", "MEM", "DISK", "DESCRIPTION"}, rows)
+	table(e.stdout, []string{"TEMPLATE", "STATUS", "VCPU", "MEM", "DISK", "DESCRIPTION"}, rows)
+	if notReady > 0 {
+		fmt.Fprintf(e.stderr, "\n%d template(s) NOT BUILT: their golden rootfs/kernel is not in this host's store.\n", notReady)
+		fmt.Fprintf(e.stderr, "Build one with: make prepare-image            # base-alpine (default)\n")
+		fmt.Fprintf(e.stderr, "                make prepare-image FLAVOR=ubuntu\n")
+	}
 	return nil
 }
 
