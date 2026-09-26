@@ -126,6 +126,19 @@ type FleetInfo struct {
 	Snapshots     int          `json:"snapshots"`
 	Volumes       VolumeCounts `json:"volumes"`
 	Templates     int          `json:"templates"`
+	// Quotas: every consumer (managed-by value) with a quota or a running VM.
+	Quotas []QuotaUsage `json:"quotas,omitempty"`
+}
+
+// QuotaUsage is one consumer's quota and what it holds against it: running
+// VMs (quarantined included) plus launches in progress, and their mem_mb.
+// A zero max is no cap on that dimension.
+type QuotaUsage struct {
+	Consumer string `json:"consumer"`
+	MaxVMs   int    `json:"max_vms"`
+	MaxMemMB int64  `json:"max_mem_mb"`
+	VMs      int    `json:"vms"`
+	MemMB    int64  `json:"mem_mb"`
 }
 
 // VMCounts breaks the fleet down by state.

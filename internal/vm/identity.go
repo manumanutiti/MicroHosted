@@ -1,21 +1,19 @@
 package vm
 
 import (
-	"errors"
 	"fmt"
 	"log"
-	"maps"
-	"regexp"
-	"strings"
 
 	"microhosted/internal/jailer"
+	"microhosted/internal/labels"
 	"microhosted/pkg/types"
 )
 
 // ErrInvalid is a request the manager refuses on its own terms — a malformed
 // name or label, an impossible VM shape — whatever the host's state. Maps to
-// 400 in the API.
-var ErrInvalid = errors.New("invalid request")
+// 400 in the API. It is the labels package's sentinel, so a bad label is the
+// same error whichever object it was written on.
+var ErrInvalid = labels.ErrInvalid
 
 const (
 	// maxVCPUs is Firecracker's own ceiling for a microVM.
@@ -23,21 +21,6 @@ const (
 	// minMemMB is below what any guest here boots in (the Alpine image idles
 	// at ~20 MB); smaller asks are a typo for a size, not a tiny VM.
 	minMemMB = 32
-
-	maxLabels      = 32
-	maxLabelKey    = 63
-	maxLabelValue  = 63
-	maxNameLength  = 63
-	labelSelectSep = "="
-)
-
-var (
-	// A DNS label: what fits in a hostname, a metric label and a file name
-	// without quoting.
-	nameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
-	// Keys may carry a prefix ("ot.plant/sensor"), as in Kubernetes.
-	labelKeyRE   = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
-	labelValueRE = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?)?$`)
 )
 
 // ValidateName checks a VM name: empty (no name) or a DNS label of up to 63
@@ -47,8 +30,8 @@ func ValidateName(name string) error {
 	if name == "" {
 		return nil
 	}
-	if len(name) > maxNameLength || !nameRE.MatchString(name) {
-		return fmt.Errorf("%w: name %q: lowercase letters, digits and '-', starting and ending with a letter or digit, at most %d characters", ErrInvalid, name, maxNameLength)
+	if err := labels.ValidateName("name", name); err != nil {
+		return err
 	}
 	if jailer.IsVMID(name) {
 		return fmt.Errorf("%w: name %q has the shape of a VM ID (8 hex characters)", ErrInvalid, name)
@@ -56,28 +39,9 @@ func ValidateName(name string) error {
 	return nil
 }
 
-// ValidateLabels checks a label set. A label written wrong is refused, never
-// dropped: an orchestrator that selects on it would silently lose the VM.
-func ValidateLabels(labels map[string]string) error {
-	if len(labels) > maxLabels {
-		return fmt.Errorf("%w: %d labels, at most %d", ErrInvalid, len(labels), maxLabels)
-	}
-	for k, v := range labels {
-		if err := validateLabelKey(k); err != nil {
-			return err
-		}
-		if len(v) > maxLabelValue || !labelValueRE.MatchString(v) {
-			return fmt.Errorf("%w: label %s: value %q: letters, digits, '.', '_' and '-', starting and ending with a letter or digit, at most %d characters", ErrInvalid, k, v, maxLabelValue)
-		}
-	}
-	return nil
-}
-
-func validateLabelKey(k string) error {
-	if len(k) > maxLabelKey || !labelKeyRE.MatchString(k) {
-		return fmt.Errorf("%w: label key %q: lowercase letters, digits, '.', '_', '-' and '/', starting and ending with a letter or digit, at most %d characters", ErrInvalid, k, maxLabelKey)
-	}
-	return nil
+// ValidateLabels checks a VM's label set (see labels.Validate).
+func ValidateLabels(l map[string]string) error {
+	return labels.Validate(l)
 }
 
 // validateShape checks the resources a create asks for. Zero means "the
@@ -152,10 +116,8 @@ func (m *Manager) adoptName(rec *types.VM) {
 // it, a key with nil removes it. The result is validated whole and persisted
 // before it is reported; on any failure the VM keeps the labels it had.
 func (m *Manager) SetLabels(id string, patch map[string]*string) (*types.VM, error) {
-	for k := range patch {
-		if err := validateLabelKey(k); err != nil {
-			return nil, err
-		}
+	if err := labels.ValidatePatch(patch); err != nil {
+		return nil, err
 	}
 
 	m.mu.Lock()
@@ -165,23 +127,10 @@ func (m *Manager) SetLabels(id string, patch map[string]*string) (*types.VM, err
 		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
 	}
 	prev := record.Config.Labels
-	next := maps.Clone(prev)
-	if next == nil {
-		next = make(map[string]string)
-	}
-	for k, v := range patch {
-		if v == nil {
-			delete(next, k)
-		} else {
-			next[k] = *v
-		}
-	}
-	if err := ValidateLabels(next); err != nil {
+	next, err := labels.Patch(prev, patch)
+	if err != nil {
 		m.mu.Unlock()
 		return nil, err
-	}
-	if len(next) == 0 {
-		next = nil
 	}
 	// Replaced, never written into: copies handed out earlier share prev.
 	record.Config.Labels = next
@@ -195,42 +144,4 @@ func (m *Manager) SetLabels(id string, patch map[string]*string) (*types.VM, err
 		return nil, fmt.Errorf("persisting vm %s: %w", id, err)
 	}
 	return &cp, nil
-}
-
-// LabelSelector is a set of key=value requirements, all of which must hold.
-type LabelSelector map[string]string
-
-// ParseLabelSelector reads "k=v" terms (one per element, or comma-separated
-// within one) into a selector. An empty input selects everything.
-func ParseLabelSelector(terms []string) (LabelSelector, error) {
-	sel := make(LabelSelector)
-	for _, t := range terms {
-		for _, term := range strings.Split(t, ",") {
-			if term == "" {
-				continue
-			}
-			k, v, ok := strings.Cut(term, labelSelectSep)
-			if !ok {
-				return nil, fmt.Errorf("%w: label selector %q: want key=value", ErrInvalid, term)
-			}
-			if err := ValidateLabels(map[string]string{k: v}); err != nil {
-				return nil, err
-			}
-			if prev, dup := sel[k]; dup && prev != v {
-				return nil, fmt.Errorf("%w: label selector asks for %s=%s and %s=%s at once", ErrInvalid, k, prev, k, v)
-			}
-			sel[k] = v
-		}
-	}
-	return sel, nil
-}
-
-// Matches reports whether labels satisfy every requirement of s.
-func (s LabelSelector) Matches(labels map[string]string) bool {
-	for k, v := range s {
-		if got, ok := labels[k]; !ok || got != v {
-			return false
-		}
-	}
-	return true
 }

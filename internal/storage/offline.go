@@ -23,13 +23,12 @@ import (
 // process, never touch the host kernel.
 //
 // And that process is NOT the daemon's root: when the daemon runs as root,
-// every debugfs invocation drops to the jailer uid/gid (OfflineIO.UID/GID) —
-// the same unprivileged identity the jailed Firecracker runs as, and the owner
-// of every image file it touches (clones and volumes are chowned to it at
-// creation). A debugfs parser exploit triggered by a malicious image then
-// lands in an unprivileged process with no capabilities, not in root: it can
-// scribble on the store's images (which it could anyway — it IS the parser
-// writing them) but not on the host. This is mitigation, not a jail — the
+// every debugfs invocation drops to OfflineIO.UID/GID — the identity that owns
+// the image being parsed (the VM's for its disk, the volume's own for a
+// detached volume; see internal/jailer/identity.go). A debugfs parser exploit
+// triggered by a malicious image then lands in an unprivileged process with no
+// capabilities that can reach that one image (which it could anyway — it IS
+// the parser writing it), not another VM's disk, and not the host. This is mitigation, not a jail — the
 // process still shares the host's namespaces — but it removes the root-shell
 // prize from the ext4-parser attack surface.
 //
@@ -186,35 +185,6 @@ func (o OfflineIO) ExtractFileStream(imagePath, guestPath string) (*os.File, int
 	return f, fi.Size(), nil
 }
 
-// ExtractDir recursively copies the directory tree at guestPath out of the image
-// into destDir on the host (destDir gets a subdirectory named after guestPath's
-// last component). The one-shot way to collect a whole artifact tree — pcaps,
-// memory dumps — from a stopped VM's disk. debugfs streams straight to destDir,
-// so this is constant-memory too. destDir is chowned to the debugfs identity
-// (rdump has to create entries in it), so expect its contents owned by the
-// jailer uid, not root.
-func (o OfflineIO) ExtractDir(imagePath, guestPath, destDir string) error {
-	clean, err := cleanGuestPath(guestPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return fmt.Errorf("creating extract dest %s: %w", destDir, err)
-	}
-	if err := o.grant(destDir); err != nil {
-		return err
-	}
-	if err := o.statInImage(imagePath, clean); err != nil {
-		return fmt.Errorf("extracting dir %s: %w", guestPath, err)
-	}
-	script, err := debugfsLine("rdump", clean, destDir)
-	if err != nil {
-		return err
-	}
-	_, err = o.runDebugfs(imagePath, false, script)
-	return err
-}
-
 // stageFile creates a temp file under StagingDir (rooted on the store by the
 // caller, never /tmp), making the directory if needed, and grants it to the
 // debugfs identity — every staged file is either read or written by the
@@ -223,7 +193,7 @@ func (o OfflineIO) stageFile(pattern string) (*os.File, error) {
 	if o.StagingDir == "" {
 		return nil, fmt.Errorf("staging dir is required")
 	}
-	if err := os.MkdirAll(o.StagingDir, 0o755); err != nil {
+	if err := os.MkdirAll(o.StagingDir, StoreDirMode); err != nil {
 		return nil, fmt.Errorf("creating staging dir %s: %w", o.StagingDir, err)
 	}
 	f, err := os.CreateTemp(o.StagingDir, pattern)
@@ -245,17 +215,41 @@ func (o OfflineIO) stageFile(pattern string) (*os.File, error) {
 // rather than -R so multi-command sequences work. The command file is small but
 // still staged on the store, not /tmp, to keep the "never /tmp" rule uniform.
 func (o OfflineIO) runDebugfs(image string, write bool, script string) (string, error) {
+	out := &cappedBuffer{max: maxToolOutput}
+	if err := o.debugfs(image, write, script, out, out); err != nil {
+		return out.String(), fmt.Errorf("debugfs on %s: %v: %s", image, err, out)
+	}
+	return out.String(), nil
+}
+
+// runDebugfsStdout is runDebugfs for output that is parsed: stdout alone, so
+// debugfs's unbuffered error messages on stderr can never land inside a
+// half-flushed stdout line. stderr is kept for the error message only.
+func (o OfflineIO) runDebugfsStdout(image string, script string) (string, error) {
+	stdout := &cappedBuffer{max: maxToolOutput}
+	stderr := &cappedBuffer{max: maxToolOutput}
+	if err := o.debugfs(image, false, script, stdout, stderr); err != nil {
+		return "", fmt.Errorf("debugfs on %s: %v: %s", image, err, stderr)
+	}
+	if stdout.truncated {
+		return "", fmt.Errorf("debugfs on %s: output exceeded %d bytes", image, maxToolOutput)
+	}
+	return stdout.String(), nil
+}
+
+// debugfs runs script against image with the given output sinks.
+func (o OfflineIO) debugfs(image string, write bool, script string, stdout, stderr io.Writer) error {
 	cmdFile, err := o.stageFile("debugfs-*.cmd")
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer os.Remove(cmdFile.Name())
 	if _, err := cmdFile.WriteString(script); err != nil {
 		_ = cmdFile.Close()
-		return "", fmt.Errorf("writing debugfs command file: %w", err)
+		return fmt.Errorf("writing debugfs command file: %w", err)
 	}
 	if err := cmdFile.Close(); err != nil {
-		return "", fmt.Errorf("writing debugfs command file: %w", err)
+		return fmt.Errorf("writing debugfs command file: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), debugfsTimeout)
@@ -280,12 +274,8 @@ func (o OfflineIO) runDebugfs(image string, write bool, script string) (string, 
 			},
 		}
 	}
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("debugfs on %s: %v: %s", image, err, out)
-	}
-	return string(out), nil
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	return cmd.Run()
 }
 
 // statInImage reports whether guestPath exists inside image, translating
@@ -314,8 +304,8 @@ func (o OfflineIO) statInImage(image, guestPath string) error {
 // The last rule is a security boundary, not tidiness. debugfs reads one command
 // per line and splits arguments on whitespace, so a path carrying a newline
 // would smuggle in commands of its own — "dump" writes a host file, "write"
-// reads one — running as the jailer uid, which owns every VM's disk and every
-// volume. Paths often come from the guest itself (an automation listing a
+// reads one — running as the image's identity, with every staged file the
+// daemon granted it. Paths often come from the guest itself (an automation listing a
 // sample's output dir and downloading each file), so the guest would pick
 // them. Double quotes are refused because they are how debugfsLine delimits
 // arguments; spaces are fine.

@@ -14,12 +14,13 @@ a malicious image, at worst, crashes the `debugfs` process itself, never touches
 the host kernel.
 
 And that process **doesn't run as root**: when the daemon runs as root, each
-`debugfs` invocation drops to the jailer's uid/gid (`--jailer-uid/-gid`, the same
-unprivileged identity the jailed Firecracker runs as, and the owner of every
-image in the store). An exploit of the `debugfs` parser triggered by a malicious
-image thus lands in a process with no privileges or capabilities — it can scrawl
-over store images (which it already could: it *is* the parser that writes them),
-but not the host. It's mitigation, not a jail (it shares the host namespaces);
+`debugfs` invocation drops to the identity that owns the image it parses: the
+VM's own uid for a VM's disk, the volume's own uid for a detached volume (see
+the per-VM identities in `docs/threat-model.md`). An exploit of the `debugfs`
+parser triggered by a malicious image thus lands in a process with no
+privileges or capabilities that can reach that one image — which it already
+could: it *is* the parser that writes it — but no other VM's disk or volume,
+and not the host. It's mitigation, not a jail (it shares the host namespaces);
 what it removes is the root-shell prize from the ext4 parser's attack surface.
 The staging temporaries are chowned to that uid so the degraded process can
 read/write them.

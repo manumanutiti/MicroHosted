@@ -22,6 +22,8 @@ type Snapshot struct {
 	// in-chroot drive filename) is frozen inside the snapshot's memory.
 	SourceVMID   string
 	TemplateName string
+	// Image is the source VM's store image digest (see VMConfig.Image).
+	Image string
 
 	// Sizing at snapshot time. A restored VM always comes back with exactly
 	// this shape — Firecracker restores the machine config from vmstate, so
@@ -55,6 +57,15 @@ type Snapshot struct {
 	// under this exact name, whatever the new VM's own ID is.
 	DriveBase string
 
+	// IOLimits is the source VM's (see VMConfig.IOLimits), inherited by every
+	// fork of this snapshot.
+	IOLimits *IOLimits `json:",omitempty"`
+
+	// Files is the source VM's record of the files written into its disk
+	// (see VMConfig.Files): the captured disk has them, and so will every
+	// fork and restore of it.
+	Files []InjectedFile `json:",omitempty"`
+
 	// Dir is the host directory holding the snapshot's files: vmstate, mem,
 	// disk.ext4. Lives under the CoW store (<instances-dir>/snapshots/<id>) so
 	// disk reflinks and chroot hardlinks never cross filesystems.
@@ -87,6 +98,10 @@ type ForkVMRequest struct {
 	// not claim that sensor, so whoever forks says what the fork is.
 	Name   string            `json:"name,omitempty"`
 	Labels map[string]string `json:"labels,omitempty"`
+
+	// IOLimits lowers the fork's throughput below what it inherits from the
+	// snapshot's source VM (and never above the daemon's ceiling).
+	IOLimits *IOLimits `json:"io_limits,omitempty"`
 }
 
 // RestoreVMRequest is the payload accepted by POST /v1/vms/{id}/restore.
@@ -100,6 +115,7 @@ type SnapshotResponse struct {
 	Name      string `json:"name,omitempty"`
 	SourceVM  string `json:"source_vm"`
 	Template  string `json:"template"`
+	Image     string `json:"image,omitempty"`
 	VCPUs     int64  `json:"vcpus"`
 	MemMB     int64  `json:"mem_mb"`
 	DiskMB    int64  `json:"disk_mb"`
@@ -115,6 +131,7 @@ func NewSnapshotResponse(s *Snapshot) SnapshotResponse {
 		Name:      s.Name,
 		SourceVM:  s.SourceVMID,
 		Template:  s.TemplateName,
+		Image:     s.Image,
 		VCPUs:     s.VCPUs,
 		MemMB:     s.MemMB,
 		DiskMB:    s.DiskMB,

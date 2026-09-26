@@ -94,6 +94,7 @@ mh inspect a1b2 | jq .guest_ip
 mh exec a1b2 uname -a                       # exit code = the guest command's
 mh exec a1b2 'ps | grep socat'              # one argument = a shell line (pipes work)
 mh exec a1b2 -- sh -c 'echo $HOME'
+mh exec -t 5s a1b2 /opt/probe               # give up after 5 s (default 30s, max 10m); mh flags go before the VM
 
 mh cp ./sample.bin a1b2:/root/              # upload (trailing / keeps the name)
 mh cp a1b2:/var/log/messages .              # download
@@ -104,9 +105,14 @@ mh logs -f a1b2
 
 mh stop a1b2 && mh start a1b2               # power off keeping disk + IP, boot again
 mh vm update a1b2 --autostart               # boot it again on its own after a host reboot
+mh run base-alpine --disk-mib-s 20 --net-mbit 10   # below the daemon's ceiling (never above)
 mh label ts01-a sensor=ts-02 role-          # set sensor, remove role; the rest untouched
 mh replace ts01-a --old stop                # new VM takes its IP + labels; old cut off and powered off
 mh replace ts01-a -s clean --old destroy    # replacement forked from snapshot "clean"
+mh run parser:1.2 -f /etc/parser.conf=./ts01.conf,mode=0640 --secret /etc/parser.key=./ts01.key
+                                            # written into the disk before boot; local files read by mh, not the daemon
+mh replace ts01-a -f /etc/parser.conf=./ts01.conf --secret /etc/parser.key=./ts01.key
+mh replace ts01-a --no-files                # a VM created with files needs them again, or --no-files
 mh quarantine ts01-a                        # cut it off its network in place: IP freed, still running, exec/cp work
 mh rm a1b2 e5f6                             # destroy (disk included)
 mh rm --all                                 # destroy EVERY VM
@@ -144,8 +150,12 @@ mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
 mh network create ot-52 --out tcp:192.168.50.52:502@wlan0
 mh network create mqtt-60 --subnet 172.16.9.0/24 --in tcp:192.168.50.60:1883@wlan0=172.16.9.2
 
+mh network create ts-01 -l managed-by=ot -l zone=north   # labels, as on VMs
+
 mh network ls
+mh network ls -l managed-by=ot -L           # only networks with that label; -L adds a LABELS column
 mh network inspect lab
+mh network label ts-01 zone=south owner-    # set zone, remove owner
 
 # Change a live network (VMs stay up)
 mh network update lab --intra                         # VM↔VM on
@@ -226,6 +236,27 @@ mh snapshot fork clean --name ts01-b -l sensor=ts-01   # a fork inherits no name
 mh fork a1b2 --quarantine                   # direct clone of a running VM
 mh snapshot rm clean
 ```
+
+### Images
+
+```bash
+# copy a golden into the content-addressed store (once; prints NAME:VERSION@DIGEST)
+mh image import parser:1.0 \
+  --kernel /var/lib/microhosted/store/kernels/vmlinux-6.1.102 \
+  --rootfs /var/lib/microhosted/store/rootfs/alpine-py.ext4 --mem 128 --disk 512
+
+mh image ls                                  # tags, short digest, defaults, size
+mh image ls -q                               # pinned references, for scripts and specs
+mh run parser:1.0                            # a reference with ':' is an image
+mh run parser:1.0@sha256:…                   # pinned: refused if the tag says otherwise
+mh image verify parser:1.0                   # re-hash its files (slow, explicit)
+mh image rm parser:1.0                       # refused while a VM or snapshot uses it
+mh replace ts01-a                            # a VM from an image is replaced from ITS digest
+```
+
+Files are imported from the daemon's store directory only. A tag is bound once:
+rebuilding under the same `name:version` is refused — import it as a new
+version.
 
 ### Platform
 

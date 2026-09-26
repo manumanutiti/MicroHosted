@@ -22,7 +22,7 @@ func VolumePath(instancesDir, volID string) string {
 }
 
 // CreateVolume provisions a fresh, empty ext4 volume image of sizeMB MiB and
-// chowns it to the jailer uid/gid so the jailed Firecracker can open it for
+// chowns it to uid/gid (the volume's own identity) so the jailed Firecracker can open it for
 // writing. Same shape as a golden rootfs — a bare ext4 written straight onto the
 // file with no partition table (mkfs.ext4 -F on the truncated file) — so a
 // future grow path is the same offline resize2fs the clones already use.
@@ -31,7 +31,7 @@ func CreateVolume(instancesDir, volID string, sizeMB int64, uid, gid int) (strin
 		return "", fmt.Errorf("volume size must be positive, got %d MiB", sizeMB)
 	}
 	dir := VolumesDir(instancesDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, StoreDirMode); err != nil {
 		return "", fmt.Errorf("creating volumes dir %s: %w", dir, err)
 	}
 
@@ -39,7 +39,7 @@ func CreateVolume(instancesDir, volID string, sizeMB int64, uid, gid int) (strin
 	if err := os.Truncate(path, 0); err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("preparing volume file %s: %w", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, privateFileMode)
 	if err != nil {
 		return "", fmt.Errorf("creating volume file %s: %w", path, err)
 	}
@@ -59,6 +59,11 @@ func CreateVolume(instancesDir, volID string, sizeMB int64, uid, gid int) (strin
 	if err := os.Chown(path, uid, gid); err != nil {
 		_ = os.Remove(path)
 		return "", fmt.Errorf("chowning volume %s to %d:%d: %w", path, uid, gid, err)
+	}
+	// O_CREATE's mode doesn't apply to a file that already existed.
+	if err := os.Chmod(path, privateFileMode); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("restricting volume %s: %w", path, err)
 	}
 
 	return path, nil

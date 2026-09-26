@@ -194,7 +194,7 @@ fi
 # preparation's job.
 sudo mkdir -p "$INSTANCES_DIR/rootfs" "$INSTANCES_DIR/kernels" "$INSTANCES_DIR/jailer"
 sudo chown root:root "$INSTANCES_DIR/jailer"
-sudo chmod 0755 "$INSTANCES_DIR/jailer"
+sudo chmod 0711 "$INSTANCES_DIR" "$INSTANCES_DIR/jailer"
 echo "  store with rootfs/ kernels/ jailer/ (same FS: reflink CoW + hardlinks OK)"
 
 echo ""

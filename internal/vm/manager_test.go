@@ -8,15 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"microhosted/internal/hostinfo"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
+	"microhosted/internal/storage"
 	"microhosted/internal/store"
 	"microhosted/pkg/types"
 )
 
 // newTestManager builds a Manager wired only to the pieces the reconcile path
-// touches — a real store and network manager. Catalog/jailer/instancesDir are
-// unused by the code under test, so their zero values are fine.
+// touches — a real store and network manager, and a small identity range with
+// no live processes. Catalog/instancesDir are unused by the code under test,
+// so their zero values are fine.
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -24,7 +27,11 @@ func newTestManager(t *testing.T) *Manager {
 		t.Fatalf("opening store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	return NewManager(nil, jailer.Defaults{}, "", st, network.NewManager(st, nil))
+	m := NewManager(nil, jailer.Defaults{IDBase: jailer.DefaultIDBase, IDCount: 16}, "", st, network.NewManager(st, nil))
+	m.ids.live = func() (map[int]bool, error) { return nil, nil }
+	// A roomy store: tests that exercise the disk reserve set their own.
+	m.disk.usage = func(string) (hostinfo.DiskUsage, error) { return hostinfo.DiskUsage{FreeMB: 1 << 30}, nil }
+	return m
 }
 
 // A VM stopped on purpose (poweroff) has no live process by design. Reconcile
@@ -246,7 +253,7 @@ func TestRestoreRejectsForeignSnapshot(t *testing.T) {
 	vm := &types.VM{Config: types.VMConfig{ID: "deadbeef"}, State: types.VMStateStopped}
 	m.Reconcile([]*types.VM{vm})
 
-	snapDir := t.TempDir() // exists, so LoadSnapshots keeps it
+	snapDir := fakeSnapshotDir(t) // complete, so LoadSnapshots keeps it
 	m.LoadSnapshots([]*types.Snapshot{{ID: "snap1234", SourceVMID: "otro-vm1", Dir: snapDir}})
 
 	if _, err := m.Restore(context.Background(), "deadbeef", "snap1234"); !errors.Is(err, ErrConflict) {
@@ -262,7 +269,7 @@ func TestRestoreRejectsForeignSnapshot(t *testing.T) {
 func TestLoadSnapshotsDropsMissingDir(t *testing.T) {
 	m := newTestManager(t)
 
-	alive := t.TempDir()
+	alive := fakeSnapshotDir(t)
 	m.LoadSnapshots([]*types.Snapshot{
 		{ID: "kept1234", SourceVMID: "a", Dir: alive},
 		{ID: "gone1234", SourceVMID: "a", Dir: filepath.Join(alive, "does-not-exist")},
@@ -273,5 +280,40 @@ func TestLoadSnapshotsDropsMissingDir(t *testing.T) {
 	}
 	if _, ok := m.GetSnapshot("gone1234"); ok {
 		t.Error("snapshot with missing dir was kept")
+	}
+}
+
+// fakeSnapshotDir builds a snapshot directory with all three artifacts, as
+// LoadSnapshots requires to seal and index it.
+func fakeSnapshotDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, n := range []string{storage.SnapshotStateFile, storage.SnapshotMemFile, storage.SnapshotDiskFile} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// A snapshot that can't be sealed — here its memory image is a symlink — must
+// not be offered for forks: its files would reach new VMs unprotected.
+func TestLoadSnapshotsSkipsUnsealable(t *testing.T) {
+	m := newTestManager(t)
+
+	dir := fakeSnapshotDir(t)
+	mem := filepath.Join(dir, storage.SnapshotMemFile)
+	if err := os.Remove(mem); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/hostname", mem); err != nil {
+		t.Fatal(err)
+	}
+	m.LoadSnapshots([]*types.Snapshot{{ID: "bad12345", SourceVMID: "a", Dir: dir}})
+	if _, ok := m.GetSnapshot("bad12345"); ok {
+		t.Error("unsealable snapshot was loaded")
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("snapshot dir not restricted: %v %v", fi, err)
 	}
 }

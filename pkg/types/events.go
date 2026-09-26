@@ -16,6 +16,8 @@ const (
 	EventVMReplaceFailed = "vm.replace_failed" // cut off, but the replacement did not boot: the function is down; Reason
 	EventVMAutostartFail = "vm.autostart_failed"
 	EventRulesetFailed   = "network.ruleset_failed" // nft -f refused a ruleset; the policy in force may not be the declared one
+	EventHostDiskLow     = "host.disk_low"          // the store fell under its free-space reserve; Data: free_mb, reserve_mb
+	EventHostDiskOK      = "host.disk_ok"           // the store is back above its reserve
 
 	// EventReset is not something that happened on the host: it tells a
 	// subscriber that it missed events it can no longer get — the daemon

@@ -28,6 +28,11 @@ type Volume struct {
 	// ext4 must not be written underneath a running guest.
 	AttachedTo string
 	CreatedAt  time.Time
+	// UID is the volume's own identity from the daemon's reserved range. The
+	// image file belongs to it while the volume is detached (and debugfs drops
+	// to it to parse the image); while attached it belongs to the VM's
+	// identity instead. Zero only in records written before per-VM identities.
+	UID int
 }
 
 // VolumeMount records one volume attached to a VM: how it's exposed to the guest

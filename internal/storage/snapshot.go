@@ -31,10 +31,13 @@ func SnapshotDir(instancesDir, snapshotID string) string {
 // something to silently merge into).
 func CreateSnapshotDir(instancesDir, snapshotID string) (string, error) {
 	dir := SnapshotDir(instancesDir, snapshotID)
-	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dir), snapshotDirMode); err != nil {
 		return "", fmt.Errorf("creating snapshots dir: %w", err)
 	}
-	if err := os.Mkdir(dir, 0o755); err != nil {
+	if err := os.Chmod(filepath.Dir(dir), snapshotDirMode); err != nil {
+		return "", fmt.Errorf("restricting snapshots dir: %w", err)
+	}
+	if err := os.Mkdir(dir, snapshotDirMode); err != nil {
 		return "", fmt.Errorf("creating snapshot dir %s: %w", dir, err)
 	}
 	return dir, nil
@@ -42,7 +45,7 @@ func CreateSnapshotDir(instancesDir, snapshotID string) (string, error) {
 
 // DeleteSnapshotDir removes a snapshot's directory and artifacts. Safe on an
 // already-absent directory. VMs previously restored from this snapshot are
-// unaffected: their chroots hold hardlinks to the mem/vmstate inodes (which
+// unaffected: their chroots hold hard links to the mem/vmstate inodes (which
 // survive until those VMs are destroyed) and their disks are private reflink
 // copies.
 func DeleteSnapshotDir(instancesDir, snapshotID string) error {
@@ -70,7 +73,7 @@ func ReflinkFile(src, dst string) error {
 }
 
 // CloneFromSnapshot stamps out a VM's private disk from a snapshot's captured
-// disk: a reflink copy chowned to the jailer uid/gid so the jailed Firecracker
+// disk: a reflink copy chowned to the VM's identity so its jailed Firecracker
 // can write it. No resize — the captured disk already has the size (and
 // filesystem state) the snapshotted guest had; growing it here would desync it
 // from the memory image, which remembers the old block device size.
@@ -82,6 +85,12 @@ func CloneFromSnapshot(snapDir, vmID, instancesDir string, uid, gid int) (string
 	if err := os.Chown(dst, uid, gid); err != nil {
 		_ = os.Remove(dst)
 		return "", fmt.Errorf("chowning clone %s to %d:%d: %w", dst, uid, gid, err)
+	}
+	// Explicit, like CloneRootfs: cp derives the mode from the source, and a
+	// private disk must never be readable by other local users.
+	if err := os.Chmod(dst, 0o600); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("restricting clone %s: %w", dst, err)
 	}
 	return dst, nil
 }

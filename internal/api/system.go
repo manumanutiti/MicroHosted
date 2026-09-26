@@ -39,9 +39,10 @@ type SystemConfig struct {
 	StartedAt   time.Time
 }
 
-// freeSpaceFloor: below max(5% of the store, 1 GiB) free, the disk_space
-// check fails — a full store makes every create/snapshot/upload fail in
-// worse, less obvious ways, so the health endpoint says it first.
+// freeSpaceFloor: below max(5% of the store, 1 GiB, --disk-reserve-mb) free,
+// the disk_space check fails — a full store makes every create/snapshot/upload
+// fail in worse, less obvious ways, so the health endpoint says it first, and
+// never later than admission starts refusing on the reserve.
 const freeSpaceFloorMB = 1024
 
 func registerSystemRoutes(mux *http.ServeMux, mgr *vm.Manager, netmgr *network.Manager, cfg SystemConfig) {
@@ -123,7 +124,7 @@ func runHealthChecks(mgr *vm.Manager, netmgr *network.Manager, facts vm.Facts) [
 	if du, err := hostinfo.ReadDiskUsage(facts.StoreDir); err != nil {
 		space.OK, space.Detail = false, err.Error()
 	} else {
-		floor := max(du.TotalMB*5/100, freeSpaceFloorMB)
+		floor := max(du.TotalMB*5/100, freeSpaceFloorMB, mgr.Limits().DiskReserveMB)
 		space.Detail = fmt.Sprintf("%d MiB free of %d MiB", du.FreeMB, du.TotalMB)
 		if du.FreeMB < floor {
 			space.OK = false
@@ -223,6 +224,7 @@ func storageReport(mgr *vm.Manager, facts vm.Facts) types.StorageInfo {
 func fleetReport(mgr *vm.Manager, netmgr *network.Manager) types.FleetInfo {
 	info := mgr.FleetStats()
 	info.Networks = len(netmgr.List())
+	info.Quotas = mgr.QuotaUsage()
 	info.ManagedIfaces = netmgr.ManagedIfaceNames()
 	return info
 }

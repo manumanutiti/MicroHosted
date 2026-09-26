@@ -48,7 +48,7 @@ func TestBuildConfigSetsNameservers(t *testing.T) {
 		GatewayIP: "172.16.1.1",
 		PrefixLen: 24,
 	}
-	cfg, err := BuildConfig(vm, fc.JailerConfig{})
+	cfg, err := BuildConfig(vm, types.IOLimits{}, fc.JailerConfig{})
 	if err != nil {
 		t.Fatalf("BuildConfig: %v", err)
 	}
@@ -64,11 +64,64 @@ func TestBuildConfigSetsNameservers(t *testing.T) {
 // NoNetwork VMs (no TapDevice) must not get a network interface at all.
 func TestBuildConfigNoNetwork(t *testing.T) {
 	vm := types.VMConfig{ID: "abc12345", Kernel: "/img/vmlinux", Rootfs: "/img/rootfs.ext4", VCPUs: 1, MemMB: 128}
-	cfg, err := BuildConfig(vm, fc.JailerConfig{})
+	cfg, err := BuildConfig(vm, types.IOLimits{}, fc.JailerConfig{})
 	if err != nil {
 		t.Fatalf("BuildConfig: %v", err)
 	}
 	if len(cfg.NetworkInterfaces) != 0 {
 		t.Fatalf("expected no network interfaces for a no-network VM, got %d", len(cfg.NetworkInterfaces))
+	}
+}
+
+// Every drive (rootfs and volumes) and both directions of the NIC carry the
+// VM's limits; a boot burst keeps the disk from throttling the boot itself.
+func TestBuildConfigRateLimiters(t *testing.T) {
+	vm := types.VMConfig{
+		ID: "abc12345", Kernel: "/img/vmlinux", Rootfs: "/img/rootfs.ext4", VCPUs: 1, MemMB: 128,
+		TapDevice: "tapabc12345", GuestIP: "172.16.1.2", GatewayIP: "172.16.1.1", PrefixLen: 24,
+		Volumes: []types.VolumeMount{{DriveID: "vol1", HostPath: "/v/1.ext4"}},
+	}
+	io := types.IOLimits{DiskMiBs: 50, DiskIOPS: 1000, NetMbit: 80}
+	cfg, err := BuildConfig(vm, io, fc.JailerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Drives) != 2 {
+		t.Fatalf("drives = %d, want 2", len(cfg.Drives))
+	}
+	for _, d := range cfg.Drives {
+		rl := d.RateLimiter
+		if rl == nil || rl.Bandwidth == nil || rl.Ops == nil {
+			t.Fatalf("drive %s: limiter = %+v", *d.DriveID, rl)
+		}
+		if *rl.Bandwidth.Size != 50<<20 || *rl.Bandwidth.RefillTime != 1000 || *rl.Ops.Size != 1000 {
+			t.Errorf("drive %s: bandwidth %d/%dms, ops %d", *d.DriveID, *rl.Bandwidth.Size, *rl.Bandwidth.RefillTime, *rl.Ops.Size)
+		}
+		if rl.Bandwidth.OneTimeBurst == nil || *rl.Bandwidth.OneTimeBurst != diskBootBurstBytes {
+			t.Errorf("drive %s: no boot burst", *d.DriveID)
+		}
+	}
+	nic := cfg.NetworkInterfaces[0]
+	for _, rl := range []*struct{ in bool }{{true}, {false}} {
+		lim := nic.OutRateLimiter
+		if rl.in {
+			lim = nic.InRateLimiter
+		}
+		if lim == nil || lim.Bandwidth == nil || *lim.Bandwidth.Size != 80*1_000_000/8 || lim.Bandwidth.OneTimeBurst != nil {
+			t.Errorf("nic (in=%v): limiter = %+v", rl.in, lim)
+		}
+	}
+}
+
+// Zero limits (the operator lifted them) configure no limiter at all.
+func TestBuildConfigUnlimited(t *testing.T) {
+	vm := types.VMConfig{ID: "abc12345", Kernel: "/img/vmlinux", Rootfs: "/img/rootfs.ext4", VCPUs: 1, MemMB: 128,
+		TapDevice: "tapabc12345", GuestIP: "172.16.1.2", GatewayIP: "172.16.1.1", PrefixLen: 24}
+	cfg, err := BuildConfig(vm, types.IOLimits{}, fc.JailerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Drives[0].RateLimiter != nil || cfg.NetworkInterfaces[0].InRateLimiter != nil || cfg.NetworkInterfaces[0].OutRateLimiter != nil {
+		t.Error("limiters configured with no limits")
 	}
 }

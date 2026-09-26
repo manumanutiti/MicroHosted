@@ -18,7 +18,12 @@ make prepare-image      # kernel + ultra-minimal Alpine rootfs (default)
 With that the system is up from scratch: after `prepare-image` you can already
 create the first VM (`POST /v1/vms {"template":"base-alpine"}`). For the classic
 Ubuntu image (systemd + SSH): `make prepare-image FLAVOR=ubuntu` (template
-`base-ubuntu-noble`).
+`base-ubuntu-noble`). For an isolated development workstation with Docker
+Engine inside the guest: `make prepare-image FLAVOR=ubuntu-docker` (template
+`dev-ubuntu`: 2 vCPUs, 1 GiB RAM, 8 GiB disk by default). Containers run
+inside the microVM, so the VM stays the isolation boundary; the guest uses
+the legacy iptables backend because the guest kernel has no nf_tables, and
+`docker pull` needs `egress` towards the registries.
 
 It works on **x86_64 and aarch64** (ARM64 boards with a 64-bit kernel, Jetson, ARM
 gateways): the architecture is auto-detected and every step respects it
@@ -98,6 +103,22 @@ host into its OOM killer. Defaults, overridable on the daemon's command line:
 | `--mem-reserve-mb` | 512 | host memory a launch must leave available (judged on `MemAvailable`, not on the sum of `mem_mb`: guest RAM is lazy) |
 | `--max-vms` | 0 (off) | cap on running VMs plus launches in progress |
 | `--max-parallel-boots` | 4 | launches running at once; the rest wait |
+| `--quota` | none | `CONSUMER=vms:N,mem:MB` (repeatable): cap on what the VMs labelled `managed-by=CONSUMER` may hold at once (running + launching, their `mem_mb`); over it a launch is 429 |
+| `--quota-default` | none | `vms:N,mem:MB`: the quota of every labelled consumer without its own `--quota` |
+| `--disk-reserve-mb` | 1024 | store space kept free: a launch, snapshot, volume, image import or upload that would leave less is refused (503), and `host.disk_low` is raised while the store is under it |
+
+Every VM's disk and network throughput has a ceiling too. A VM may ask for
+less (`io_limits` on create or fork), never more; `0` lifts a limit, and the
+daemon logs a warning when one is lifted:
+
+| flag | default | meaning |
+|---|---|---|
+| `--vm-disk-mib-s` | 100 | throughput of each VM drive (rootfs and every volume), MiB/s; the first 128 MiB after a boot are not throttled |
+| `--vm-disk-iops` | 4000 | operations per second of each VM drive |
+| `--vm-net-mbit` | 100 | throughput of each VM's network, per direction, Mbit/s |
+
+A lowered ceiling reaches each VM at its next boot (start, restore, fork);
+VMs running now keep what they booted with.
 
 ### Fault injection
 
@@ -133,6 +154,33 @@ set, and the daemon logs a warning when it is.
   startup, not later with an obscure error.
 - Runs as **root**: Jailer needs to create chroots/cgroups/tap and open
   `/dev/kvm`.
+
+## Daemon state (database and catalog)
+
+The SQLite database and the template catalog live in `/var/lib/microhosted`
+(`microhosted.db`, `catalog.json`), owned by root, never in the source checkout.
+They are trusted input for a root daemon: a VM record names the files it
+truncates (the console log), clones and deletes (the disk), and a template names
+the kernel and disk it boots. Whoever can write either file, or replace it
+through a writable directory above it, could aim those operations at any file
+on the host.
+
+The daemon enforces this. Running as root, it **refuses to start** if `--db`
+or `--catalog`, or any directory leading to them, is owned by anyone but root
+or writable by group or others. It keeps the database and its SQLite side files
+at mode 0600. `/var/lib/microhosted` itself is 0711: the per-VM identities
+traverse it to reach the store, but nobody can list it.
+
+- `images/catalog.json` in the repository is only the **seed**:
+  `install-service.sh` copies it to `/var/lib/microhosted/catalog.json` when no
+  catalog is installed yet, and never overwrites an existing one.
+  `make prepare-image` registers templates in the installed catalog (as root).
+- **Migration from older installs**, which kept both files under `images/`:
+  `make install-service` stops the daemon (the VMs keep running), moves the
+  database to `/var/lib/microhosted/microhosted.db` as root 0600, starts the
+  daemon again (it re-adopts the VMs), and leaves the old copy as
+  `images/microhosted.db.migrated`. Delete that copy once the daemon is
+  confirmed healthy.
 
 ## Storage (copy-on-write store)
 

@@ -44,7 +44,7 @@ const bytesPerMiB = 1024 * 1024
 // growRootfs for why an offline resize is all it takes. The grow runs once per
 // golden and size, not once per VM: see sizedGolden.
 func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid int, diskMB int64) (string, error) {
-	if err := os.MkdirAll(instancesDir, 0o755); err != nil {
+	if err := os.MkdirAll(instancesDir, StoreDirMode); err != nil {
 		return "", fmt.Errorf("creating instances dir %s: %w", instancesDir, err)
 	}
 
@@ -75,6 +75,13 @@ func CloneRootfs(tpl types.Template, vmID string, instancesDir string, uid, gid 
 	if err := os.Chown(dst, uid, gid); err != nil {
 		_ = os.Remove(dst)
 		return "", fmt.Errorf("chowning clone %s to %d:%d: %w", dst, uid, gid, err)
+	}
+	// cp gives the clone its source's mode: 0444 for a store image, which
+	// the jailed Firecracker could not write, and whatever a hand-built
+	// golden had otherwise. The disk is its VM's alone.
+	if err := os.Chmod(dst, 0o600); err != nil {
+		_ = os.Remove(dst)
+		return "", fmt.Errorf("setting the mode of clone %s: %w", dst, err)
 	}
 
 	return dst, nil
@@ -269,7 +276,7 @@ func growRootfs(path string, sizeMB int64) error {
 	// for) would otherwise make the grow bail out. e2fsck exits 1/2 when it
 	// corrected something, which is fine for an offline image we're about to
 	// grow; only 4+ (uncorrected errors / usage) is a real failure.
-	if out, err := exec.Command("e2fsck", "-fy", path).CombinedOutput(); err != nil {
+	if out, err := cappedCombinedOutput(exec.Command("e2fsck", "-fy", path)); err != nil {
 		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() >= 4 {
 			return fmt.Errorf("e2fsck before resize: %v: %s", err, out)
 		}
@@ -277,7 +284,7 @@ func growRootfs(path string, sizeMB int64) error {
 
 	// No size argument: resize2fs grows the filesystem to fill the whole device
 	// (here, the freshly-truncated file).
-	if out, err := exec.Command("resize2fs", path).CombinedOutput(); err != nil {
+	if out, err := cappedCombinedOutput(exec.Command("resize2fs", path)); err != nil {
 		return fmt.Errorf("resize2fs: %v: %s", err, out)
 	}
 	return nil
@@ -316,7 +323,7 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, privateFileMode)
 	if err != nil {
 		return err
 	}

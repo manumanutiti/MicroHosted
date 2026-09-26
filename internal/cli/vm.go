@@ -21,7 +21,7 @@ var vmGroup = &group{
 	aliases: []string{"vms"},
 	summary: "Manage microVMs",
 	cmds: []*command{
-		{name: "create", aliases: []string{"run", "new"}, args: "TEMPLATE", summary: "Create and boot a VM from a template", run: vmCreate},
+		{name: "create", aliases: []string{"run", "new"}, args: "TEMPLATE | IMAGE", summary: "Create and boot a VM from a template or a stored image (NAME:VERSION[@sha256:…])", run: vmCreate},
 		{name: "ls", aliases: []string{"list", "ps"}, summary: "List VMs (running ones; -a for all)", run: vmList},
 		{name: "inspect", aliases: []string{"show"}, args: "VM...", summary: "Show a VM's full detail as JSON", run: vmInspect},
 		{name: "rm", aliases: []string{"remove", "delete"}, args: "VM... | --all", summary: "Destroy VMs (disk included)", run: vmRemove},
@@ -55,17 +55,28 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 	fs.stringVar(&req.GuestIP, "ip", "", "", "take this exact `ADDRESS` on the network (a replacement's; the only way to get an ingress rule's to_ip)")
 	fs.listVar(&volumes, "volume", "v", "attach volume `NAME[:GUEST_PATH][:ro]` (repeatable; default path /vol/NAME)")
 	fs.boolVar(&req.Autostart, "autostart", "", "boot it again when the daemon starts and finds it dead (host reboot)")
+	var files, secrets []string
+	fileFlags(fs, &files, &secrets)
+	var io types.IOLimits
+	ioLimitFlags(fs, &io)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
 	}
+	req.IOLimits = askedIOLimits(io)
 	if len(pos) != 1 {
-		return usagef(p, "expected exactly one TEMPLATE, got %d arguments", len(pos))
+		return usagef(p, "expected exactly one TEMPLATE or IMAGE, got %d arguments", len(pos))
 	}
 	if req.NoNetwork && req.Network != "" {
 		return usagef(p, "--net and --no-net are mutually exclusive")
 	}
-	req.Template = pos[0]
+	// Image references always carry a ':' (name:version, sha256:…);
+	// template names never do.
+	if strings.Contains(pos[0], ":") {
+		req.Image = pos[0]
+	} else {
+		req.Template = pos[0]
+	}
 	if req.Labels, err = parseLabels(labels); err != nil {
 		return usagef(p, "%v", err)
 	}
@@ -75,6 +86,9 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 			return usagef(p, "%v", err)
 		}
 		req.Volumes = append(req.Volumes, va)
+	}
+	if req.Files, err = parseFileSpecs(files, secrets); err != nil {
+		return err
 	}
 	c, err := e.api()
 	if err != nil {
@@ -309,10 +323,15 @@ func vmReplace(e *env, cmd *command, p string, args []string) error {
 	var labels []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.stringVar(&req.Snapshot, "snapshot", "s", "", "fork the replacement from `SNAPSHOT` (taken at the function's address)")
-	fs.stringVar(&req.Template, "template", "t", "", "boot the replacement from `TEMPLATE` (default: the old VM's)")
+	fs.stringVar(&req.Template, "template", "t", "", "boot the replacement from `TEMPLATE` (default: the old VM's own source)")
+	fs.stringVar(&req.Image, "image", "i", "", "boot the replacement from stored `IMAGE` (default: the old VM's own image digest)")
 	fs.stringVar(&req.Old, "old", "", "", "what to do with the old VM: quarantine (default, left running), stop (disk kept, RAM freed) or destroy")
 	fs.stringVar(&req.Name, "name", "", "", "`NAME` for the replacement")
 	fs.listVar(&labels, "label", "l", "extra label `KEY=VALUE` for the replacement (it inherits the old VM's)")
+	var files, secrets []string
+	fileFlags(fs, &files, &secrets)
+	var noFiles bool
+	fs.boolVar(&noFiles, "no-files", "", "boot the replacement without the files the old VM was created with")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -320,11 +339,20 @@ func vmReplace(e *env, cmd *command, p string, args []string) error {
 	if len(pos) != 1 {
 		return usagef(p, "expected exactly one VM, got %d arguments", len(pos))
 	}
-	if req.Snapshot != "" && req.Template != "" {
-		return usagef(p, "--snapshot and --template are mutually exclusive")
+	if n := countNonEmpty(req.Snapshot, req.Template, req.Image); n > 1 {
+		return usagef(p, "--snapshot, --template and --image are mutually exclusive")
 	}
 	if req.Labels, err = parseLabels(labels); err != nil {
 		return usagef(p, "%v", err)
+	}
+	if noFiles && len(files)+len(secrets) > 0 {
+		return usagef(p, "--no-files and --file/--secret are mutually exclusive")
+	}
+	if req.Files, err = parseFileSpecs(files, secrets); err != nil {
+		return err
+	}
+	if noFiles {
+		req.Files = []types.FileSpec{}
 	}
 	c, err := e.api()
 	if err != nil {
@@ -424,6 +452,8 @@ func vmAction(e *env, cmd *command, p string, args []string, verb string) error 
 
 func vmExec(e *env, cmd *command, p string, args []string) error {
 	fs := newCmdFlags(e, p, cmd)
+	timeout := fs.Duration("timeout", 0, "give up after `DURATION`, e.g. 5s (default 30s, at most 10m)")
+	fs.alias("timeout", "t")
 	pos, err := fs.parseLeading(args)
 	if err != nil {
 		return err
@@ -447,8 +477,12 @@ func vmExec(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *timeout < 0 || (*timeout > 0 && *timeout < time.Millisecond) {
+		return usagef(p, "--timeout must be at least 1ms")
+	}
+	req := types.ExecRequest{Cmd: shellCommand(argv), TimeoutMS: timeout.Milliseconds()}
 	var res types.ExecResponse
-	if err := c.Do("POST", "/v1/vms/"+id+"/exec", types.ExecRequest{Cmd: shellCommand(argv)}, &res); err != nil {
+	if err := c.Do("POST", "/v1/vms/"+id+"/exec", req, &res); err != nil {
 		return err
 	}
 	fmt.Fprint(e.stdout, res.Output)
@@ -650,6 +684,13 @@ func tailFile(w io.Writer, f *os.File, n int64, follow bool) error {
 	if _, err := w.Write(data); err != nil || !follow {
 		return err
 	}
+	// f is replaced when the log rotates; the caller closes only the original.
+	orig := f
+	defer func() {
+		if f != orig {
+			f.Close()
+		}
+	}()
 	buf := make([]byte, 32<<10)
 	for {
 		k, err := f.Read(buf)
@@ -662,8 +703,36 @@ func tailFile(w io.Writer, f *os.File, n int64, follow bool) error {
 		if err != nil && err != io.EOF {
 			return err
 		}
+		// The daemon caps console logs by rotating them: the live file is
+		// renamed away and a new one started. At EOF, if the path now names a
+		// different file, drain nothing more from the old one and switch.
+		if nf := reopenIfRotated(f); nf != nil {
+			if f != orig {
+				f.Close()
+			}
+			f = nf
+			continue
+		}
 		time.Sleep(300 * time.Millisecond)
 	}
+}
+
+// reopenIfRotated returns a fresh handle on f's path when the path no longer
+// refers to the file f has open, or nil when it still does (or can't tell).
+func reopenIfRotated(f *os.File) *os.File {
+	cur, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	now, err := os.Stat(f.Name())
+	if err != nil || os.SameFile(cur, now) {
+		return nil
+	}
+	nf, err := os.Open(f.Name())
+	if err != nil {
+		return nil
+	}
+	return nf
 }
 
 func vmSnapshot(e *env, cmd *command, p string, args []string) error {
@@ -703,10 +772,13 @@ func vmFork(e *env, cmd *command, p string, args []string) error {
 	fs := newCmdFlags(e, p, cmd)
 	fs.boolVar(&req.Quarantine, "quarantine", "", "attach the clone to no network (vsock only) — needed while the source VM holds its IP")
 	forkIdentityFlags(fs, &req, &labels)
+	var io types.IOLimits
+	ioLimitFlags(fs, &io)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
 	}
+	req.IOLimits = askedIOLimits(io)
 	if len(pos) != 1 {
 		return usagef(p, "expected exactly one VM")
 	}
@@ -829,6 +901,23 @@ func forkIdentityFlags(fs *flagSet, req *types.ForkVMRequest, labels *[]string) 
 	fs.listVar(labels, "label", "l", "label `KEY=VALUE` for the new VM (repeatable)")
 }
 
+// ioLimitFlags adds the throughput flags of a new VM. Each can only lower the
+// daemon's ceiling (or, for a fork, what it inherits); the daemon refuses more.
+func ioLimitFlags(fs *flagSet, io *types.IOLimits) {
+	fs.int64Var(&io.DiskMiBs, "disk-mib-s", "", "cap each drive at `MIB` per second, below the daemon's ceiling")
+	fs.int64Var(&io.DiskIOPS, "disk-iops", "", "cap each drive at `N` operations per second, below the daemon's ceiling")
+	fs.int64Var(&io.NetMbit, "net-mbit", "", "cap the network at `MBIT` per second each way, below the daemon's ceiling")
+}
+
+// askedIOLimits is nil when no throughput flag was given, so the request
+// carries no io_limits at all.
+func askedIOLimits(io types.IOLimits) *types.IOLimits {
+	if io == (types.IOLimits{}) {
+		return nil
+	}
+	return &io
+}
+
 // parseLabels reads KEY=VALUE arguments into a label set. The daemon validates
 // keys and values; this only checks the shape.
 func parseLabels(args []string) (map[string]string, error) {
@@ -860,17 +949,9 @@ func vmLabel(e *env, cmd *command, p string, args []string) error {
 	if len(pos) < 2 {
 		return usagef(p, "expected a VM and at least one KEY=VALUE or KEY-")
 	}
-	patch := make(map[string]*string, len(pos)-1)
-	for _, a := range pos[1:] {
-		if k, v, ok := strings.Cut(a, "="); ok && k != "" {
-			patch[k] = &v
-			continue
-		}
-		if k, ok := strings.CutSuffix(a, "-"); ok && k != "" {
-			patch[k] = nil
-			continue
-		}
-		return usagef(p, "%q: expected KEY=VALUE to set or KEY- to remove", a)
+	patch, err := parseLabelPatch(pos[1:])
+	if err != nil {
+		return usagef(p, "%v", err)
 	}
 	c, err := e.api()
 	if err != nil {
@@ -888,6 +969,24 @@ func vmLabel(e *env, cmd *command, p string, args []string) error {
 	return nil
 }
 
+// parseLabelPatch reads kubectl-style label edits into a merge patch:
+// KEY=VALUE sets, KEY- removes.
+func parseLabelPatch(args []string) (map[string]*string, error) {
+	patch := make(map[string]*string, len(args))
+	for _, a := range args {
+		if k, v, ok := strings.Cut(a, "="); ok && k != "" {
+			patch[k] = &v
+			continue
+		}
+		if k, ok := strings.CutSuffix(a, "-"); ok && k != "" {
+			patch[k] = nil
+			continue
+		}
+		return nil, fmt.Errorf("%q: expected KEY=VALUE to set or KEY- to remove", a)
+	}
+	return patch, nil
+}
+
 // fmtLabels renders labels as "k=v,k2=v2", sorted, or "-" for none.
 func fmtLabels(labels map[string]string) string {
 	if len(labels) == 0 {
@@ -899,4 +998,14 @@ func fmtLabels(labels map[string]string) string {
 	}
 	sort.Strings(terms)
 	return strings.Join(terms, ",")
+}
+
+func countNonEmpty(ss ...string) int {
+	n := 0
+	for _, s := range ss {
+		if s != "" {
+			n++
+		}
+	}
+	return n
 }

@@ -2,6 +2,8 @@ package vsock
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +13,18 @@ import (
 	"testing"
 	"time"
 )
+
+// testUID stands in for a VM's jailed uid: the fake sockets below are plain
+// temp-dir sockets, so TestMain swaps the jail-checking dialer for a plain one.
+const testUID = 1
+
+func TestMain(m *testing.M) {
+	dialJail = func(ctx context.Context, path string, _ int) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", path)
+	}
+	os.Exit(m.Run())
+}
 
 // serveOne stands up a fake Firecracker vsock UDS that accepts exactly one
 // connection, answers the CONNECT handshake, and hands the connection to
@@ -67,7 +81,7 @@ func TestExecNoEOF(t *testing.T) {
 	})
 
 	start := time.Now()
-	out, code, err := Exec(sock, "echo hello")
+	out, code, err := Exec(sock, testUID, "echo hello")
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -89,7 +103,7 @@ func TestExecWithEOF(t *testing.T) {
 		fmt.Fprintf(w, "line1\nline2\n%s3\n", exitMarker)
 	})
 
-	out, code, err := Exec(sock, "whatever")
+	out, code, err := Exec(sock, testUID, "whatever")
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -108,7 +122,7 @@ func TestExecOutputWithoutTrailingNewline(t *testing.T) {
 		fmt.Fprintf(w, "foo%s7\n", exitMarker)
 	})
 
-	out, code, err := Exec(sock, "printf foo; exit 7")
+	out, code, err := Exec(sock, testUID, "printf foo; exit 7")
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -127,7 +141,7 @@ func TestExecMarkerLikeTextMidLine(t *testing.T) {
 		fmt.Fprintf(w, "echo \"%s$?\"\n%s0\n", exitMarker, exitMarker)
 	})
 
-	out, code, err := Exec(sock, "cat /usr/local/bin/microhosted-exec")
+	out, code, err := Exec(sock, testUID, "cat /usr/local/bin/microhosted-exec")
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -146,7 +160,7 @@ func TestExecMissingMarker(t *testing.T) {
 		fmt.Fprintf(w, "garbage with no marker\n")
 	})
 
-	_, _, err := Exec(sock, "true")
+	_, _, err := Exec(sock, testUID, "true")
 	if err == nil || !strings.Contains(err.Error(), "missing exit marker") {
 		t.Fatalf("want missing-marker error, got %v", err)
 	}
@@ -176,7 +190,7 @@ func TestExecFloodIsCapped(t *testing.T) {
 		flood(w, strings.Repeat("A", 1023)+"\n")
 	})
 
-	out, _, err := Exec(sock, "cat /dev/urandom")
+	out, _, err := Exec(sock, testUID, "cat /dev/urandom")
 	if err == nil {
 		t.Fatal("Exec accepted an unbounded agent response")
 	}
@@ -199,7 +213,7 @@ func TestExecFloodWithoutNewlinesIsCapped(t *testing.T) {
 		flood(w, strings.Repeat("A", 64<<10))
 	})
 
-	out, _, err := Exec(sock, "yes | tr -d '\\n'")
+	out, _, err := Exec(sock, testUID, "yes | tr -d '\\n'")
 	if err == nil {
 		t.Fatal("Exec accepted an unterminated agent response")
 	}
@@ -228,7 +242,7 @@ func TestPutFileNoEOF(t *testing.T) {
 	})
 
 	start := time.Now()
-	if err := PutFile(sock, "/tmp/x", strings.NewReader(payload), int64(len(payload))); err != nil {
+	if err := PutFile(sock, testUID, "/tmp/x", strings.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatalf("PutFile: %v", err)
 	}
 	if d := time.Since(start); d > 5*time.Second {
@@ -250,8 +264,112 @@ func TestPutFileGuestFailure(t *testing.T) {
 		fmt.Fprintf(w, "%s1\n", exitMarker)
 	})
 
-	err := PutFile(sock, "/readonly/x", strings.NewReader("a"), 1)
+	err := PutFile(sock, testUID, "/readonly/x", strings.NewReader("a"), 1)
 	if err == nil || !strings.Contains(err.Error(), "exit 1") {
 		t.Fatalf("want guest-failure error, got %v", err)
+	}
+}
+
+// TestGetFileHeaderFloodIsCapped: a guest answering GET with a header that
+// never ends must be refused after maxHeaderLine bytes, not buffered forever.
+func TestGetFileHeaderFloodIsCapped(t *testing.T) {
+	sock := serveOne(t, false, func(r *bufio.Reader, w net.Conn) {
+		if _, err := r.ReadString('\n'); err != nil {
+			return
+		}
+		flood(w, strings.Repeat("A", 64<<10))
+	})
+
+	rc, _, err := GetFileStream(sock, testUID, "/tmp/x")
+	if err == nil {
+		rc.Close()
+		t.Fatal("GetFileStream accepted an unterminated header")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("got %v, want the header-ceiling error", err)
+	}
+}
+
+// TestGetFileNegativeLengthRefused: "OK -1" must not reach io.LimitReader.
+func TestGetFileNegativeLengthRefused(t *testing.T) {
+	sock := serveOne(t, false, func(r *bufio.Reader, w net.Conn) {
+		if _, err := r.ReadString('\n'); err != nil {
+			return
+		}
+		fmt.Fprintf(w, "OK -1\n")
+	})
+
+	if rc, _, err := GetFileStream(sock, testUID, "/tmp/x"); err == nil {
+		rc.Close()
+		t.Fatal("GetFileStream accepted a negative length")
+	}
+}
+
+// TestConnectAckFloodIsCapped: the CONNECT ack is written by the Firecracker
+// process, which is untrusted; an endless ack must be refused.
+func TestConnectAckFloodIsCapped(t *testing.T) {
+	dir, err := os.MkdirTemp("", "vs") // short path: UDS names cap at 108 bytes
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "v.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		flood(conn, strings.Repeat("A", 64<<10))
+	}()
+
+	if _, _, err := Exec(sock, testUID, "true"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("got %v, want the header-ceiling error", err)
+	}
+}
+
+// TestExecContextTimeout: a guest that takes the command and never answers
+// costs the caller its own deadline, not the 30 s default, and the error says
+// it was a timeout.
+func TestExecContextTimeout(t *testing.T) {
+	sock := serveOne(t, true, func(r *bufio.Reader, w net.Conn) {
+		_, _ = r.ReadString('\n')
+		fmt.Fprint(w, "partial output\n")
+	})
+
+	start := time.Now()
+	out, _, err := ExecContext(context.Background(), sock, testUID, "sleep 999", 200*time.Millisecond)
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+	}
+	if out != "" {
+		t.Errorf("output %q returned with a timeout — a truncated answer must not pass for one", out)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %s, want about the 200ms deadline", d)
+	}
+}
+
+// TestExecContextCancel: a caller that goes away (API client hung up) frees
+// the connection at once, and is told it was cancelled, not timed out.
+func TestExecContextCancel(t *testing.T) {
+	sock := serveOne(t, true, func(r *bufio.Reader, w net.Conn) {
+		_, _ = r.ReadString('\n')
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, _, err := ExecContext(ctx, sock, testUID, "sleep 999", time.Minute)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrTimeout) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("took %s after cancel", d)
 	}
 }

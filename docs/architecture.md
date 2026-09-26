@@ -76,6 +76,11 @@ filesystems on Linux. That's why goldens, kernels, and the Jailer chroot all
 live under the store:
 
 ```
+/var/lib/microhosted/                  (root, 0711)
+├── microhosted.db            # SQLite state (root, 0600)
+├── catalog.json              # template catalog (root, 0644; seeded from images/)
+└── store/                    # the CoW store below
+
 /var/lib/microhosted/store/            (btrfs, CoW)
 ├── rootfs/                   # goldens (reflink source)
 ├── kernels/                  # kernels (Jailer hardlinks them into the chroot)
@@ -102,8 +107,9 @@ See `docs/layers.md` (L3) for the detail.
 
 **Create** (`vm.Manager.Snapshot`): pauses the VM (`PATCH /vm`), asks Firecracker
 for a Full snapshot (`PUT /snapshot/create` — the process is chrooted, so it
-writes vmstate+mem inside its own chroot), the daemon moves them with `os.Rename`
-(same FS ⇒ free) to `snapshots/<sid>/`, reflinks the disk **while still paused**
+writes vmstate+mem inside its own chroot), the daemon captures them into fresh
+root-owned inodes in `snapshots/<sid>/` (a reflink on the CoW store, then the
+originals are deleted — `storage.CaptureSnapshotFile`), reflinks the disk **while still paused**
 (memory and disk stay mutually consistent), and resumes. These calls go straight
 to the UDS socket (`internal/firecracker/rawapi.go`), not through the SDK: this
 way they work the same on VMs adopted after a daemon restart (no SDK handle) and
@@ -111,10 +117,14 @@ give access to fields the SDK v1.0.0 doesn't know about.
 
 **Restore/fork** (`vm.Manager.Fork` / `Restore`): a new Firecracker is launched
 via Jailer **without boot** — the SDK's boot pipeline is replaced by StartVMM + a
-custom handler (`internal/firecracker.LaunchFromSnapshot`) that hardlinks
-vmstate/mem/disk into the freshly created chroot and does `PUT /snapshot/load`
-with `resume_vm`. The mem is mapped copy-on-write: N VMs can restore from the
-same snapshot at once without copying it.
+custom handler (`internal/firecracker.LaunchFromSnapshot`) that hardlinks the
+sealed vmstate/mem and the VM's own disk clone into the freshly created chroot,
+grants the VM's group read access to vmstate/mem with a POSIX ACL entry, does
+`PUT /snapshot/load` with `resume_vm`, and revokes the grant as soon as the load
+returns (`storage.ShareSnapshotFile`). The memory is mapped copy-on-write from
+one shared inode: N VMs restore from the same snapshot at once without copying
+it, and they share the page cache of the memory none of them has modified.
+Without ACL support on the store, each restore gets a private copy instead.
 
 **TAP and Firecracker version**: the vmstate remembers the original TAP's name,
 and `network_overrides` (the `/snapshot/load` field that lets you remap the NIC

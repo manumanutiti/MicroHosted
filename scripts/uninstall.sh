@@ -12,9 +12,10 @@
 #   5. deletes the daemon's cgroups (/sys/fs/cgroup/microhosted and the
 #      Jailer's /sys/fs/cgroup/firecracker)
 #   6. unmounts the CoW store, removes its /etc/fstab line, and deletes the
-#      btrfs image file and all of /var/lib/microhosted
+#      btrfs image file and all of /var/lib/microhosted (state DB and catalog
+#      included)
 #   7. deletes the installed binaries (microhosted, mh; firecracker and jailer
-#      unless KEEP_FC=1) and the repo's state DB
+#      unless KEEP_FC=1) and any state DB an older install left in the repo
 #
 # Idempotent: it can be re-run over a partial installation without failing.
 #
@@ -188,7 +189,7 @@ if [[ -d "$STATE_ROOT" ]]; then
     exit 1
   fi
   run rm -rf "$STATE_ROOT"
-  echo "  $STATE_ROOT: deleted (btrfs image included)"
+  echo "  $STATE_ROOT: deleted (btrfs image, state DB and catalog included)"
 else
   echo "  $STATE_ROOT didn't exist"
 fi
@@ -205,10 +206,15 @@ else
   echo "  $BIN_DIR/{firecracker,jailer}: removed"
 fi
 
-# The DB points to VMs/clones in the just-deleted store: leaving it only poisons
-# a future reinstall with phantom state.
-run rm -f "$REPO_ROOT/images/microhosted.db"
-echo "  images/microhosted.db: removed"
+# Older installs kept the DB in the repo (now it lives in $STATE_ROOT, deleted
+# above). It points to VMs/clones in the just-deleted store: leaving it, or the
+# copy the migration kept, only poisons a future reinstall with phantom state.
+for f in "$REPO_ROOT"/images/microhosted.db "$REPO_ROOT"/images/microhosted.db-* "$REPO_ROOT"/images/microhosted.db*.migrated; do
+  if [[ -e "$f" ]]; then
+    run rm -f "$f"
+    echo "  $f: removed"
+  fi
+done
 
 if [[ -n "${PURGE:-}" ]]; then
   run rm -rf "$REPO_ROOT/images/kernels" "$REPO_ROOT/images/rootfs" \
@@ -228,4 +234,4 @@ echo "    - /dev/kvm permissions and kvm group membership"
 if [[ -z "${PURGE:-}" ]]; then
   echo "  The image artifacts remain in the repo (images/); PURGE=1 deletes them."
 fi
-echo "  The catalog (images/catalog.json) is versioned: git checkout restores it."
+echo "  The seed catalog (images/catalog.json) is versioned and stays in the repo."

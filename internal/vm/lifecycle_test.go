@@ -74,17 +74,17 @@ func TestAdmitMemoryReserve(t *testing.T) {
 	m.SetLimits(Limits{MemReserveMB: 500, MaxParallelBoots: 4})
 	m.memAvailable = func() (int64, error) { return 1000, nil }
 
-	rel, err := m.admit(context.Background(), "aaaa0001", 300) // leaves 700
+	rel, err := m.admit(context.Background(), "aaaa0001", "", 300, 0) // leaves 700
 	if err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	// 1000 - 300 in flight - 300 = 400 < 500: the in-flight launch counts
 	// although MemAvailable does not show it yet.
-	if _, err := m.admit(context.Background(), "aaaa0002", 300); !errors.Is(err, ErrCapacity) {
+	if _, err := m.admit(context.Background(), "aaaa0002", "", 300, 0); !errors.Is(err, ErrCapacity) {
 		t.Errorf("second admit = %v, want ErrCapacity", err)
 	}
 	rel()
-	rel2, err := m.admit(context.Background(), "aaaa0002", 300)
+	rel2, err := m.admit(context.Background(), "aaaa0002", "", 300, 0)
 	if err != nil {
 		t.Errorf("admit after release: %v", err)
 	} else {
@@ -92,7 +92,7 @@ func TestAdmitMemoryReserve(t *testing.T) {
 	}
 
 	m.memAvailable = func() (int64, error) { return 0, errors.New("no /proc") }
-	if _, err := m.admit(context.Background(), "aaaa0003", 1); !errors.Is(err, ErrCapacity) {
+	if _, err := m.admit(context.Background(), "aaaa0003", "", 1, 0); !errors.Is(err, ErrCapacity) {
 		t.Errorf("admit without a memory reading = %v, want ErrCapacity (fail closed)", err)
 	}
 }
@@ -104,12 +104,12 @@ func TestAdmitMaxVMs(t *testing.T) {
 	m.vms["run00001"] = &types.VM{Config: types.VMConfig{ID: "run00001"}, State: types.VMStateRunning}
 	m.vms["a0000001"] = &types.VM{Config: types.VMConfig{ID: "a0000001"}, State: types.VMStateStopped}
 
-	rel, err := m.admit(context.Background(), "new00001", 64)
+	rel, err := m.admit(context.Background(), "new00001", "", 64, 0)
 	if err != nil {
 		t.Fatalf("admit under the cap: %v", err)
 	}
 	defer rel()
-	if _, err := m.admit(context.Background(), "new00002", 64); !errors.Is(err, ErrCapacity) {
+	if _, err := m.admit(context.Background(), "new00002", "", 64, 0); !errors.Is(err, ErrCapacity) {
 		t.Errorf("admit over the cap = %v, want ErrCapacity", err)
 	}
 }
@@ -121,17 +121,17 @@ func TestAdmitWaitsForSlot(t *testing.T) {
 	m.SetLimits(Limits{MaxParallelBoots: 1})
 	m.memAvailable = func() (int64, error) { return 1 << 20, nil }
 
-	rel, err := m.admit(context.Background(), "slot0001", 64)
+	rel, err := m.admit(context.Background(), "slot0001", "", 64, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := m.admit(ctx, "slot0002", 64); !errors.Is(err, ErrCapacity) {
+	if _, err := m.admit(ctx, "slot0002", "", 64, 0); !errors.Is(err, ErrCapacity) {
 		t.Errorf("admit with every slot taken = %v, want ErrCapacity after the context ends", err)
 	}
 	rel()
-	rel2, err := m.admit(context.Background(), "slot0002", 64)
+	rel2, err := m.admit(context.Background(), "slot0002", "", 64, 0)
 	if err != nil {
 		t.Errorf("admit after the slot freed: %v", err)
 	} else {

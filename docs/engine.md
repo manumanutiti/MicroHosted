@@ -432,6 +432,7 @@ is in [api.md § Events](api.md#events); the ones an orchestrator lives on:
 | `vm.replace_failed` | **the function is down**: old VM cut off, replacement did not boot | retry with back-off; after N failures mark the function degraded and alert |
 | `vm.replaced` | the function moved; `data.replacement` is the new VM | update your map from function to VM |
 | `network.ruleset_failed` | `nft -f` refused a ruleset: the policy in force may not be the declared one | alert: this is a security event |
+| `host.disk_low` / `host.disk_ok` | the store crossed its free-space reserve (`--disk-reserve-mb`) | alert: free space before running VMs fill the reserve; new launches are refused meanwhile |
 | `reset` | you missed events you can no longer get | re-read the state (`GET /v1/vms?label=…`), then carry on |
 
 ### How to consume them
@@ -542,7 +543,8 @@ The host never mounts a guest filesystem; see [volumes.md](volumes.md).
 | 409 | `conflicting resources: network "doc-demo": address already in use on this network: 172.16.79.2` | the request is valid but collides with what exists: an address taken, a name taken, a function already served, a snapshot at the wrong address, volumes attached | free the resource, or choose another |
 | 409 | `vm in incompatible state: vm b5195576 is not running (state stopped)` | wrong state for the operation (exec on a stopped VM, start on a running one, quarantine twice) | |
 | 409 | `conflicting resources: vm … is busy (replace in progress)` | another operation on the same VM is running: **one lifecycle operation per VM at a time** | retry after it |
-| 503 | `insufficient host capacity: …` | admission refused a launch: it would leave less than `--mem-reserve-mb` (512 MB) of host memory available, or exceed `--max-vms` | nothing is wrong with the request; retry once something stops |
+| 429 | `consumer quota exceeded: …` | the launch would take its consumer (`managed-by`) over its `--quota` | the host may have room, this consumer does not: stop or destroy one of its VMs, or raise the quota |
+| 503 | `insufficient host capacity: …` | admission refused a launch: it would leave less than `--mem-reserve-mb` (512 MB) of host memory available, less than `--disk-reserve-mb` (1024 MB) free on the store, or exceed `--max-vms` | nothing is wrong with the request; retry once something stops |
 | 500 | the step that failed (`cloning rootfs: …`, `creating tap device: …`) | the host failed underneath — **and everything done so far was undone** | look at the journal; `mh doctor` |
 
 `mh` exits 1 when the operation failed, 2 for a bad command line, and for `exec`
@@ -588,12 +590,11 @@ Open, and known:
 - **exec right after create** can fail until the guest agent is up (§2). Either
   `create` waits for the agent, or callers retry.
 - **Replace does not hand over volumes** (409 for a VM with volumes).
-- **No per-consumer quota**: admission is host-wide; one orchestrator can starve
-  another.
 - **Events do not cover** vsock exec timeouts or cgroup memory pressure short of
   an OOM kill.
-- **No disk or network rate limits per VM**: CPU, memory and PIDs are capped, but
-  one VM can saturate the SD card or its bridge for the others.
+- **Throughput limits are per device**: each drive and each NIC direction is
+  capped (`--vm-disk-mib-s`, `--vm-disk-iops`, `--vm-net-mbit`), but there is
+  no budget shared across a VM's drives or across VMs.
 - **`mh doctor` does not check** that each TAP is on the bridge its record says
   (a quarantine whose rollback failed would show only after a daemon restart
   fixes it).

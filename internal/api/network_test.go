@@ -106,3 +106,41 @@ func TestCreateNetworkIngressValidation(t *testing.T) {
 		t.Errorf("POST /v1/networks with an unmanaged ingress iface = %d, want 400", res.StatusCode)
 	}
 }
+
+// Names, labels and error kinds on networks: all refused or mapped before a
+// bridge or nft is touched, so no root is needed.
+func TestNetworkIdentityStatuses(t *testing.T) {
+	ts := newTestServer(t)
+	do := func(method, path, body string) int {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+path, bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	for _, c := range []struct {
+		method, path, body string
+		want               int
+	}{
+		{"POST", "/v1/networks", `{}`, http.StatusBadRequest},
+		{"POST", "/v1/networks", `{"name":"Bad_Name"}`, http.StatusBadRequest},
+		{"POST", "/v1/networks", `{"name":"lab","labels":{"Bad":"x"}}`, http.StatusBadRequest},
+		{"POST", "/v1/networks", `{"name":"lab","labels":{"k":"has space"}}`, http.StatusBadRequest},
+		{"GET", "/v1/networks?label=nokey", "", http.StatusBadRequest},
+		{"GET", "/v1/networks?label=managed-by=mh-orchestrator", "", http.StatusOK},
+		{"PATCH", "/v1/networks/nope/labels", `{"labels":{"k":"v"}}`, http.StatusNotFound},
+		{"PATCH", "/v1/networks/nope/labels", `{"labels":{"Bad":"v"}}`, http.StatusBadRequest},
+		{"PATCH", "/v1/networks/nope/labels", `{not json`, http.StatusBadRequest},
+		{"DELETE", "/v1/networks/nope", "", http.StatusNotFound},
+	} {
+		if got := do(c.method, c.path, c.body); got != c.want {
+			t.Errorf("%s %s %s = %d, want %d", c.method, c.path, c.body, got, c.want)
+		}
+	}
+}

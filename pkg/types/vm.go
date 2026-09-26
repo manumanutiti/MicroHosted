@@ -26,10 +26,14 @@ type VMConfig struct {
 	// never writes into it.
 	Labels       map[string]string
 	TemplateName string
-	Kernel       string
-	Rootfs       string
-	VCPUs        int64
-	MemMB        int64
+	// Image is the digest of the store image the VM was created from
+	// ("sha256:…"), empty for a catalog template. TemplateName then holds the
+	// image's tag, for display. A replacement boots this same digest.
+	Image  string
+	Kernel string
+	Rootfs string
+	VCPUs  int64
+	MemMB  int64
 	// DiskMB is the size the clone was grown to at Create time. Recorded for
 	// visibility (List/Get) and so a future resize path can tell what a VM
 	// already has; the actual growth happens once, in storage.CloneRootfs.
@@ -89,6 +93,23 @@ type VMConfig struct {
 	// stays off. It is not a crash supervisor — nothing restarts a VM that dies
 	// while the daemon is up. See vm.Manager.Reconcile.
 	Autostart bool
+
+	// IOLimits is the disk and network throughput this VM asked for, below the
+	// daemon's ceiling; nil takes the ceiling. What is in force is worked out
+	// at every boot as the lower of the two (see vm.EffectiveIO), so lowering
+	// the ceiling reaches every VM at its next boot.
+	IOLimits *IOLimits `json:",omitempty"`
+
+	// Files are the files written into the disk before the first boot, as
+	// metadata only: the daemon never keeps a file's content.
+	Files []InjectedFile `json:",omitempty"`
+
+	// JailUID is the identity this VM's Firecracker runs as (uid, and a gid
+	// with the same number), from the daemon's reserved range and never
+	// shared with another VM or volume. It owns the VM's disk and the volumes
+	// attached to it. Zero only in records written before per-VM identities;
+	// the daemon assigns one at startup. See internal/jailer/identity.go.
+	JailUID int
 }
 
 type VM struct {
@@ -114,8 +135,35 @@ type VM struct {
 	LastExit *VMExit
 }
 
+// IOLimits caps a VM's throughput with Firecracker's rate limiters. Disk
+// limits apply to each of its drives (rootfs and every volume) separately;
+// the network limit to each direction of its NIC. In a request, a zero field
+// means "the daemon's ceiling"; as a ceiling, zero means no limit.
+type IOLimits struct {
+	// DiskMiBs is bytes per second per drive, in MiB/s.
+	DiskMiBs int64 `json:"disk_mib_s,omitempty"`
+	// DiskIOPS is operations per second per drive.
+	DiskIOPS int64 `json:"disk_iops,omitempty"`
+	// NetMbit is bits per second in each direction, in Mbit/s.
+	NetMbit int64 `json:"net_mbit,omitempty"`
+}
+
 // VMExit describes an involuntary VM death (see VM.LastExit).
 type VMExit struct {
 	At     time.Time
 	Reason string
+}
+
+// InjectedFile records a FileSpec written into a VM's disk: what it was, never
+// its content. SHA256 (hex) lets a caller tell whether the VM has the file it
+// wants without reading the disk; it is empty for a secret, whose hash would
+// let a guessable secret be recovered from the record.
+type InjectedFile struct {
+	Path   string `json:"path"`
+	Mode   string `json:"mode"`
+	UID    int    `json:"uid"`
+	GID    int    `json:"gid"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256,omitempty"`
+	Secret bool   `json:"secret,omitempty"`
 }

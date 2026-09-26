@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"microhosted/internal/firecracker"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
 	"microhosted/pkg/types"
@@ -161,6 +162,28 @@ func (m *Manager) Doctor() types.DoctorReport {
 		add("ruleset_failed", "nftables", "the last ruleset install failed at %s: the policy in force may not be the declared one: %s",
 			st.At.Format("2006-01-02T15:04:05Z07:00"), firstLine(st.Err))
 	}
+	if st := m.netmgr.PortsStatus(); !st.At.IsZero() && !st.OK {
+		add("port_filter_failed", "nftables", "the last port filter install failed at %s: VM addresses may not be pinned and no VM can join a network: %s",
+			st.At.Format("2006-01-02T15:04:05Z07:00"), firstLine(st.Err))
+	}
+
+	reserve := m.Limits().DiskReserveMB
+	if du, err := m.disk.usage(m.instancesDir); err != nil {
+		add("disk_low", "store", "the store's free space cannot be read: %v", err)
+	} else if du.FreeMB < reserve {
+		add("disk_low", "store", "%d MB free, under the %d MB reserve (--disk-reserve-mb): launches, snapshots, volumes and imports are refused until space is freed", du.FreeMB, reserve)
+	}
+
+	// A VMM without its syscall filter: started before seccomp was turned on
+	// (it stays off until the VM boots again), or something disabled it.
+	for id, v := range running {
+		if v.PID <= 0 {
+			continue
+		}
+		if err := firecracker.CheckSeccomp(v.PID); err != nil {
+			add("seccomp_off", id, "%v; stop and start the VM (or restore it) to boot it with the filters", err)
+		}
+	}
 
 	// Jail dirs and cgroups: only a running VM has them.
 	for _, id := range jailer.InstanceIDs(m.jailerCfg) {
@@ -178,11 +201,11 @@ func (m *Manager) Doctor() types.DoctorReport {
 	if entries, err := os.ReadDir(m.instancesDir); err == nil {
 		for _, e := range entries {
 			name := e.Name()
-			for _, ext := range []string{".ext4", ".log"} {
+			for _, ext := range []string{".ext4", ".log", ".log.1"} {
 				id, ok := strings.CutSuffix(name, ext)
 				if ok && jailer.IsVMID(id) && !owned(id) {
 					kind := "clone_orphan"
-					if ext == ".log" {
+					if ext != ".ext4" {
 						kind = "log_orphan"
 					}
 					add(kind, filepath.Join(m.instancesDir, name), "no VM %s owns it", id)
@@ -210,6 +233,10 @@ func (m *Manager) Doctor() types.DoctorReport {
 		if !owned(vol.AttachedTo) {
 			add("volume_claim_orphan", vol.Name, "claimed by vm %s, which does not exist", vol.AttachedTo)
 		}
+	}
+
+	if m.images != nil {
+		rep.Findings = append(rep.Findings, m.images.Integrity()...)
 	}
 
 	sort.Slice(rep.Findings, func(i, j int) bool {

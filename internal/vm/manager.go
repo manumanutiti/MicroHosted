@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,7 +21,10 @@ import (
 	"microhosted/internal/events"
 	"microhosted/internal/faults"
 	"microhosted/internal/firecracker"
+	"microhosted/internal/hostinfo"
+	"microhosted/internal/images"
 	"microhosted/internal/jailer"
+	"microhosted/internal/labels"
 	"microhosted/internal/network"
 	"microhosted/internal/storage"
 	"microhosted/internal/store"
@@ -40,11 +44,11 @@ var (
 	ErrConflict         = errors.New("conflicting resources")
 )
 
-// running couples a live Machine with the log file its console/Jailer
-// output was redirected to, so Destroy can close the file handle cleanly.
+// running couples a live Machine with the capped console log its
+// Firecracker/Jailer output drains into, so Destroy can close it cleanly.
 type running struct {
 	machine *fc.Machine
-	logFile *os.File
+	logFile io.Closer
 }
 
 // Manager owns the whole lifecycle of a VM: template lookup, disk cloning,
@@ -57,7 +61,10 @@ type running struct {
 // every VM it was tracking (their processes keep running, but the manager
 // loses its bookkeeping).
 type Manager struct {
-	catalog      *storage.Catalog
+	catalog *storage.Catalog
+	// images is the content-addressed image store (see SetImages); nil means
+	// creates by image are refused.
+	images       *images.Store
 	jailerCfg    jailer.Defaults
 	netmgr       *network.Manager
 	instancesDir string
@@ -93,16 +100,20 @@ type Manager struct {
 	// not visible in MemAvailable yet.
 	limits     Limits
 	bootSlots  chan struct{}
-	inflight   map[string]bool
+	inflight   map[string]launch
 	inflightMB int64
 	// memAvailable reads the host's available memory in MB; a variable so
 	// tests can set the host they need.
 	memAvailable func() (int64, error)
+	// disk is the store-space admission and watch (see diskguard.go).
+	disk diskState
 	// replaceLaunch boots Replace's new VM; nil means launchReplacement. A
 	// variable so tests can drive Replace without Firecracker.
 	replaceLaunch func(context.Context, replacement) (*types.VM, error)
 	// events receives the lifecycle events (see SetEvents); nil drops them.
 	events *events.Bus
+	// ids hands out the per-VM and per-volume identities (see jailid.go).
+	ids *idPool
 }
 
 // NewManager wires a Manager to its template catalog, jailer defaults, the
@@ -131,10 +142,12 @@ func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDi
 		volIO:          make(map[string]bool),
 		vmIO:           make(map[string]bool),
 		busy:           make(map[string]string),
-		inflight:       make(map[string]bool),
-		limits:         Limits{MemReserveMB: DefaultMemReserveMB, MaxParallelBoots: DefaultMaxParallelBoots},
+		inflight:       make(map[string]launch),
+		limits:         Limits{MemReserveMB: DefaultMemReserveMB, MaxParallelBoots: DefaultMaxParallelBoots, DiskReserveMB: DefaultDiskReserveMB},
 		bootSlots:      make(chan struct{}, DefaultMaxParallelBoots),
 		memAvailable:   hostMemAvailable,
+		disk:           diskState{usage: hostinfo.ReadDiskUsage},
+		ids:            newIDPool(jailerCfg),
 	}
 }
 
@@ -153,6 +166,7 @@ func (m *Manager) LoadVolumes(records []*types.Volume) {
 		m.mu.Lock()
 		m.vols[vol.ID] = vol
 		m.mu.Unlock()
+		m.adoptVolumeIdentity(vol)
 	}
 }
 
@@ -165,6 +179,13 @@ func (m *Manager) LoadSnapshots(records []*types.Snapshot) {
 		if _, err := os.Stat(snap.Dir); err != nil {
 			log.Printf("reconcile: dropping snapshot %s: dir %s missing", snap.ID, snap.Dir)
 			_ = m.store.DeleteSnapshot(snap.ID)
+			continue
+		}
+		// Also migrates snapshots taken before artifacts were sealed. One
+		// that can't be sealed is not offered for forks: linking a writable
+		// memory image into a new VM is exactly what sealing prevents.
+		if err := storage.SealSnapshotDir(snap.Dir); err != nil {
+			log.Printf("reconcile: snapshot %s cannot be sealed, not loading it (files kept for inspection): %v", snap.ID, err)
 			continue
 		}
 		m.mu.Lock()
@@ -202,6 +223,11 @@ func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, auto
 		// never handed to anyone, so it is undone, not recovered.
 		if rec.State == types.VMStateCreating {
 			log.Printf("reconcile: vm %s was being created when the daemon stopped; undoing it", id)
+			// Held until the undo succeeds: residue it leaves behind (its
+			// disk) still belongs to this identity.
+			m.mu.Lock()
+			m.ids.take(rec.Config.JailUID, vmOwner(id))
+			m.mu.Unlock()
 			m.undoCreate(rec)
 			continue
 		}
@@ -209,6 +235,7 @@ func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, auto
 		if rec.State != types.VMStateStopped {
 			if m.adoptIfAlive(rec, keepTaps) {
 				m.adoptName(rec)
+				m.adoptVMIdentity(rec)
 				continue
 			}
 			if !m.keepDead(rec) {
@@ -231,13 +258,15 @@ func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, auto
 		m.run[id] = &running{}
 		m.mu.Unlock()
 		m.adoptName(rec)
+		m.adoptVMIdentity(rec)
 		// Quarantined forks hold no reservation: their GuestIP is only what the
 		// restored guest believes it has, not an IPAM lease.
 		if rec.Config.GuestIP != "" && rec.Config.NetworkName != "" {
-			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP, rec.Config.TapDevice)
 		}
 	}
 
+	m.enforceVolumeOwners()
 	return keepTaps, autostart
 }
 
@@ -248,9 +277,17 @@ func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
 	if !processAlive(rec.PID, id) {
 		return false
 	}
+	// No SDK handle for adopted VMs (Destroy signals by PID); the console
+	// pipe is re-attached so its output is captured and capped again.
+	r := &running{}
+	if lf, err := attachConsole(rec.PID, rec.LogPath); err != nil {
+		log.Printf("reconcile: vm %s: %v", id, err)
+	} else {
+		r.logFile = lf
+	}
 	m.mu.Lock()
 	m.vms[id] = rec
-	m.run[id] = &running{} // no SDK handle / log file for adopted VMs
+	m.run[id] = r
 	m.mu.Unlock()
 
 	if tap := rec.Config.TapDevice; tap != "" {
@@ -264,7 +301,7 @@ func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
 			}
 		}
 		if rec.Config.NetworkName != "" {
-			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP)
+			m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP, rec.Config.TapDevice)
 			// The TAP predates this daemon run — converge it to the record
 			// (on its bridge: a quarantine the daemon died in the middle of
 			// was never acknowledged, so it is undone) and to the network's
@@ -301,9 +338,11 @@ func (m *Manager) keepDead(rec *types.VM) bool {
 		m.releaseVolumes(id, rec.Config.Volumes)
 		_ = storage.DeleteClone(m.instancesDir, id)
 		_ = jailer.RemoveInstanceDir(m.jailerCfg, id)
-		_ = removeIfExists(rec.LogPath)
+		_ = removeConsoleLog(rec.LogPath)
 		if err := m.store.DeleteVM(id); err != nil {
 			log.Printf("reconcile: dropping dead vm record %s: %v", id, err)
+		} else {
+			m.releaseID(rec.Config.JailUID, vmOwner(id))
 		}
 		log.Printf("reconcile: swept dead vm %s (pid %d no longer running, disk %q missing)", id, rec.PID, rec.Config.Rootfs)
 		return false
@@ -387,9 +426,22 @@ func (m *Manager) CreateVolume(req types.CreateVolumeRequest) (*types.Volume, er
 	}
 	m.mu.Unlock()
 
-	id := uuid.NewString()[:8]
-	path, err := storage.CreateVolume(m.instancesDir, id, req.SizeMB, m.jailerCfg.UID, m.jailerCfg.GID)
+	// Sparse: nothing up front but what mkfs writes, and room to grow — so
+	// no new volume while the store is already under its reserve.
+	releaseDisk, err := m.reserveDisk("creating volume "+req.Name, 0)
 	if err != nil {
+		return nil, err
+	}
+	defer releaseDisk()
+
+	id := uuid.NewString()[:8]
+	uid, err := m.allocID(volOwner(id))
+	if err != nil {
+		return nil, err
+	}
+	path, err := storage.CreateVolume(m.instancesDir, id, req.SizeMB, uid, uid)
+	if err != nil {
+		m.releaseID(uid, volOwner(id))
 		return nil, err
 	}
 
@@ -399,9 +451,11 @@ func (m *Manager) CreateVolume(req types.CreateVolumeRequest) (*types.Volume, er
 		SizeMB:    req.SizeMB,
 		Path:      path,
 		CreatedAt: time.Now(),
+		UID:       uid,
 	}
 	if err := m.store.SaveVolume(vol); err != nil {
 		_ = storage.DeleteVolume(m.instancesDir, id)
+		m.releaseID(uid, volOwner(id))
 		return nil, fmt.Errorf("persisting volume %s: %w", req.Name, err)
 	}
 
@@ -430,6 +484,9 @@ func (m *Manager) DeleteVolume(id string) error {
 
 	fileErr := storage.DeleteVolume(m.instancesDir, id)
 	storeErr := m.store.DeleteVolume(id)
+	if storeErr == nil {
+		m.releaseID(vol.UID, volOwner(id))
+	}
 	return errors.Join(
 		wrapErr("removing volume image %s", id, fileErr),
 		wrapErr("removing volume record %s", id, storeErr),
@@ -460,7 +517,10 @@ func (m *Manager) Volumes() []*types.Volume {
 // request), and returns the VolumeMounts to record on the VM. The claim is taken
 // under the lock so two concurrent Creates can't grab the same volume; on any
 // failure every claim made so far is released before returning.
-func (m *Manager) attachVolumes(vmID string, reqs []types.VolumeAttachRequest) ([]types.VolumeMount, error) {
+//
+// uid is the VM's identity: each claimed volume's file is handed to it, so
+// the VM's Firecracker can open it and no other VM's can.
+func (m *Manager) attachVolumes(vmID string, uid int, reqs []types.VolumeAttachRequest) ([]types.VolumeMount, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
@@ -527,6 +587,12 @@ func (m *Manager) attachVolumes(vmID string, reqs []types.VolumeAttachRequest) (
 			return nil, fmt.Errorf("persisting volume attachment %s: %w", vol.Name, err)
 		}
 	}
+	for _, vol := range claimed {
+		if err := giveVolume(vol, uid); err != nil {
+			m.releaseVolumes(vmID, mounts)
+			return nil, fmt.Errorf("attaching volume %s: %w", vol.Name, err)
+		}
+	}
 	return mounts, nil
 }
 
@@ -560,6 +626,11 @@ func (m *Manager) releaseVolumes(vmID string, mounts []types.VolumeMount) {
 		if err := m.store.SaveVolume(vol); err != nil {
 			log.Printf("releasing volume %s from vm %s: %v", vol.ID, vmID, err)
 		}
+		// Back to the volume's own identity: the VM's may be handed to
+		// another VM once this one is gone.
+		if err := giveVolume(vol, vol.UID); err != nil {
+			log.Printf("releasing volume %s from vm %s: %v", vol.ID, vmID, err)
+		}
 	}
 }
 
@@ -572,7 +643,7 @@ func (m *Manager) mountVolumes(record *types.VM) error {
 	if len(record.Config.Volumes) == 0 {
 		return nil
 	}
-	if err := m.waitAgentReady(record.VsockPath); err != nil {
+	if err := m.waitAgentReady(record.VsockPath, record.Config.JailUID); err != nil {
 		return err
 	}
 	for i, mt := range record.Config.Volumes {
@@ -585,7 +656,7 @@ func (m *Manager) mountVolumes(record *types.VM) error {
 			opts = "-o ro "
 		}
 		cmd := fmt.Sprintf("mkdir -p %s && mount %s%s %s", mt.GuestPath, opts, device, mt.GuestPath)
-		out, code, err := vsock.Exec(record.VsockPath, cmd)
+		out, code, err := vsock.Exec(record.VsockPath, record.Config.JailUID, cmd)
 		if err != nil {
 			return fmt.Errorf("mounting volume %s at %s: %w", mt.VolumeName, mt.GuestPath, err)
 		}
@@ -600,7 +671,7 @@ func (m *Manager) mountVolumes(record *types.VM) error {
 // auto-mount issued right after boot doesn't race the guest still coming up.
 // The interval is short because the guest is typically up in ~200 ms and a
 // refused dial costs next to nothing; a coarse one would dominate the create.
-func (m *Manager) waitAgentReady(vsockPath string) error {
+func (m *Manager) waitAgentReady(vsockPath string, uid int) error {
 	const (
 		budget   = 30 * time.Second
 		interval = 20 * time.Millisecond
@@ -608,7 +679,7 @@ func (m *Manager) waitAgentReady(vsockPath string) error {
 	deadline := time.Now().Add(budget)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if _, _, err := vsock.Exec(vsockPath, "true"); err == nil {
+		if _, _, err := vsock.Exec(vsockPath, uid, "true"); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -623,17 +694,19 @@ func (m *Manager) waitAgentReady(vsockPath string) error {
 // side effect, so any failure — here, or the daemon dying in the middle — is
 // undone completely (see undoCreate): the result is a running VM or nothing.
 func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types.VM, error) {
-	if err := errors.Join(validateShape(req.VCPUs, req.MemMB, req.DiskMB), ValidateName(req.Name), ValidateLabels(req.Labels)); err != nil {
+	if err := errors.Join(validateShape(req.VCPUs, req.MemMB, req.DiskMB), ValidateName(req.Name), ValidateLabels(req.Labels),
+		ValidateIOLimits(req.IOLimits, m.Limits().IO)); err != nil {
+		return nil, err
+	}
+	injects, fileRecs, err := prepareFiles(req.Files)
+	if err != nil {
 		return nil, err
 	}
 	if req.GuestIP != "" && req.NoNetwork {
 		return nil, fmt.Errorf("%w: guest_ip needs a network, and no_network is set", ErrInvalid)
 	}
-	tpl, err := m.catalog.Get(req.Template)
+	tpl, imageDigest, err := m.resolveSource(req.Template, req.Image)
 	if err != nil {
-		return nil, err
-	}
-	if err := checkTemplateGoldens(tpl); err != nil {
 		return nil, err
 	}
 
@@ -669,7 +742,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		lap = now
 	}
 
-	release, err := m.admit(ctx, id, memMB)
+	release, err := m.admit(ctx, id, req.Labels[labels.ManagedBy], memMB, m.copyCostMB(max(diskMB, fileMB(tpl.RootfsPath))))
 	if err != nil {
 		return nil, err
 	}
@@ -682,21 +755,29 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 			Name:         req.Name,
 			Labels:       maps.Clone(req.Labels),
 			TemplateName: tpl.Name,
+			Image:        imageDigest,
 			Kernel:       tpl.KernelPath,
 			VCPUs:        vcpus,
 			MemMB:        memMB,
 			DiskMB:       diskMB,
 			Autostart:    req.Autostart,
+			IOLimits:     cloneIOLimits(req.IOLimits),
+			Files:        fileRecs,
 		},
 		State:     types.VMStateCreating,
 		LogPath:   filepath.Join(m.instancesDir, id+".log"),
 		CreatedAt: time.Now(),
 	}
+	if record.Config.JailUID, err = m.allocID(vmOwner(id)); err != nil {
+		return nil, err
+	}
 	if err := m.reserveName(req.Name, id); err != nil {
+		m.releaseID(record.Config.JailUID, vmOwner(id))
 		return nil, err
 	}
 	if err := m.store.SaveVM(record); err != nil {
 		m.releaseName(req.Name, id)
+		m.releaseID(record.Config.JailUID, vmOwner(id))
 		return nil, fmt.Errorf("recording vm %s before creating it: %w", id, err)
 	}
 	fail := func(err error) (*types.VM, error) {
@@ -708,7 +789,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	}
 	mark("record")
 
-	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID, diskMB)
+	rootfsPath, err := storage.CloneRootfs(tpl, id, m.instancesDir, record.Config.JailUID, record.Config.JailUID, diskMB)
 	if err != nil {
 		return fail(fmt.Errorf("cloning rootfs: %w", err))
 	}
@@ -717,6 +798,18 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		return fail(err)
 	}
 	mark("clone")
+
+	// Configuration goes into the disk before the VM ever runs: no window in
+	// which it is up unconfigured. debugfs runs as the VM's own identity.
+	if len(injects) > 0 {
+		if err := m.offlineIO(record.Config.JailUID).InjectFiles(rootfsPath, injects); err != nil {
+			if errors.Is(err, storage.ErrNotWritten) {
+				err = fmt.Errorf("%w: %v", ErrInvalid, err)
+			}
+			return fail(fmt.Errorf("writing files into the disk: %w", err))
+		}
+		mark("files")
+	}
 
 	// Network is opt-out, not mandatory: sandboxed/ephemeral workloads often
 	// shouldn't have any path to the host at all (see NoNetwork's doc comment).
@@ -732,9 +825,12 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		}
 		var ip, gw, br string
 		var prefix int
+		// Named before the lease: the port filter pins it to the address
+		// before the TAP exists (see network.Manager.AttachVM).
+		tapName := "tap" + id
 		if req.GuestIP != "" {
 			ip = req.GuestIP
-			gw, br, prefix, err = m.netmgr.ClaimVM(networkName, id, ip)
+			gw, br, prefix, err = m.netmgr.ClaimVM(networkName, id, ip, tapName)
 			switch {
 			case errors.Is(err, network.ErrAddressInUse):
 				return fail(fmt.Errorf("%w: network %q: %v", ErrConflict, networkName, err))
@@ -742,7 +838,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 				return fail(fmt.Errorf("%w: network %q: %v", ErrInvalid, networkName, err))
 			}
 		} else {
-			ip, gw, br, prefix, err = m.netmgr.AttachVM(networkName, id)
+			ip, gw, br, prefix, err = m.netmgr.AttachVM(networkName, id, tapName)
 		}
 		if err != nil {
 			return fail(fmt.Errorf("attaching to network %q: %w", networkName, err))
@@ -753,8 +849,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 		record.Config.GatewayIP = gw
 		record.Config.PrefixLen = prefix
 
-		tapName := "tap" + id
-		if err := network.CreateTapEnslaved(tapName, br, !m.netmgr.Intra(networkName)); err != nil {
+		if err := network.CreateTapEnslaved(tapName, br, !m.netmgr.Intra(networkName), record.Config.JailUID); err != nil {
 			return fail(fmt.Errorf("creating tap device: %w", err))
 		}
 		record.Config.TapDevice = tapName
@@ -766,7 +861,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 
 	// Attach any requested volumes before boot: their drives must be in the
 	// Firecracker config (built inside boot).
-	mounts, err := m.attachVolumes(id, req.Volumes)
+	mounts, err := m.attachVolumes(id, record.Config.JailUID, req.Volumes)
 	if err != nil {
 		return fail(fmt.Errorf("attaching volumes: %w", err))
 	}
@@ -819,16 +914,20 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 // them). Shared by Create (first boot) and Start (boot from a stopped VM).
 func (m *Manager) boot(record *types.VM) error {
 	id := record.Config.ID
-
-	logFile, err := os.OpenFile(record.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening console log %s: %w", record.LogPath, err)
+	if err := m.checkIdentity(record); err != nil {
+		return err
 	}
 
-	// stdout/stderr point at the VM's own log file, never at the daemon's
-	// terminal — see the comment on jailer.Build for why.
-	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, logFile, logFile)
-	fcCfg, err := firecracker.BuildConfig(record.Config, jcfg)
+	logFile, err := openConsoleLog(record.LogPath)
+	if err != nil {
+		return err
+	}
+
+	// stdout/stderr point at the VM's own capped log, never at the daemon's
+	// terminal — see the comment on jailer.Build for why. logFile is not an
+	// *os.File, so exec hands Firecracker a pipe and copies it into the cap.
+	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, record.Config.JailUID, logFile, logFile)
+	fcCfg, err := firecracker.BuildConfig(record.Config, m.effectiveIO(record.Config.IOLimits), jcfg)
 	if err != nil {
 		_ = logFile.Close()
 		return err
@@ -847,6 +946,12 @@ func (m *Manager) boot(record *types.VM) error {
 
 	pid, _ := machine.PID()
 	if err := m.applyLimits(id, pid, record.Config); err != nil {
+		_ = firecracker.Kill(context.Background(), machine)
+		_ = logFile.Close()
+		return err
+	}
+	// Fail-closed: a VMM without its syscall filter never runs a guest.
+	if err := firecracker.CheckSeccomp(pid); err != nil {
 		_ = firecracker.Kill(context.Background(), machine)
 		_ = logFile.Close()
 		return err
@@ -970,8 +1075,11 @@ func (m *Manager) destroy(ctx context.Context, id string) error {
 	// ChrootBaseDir on every create/destroy cycle. Safe now that the process
 	// is stopped above.
 	jailErr := jailer.RemoveInstanceDir(m.jailerCfg, id)
-	logErr := removeIfExists(record.LogPath)
+	logErr := removeConsoleLog(record.LogPath)
 	storeErr := m.store.DeleteVM(id)
+	if storeErr == nil {
+		m.releaseID(record.Config.JailUID, vmOwner(id))
+	}
 
 	m.mu.Lock()
 	delete(m.vms, id)
@@ -1082,7 +1190,7 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	if record.State != types.VMStateStopped {
 		return nil, fmt.Errorf("%w: vm %s is not stopped (state %s)", ErrVMState, id, record.State)
 	}
-	release, err := m.admit(ctx, id, record.Config.MemMB)
+	release, err := m.admit(ctx, id, m.consumerOf(record), record.Config.MemMB, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1167,9 +1275,14 @@ func (m *Manager) SyncTapIsolation(networkName string, isolated bool) error {
 // copy, so a restarted VM always lands on the network's present policy.
 func (m *Manager) recreateTap(cfg types.VMConfig) error {
 	if cfg.Quarantine {
-		return network.CreateTapQuarantined(cfg.TapDevice)
+		return network.CreateTapQuarantined(cfg.TapDevice, cfg.JailUID)
 	}
-	return network.CreateTapEnslaved(cfg.TapDevice, cfg.Bridge, !m.netmgr.Intra(cfg.NetworkName))
+	// Its lease (and so its port) is kept across the stop, but the filter
+	// pinning it must be in force before the TAP joins the bridge.
+	if err := m.netmgr.RequirePorts(); err != nil {
+		return fmt.Errorf("port filter not in force, refusing to join %s: %w", cfg.Bridge, err)
+	}
+	return network.CreateTapEnslaved(cfg.TapDevice, cfg.Bridge, !m.netmgr.Intra(cfg.NetworkName), cfg.JailUID)
 }
 
 // Snapshot captures a running VM's full state — guest memory, device state,
@@ -1198,6 +1311,14 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		return nil, errVolumesAttached(vmID)
 	}
 
+	// The memory file is written in full; the disk is a reflink where the
+	// store allows it.
+	releaseDisk, err := m.reserveDisk("snapshot of vm "+vmID, record.Config.MemMB+m.copyCostMB(max(record.Config.DiskMB, fileMB(filepath.Join(m.instancesDir, vmID+".ext4")))))
+	if err != nil {
+		return nil, err
+	}
+	defer releaseDisk()
+
 	sid := uuid.NewString()[:8]
 	dir, err := storage.CreateSnapshotDir(m.instancesDir, sid)
 	if err != nil {
@@ -1208,8 +1329,8 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		return nil, fmt.Errorf("%s for vm %s: %w", step, vmID, err)
 	}
 
-	socket := record.SocketPath
-	if err := firecracker.PauseVM(ctx, socket); err != nil {
+	socket, uid := record.SocketPath, record.Config.JailUID
+	if err := firecracker.PauseVM(ctx, socket, uid); err != nil {
 		return fail("pausing vm", err)
 	}
 	// From here on the VM must be resumed no matter what fails — a VM left
@@ -1219,26 +1340,26 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 	paused := true
 	defer func() {
 		if paused {
-			if err := firecracker.ResumeVM(context.Background(), socket); err != nil {
+			if err := firecracker.ResumeVM(context.Background(), socket, uid); err != nil {
 				log.Printf("snapshot: resuming vm %s after failure: %v", vmID, err)
 			}
 		}
 	}()
 
 	// Chroot-relative paths: Firecracker writes these inside its jail, and the
-	// daemon then moves them (same-FS rename, free) into the snapshot dir.
+	// daemon then captures them into the snapshot dir (below).
 	stateBase := "snap_" + sid + ".vmstate"
 	memBase := "snap_" + sid + ".mem"
-	if err := firecracker.SnapshotCreate(ctx, socket, "/"+stateBase, "/"+memBase); err != nil {
-		return fail("creating snapshot", err)
-	}
-
 	ws := jailer.WorkspaceRoot(m.jailerCfg, vmID)
-	if err := os.Rename(filepath.Join(ws, stateBase), filepath.Join(dir, storage.SnapshotStateFile)); err != nil {
-		return fail("collecting vmstate", err)
-	}
-	if err := os.Rename(filepath.Join(ws, memBase), filepath.Join(dir, storage.SnapshotMemFile)); err != nil {
-		return fail("collecting memory file", err)
+	chrootState, chrootMem := filepath.Join(ws, stateBase), filepath.Join(ws, memBase)
+	// Whatever happens, Firecracker's own output does not stay in its chroot
+	// (a no-op once captured, which removes it).
+	defer func() {
+		_ = os.Remove(chrootState)
+		_ = os.Remove(chrootMem)
+	}()
+	if err := firecracker.SnapshotCreate(ctx, socket, uid, "/"+stateBase, "/"+memBase); err != nil {
+		return fail("creating snapshot", err)
 	}
 
 	// Disk capture happens while still paused, so it matches the memory image
@@ -1247,11 +1368,32 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		return fail("capturing disk", err)
 	}
 
+	// Resume BEFORE capturing memory and state: Firecracker has finished
+	// writing them, and capturing flushes the whole memory image to disk
+	// (the reflink needs its dirty pages written back first) — seconds on
+	// slow storage that the guest must not spend frozen. Nothing is lost by
+	// capturing late: the source VMM wrote these files and could shape them
+	// however it wanted at creation; what sealing protects is the snapshot
+	// from every OTHER VMM afterwards.
 	paused = false
-	if err := firecracker.ResumeVM(ctx, socket); err != nil {
+	resumeErr := firecracker.ResumeVM(ctx, socket, uid)
+
+	// Captured into fresh root-owned inodes, never renamed: the files are
+	// Firecracker's — see storage.CaptureSnapshotFile.
+	if err := storage.CaptureSnapshotFile(chrootState, filepath.Join(dir, storage.SnapshotStateFile)); err != nil {
+		return fail("collecting vmstate", err)
+	}
+	if err := storage.CaptureSnapshotFile(chrootMem, filepath.Join(dir, storage.SnapshotMemFile)); err != nil {
+		return fail("collecting memory file", err)
+	}
+	if err := storage.SealSnapshotDir(dir); err != nil {
+		return fail("sealing snapshot", err)
+	}
+
+	if resumeErr != nil {
 		// The snapshot itself is complete and usable; what failed is bringing
 		// the SOURCE back. Keep the snapshot, surface the resume failure.
-		return nil, fmt.Errorf("snapshot %s created, but resuming vm %s failed: %w", sid, vmID, err)
+		return nil, fmt.Errorf("snapshot %s created, but resuming vm %s failed: %w", sid, vmID, resumeErr)
 	}
 
 	snap := &types.Snapshot{
@@ -1259,6 +1401,7 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		Name:         name,
 		SourceVMID:   vmID,
 		TemplateName: record.Config.TemplateName,
+		Image:        record.Config.Image,
 		VCPUs:        record.Config.VCPUs,
 		MemMB:        record.Config.MemMB,
 		DiskMB:       record.Config.DiskMB,
@@ -1269,6 +1412,8 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		HadNetwork:   record.Config.TapDevice != "",
 		TapDevice:    record.Config.TapDevice,
 		DriveBase:    filepath.Base(record.Config.Rootfs),
+		IOLimits:     cloneIOLimits(record.Config.IOLimits),
+		Files:        slices.Clone(record.Config.Files),
 		Dir:          dir,
 		CreatedAt:    time.Now(),
 	}
@@ -1300,7 +1445,7 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 //     via vsock exec only. Any number of quarantined forks of one snapshot
 //     can run simultaneously.
 func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMRequest) (*types.VM, error) {
-	if err := errors.Join(ValidateName(req.Name), ValidateLabels(req.Labels)); err != nil {
+	if err := errors.Join(ValidateName(req.Name), ValidateLabels(req.Labels), ValidateIOLimits(req.IOLimits, m.Limits().IO)); err != nil {
 		return nil, err
 	}
 	quarantine := req.Quarantine
@@ -1316,7 +1461,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 		return nil, err
 	}
 	defer m.end(id)
-	release, err := m.admit(ctx, id, snap.MemMB)
+	release, err := m.admit(ctx, id, req.Labels[labels.ManagedBy], snap.MemMB, m.copyCostMB(snapDiskMB(m.instancesDir, snap)))
 	if err != nil {
 		return nil, err
 	}
@@ -1327,7 +1472,14 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 	// boot of the fork's disk — still knows what to boot. A template deleted
 	// from the catalog since the snapshot just leaves it blank.
 	var kernel string
-	if m.catalog != nil {
+	switch {
+	case snap.Image != "" && m.images != nil:
+		// The image's own kernel, by digest — never whatever a template of
+		// the same name points at now.
+		if img, err := m.images.Resolve(snap.Image); err == nil {
+			kernel = m.images.Template(img).KernelPath
+		}
+	case snap.Image == "" && m.catalog != nil:
 		if tpl, err := m.catalog.Get(snap.TemplateName); err == nil {
 			kernel = tpl.KernelPath
 		}
@@ -1340,21 +1492,30 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 			Name:         req.Name,
 			Labels:       maps.Clone(req.Labels),
 			TemplateName: snap.TemplateName,
+			Image:        snap.Image,
 			Kernel:       kernel,
 			VCPUs:        snap.VCPUs,
 			MemMB:        snap.MemMB,
 			DiskMB:       snap.DiskMB,
 			RestoredFrom: snapID,
+			// The source VM's limits, lowered further if the fork asks.
+			IOLimits: lowerIOLimits(snap.IOLimits, req.IOLimits),
+			Files:    slices.Clone(snap.Files),
 		},
 		State:     types.VMStateCreating,
 		LogPath:   filepath.Join(m.instancesDir, id+".log"),
 		CreatedAt: time.Now(),
 	}
+	if record.Config.JailUID, err = m.allocID(vmOwner(id)); err != nil {
+		return nil, err
+	}
 	if err := m.reserveName(req.Name, id); err != nil {
+		m.releaseID(record.Config.JailUID, vmOwner(id))
 		return nil, err
 	}
 	if err := m.store.SaveVM(record); err != nil {
 		m.releaseName(req.Name, id)
+		m.releaseID(record.Config.JailUID, vmOwner(id))
 		return nil, fmt.Errorf("recording vm %s before forking it: %w", id, err)
 	}
 	fail := func(err error) (*types.VM, error) {
@@ -1362,7 +1523,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 		return nil, err
 	}
 
-	rootfs, err := storage.CloneFromSnapshot(snap.Dir, id, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	rootfs, err := storage.CloneFromSnapshot(snap.Dir, id, m.instancesDir, record.Config.JailUID, record.Config.JailUID)
 	if err != nil {
 		return fail(err)
 	}
@@ -1388,7 +1549,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 			tap = snapTap
 		}
 		if quarantine {
-			if err := network.CreateTapQuarantined(tap); err != nil {
+			if err := network.CreateTapQuarantined(tap, record.Config.JailUID); err != nil {
 				return fail(fmt.Errorf("creating quarantined tap: %w", err))
 			}
 			// GuestIP/gateway are what the restored guest BELIEVES it has —
@@ -1399,7 +1560,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 			record.Config.PrefixLen = snap.PrefixLen
 			record.Config.Quarantine = true
 		} else {
-			gateway, bridge, prefix, err := m.netmgr.ClaimVM(snap.NetworkName, id, snap.GuestIP)
+			gateway, bridge, prefix, err := m.netmgr.ClaimVM(snap.NetworkName, id, snap.GuestIP, tap)
 			if err != nil {
 				return fail(fmt.Errorf("%w: fork needs the snapshot's address on network %q (%s): %v — destroy the VM holding it, or fork with quarantine=true", ErrConflict, snap.NetworkName, snap.GuestIP, err))
 			}
@@ -1408,7 +1569,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 			record.Config.GuestIP = snap.GuestIP
 			record.Config.GatewayIP = gateway
 			record.Config.PrefixLen = prefix
-			if err := network.CreateTapEnslaved(tap, bridge, !m.netmgr.Intra(snap.NetworkName)); err != nil {
+			if err := network.CreateTapEnslaved(tap, bridge, !m.netmgr.Intra(snap.NetworkName), record.Config.JailUID); err != nil {
 				return fail(fmt.Errorf("creating tap device: %w", err))
 			}
 			record.Config.TapDevice = tap
@@ -1509,8 +1670,16 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	}
 	// A running VM gives its memory back before the restored one takes it; a
 	// stopped one is a new launch and is admitted like one.
+	// Either way the snapshot's disk is copied back into place.
+	diskCost := m.copyCostMB(snapDiskMB(m.instancesDir, snap))
 	if record.State == types.VMStateStopped {
-		release, err := m.admit(ctx, vmID, record.Config.MemMB)
+		release, err := m.admit(ctx, vmID, m.consumerOf(record), record.Config.MemMB, diskCost)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	} else {
+		release, err := m.reserveDisk("restoring vm "+vmID, diskCost)
 		if err != nil {
 			return nil, err
 		}
@@ -1554,12 +1723,14 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	if err := storage.DeleteClone(m.instancesDir, vmID); err != nil {
 		return nil, err
 	}
-	rootfs, err := storage.CloneFromSnapshot(snap.Dir, vmID, m.instancesDir, m.jailerCfg.UID, m.jailerCfg.GID)
+	rootfs, err := storage.CloneFromSnapshot(snap.Dir, vmID, m.instancesDir, record.Config.JailUID, record.Config.JailUID)
 	if err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
 	record.Config.Rootfs = rootfs
+	// The disk is the snapshot's now, with the files it had.
+	record.Config.Files = slices.Clone(snap.Files)
 	m.mu.Unlock()
 
 	if record.Config.TapDevice != "" {
@@ -1598,23 +1769,28 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 // no kernel boot, the guest resumes where the snapshot froze it.
 func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error {
 	id := record.Config.ID
-
-	logFile, err := os.OpenFile(record.LogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening console log %s: %w", record.LogPath, err)
+	if err := m.checkIdentity(record); err != nil {
+		return err
 	}
 
-	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, logFile, logFile)
+	logFile, err := openConsoleLog(record.LogPath)
+	if err != nil {
+		return err
+	}
+
+	jcfg := jailer.Build(id, record.Config.Kernel, m.jailerCfg, record.Config.JailUID, logFile, logFile)
 	fcCfg := firecracker.BuildRestoreConfig(id, record.Config.Rootfs, jcfg)
 
 	spec := firecracker.RestoreSpec{
 		StatePath:   filepath.Join(snap.Dir, storage.SnapshotStateFile),
 		MemPath:     filepath.Join(snap.Dir, storage.SnapshotMemFile),
+		JailGID:     record.Config.JailUID,
 		DiskPath:    record.Config.Rootfs,
 		DriveBase:   snap.DriveBase,
 		ChrootDir:   jailer.WorkspaceRoot(m.jailerCfg, id),
 		TapDevice:   record.Config.TapDevice,
 		SnapshotTap: snapshotTapName(snap),
+		IO:          m.effectiveIO(record.Config.IOLimits),
 	}
 
 	// Background context for the same reason as boot(): the SDK ties the
@@ -1627,6 +1803,12 @@ func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error
 
 	pid, _ := machine.PID()
 	if err := m.applyLimits(id, pid, record.Config); err != nil {
+		_ = firecracker.Kill(context.Background(), machine)
+		_ = logFile.Close()
+		return err
+	}
+	// Fail-closed: a VMM without its syscall filter never runs a guest.
+	if err := firecracker.CheckSeccomp(pid); err != nil {
 		_ = firecracker.Kill(context.Background(), machine)
 		_ = logFile.Close()
 		return err
@@ -1780,18 +1962,26 @@ func (m *Manager) destroyMatching(ctx context.Context, match func(*types.VM) boo
 
 // Exec runs cmd inside a VM over its vsock channel — no SSH key, no IP, no
 // network interface needed, works even on a VM created with NoNetwork.
-func (m *Manager) Exec(id, cmd string) (string, int, error) {
+// timeout bounds the whole exchange (0 = vsock.DefaultExecTimeout); past it the
+// error wraps vsock.ErrTimeout. Cancelling ctx aborts it early.
+func (m *Manager) Exec(ctx context.Context, id, cmd string, timeout time.Duration) (string, int, error) {
+	if timeout < 0 || timeout > vsock.MaxExecTimeout {
+		return "", 0, fmt.Errorf("%w: exec timeout %s is outside (0, %s]", ErrInvalid, timeout, vsock.MaxExecTimeout)
+	}
+	if timeout == 0 {
+		timeout = vsock.DefaultExecTimeout
+	}
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	m.mu.Unlock()
 	if !ok {
-		return "", 0, fmt.Errorf("vm %q not found", id)
+		return "", 0, fmt.Errorf("%w: %s", ErrVMNotFound, id)
 	}
 	if record.State != types.VMStateRunning {
 		return "", 0, fmt.Errorf("%w: vm %s is not running (state %s)", ErrVMState, id, record.State)
 	}
 
-	return vsock.Exec(record.VsockPath, cmd)
+	return vsock.ExecContext(ctx, record.VsockPath, record.Config.JailUID, cmd, timeout)
 }
 
 // stagingDir is where offline debugfs I/O stages its temp files: on the store,
@@ -1803,14 +1993,17 @@ func (m *Manager) stagingDir() string {
 }
 
 // offlineIO builds the context for offline debugfs operations: staging on the
-// store, and debugfs dropped to the jailer uid/gid — the untrusted-ext4 parser
-// runs with the same unprivileged identity as the VMs themselves, never as the
-// daemon's root (see internal/storage/offline.go).
-func (m *Manager) offlineIO() storage.OfflineIO {
+// store, and debugfs dropped to an unprivileged identity — the untrusted-ext4
+// parser never runs as the daemon's root (see internal/storage/offline.go).
+//
+// uid is the identity owning the image being parsed — the VM's for its disk,
+// the volume's for a detached volume — so an exploited debugfs holds that
+// image's permissions and no other's.
+func (m *Manager) offlineIO(uid int) storage.OfflineIO {
 	return storage.OfflineIO{
 		StagingDir: m.stagingDir(),
-		UID:        m.jailerCfg.UID,
-		GID:        m.jailerCfg.GID,
+		UID:        uid,
+		GID:        uid,
 	}
 }
 
@@ -1839,7 +2032,7 @@ func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) erro
 	}
 	state := record.State
 	vsockPath := record.VsockPath
-	rootfs := record.Config.Rootfs
+	rootfs, uid := record.Config.Rootfs, record.Config.JailUID
 	// Reserve the disk against a concurrent Start (which would boot Firecracker
 	// on this rootfs while debugfs is writing it — corruption). Only the offline
 	// path needs it; the running path talks to the live guest over vsock.
@@ -1855,7 +2048,11 @@ func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) erro
 	switch state {
 	case types.VMStateRunning:
 		if size >= 0 {
-			return vsock.PutFile(vsockPath, guestPath, data, size)
+			return vsock.PutFile(vsockPath, uid, guestPath, data, size)
+		}
+		data, err := m.uploadBudget("uploading into vm "+id, data, 1)
+		if err != nil {
+			return err
 		}
 		staged, n, err := m.stageReader(data)
 		if err != nil {
@@ -1867,10 +2064,14 @@ func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) erro
 			return fmt.Errorf("reopening staged upload: %w", err)
 		}
 		defer f.Close()
-		return vsock.PutFile(vsockPath, guestPath, f, n)
+		return vsock.PutFile(vsockPath, uid, guestPath, f, n)
 	case types.VMStateStopped:
 		defer m.endVMDiskIO(id)
-		return m.offlineIO().InjectFile(rootfs, guestPath, data)
+		data, err := m.uploadBudget("writing into the disk of vm "+id, data, 2)
+		if err != nil {
+			return err
+		}
+		return m.offlineIO(uid).InjectFile(rootfs, guestPath, data)
 	default:
 		return fmt.Errorf("%w: vm %s is %s (files need it running or stopped)", ErrVMState, id, state)
 	}
@@ -1887,7 +2088,7 @@ func (m *Manager) endVMDiskIO(id string) {
 // length it wasn't given up front.
 func (m *Manager) stageReader(data io.Reader) (string, int64, error) {
 	dir := m.stagingDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, storage.StoreDirMode); err != nil {
 		return "", 0, fmt.Errorf("creating staging dir %s: %w", dir, err)
 	}
 	f, err := os.CreateTemp(dir, "upload-*")
@@ -1925,7 +2126,7 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 	}
 	state := record.State
 	vsockPath := record.VsockPath
-	rootfs := record.Config.Rootfs
+	rootfs, uid := record.Config.Rootfs, record.Config.JailUID
 	if state == types.VMStateStopped {
 		if m.vmIO[id] {
 			m.mu.Unlock()
@@ -1937,13 +2138,13 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 
 	switch state {
 	case types.VMStateRunning:
-		return vsock.GetFileStream(vsockPath, guestPath)
+		return vsock.GetFileStream(vsockPath, uid, guestPath)
 	case types.VMStateStopped:
 		// The debugfs read finishes inside ExtractFileStream (into an unlinked
 		// temp the reader wraps), so releasing the reservation here is safe even
 		// though the caller reads the stream afterwards.
 		defer m.endVMDiskIO(id)
-		f, size, err := m.offlineIO().ExtractFileStream(rootfs, guestPath)
+		f, size, err := m.offlineIO(uid).ExtractFileStream(rootfs, guestPath)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1957,21 +2158,24 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 // returning its path. It fails if the volume is attached to a VM or already
 // busy with another file operation — either would mean two writers on one ext4.
 // Pair every success with endVolumeIO.
-func (m *Manager) beginVolumeIO(volID string) (string, error) {
+func (m *Manager) beginVolumeIO(volID string) (string, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	vol, ok := m.vols[volID]
 	if !ok {
-		return "", fmt.Errorf("%w: volume %s", ErrVMNotFound, volID)
+		return "", 0, fmt.Errorf("%w: volume %s", ErrVMNotFound, volID)
 	}
 	if vol.AttachedTo != "" {
-		return "", fmt.Errorf("%w: volume %s is attached to vm %s — write/read through that VM instead", ErrConflict, volID, vol.AttachedTo)
+		return "", 0, fmt.Errorf("%w: volume %s is attached to vm %s — write/read through that VM instead", ErrConflict, volID, vol.AttachedTo)
 	}
 	if m.volIO[volID] {
-		return "", fmt.Errorf("%w: volume %s is busy with another file operation", ErrConflict, volID)
+		return "", 0, fmt.Errorf("%w: volume %s is busy with another file operation", ErrConflict, volID)
+	}
+	if vol.UID <= 0 {
+		return "", 0, fmt.Errorf("%w: volume %s has no identity to parse it as", ErrConflict, volID)
 	}
 	m.volIO[volID] = true
-	return vol.Path, nil
+	return vol.Path, vol.UID, nil
 }
 
 func (m *Manager) endVolumeIO(volID string) {
@@ -1989,12 +2193,16 @@ func (m *Manager) endVolumeIO(volID string) {
 // create time — Firecracker has no disk hot-plug, so prepare-then-attach is the
 // clean model, not attaching to an already-running VM.
 func (m *Manager) InjectToVolume(volID, guestPath string, data io.Reader) error {
-	path, err := m.beginVolumeIO(volID)
+	path, uid, err := m.beginVolumeIO(volID)
 	if err != nil {
 		return err
 	}
 	defer m.endVolumeIO(volID)
-	return m.offlineIO().InjectFile(path, guestPath, data)
+	data, err = m.uploadBudget("writing into volume "+volID, data, 2)
+	if err != nil {
+		return err
+	}
+	return m.offlineIO(uid).InjectFile(path, guestPath, data)
 }
 
 // ExtractFromVolumeStream reads guestPath out of a detached volume as a
@@ -2003,12 +2211,12 @@ func (m *Manager) InjectToVolume(volID, guestPath string, data io.Reader) error 
 // unlinked temp the reader wraps), so the busy reservation is released here even
 // though the caller consumes the stream afterwards. The caller must Close it.
 func (m *Manager) ExtractFromVolumeStream(volID, guestPath string) (io.ReadCloser, int64, error) {
-	path, err := m.beginVolumeIO(volID)
+	path, uid, err := m.beginVolumeIO(volID)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer m.endVolumeIO(volID)
-	f, size, err := m.offlineIO().ExtractFileStream(path, guestPath)
+	f, size, err := m.offlineIO(uid).ExtractFileStream(path, guestPath)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2066,6 +2274,90 @@ func missingGolden(tpl types.Template) string {
 		}
 		if _, err := os.Stat(p); err != nil {
 			return p
+		}
+	}
+	return ""
+}
+
+// SetImages connects the image store. Call before serving; without it a
+// create by image is refused.
+func (m *Manager) SetImages(s *images.Store) {
+	m.images = s
+}
+
+// Images returns the image store, nil if none was connected.
+func (m *Manager) Images() *images.Store {
+	return m.images
+}
+
+// resolveSource turns a create's source — a catalog template or a store image,
+// exactly one — into the template it boots, and the image digest when it is
+// one. For an image this is a lookup, nothing more: the files were hashed at
+// import and cannot have changed, so the create path reads no byte of them.
+func (m *Manager) resolveSource(template, image string) (types.Template, string, error) {
+	switch {
+	case template != "" && image != "":
+		return types.Template{}, "", fmt.Errorf("%w: give a template or an image, not both", ErrInvalid)
+	case image != "":
+		if m.images == nil {
+			return types.Template{}, "", fmt.Errorf("%w: this daemon has no image store", ErrInvalid)
+		}
+		img, err := m.images.Resolve(image)
+		if err != nil {
+			return types.Template{}, "", imageErr(err)
+		}
+		if missing := m.images.Missing(img); missing != "" {
+			return types.Template{}, "", fmt.Errorf("%w: image %s: file %s is missing from the store; import it again", ErrInvalid, image, missing)
+		}
+		return m.images.Template(img), img.Digest, nil
+	case template == "":
+		return types.Template{}, "", fmt.Errorf("%w: a template or an image is required", ErrInvalid)
+	}
+	if images.IsRef(template) {
+		// "parser:1.2" in the template field is an image reference sent to
+		// the wrong field; resolving it as a template would only ever fail
+		// with a confusing message.
+		return types.Template{}, "", fmt.Errorf("%w: %q is an image reference; send it as image", ErrInvalid, template)
+	}
+	if m.catalog == nil {
+		return types.Template{}, "", fmt.Errorf("%w: this daemon has no template catalog", ErrInvalid)
+	}
+	tpl, err := m.catalog.Get(template)
+	if err != nil {
+		return types.Template{}, "", err
+	}
+	if err := checkTemplateGoldens(tpl); err != nil {
+		return types.Template{}, "", err
+	}
+	return tpl, "", nil
+}
+
+// imageErr maps an image-store error onto the manager's kinds, so the API
+// answers 400/404/409 the same way it does for VMs.
+func imageErr(err error) error {
+	switch {
+	case errors.Is(err, images.ErrNotFound):
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	case errors.Is(err, images.ErrConflict):
+		return fmt.Errorf("%w: %v", ErrConflict, err)
+	}
+	return err
+}
+
+// ImageInUse names a VM or snapshot that boots from digest, or "" — what
+// keeps an image from being deleted: a stopped VM restarts from its kernel,
+// and a snapshot's forks and replacements come back to it.
+func (m *Manager) ImageInUse(digest string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, v := range m.vms {
+		if v.Config.Image == digest {
+			return "vm " + id
+		}
+	}
+	for id, s := range m.snaps {
+		if s.Image == digest {
+			return "snapshot " + id
 		}
 	}
 	return ""
@@ -2139,6 +2431,16 @@ func removeIfExists(path string) error {
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	return nil
+}
+
+// checkIdentity refuses to launch a VM without an identity of its own: jailer
+// would run it as whatever uid it was handed, and 0 is root. Fail-closed — an
+// identity-less record can only come from a startup that could not assign one.
+func (m *Manager) checkIdentity(record *types.VM) error {
+	if uid := record.Config.JailUID; !m.jailerCfg.ContainsID(uid) {
+		return fmt.Errorf("%w: vm %s has no valid identity (uid %d outside the reserved range)", ErrConflict, record.Config.ID, uid)
 	}
 	return nil
 }

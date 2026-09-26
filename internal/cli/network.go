@@ -21,6 +21,7 @@ var networkGroup = &group{
 		{name: "ls", aliases: []string{"list"}, summary: "List networks", run: netList},
 		{name: "inspect", aliases: []string{"show"}, args: "NAME...", summary: "Show a network's full detail as JSON", run: netInspect},
 		{name: "update", aliases: []string{"change", "set"}, args: "NAME", summary: "Change a live network's in/out policy and/or VM↔VM reachability (VMs stay up)", help: netDirections, examples: netUpdateExamples, run: netUpdate},
+		{name: "label", args: "NAME KEY=VALUE... | KEY-...", summary: "Set (KEY=VALUE) or remove (KEY-) a network's labels", run: netLabel},
 		{name: "rm", aliases: []string{"remove", "delete"}, args: "NAME...", summary: "Delete networks (-f destroys their VMs first)", run: netRemove},
 	},
 }
@@ -207,8 +208,9 @@ func onOff(b bool) string {
 
 func netCreate(e *env, cmd *command, p string, args []string) error {
 	var req types.CreateNetworkRequest
-	var allow, ingress []string
+	var allow, ingress, labels []string
 	fs := newCmdFlags(e, p, cmd)
+	fs.listVar(&labels, "label", "l", "label `KEY=VALUE` (repeatable)")
 	fs.listVar(&allow, "out", "", "allow an OUT flow: `RULE` = "+ruleSyntax+" (repeatable)")
 	fs.stringVar(&req.EgressIface, "internet", "", "", "allow ALL outbound through host interface `IFACE` (NAT), e.g. eth0, instead of --out rules")
 	fs.listVar(&ingress, "in", "", "allow an IN flow: `RULE` = "+ingressSyntax+" (repeatable; needs --subnet)")
@@ -225,6 +227,9 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 		return usagef(p, "expected exactly one NAME")
 	}
 	req.Name = pos[0]
+	if req.Labels, err = parseLabels(labels); err != nil {
+		return usagef(p, "%v", err)
+	}
 	req.Egress = req.EgressIface != ""
 	if req.AllowedEgress, err = parseRules(allow); err != nil {
 		return usagef(p, "%v", err)
@@ -243,21 +248,32 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	if err := c.Do("POST", "/v1/networks", req, &n); err != nil {
 		return err
 	}
-	printNetworks(e, []types.NetworkResponse{n})
+	printNetworks(e, []types.NetworkResponse{n}, len(n.Labels) > 0)
 	return nil
 }
 
-func printNetworks(e *env, nets []types.NetworkResponse) {
+func printNetworks(e *env, nets []types.NetworkResponse, showLabels bool) {
 	rows := make([][]string, 0, len(nets))
 	for _, n := range nets {
-		rows = append(rows, []string{n.Name, n.Subnet, n.Gateway, n.Bridge, onOff(n.Intra), describeEgress(n), describeIngress(n)})
+		row := []string{n.Name, n.Subnet, n.Gateway, n.Bridge, onOff(n.Intra), describeEgress(n), describeIngress(n)}
+		if showLabels {
+			row = append(row, fmtLabels(n.Labels))
+		}
+		rows = append(rows, row)
 	}
-	table(e.stdout, []string{"NAME", "SUBNET", "GATEWAY", "BRIDGE", "INTRA", "OUT", "IN"}, rows)
+	header := []string{"NAME", "SUBNET", "GATEWAY", "BRIDGE", "INTRA", "OUT", "IN"}
+	if showLabels {
+		header = append(header, "LABELS")
+	}
+	table(e.stdout, header, rows)
 }
 
 func netList(e *env, cmd *command, p string, args []string) error {
-	var quiet, asJSON bool
+	var quiet, asJSON, showLabels bool
+	var selector []string
 	fs := newCmdFlags(e, p, cmd)
+	fs.listVar(&selector, "label", "l", "only networks labelled `KEY=VALUE` (repeatable: all must match)")
+	fs.boolVar(&showLabels, "show-labels", "L", "add a LABELS column")
 	fs.boolVar(&quiet, "quiet", "q", "print names only")
 	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
 	pos, err := fs.parse(args)
@@ -271,8 +287,13 @@ func netList(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
+	path := "/v1/networks"
+	if len(selector) > 0 {
+		// The daemon validates and filters, as for VMs.
+		path += "?" + url.Values{"label": selector}.Encode()
+	}
 	var nets []types.NetworkResponse
-	if err := c.Do("GET", "/v1/networks", nil, &nets); err != nil {
+	if err := c.Do("GET", path, nil, &nets); err != nil {
 		return err
 	}
 	sort.Slice(nets, func(i, j int) bool { return nets[i].Name < nets[j].Name })
@@ -285,7 +306,33 @@ func netList(e *env, cmd *command, p string, args []string) error {
 		}
 		return nil
 	}
-	printNetworks(e, nets)
+	printNetworks(e, nets, showLabels)
+	return nil
+}
+
+// netLabel sets and removes a network's labels, like `mh label` for VMs.
+func netLabel(e *env, cmd *command, p string, args []string) error {
+	fs := newCmdFlags(e, p, cmd)
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 2 {
+		return usagef(p, "expected a NAME and at least one KEY=VALUE or KEY-")
+	}
+	patch, err := parseLabelPatch(pos[1:])
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	var n types.NetworkResponse
+	if err := c.Do("PATCH", "/v1/networks/"+url.PathEscape(pos[0])+"/labels", types.UpdateNetworkLabelsRequest{Labels: patch}, &n); err != nil {
+		return err
+	}
+	fmt.Fprintln(e.stdout, n.Name)
 	return nil
 }
 
@@ -448,7 +495,7 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 			return err
 		}
 	}
-	printNetworks(e, []types.NetworkResponse{n})
+	printNetworks(e, []types.NetworkResponse{n}, len(n.Labels) > 0)
 	return nil
 }
 

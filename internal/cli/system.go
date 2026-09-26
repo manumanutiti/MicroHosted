@@ -141,6 +141,9 @@ func sysInfo(e *env, cmd *command, p string, args []string) error {
 	if len(f.ManagedIfaces) > 0 {
 		fmt.Fprintf(tw, "Managed ifaces:\t%s\n", strings.Join(f.ManagedIfaces, ", "))
 	}
+	for _, q := range f.Quotas {
+		fmt.Fprintf(tw, "Quota %s:\t%s VMs, %s\n", q.Consumer, ofMax(strconv.Itoa(q.VMs), q.MaxVMs > 0, strconv.Itoa(q.MaxVMs)), ofMax(fmtMB(q.MemMB), q.MaxMemMB > 0, fmtMB(q.MaxMemMB)))
+	}
 	tw.Flush()
 
 	fmt.Fprintln(w)
@@ -265,4 +268,12 @@ func sysDoctor(e *env, cmd *command, p string, args []string) error {
 		return exitError{code: 1}
 	}
 	return nil
+}
+
+// ofMax renders "used of max", or "used (no cap)" when there is no max.
+func ofMax(used string, capped bool, max string) string {
+	if !capped {
+		return used + " (no cap)"
+	}
+	return used + " of " + max
 }

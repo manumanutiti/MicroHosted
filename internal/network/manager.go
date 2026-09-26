@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"sort"
 	"strconv"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"microhosted/internal/events"
 	"microhosted/internal/faults"
+	"microhosted/internal/labels"
 	"microhosted/internal/store"
 	"microhosted/pkg/types"
 )
@@ -29,12 +31,23 @@ const defaultSubnet = "172.16.0.0/24"
 // failure of the host. The API turns it into a 400.
 var ErrInvalidIngress = errors.New("invalid ingress policy")
 
+// Errors the API maps to a status of their own: an unknown network is 404; a
+// name already taken, or a delete while VMs are attached, is 409. A bad name
+// or label is labels.ErrInvalid (400).
+var (
+	ErrNotFound = errors.New("not found")
+	ErrExists   = errors.New("already exists")
+	ErrInUse    = errors.New("is in use")
+)
+
 // managedNet couples a persisted Network with its live IPAM and the set of VMs
 // currently attached (so Delete can refuse a network still in use).
 type managedNet struct {
 	net    *types.Network
 	subnet *Subnet
-	vms    map[string]bool
+	// vms maps each attached VM to its TAP: the bridge port the port filter
+	// pins to the VM's leased address (see renderPortFilter).
+	vms map[string]string
 	// pending marks a network whose rules are not in force yet (Create is
 	// between bringing its bridge up and a successful apply). It holds its
 	// name and subnet, but no VM may attach to it: a VM on a bridge the
@@ -48,6 +61,7 @@ var (
 	createBridge  = CreateBridge
 	deleteBridge  = DeleteBridge
 	applyNftables = ApplyNftables
+	applyPorts    = ApplyPortFilter
 	// ensureForwarding turns on kernel forwarding and clears Docker's blanket
 	// FORWARD drop out of our bridges' way. Best-effort, see applyRules.
 	ensureForwarding = func() {
@@ -91,6 +105,13 @@ type Manager struct {
 	// network.
 	applyMu sync.Mutex
 	rules   RulesStatus // guarded by mu
+
+	// portsMu serializes installs of the port filter, snapshot included, so
+	// the newest set of leases is always the one installed last. Separate from
+	// applyMu: a VM attach waits for other port installs, not for a network's
+	// full ruleset.
+	portsMu sync.Mutex
+	ports   RulesStatus // guarded by mu
 
 	mu   sync.Mutex
 	nets map[string]*managedNet // by name
@@ -228,7 +249,7 @@ func (m *Manager) Reconcile() error {
 			return fmt.Errorf("network %s has invalid subnet %q: %w", n.Name, n.Subnet, err)
 		}
 		m.pool.reserve(n.Subnet)
-		m.nets[n.Name] = &managedNet{net: n, subnet: subnet, vms: make(map[string]bool)}
+		m.nets[n.Name] = &managedNet{net: n, subnet: subnet, vms: make(map[string]string)}
 
 		if !BridgeExists(n.Bridge) {
 			if err := CreateBridge(n.Bridge, subnet.GatewayCIDR()); err != nil {
@@ -314,8 +335,14 @@ func (m *Manager) Create(req types.CreateNetworkRequest) (*types.Network, error)
 // create is Create with applyMu already held (Reconcile holds it while it
 // creates the default network).
 func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error) {
-	if req.Name == "" {
-		return nil, fmt.Errorf("network name is required")
+	// The name travels in URL paths and, from an orchestrator, in a spec
+	// file: a DNS label fits both without escaping. Records created before
+	// this check keep their names; only new ones are held to it.
+	if err := labels.ValidateName("network name", req.Name); err != nil {
+		return nil, err
+	}
+	if err := labels.Validate(req.Labels); err != nil {
+		return nil, err
 	}
 	if err := ValidateEgressPolicy(req.Egress, req.EgressIface, req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
@@ -333,7 +360,7 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 	m.mu.Lock()
 	if _, exists := m.nets[req.Name]; exists {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("network %q already exists", req.Name)
+		return nil, fmt.Errorf("network %q %w", req.Name, ErrExists)
 	}
 
 	cidr := req.Subnet
@@ -374,6 +401,7 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 	n := &types.Network{
 		ID:             id,
 		Name:           req.Name,
+		Labels:         nonEmpty(req.Labels),
 		Bridge:         BridgePrefix + id,
 		Subnet:         cidr,
 		Gateway:        subnet.Gateway(),
@@ -385,7 +413,7 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 		CreatedAt:      time.Now(),
 	}
 	m.pool.reserve(cidr)
-	m.nets[n.Name] = &managedNet{net: n, subnet: subnet, vms: make(map[string]bool), pending: true}
+	m.nets[n.Name] = &managedNet{net: n, subnet: subnet, vms: make(map[string]string), pending: true}
 	m.mu.Unlock()
 
 	// Undo everything above; the bridge is removed only once no ruleset can
@@ -475,7 +503,7 @@ func (m *Manager) updatePolicy(name string, change func(*types.Network) error) (
 	mn, ok := m.nets[name]
 	if !ok || mn.pending {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("network %q not found", name)
+		return nil, fmt.Errorf("network %q %w", name, ErrNotFound)
 	}
 	prev := mn.net
 	updated := *prev
@@ -528,14 +556,49 @@ func (m *Manager) UpdateIngress(name string, rules []types.IngressRule) (*types.
 // taps via vm.Manager.SyncTapIsolation: tap devices belong to VMs, which this
 // manager doesn't track by name. New taps pick the flag up on their own.
 func (m *Manager) UpdateIntra(name string, intra bool) (*types.Network, error) {
+	return m.updateRecord(name, func(n *types.Network) error {
+		n.Intra = intra
+		return nil
+	})
+}
+
+// SetLabels applies a merge patch to a network's labels (see labels.Patch):
+// validated whole, persisted, and only then in memory. Labels are not in the
+// ruleset, so nothing is re-applied.
+func (m *Manager) SetLabels(name string, patch map[string]*string) (*types.Network, error) {
+	if err := labels.ValidatePatch(patch); err != nil {
+		return nil, err
+	}
+	return m.updateRecord(name, func(n *types.Network) error {
+		next, err := labels.Patch(n.Labels, patch)
+		if err != nil {
+			return err
+		}
+		n.Labels = next
+		return nil
+	})
+}
+
+// updateRecord swaps a live network's record for a modified copy that does
+// not change the ruleset, persisting it first. It holds applyMu like
+// updatePolicy: that one works on a copy taken before its apply and installs
+// the copy afterwards, so a change made in between — an intra flag turned
+// off, a label — would be silently overwritten, in memory and in the store.
+func (m *Manager) updateRecord(name string, change func(*types.Network) error) (*types.Network, error) {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+
 	m.mu.Lock()
 	mn, ok := m.nets[name]
 	if !ok || mn.pending {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("network %q not found", name)
+		return nil, fmt.Errorf("network %q %w", name, ErrNotFound)
 	}
 	updated := *mn.net
-	updated.Intra = intra
+	if err := change(&updated); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	if err := m.store.SaveNetwork(&updated); err != nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("persisting network %s: %w", name, err)
@@ -555,11 +618,11 @@ func (m *Manager) Delete(name string) error {
 	mn, ok := m.nets[name]
 	if !ok || mn.pending {
 		m.mu.Unlock()
-		return fmt.Errorf("network %q not found", name)
+		return fmt.Errorf("network %q %w", name, ErrNotFound)
 	}
 	if len(mn.vms) > 0 {
 		m.mu.Unlock()
-		return fmt.Errorf("network %q still has %d VM(s) attached", name, len(mn.vms))
+		return fmt.Errorf("network %q %w: %d VM(s) attached", name, ErrInUse, len(mn.vms))
 	}
 
 	if err := deleteBridge(mn.net.Bridge); err != nil {
@@ -581,20 +644,30 @@ func (m *Manager) Delete(name string) error {
 
 // AttachVM allocates an IP for vmID on the named network and returns the guest
 // IP, the gateway it routes through, the bridge its TAP must be enslaved to,
-// and the subnet prefix length the guest must use.
-func (m *Manager) AttachVM(networkName, vmID string) (guestIP, gateway, bridge string, prefixLen int, err error) {
+// and the subnet prefix length the guest must use. tap is the TAP the caller
+// will enslave: the lease is in the port filter before AttachVM returns, and
+// if the filter cannot be installed the lease is undone — a port the filter
+// does not pin is never handed out.
+func (m *Manager) AttachVM(networkName, vmID, tap string) (guestIP, gateway, bridge string, prefixLen int, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	mn, ok := m.nets[networkName]
 	if !ok || mn.pending {
-		return "", "", "", 0, fmt.Errorf("network %q not found", networkName)
+		m.mu.Unlock()
+		return "", "", "", 0, fmt.Errorf("network %q %w", networkName, ErrNotFound)
 	}
 	ip, err := mn.subnet.AllocateAvoiding(vmID, pinnedIPs(mn.net))
 	if err != nil {
+		m.mu.Unlock()
 		return "", "", "", 0, err
 	}
-	mn.vms[vmID] = true
-	return ip, mn.net.Gateway, mn.net.Bridge, mn.subnet.Prefix(), nil
+	mn.vms[vmID] = tap
+	gateway, bridge, prefixLen = mn.net.Gateway, mn.net.Bridge, mn.subnet.Prefix()
+	m.mu.Unlock()
+	if err := m.applyPortFilter(); err != nil {
+		m.DetachVM(networkName, vmID)
+		return "", "", "", 0, err
+	}
+	return ip, gateway, bridge, prefixLen, nil
 }
 
 // pinnedIPs are the addresses of n that ingress rules point at (to_ip). An
@@ -615,10 +688,12 @@ func pinnedIPs(n *types.Network) map[string]bool {
 	return pinned
 }
 
-// ReserveVM re-registers an adopted VM's IP on its network at startup, so the
-// address isn't later handed to a new VM. Missing network is a soft error (the
-// VM is still adopted; its network is just inconsistent) — logged, not fatal.
-func (m *Manager) ReserveVM(networkName, vmID, ip string) {
+// ReserveVM re-registers an adopted VM's IP (and its TAP, for the port filter)
+// on its network at startup, so the address isn't later handed to a new VM.
+// Missing network is a soft error (the VM is still adopted; its network is
+// just inconsistent) — logged, not fatal. The port filter is installed once,
+// after every VM is reserved: see ApplyPorts.
+func (m *Manager) ReserveVM(networkName, vmID, ip, tap string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	mn, ok := m.nets[networkName]
@@ -630,7 +705,7 @@ func (m *Manager) ReserveVM(networkName, vmID, ip string) {
 		log.Printf("network reconcile: reserving %s for vm %s on %s: %v", ip, vmID, networkName, err)
 		return
 	}
-	mn.vms[vmID] = true
+	mn.vms[vmID] = tap
 }
 
 // ClaimVM attaches vmID to the named network at one specific address — the
@@ -640,31 +715,120 @@ func (m *Manager) ReserveVM(networkName, vmID, ip string) {
 // fails if the address is held by anyone else, so a fork can never collide
 // with its origin VM on the same bridge. It is also the only way to take a
 // pinned address (see pinnedIPs): a create asking for guest_ip, or a fork.
-func (m *Manager) ClaimVM(networkName, vmID, ip string) (gateway, bridge string, prefixLen int, err error) {
+// tap is pinned to the address in the port filter before it returns, as in
+// AttachVM.
+func (m *Manager) ClaimVM(networkName, vmID, ip, tap string) (gateway, bridge string, prefixLen int, err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	mn, ok := m.nets[networkName]
 	if !ok || mn.pending {
-		return "", "", 0, fmt.Errorf("network %q not found", networkName)
+		m.mu.Unlock()
+		return "", "", 0, fmt.Errorf("network %q %w", networkName, ErrNotFound)
 	}
 	if err := mn.subnet.CheckGuestIP(ip); err != nil {
+		m.mu.Unlock()
 		return "", "", 0, fmt.Errorf("%w: %v", ErrBadAddress, err)
 	}
 	if err := mn.subnet.ReserveExclusive(vmID, ip); err != nil {
+		m.mu.Unlock()
 		return "", "", 0, err
 	}
-	mn.vms[vmID] = true
-	return mn.net.Gateway, mn.net.Bridge, mn.subnet.Prefix(), nil
+	mn.vms[vmID] = tap
+	gateway, bridge, prefixLen = mn.net.Gateway, mn.net.Bridge, mn.subnet.Prefix()
+	m.mu.Unlock()
+	if err := m.applyPortFilter(); err != nil {
+		m.DetachVM(networkName, vmID)
+		return "", "", 0, err
+	}
+	return gateway, bridge, prefixLen, nil
 }
 
-// DetachVM releases vmID's IP back to its network's pool.
+// DetachVM releases vmID's IP back to its network's pool and unpins its TAP.
+// An unpin that fails leaves a stale entry for a TAP that is gone or off its
+// bridge (the callers delete or detach it) — nothing can use it; it is logged
+// and the next install drops it.
 func (m *Manager) DetachVM(networkName, vmID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if mn, ok := m.nets[networkName]; ok {
+	mn, ok := m.nets[networkName]
+	if ok {
 		mn.subnet.Release(vmID)
 		delete(mn.vms, vmID)
 	}
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	if err := m.applyPortFilter(); err != nil {
+		log.Printf("network: unpinning vm %s from %s: %v", vmID, networkName, err)
+	}
+}
+
+// ApplyPorts installs the port filter for every lease. Called once at startup,
+// after the VMs have been reserved (see ReserveVM); before that the filter
+// installed by the previous run stays in force.
+func (m *Manager) ApplyPorts() error {
+	return m.applyPortFilter()
+}
+
+// RequirePorts fails unless the port filter is in force — the check before a
+// TAP joins a bridge outside AttachVM/ClaimVM (a stopped VM starting on its
+// kept lease). A failed install is retried once here, so a transient failure
+// at startup does not strand every stopped VM.
+func (m *Manager) RequirePorts() error {
+	m.mu.Lock()
+	ok := m.ports.OK
+	m.mu.Unlock()
+	if ok {
+		return nil
+	}
+	return m.applyPortFilter()
+}
+
+// PortsStatus reports the outcome of the last port filter install.
+func (m *Manager) PortsStatus() RulesStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ports
+}
+
+// applyPortFilter snapshots every lease and its TAP and installs the port
+// filter. A lease without a TAP (none today) is left out: it has no port.
+func (m *Manager) applyPortFilter() error {
+	m.portsMu.Lock()
+	defer m.portsMu.Unlock()
+
+	m.mu.Lock()
+	var ports []Port
+	for _, mn := range m.nets {
+		for vmID, tap := range mn.vms {
+			ip, ok := mn.subnet.IPOf(vmID)
+			if !ok || tap == "" {
+				continue
+			}
+			ports = append(ports, Port{Tap: tap, MAC: GuestMAC(net.ParseIP(ip)), IP: ip})
+		}
+	}
+	m.mu.Unlock()
+
+	err := applyPorts(ports)
+	m.mu.Lock()
+	m.ports = RulesStatus{OK: err == nil, At: time.Now()}
+	if err != nil {
+		m.ports.Err = err.Error()
+	}
+	m.mu.Unlock()
+	if err != nil {
+		m.events.Publish(types.Event{Type: types.EventRulesetFailed, Reason: err.Error()})
+	}
+	return err
+}
+
+// nonEmpty returns l, or nil when it has no entries, so "no labels" has one
+// representation in the store and on the wire.
+func nonEmpty(l map[string]string) map[string]string {
+	if len(l) == 0 {
+		return nil
+	}
+	return l
 }
 
 // Intra reports whether the named network allows VM↔VM traffic — the flag the

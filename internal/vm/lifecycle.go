@@ -47,6 +47,16 @@ type Limits struct {
 	// from stopped) run at once; the rest wait their turn, or give up when
 	// their request is cancelled.
 	MaxParallelBoots int
+	// DiskReserveMB is the store space kept free (see diskguard.go): an
+	// operation that writes to the store is refused while it would leave less.
+	DiskReserveMB int64
+	// Quotas caps each consumer (managed-by value) named in it; DefaultQuota,
+	// when set, every other labelled consumer. See quota.go.
+	Quotas       map[string]Quota
+	DefaultQuota *Quota
+	// IO is the throughput ceiling of every VM (see EffectiveIO). Unlike the
+	// fields above, zero is taken literally: no limit, the operator's call.
+	IO types.IOLimits
 }
 
 // Defaults for Limits fields left at zero.
@@ -62,6 +72,9 @@ func (m *Manager) SetLimits(l Limits) {
 	}
 	if l.MaxParallelBoots <= 0 {
 		l.MaxParallelBoots = DefaultMaxParallelBoots
+	}
+	if l.DiskReserveMB <= 0 {
+		l.DiskReserveMB = DefaultDiskReserveMB
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,10 +109,19 @@ func (m *Manager) end(id string) {
 	m.mu.Unlock()
 }
 
+// launch is an admitted launch not finished yet: its memory is not visible in
+// MemAvailable, and it counts against its consumer's quota.
+type launch struct {
+	consumer string
+	memMB    int64
+}
+
 // admit waits for a boot slot and reserves room for a VM of memMB about to
-// launch. The returned release must be called once the launch is over,
-// whether it worked or not.
-func (m *Manager) admit(ctx context.Context, id string, memMB int64) (release func(), err error) {
+// launch for consumer (its managed-by label, "" for none), whose launch writes diskMB to the store (see copyCostMB; a VM that
+// boots on a disk it already has writes 0 but will grow, so the store's
+// reserve is checked all the same). The returned release must be called once
+// the launch is over, whether it worked or not.
+func (m *Manager) admit(ctx context.Context, id, consumer string, memMB, diskMB int64) (release func(), err error) {
 	m.mu.Lock()
 	slots := m.bootSlots
 	m.mu.Unlock()
@@ -111,6 +133,7 @@ func (m *Manager) admit(ctx context.Context, id string, memMB int64) (release fu
 	}
 
 	avail, memErr := m.memAvailable()
+	du, duErr := m.disk.usage(m.instancesDir)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -121,13 +144,18 @@ func (m *Manager) admit(ctx context.Context, id string, memMB int64) (release fu
 	if m.limits.MaxVMs > 0 {
 		live := len(m.inflight)
 		for vid, v := range m.vms {
-			if v.State == types.VMStateRunning && !m.inflight[vid] {
+			if _, launching := m.inflight[vid]; v.State == types.VMStateRunning && !launching {
 				live++
 			}
 		}
 		if live >= m.limits.MaxVMs {
 			return refuse(fmt.Errorf("%w: %d VMs running or launching, the cap is %d (--max-vms)", ErrCapacity, live, m.limits.MaxVMs))
 		}
+	}
+	// The consumer's own limit before the host's: a consumer at its quota is
+	// told so (429) even when the host is also full.
+	if err := m.checkQuotaLocked(consumer, memMB); err != nil {
+		return refuse(err)
 	}
 	if memErr != nil {
 		// Admission that cannot see the host's memory admits nothing: the
@@ -138,12 +166,17 @@ func (m *Manager) admit(ctx context.Context, id string, memMB int64) (release fu
 		return refuse(fmt.Errorf("%w: %d MB available, %d MB promised to launches in progress; a %d MB VM would leave %d MB, under the %d MB reserve (--mem-reserve-mb)",
 			ErrCapacity, avail, m.inflightMB, memMB, left, m.limits.MemReserveMB))
 	}
+	if err := m.checkDiskLocked("launching vm "+id, du, duErr, diskMB); err != nil {
+		return refuse(err)
+	}
 	m.inflightMB += memMB
-	m.inflight[id] = true
+	m.disk.inflightMB += diskMB
+	m.inflight[id] = launch{consumer: consumer, memMB: memMB}
 
 	return func() {
 		m.mu.Lock()
 		m.inflightMB -= memMB
+		m.disk.inflightMB -= diskMB
 		delete(m.inflight, id)
 		m.mu.Unlock()
 		<-slots
@@ -201,7 +234,7 @@ func (m *Manager) undoCreate(rec *types.VM) {
 	errs = append(errs,
 		wrapErr("removing jail dir for vm %s", id, jailer.RemoveInstanceDir(m.jailerCfg, id)),
 		wrapErr("removing rootfs clone for vm %s", id, storage.DeleteClone(m.instancesDir, id)),
-		wrapErr("removing console log for vm %s", id, removeIfExists(rec.LogPath)),
+		wrapErr("removing console log for vm %s", id, removeConsoleLog(rec.LogPath)),
 	)
 	if err := errors.Join(errs...); err != nil {
 		log.Printf("vm %s: undoing a failed create left residue; its record stays \"creating\" so the next daemon start retries: %v", id, err)
@@ -209,6 +242,9 @@ func (m *Manager) undoCreate(rec *types.VM) {
 	}
 	if err := m.store.DeleteVM(id); err != nil {
 		log.Printf("vm %s: dropping the record of a failed create: %v", id, err)
+	} else {
+		// Only once the record is gone: until then it names this identity.
+		m.releaseID(rec.Config.JailUID, vmOwner(id))
 	}
 	m.releaseName(rec.Config.Name, id)
 }
@@ -226,6 +262,7 @@ func (m *Manager) Monitor(ctx context.Context, every time.Duration) {
 			return
 		case <-t.C:
 			m.reapDead()
+			m.watchDisk()
 		}
 	}
 }
@@ -362,6 +399,9 @@ func (m *Manager) SweepResidue() {
 		if err := m.store.SaveVolume(vol); err != nil {
 			log.Printf("sweep: persisting released volume %s: %v", vol.ID, err)
 		}
+		if err := giveVolume(vol, vol.UID); err != nil {
+			log.Printf("sweep: %v", err)
+		}
 	}
 }
 
@@ -374,6 +414,11 @@ func (m *Manager) PruneSizedGoldens() {
 	var goldens []string
 	for _, tpl := range m.catalog.List() {
 		goldens = append(goldens, tpl.RootfsPath)
+	}
+	if m.images != nil {
+		for _, img := range m.images.List() {
+			goldens = append(goldens, m.images.Template(img).RootfsPath)
+		}
 	}
 	removed, err := storage.PruneSizedGoldens(m.instancesDir, goldens)
 	for _, path := range removed {

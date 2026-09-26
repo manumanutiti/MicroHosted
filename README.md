@@ -30,8 +30,10 @@ through an HTTP API.
 | [docs/api.md](docs/api.md) | Complete HTTP API reference (VMs, networks, exec, snapshots/forks, volumes) |
 | [docs/networking.md](docs/networking.md) | Segmented networking: bridges, IPAM, egress, quarantine |
 | [docs/volumes.md](docs/volumes.md) | Volumes and secure host↔VM data transfer |
+| [docs/development-environments.md](docs/development-environments.md) | Disposable development workstations: Docker inside a microVM, persistent Docker data (exploratory) |
 | [docs/deploy.md](docs/deploy.md) | Deployment as a systemd service |
 | [docs/roadmap.md](docs/roadmap.md) | Where the engine stands and what comes next |
+| [docs/orchestrator.md](docs/orchestrator.md) | OT orchestrator design: build/deploy/operate, lifetimes, redundancy, bounded VM budget (in progress) |
 | [docs/iot-edge.md](docs/iot-edge.md) | IoT/OT isolation gateway design (current niche) |
 
 ## Examples

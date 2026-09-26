@@ -18,11 +18,13 @@ import (
 
 	"microhosted/internal/api"
 	"microhosted/internal/events"
+	"microhosted/internal/images"
 	"microhosted/internal/jailer"
 	"microhosted/internal/network"
 	"microhosted/internal/storage"
 	"microhosted/internal/store"
 	"microhosted/internal/vm"
+	"microhosted/pkg/types"
 )
 
 func main() {
@@ -48,20 +50,32 @@ func main() {
 	// everything, including DHCP.
 	hostAllowList := flag.String("managed-host-allow", "udp/67", "host services reachable from a managed interface, e.g. \"udp/67,udp/123\"; empty denies every host service")
 	addr := flag.String("addr", "", "serve on this TCP address INSTEAD of the socket — unauthenticated, exposes root-equivalent control of the host")
-	catalogPath := flag.String("catalog", "images/catalog.json", "path to the template catalog (JSON)")
+	catalogPath := flag.String("catalog", storage.DefaultCatalogPath, "path to the template catalog (JSON); must be root-owned and writable by root alone")
 	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "disk store (btrfs CoW): clones, goldens, kernels, and the Jailer chroot. Outside the repo on purpose: it's root-owned runtime data, not sources")
-	dbPath := flag.String("db", "images/microhosted.db", "path to the SQLite state database")
+	dbPath := flag.String("db", storage.DefaultDBPath, "path to the SQLite state database; must be root-owned and writable by root alone")
 	chrootBase := flag.String("chroot-base", "", "Jailer chroot base directory (default <instances-dir>/jailer)")
 	jailerBinary := flag.String("jailer-binary", def.JailerBinary, "path to the jailer binary")
 	execFile := flag.String("exec-file", def.ExecFile, "path to the firecracker binary")
-	uid := flag.Int("jailer-uid", def.UID, "uid Jailer runs firecracker as")
-	gid := flag.Int("jailer-gid", def.GID, "gid Jailer runs firecracker as")
+	// Every VM runs as an identity of its own from this range (uid = gid),
+	// never shared with another VM or with any account on the host.
+	idBase := flag.Int("jailer-id-base", def.IDBase, "first uid/gid of the range VMs and volumes get their own identity from; must not overlap any user, group or /etc/sub[ug]id range")
+	idCount := flag.Int("jailer-id-count", def.IDCount, "size of the identity range: the most VMs plus volumes the daemon can hold")
 	cgroupVersion := flag.String("cgroup-version", def.CgroupVersion, "cgroup version Jailer uses (auto-detected; only force it if needed)")
 	// Admission control (docs/roadmap.md Phase 0b): judged against what the
 	// host has now, since guest memory is allocated lazily.
 	memReserve := flag.Int64("mem-reserve-mb", vm.DefaultMemReserveMB, "refuse a VM launch that would leave less than this much host memory available (MB)")
+	var quotaFlags []string
+	flag.Func("quota", "cap what one consumer (VMs labelled managed-by=CONSUMER) may run at once: `CONSUMER=vms:N,mem:MB` (repeatable; either part optional). Over it a launch is refused with 429", func(s string) error {
+		quotaFlags = append(quotaFlags, s)
+		return nil
+	})
+	defaultQuota := flag.String("quota-default", "", "quota for every labelled consumer without its own --quota: `vms:N,mem:MB` (default: none)")
+	diskReserve := flag.Int64("disk-reserve-mb", vm.DefaultDiskReserveMB, "store space kept free (MB): VM launches, snapshots, volumes and image imports that would leave less are refused, and host.disk_low is raised while the store is under it")
 	maxVMs := flag.Int("max-vms", 0, "cap on running VMs plus launches in progress (0 = no cap)")
 	maxBoots := flag.Int("max-parallel-boots", vm.DefaultMaxParallelBoots, "launches (create/fork/start) allowed to run at once; the rest wait")
+	diskMiBs := flag.Int64("vm-disk-mib-s", vm.DefaultDiskMiBs, "ceiling on each VM drive's throughput (MiB/s); a VM may ask for less, never more; 0 lifts it")
+	diskIOPS := flag.Int64("vm-disk-iops", vm.DefaultDiskIOPS, "ceiling on each VM drive's operations per second; 0 lifts it")
+	netMbit := flag.Int64("vm-net-mbit", vm.DefaultNetMbit, "ceiling on each VM's network throughput, per direction (Mbit/s); 0 lifts it")
 	flag.Parse()
 
 	// The Jailer chroot MUST live on the same filesystem as the rootfs clones:
@@ -81,8 +95,26 @@ func main() {
 	if *chrootBase == "" {
 		*chrootBase = filepath.Join(absInstances, "jailer")
 	}
-	if err := os.MkdirAll(*chrootBase, 0o755); err != nil {
+	// 0711: Jailer (root) builds each chroot under it and Firecracker only
+	// ever sees the inside of its own; nobody needs to list it.
+	if err := os.MkdirAll(*chrootBase, storage.StoreDirMode); err != nil {
 		log.Fatalf("creating chroot base %s: %v", *chrootBase, err)
+	}
+	if err := os.Chmod(*chrootBase, storage.StoreDirMode); err != nil {
+		log.Fatalf("restricting chroot base %s: %v", *chrootBase, err)
+	}
+
+	// The database and the catalog name the paths the daemon truncates, clones,
+	// deletes and boots as root: if anyone else can write them, or a directory
+	// above them, they can aim those operations at any file on the host. Refuse
+	// to start rather than trust them (see storage.CheckRootOnly). Only as root:
+	// an unprivileged run cannot hurt anything the files point at.
+	if os.Geteuid() == 0 {
+		for _, p := range []struct{ flag, path string }{{"--db", *dbPath}, {"--catalog", *catalogPath}} {
+			if err := storage.CheckRootOnly(p.path); err != nil {
+				log.Fatalf("%s %s is not safe to trust: %v — keep it under %s (scripts/install-service.sh migrates it)", p.flag, p.path, err, storage.StateDir)
+			}
+		}
 	}
 
 	catalog, err := storage.LoadCatalog(*catalogPath)
@@ -95,14 +127,25 @@ func main() {
 		log.Fatalf("opening state database: %v", err)
 	}
 	defer st.Close()
+	// Records hold network policy, labels and paths: nobody but the daemon
+	// reads them.
+	if err := storage.RestrictDB(*dbPath); err != nil {
+		log.Fatalf("restricting state database %s: %v", *dbPath, err)
+	}
 
 	jcfg := jailer.Defaults{
-		UID:           *uid,
-		GID:           *gid,
+		IDBase:        *idBase,
+		IDCount:       *idCount,
 		ChrootBaseDir: *chrootBase,
 		JailerBinary:  *jailerBinary,
 		ExecFile:      *execFile,
 		CgroupVersion: *cgroupVersion,
+	}
+	// Refuse to start rather than hand a VM an id some account, group or
+	// rootless-container range already uses: that account would own the VM's
+	// disk.
+	if err := jcfg.ValidateIDRange(); err != nil {
+		log.Fatalf("--jailer-id-base: %v", err)
 	}
 
 	// Networks come up before VMs: recreate bridges wiped by a host reboot,
@@ -129,8 +172,15 @@ func main() {
 	// so a handful of 1GB VMs fills the disk fast — provision a CoW store with
 	// scripts/setup-host.sh. Just a warning, not fatal: full-copy clones still
 	// work, they just don't scale.
-	if err := os.MkdirAll(*instancesDir, 0o755); err != nil {
+	if err := os.MkdirAll(*instancesDir, storage.StoreDirMode); err != nil {
 		log.Fatalf("creating instances directory %s: %v", *instancesDir, err)
+	}
+	// Stores created before the lockdown held world-readable disks and logs:
+	// bring every existing file to the modes new ones get. A file that can't
+	// be fixed is reported, not fatal — the daemon still owns the VMs that
+	// keep running, and refusing to start would not make that file private.
+	if err := storage.HardenStore(*instancesDir); err != nil {
+		log.Printf("WARNING: some store files could not be made private: %v", err)
 	}
 	if !storage.SupportsReflink(*instancesDir) {
 		log.Printf("WARNING: the instances store %s does NOT support copy-on-write (reflink): "+
@@ -140,7 +190,46 @@ func main() {
 
 	mgr := vm.NewManager(catalog, jcfg, *instancesDir, st, netmgr)
 	mgr.SetEvents(bus)
-	mgr.SetLimits(vm.Limits{MemReserveMB: *memReserve, MaxVMs: *maxVMs, MaxParallelBoots: *maxBoots})
+	if *diskMiBs < 0 || *diskIOPS < 0 || *netMbit < 0 {
+		log.Fatalf("--vm-disk-mib-s, --vm-disk-iops and --vm-net-mbit must not be negative (0 lifts the limit)")
+	}
+	io := types.IOLimits{DiskMiBs: *diskMiBs, DiskIOPS: *diskIOPS, NetMbit: *netMbit}
+	if io.DiskMiBs == 0 || io.DiskIOPS == 0 || io.NetMbit == 0 {
+		log.Printf("WARNING: a VM throughput limit is lifted (disk %d MiB/s, %d IOPS, net %d Mbit/s; 0 = none): "+
+			"a compromised VM can saturate the storage or its network and degrade every other VM", io.DiskMiBs, io.DiskIOPS, io.NetMbit)
+	}
+	quotas := make(map[string]vm.Quota, len(quotaFlags))
+	for _, s := range quotaFlags {
+		consumer, q, err := vm.ParseConsumerQuota(s)
+		if err != nil {
+			log.Fatalf("--quota: %v", err)
+		}
+		if _, dup := quotas[consumer]; dup {
+			log.Fatalf("--quota: %s given twice", consumer)
+		}
+		quotas[consumer] = q
+	}
+	var defQuota *vm.Quota
+	if *defaultQuota != "" {
+		q, err := vm.ParseQuota(*defaultQuota)
+		if err != nil {
+			log.Fatalf("--quota-default: %v", err)
+		}
+		defQuota = &q
+	}
+	mgr.SetLimits(vm.Limits{MemReserveMB: *memReserve, MaxVMs: *maxVMs, MaxParallelBoots: *maxBoots, DiskReserveMB: *diskReserve,
+		Quotas: quotas, DefaultQuota: defQuota, IO: io})
+
+	// The content-addressed image store lives in the instances dir: clones
+	// reflink from it and the kernel is hard-linked from it into each jail.
+	// A store that cannot open disables creates by image, not the daemon:
+	// VMs already created from an image keep their kernel and disk paths.
+	if imgs, err := images.Open(*instancesDir, st); err != nil {
+		log.Printf("WARNING: image store unavailable, creates by image are refused: %v", err)
+	} else {
+		imgs.SetReserve(mgr.ReserveCopy)
+		mgr.SetImages(imgs)
+	}
 
 	// Volumes load before Reconcile: sweeping a dead VM releases its volumes, so
 	// the volume index must already be populated when Reconcile runs.
@@ -160,6 +249,12 @@ func main() {
 		log.Fatalf("loading persisted state: %v", err)
 	}
 	keepTaps, autostart := mgr.Reconcile(records)
+	// Every lease is known now: pin each VM's TAP to its addresses. Not fatal —
+	// VMs already running keep the filter the previous run installed — but no
+	// TAP joins a bridge until it is in force (network.Manager.RequirePorts).
+	if err := netmgr.ApplyPorts(); err != nil {
+		log.Printf("WARNING: port filter (anti-spoofing) not installed; no VM can join a network until it is: %v", err)
+	}
 
 	// Snapshots are inert (files + record, no liveness): just re-index them,
 	// dropping any whose files were removed out-of-band.

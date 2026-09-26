@@ -79,6 +79,91 @@ volumes/files + observability (`/v1/system`, `/v1/health`). The full CRUD
 - **Read-only singletons**: `GET /v1/system` and `GET /v1/health` — unique
   resources (there's only one host), with no `{id}` (see `## Observability`).
 
+**Request bodies are parsed strictly.** A request the daemon would only partly
+understand is refused before anything changes, never half-applied:
+
+- an unknown field is a **400** — a misspelt `alowed_egress` does not create a
+  network with no rules, and a field this daemon does not support yet is not
+  silently ignored;
+- a key given twice in one object, including with different case
+  (`{"intra":false,"INTRA":true}`), is a **400**;
+- the body must be exactly one JSON object: `null`, an array or data after the
+  object is a **400**;
+- a body over 1 MiB is a **413**.
+
+Endpoints whose body is optional (`snapshot`, `fork`, `replace`) accept an empty
+body; `{}` is equivalent.
+
+---
+
+## Images
+
+The content-addressed image store: a kernel and a root filesystem kept
+**read-only under their sha256**, plus the VM defaults, identified by the digest
+of the three together. Unlike a catalog template, whose files are addressed by
+path and can be rebuilt in place, an image never changes: a new build is a new
+digest. A VM created from an image boots exactly the bytes that were hashed.
+
+- **Hashing happens once, at import**, over the store's own copy of each file —
+  never the caller's, which could change between the hash and the copy.
+  Creating a VM from an image reads and hashes nothing: it costs the same as a
+  template.
+- **Files are protected, not re-checked**: 0444, in a directory only root can
+  enter (`<instances-dir>/images`, mode 0700), and never opened for writing.
+  `mh doctor` reports a file that went missing or writable; `verify` re-hashes
+  on demand.
+- **Tags never move.** `name:version` is bound to one digest at import;
+  importing a different image under a taken tag is a **409** (use a new
+  version). The same image may carry several tags.
+- **Imports are confined to the daemon's store directory.** The daemon reads
+  the files as root, so a path anywhere on the host would let an API caller copy
+  any file root can read into a VM. Build goldens there (`make prepare-image`
+  does) and import them from there; symlinks are resolved before the check.
+- **Storage:** the copy is a reflink on a CoW store — no extra space; identical
+  files are stored once.
+
+### `POST /v1/images` — import
+
+| field         | type   | required | description |
+|---------------|--------|----------|-------------|
+| `name`        | string | yes      | `name:version`; name a DNS label, version `[A-Za-z0-9._-]` |
+| `kernel_path` | string | yes      | absolute path of the kernel, under the daemon's store directory |
+| `rootfs_path` | string | yes      | absolute path of the ext4 root filesystem, same rule |
+| `vcpus`       | int    | yes      | default vCPUs of its VMs, 1–32 |
+| `mem_mb`      | int    | yes      | default memory, at least 32 |
+| `disk_mb`     | int    | no       | default disk size its VMs are grown to |
+
+```bash
+mhcurl -X POST http://localhost/v1/images -d '{"name":"parser:1.0",
+  "kernel_path":"/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
+  "rootfs_path":"/var/lib/microhosted/store/rootfs/alpine-py.ext4",
+  "vcpus":1,"mem_mb":128,"disk_mb":512}'
+```
+
+**201 response** (`ImageResponse`) — importing the same files with the same
+defaults under the same tag again returns the same image · **400** malformed
+request, a path outside the store directory, not a regular file, or empty ·
+**409** the tag is bound to a different image.
+
+### `GET /v1/images` · `GET /v1/images/{ref}`
+
+`{ref}` is `name:version`, `sha256:<hex>` or `name:version@sha256:<hex>`
+(URL-escape the `@`). **Shape of `ImageResponse`:** `digest`, `tags`, `kernel`
+and `rootfs` (the files' digests), `vcpus`, `mem_mb`, `disk_mb`, `size_mb`,
+`imported_at`, and `missing` (a file gone from the store; the image cannot boot).
+**404** unknown · **400** malformed · **409** tag and digest disagree.
+
+### `POST /v1/images/{ref}/verify` — re-hash
+
+Reads every byte of the image's files and compares them with their digests.
+Slow, explicit, never part of a boot. **200** `{"digest", "ok", "error"?}`.
+
+### `DELETE /v1/images/{ref}`
+
+Removes the image, all its tags, and every file no other image uses (a kernel
+shared by several images stays). **204** · **404** · **409** while any VM (in
+any state — a stopped VM restarts from the image's kernel) or snapshot uses it.
+
 ---
 
 ## Templates (catalog)
@@ -119,7 +204,8 @@ Named L2 segments (bridge + subnet + nftables policy). Model detail in
 
 | field            | type   | required | description                                                        |
 |------------------|--------|----------|---------------------------------------------------------------------|
-| `name`           | string | yes      | unique network name                                                |
+| `name`           | string | yes      | unique network name: a DNS label (`[a-z0-9-]`, starting and ending with a letter or digit, at most 63) |
+| `labels`         | object | no       | key=value metadata, same rules as a VM's (see VMs § Names and labels) |
 | `subnet`         | string | no       | CIDR (e.g. `10.10.0.0/24`); if omitted, a free `/24` is assigned   |
 | `egress`         | bool   | no       | if `true`, the subnet goes out via NAT through `egress_iface`, and only through it; `false` by default |
 | `egress_iface`   | string | with `egress` | the host interface full egress leaves through (e.g. `eth0`). Required with `egress: true`, forbidden without it. Never a managed interface, a VPN you did not mean, or one of the daemon's own bridges/taps: "everything that is not a bridge" would include the LAN behind a second NIC, VPNs and Docker networks |
@@ -164,13 +250,14 @@ mhcurl -X POST http://localhost/v1/networks -d '{"name":"mqtt-60","subnet":"172.
 ]}'
 ```
 
-**201 response** (`NetworkResponse`) · **400** if `name` is missing, if an
+**201 response** (`NetworkResponse`) · **400** if `name` is missing or not a
+DNS label, if a label is malformed, if an
 `allowed_egress` or `allowed_ingress` rule is invalid (including an ingress rule
 without `subnet`, with `to_ip` outside it, or clashing with another network's),
 if `egress: true` comes without `egress_iface` (or `egress_iface` without
-`egress`), or if `egress: true` and `allowed_egress` are combined · **500** if the
-name already exists, the subnet is invalid or overlaps another network's, bridge
-creation fails, or the firewall ruleset cannot be applied.
+`egress`), or if `egress: true` and `allowed_egress` are combined · **409** if the
+name already exists · **500** if the subnet is invalid or overlaps another
+network's, bridge creation fails, or the firewall ruleset cannot be applied.
 
 **The network is all or nothing.** Its bridge comes up dark — the ruleset drops
 any `mhbr*` bridge it does not list — and no VM can attach to it until the
@@ -180,11 +267,20 @@ the policy never exists.
 
 ### `GET /v1/networks` · `GET /v1/networks/{name}`
 
-Lists all networks / detail of one. **Shape of `NetworkResponse`:**
+Lists all networks / detail of one. The list takes `label=KEY=VALUE`
+(repeatable, or comma-separated) and keeps only the networks carrying every one
+of those labels; **400** if a selector term is malformed.
+
+```bash
+mhcurl 'http://localhost/v1/networks?label=managed-by=mh-orchestrator'
+```
+
+**Shape of `NetworkResponse`:**
 
 | field        | description                                             |
 |--------------|----------------------------------------------------------|
 | `name`       | network name                                            |
+| `labels`     | key=value metadata (omitted if none)                    |
 | `bridge`     | Linux bridge backing it (`mhbr<id>`)                    |
 | `subnet`     | the network's CIDR                                      |
 | `gateway`    | the host's IP on the bridge (the `.1`, the guests' route) |
@@ -255,6 +351,22 @@ mhcurl -X PUT http://localhost/v1/networks/pingtest/intra -d '{"intra":false}'
 the network doesn't exist · **500** if the flag was saved but some live TAP didn't
 converge (the message says which — re-issue the PUT).
 
+### `PATCH /v1/networks/{name}/labels` — change labels
+
+A merge patch, as on VMs: a key with a value sets it, a key with `null` removes
+it, every label not mentioned stays. Metadata only — the ruleset and the
+attached VMs are not touched.
+
+```bash
+mhcurl -X PATCH http://localhost/v1/networks/ot-52/labels \
+  -d '{"labels":{"zone":"north","owner":null}}'
+```
+
+**200 response** (updated `NetworkResponse`) · **400** if a key or value is
+malformed, the patch touches `managed-by` (fixed at create), or the result would
+exceed 32 labels (nothing is changed) · **404** if
+the network doesn't exist. Persisted immediately. The name cannot be changed.
+
 ### `DELETE /v1/networks/{name}`
 
 ```bash
@@ -285,7 +397,8 @@ network doesn't exist.
 
 | field         | type   | required | description                                                                 |
 |---------------|--------|----------|------------------------------------------------------------------------------|
-| `template`    | string | yes      | name of a catalog template                                                  |
+| `template`    | string | one of   | name of a catalog template                                                  |
+| `image`       | string | one of   | an image in the store: `name:version`, `sha256:<hex>` or `name:version@sha256:<hex>` (tag and digest must agree). Exactly one of `template` and `image` (see `## Images`) |
 | `name`        | string | no       | alias for this VM, unique among the VMs the daemon tracks, fixed for its life (see "Names and labels") |
 | `labels`      | object | no       | `{"key": "value", …}` metadata, changeable later (see "Names and labels") |
 | `vcpus`       | int    | no       | overrides the template's `vcpus`; 1–32                                      |
@@ -296,6 +409,8 @@ network doesn't exist.
 | `guest_ip`    | string | no       | take this exact address on `network` instead of the next free one; **409** if someone holds it, **400** if it isn't a guest address of the subnet. The only way to get an address an ingress rule points at (see `docs/networking.md`) |
 | `volumes`     | array  | no       | volumes to attach at boot (see `## Volumes`); each one `{name, read_only?, guest_path?}` |
 | `autostart`   | bool   | no       | if `true`, the daemon boots the VM again when it starts and finds it dead (host reboot) — see "Host reboot" below |
+| `io_limits`   | object | no       | `{disk_mib_s?, disk_iops?, net_mbit?}`: lower this VM's throughput below the daemon's ceiling; **400** if a field exceeds it or is negative. Omitted fields take the ceiling |
+| `files`       | array  | no       | files written into the disk before the first boot, each `{path, content, mode?, uid?, gid?, secret?}` — see "Files" below |
 
 ```bash
 mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu"}'
@@ -307,7 +422,9 @@ mhcurl -X POST http://localhost/v1/vms -d '{"template":"base-ubuntu","no_network
              {"name":"output"}]}'
 ```
 
-**201 response** (`VMResponse`, see below) · **400** if `template` is missing,
+**201 response** (`VMResponse`, see below) · **400** if neither or both of
+`template` and `image` are given, the image is unknown or a file of it is
+missing from the store,
 the JSON is invalid, or a name, label or size is malformed (checked before
 anything is touched on the host) · **409** if the name is taken · **503** if the host has no room for it right now (see
 "Admission" below) · **500** if clone/network/boot fails (the error message
@@ -323,8 +440,40 @@ undo. A create ends in a running VM or in nothing.
 guest sees: the daemon writes them into the VM's cgroup, so a guest cannot take
 more whatever it runs — `cpu.max` = `vcpus` full cores, `memory.max` = `mem_mb`
 + 64 MiB for Firecracker itself (no swap), `pids.max` = `vcpus` + 16. Neither
-can be changed after the create. Disk and network throughput are not limited
-yet.
+can be changed after the create. Disk and network throughput are capped the
+same way, with Firecracker's rate limiters: each drive (rootfs and every
+volume, separately) and each direction of the NIC get the lower of the VM's
+`io_limits` and the daemon's ceiling (`--vm-disk-mib-s`, `--vm-disk-iops`,
+`--vm-net-mbit`; see `docs/deploy.md`), worked out at every boot. A fork
+inherits its snapshot's source VM's `io_limits` and may only lower them; a
+replacement keeps the old VM's.
+
+**Files.** Per-VM configuration — a parser's config, a certificate, a key —
+goes into the VM's disk after the clone and **before the first boot**, so the
+VM is never up unconfigured and needs no agent to receive it. Each entry:
+
+| field     | description |
+|-----------|-------------|
+| `path`    | absolute path in the guest; parents are created (root, `0755`), a file already there is replaced |
+| `content` | the bytes, base64 in JSON. The content travels in the request: the daemon never reads a host path on a caller's behalf |
+| `mode`    | octal permission bits, e.g. `"0640"`; no setuid, setgid or sticky. Default `"0644"`, `"0400"` for a secret |
+| `uid` / `gid` | owner inside the guest; default `0` |
+| `secret`  | `true`: no content hash is kept in the VM's record (a guessable secret could be recovered from it), default mode `0400` |
+
+At most 64 files and 512 KiB of content together; larger data belongs in the
+image or on a volume. They are written with `debugfs` as the VM's own identity
+(no mount), then read back and compared — type, mode, owner and every byte —
+because `debugfs` reports success on a write that ran out of space. Anything
+wrong is a **400** before the VM boots, and the create is undone. The record
+(`files` in `VMResponse`) keeps path, mode, owner, size and, except for
+secrets, the SHA-256 — never the content; contents are never logged. A fork or
+restore of a snapshot keeps the record of the disk it came from.
+
+```bash
+mhcurl -X POST http://localhost/v1/vms -d '{"image":"parser:1.2","files":[
+  {"path":"/etc/parser.conf","content":"cG9ydD01MDIK","mode":"0640"},
+  {"path":"/etc/parser.key","content":"c2VjcmV0","secret":true}]}'
+```
 
 **Names and labels.** The ID is what the daemon generates; `name` is an alias
 you choose — a DNS label (`[a-z0-9-]`, at most 63, not shaped like an ID) —
@@ -336,6 +485,12 @@ that owns it — goes in `labels`: up to 32, keys `[a-z0-9._/-]`, values
 change them with `PATCH /v1/vms/{id}/labels`. A label written wrong is a 400,
 never dropped. The API addresses VMs by ID only; `mh` resolves names.
 
+`managed-by` is the one label that cannot change: it names the consumer that
+owns the VM, which is what quotas count, so it is set at create (a replacement
+inherits it) and a patch that adds, changes or removes it is a **400** — a VM
+cannot slip out of its quota, nor one consumer take over another's VMs.
+Repeating its current value is allowed. The same holds for networks.
+
 **Admission.** A create (and a fork, a start, a restore of a stopped VM) waits
 for one of `--max-parallel-boots` launch slots (default 4), then is refused with
 **503** when the host's `MemAvailable`, minus what launches in progress will
@@ -344,6 +499,34 @@ take, minus the new VM's `mem_mb`, would fall under `--mem-reserve-mb` (default
 default). It is judged against what the host has *now*, not against the sum of
 `mem_mb`: guest RAM is paged in on demand, so a 128 MB VM costs ~34 MB. A
 request cancelled while waiting for a slot gives up its place.
+
+**Quotas.** Inside the host's limits, each consumer — the value of a VM's
+`managed-by` label — can be capped with `--quota CONSUMER=vms:N,mem:MB`
+(either part optional), and every consumer without its own with
+`--quota-default vms:N,mem:MB`. A launch that would take its consumer over
+either cap is refused with **429** (checked before the host's limits, so a
+consumer at its quota is told so even on a full host). Counted: running VMs —
+quarantined ones included, they hold their RAM — and launches in progress,
+and the sum of their `mem_mb` (the configured size, the most a guest may
+touch, not what it uses now). A replace whose old VM stays quarantined needs
+room for one more VM. VMs without `managed-by` are bounded by the host's
+limits only. Current use is in `GET /v1/system` (`fleet.quotas`). Anyone who
+can reach the API is root-equivalent, so a quota contains a consumer's bugs
+and floods; it does not isolate consumers from each other.
+
+The store is judged the same way. Disks are thin (a reflink clone, a sparse
+volume), so together they can promise more than the store holds; instead of
+capping density at the sum of disk sizes, the daemon keeps `--disk-reserve-mb`
+(default 1024) free. Anything that writes to the store — a launch, a snapshot
+(its memory file), a new volume, an image import, a file upload staged on the
+store — is refused with **503** when the store's free space, minus what
+operations in progress are about to write, minus what this one writes up front
+(nothing on a reflink store, the full disk on one without), would fall under
+the reserve. An upload of unknown length is cut off with 503 once it passes
+what the store can take above the reserve. A store whose free space cannot be
+read admits nothing. VMs already running can still write into the reserve —
+their disk throughput limit bounds how fast — so the monitor raises
+`host.disk_low` while the store is under it.
 
 Each `POST` clones the template's rootfs from scratch
 (`internal/storage.CloneRootfs`, copy-on-write via `cp --reflink=auto`) and grows
@@ -399,6 +582,7 @@ mhcurl http://localhost/v1/vms/a1b2c3d4
 | `rootfs_path` | the VM's disk (rootfs clone) on the host                                    |
 | `log_path`    | the file with this VM's serial console + Jailer/Firecracker logs            |
 | `created_at`  | RFC3339 timestamp                                                            |
+| `files`       | files written into the disk before the first boot: `{path, mode, uid, gid, size, sha256?, secret?}` — never the content; no `sha256` for a secret |
 | `last_exit`   | `{at, reason}`: the last time the VM's process died **on its own** (not a stop/destroy/restore). The daemon notices within ~2 s, marks the VM `stopped` (disk, IP and volumes kept, like `stop`) and records why: `killed by the OOM killer (reached its cgroup memory.max)`, `killed by the host's OOM killer (host out of memory)`, or `process exited` (a Firecracker crash, or the guest rebooting — Firecracker exits on a guest reboot). It is **not** restarted: that is policy, the orchestrator's call |
 
 Note: `VMResponse` doesn't currently include `socket_path` or `vsock_path` (they
@@ -523,10 +707,12 @@ orchestrator's call; this makes the handover safe.
 | field      | type   | description |
 |------------|--------|-------------|
 | `snapshot` | string | fork the replacement from this snapshot; it must have been taken at the function's address (**409** otherwise) |
-| `template` | string | boot the replacement from this template, with the old VM's vcpus/mem/disk. Neither given: the old VM's template |
+| `template` | string | boot the replacement from this template, with the old VM's vcpus/mem/disk |
+| `image`    | string | boot the replacement from this store image, with the old VM's vcpus/mem/disk. None of `snapshot`, `template`, `image` given: the old VM's own source — for a VM created from an image, **its digest**, never a later build under the same name |
 | `old`      | string | `quarantine` (default: left running, cut off, reachable over vsock) · `stop` (quarantined and powered off: disk kept, RAM freed) · `destroy` |
 | `name`     | string | name for the replacement (it does not inherit the old one's) |
 | `labels`   | object | merged over the labels it inherits (all of the old VM's but `lease`) |
+| `files`    | array  | files for a replacement booted from a template or image (see "Files"); not allowed with `snapshot`, whose disk already has them. The daemon keeps no contents, so replacing a VM created with files **requires** them again: omitted is a **400** naming the paths; `[]` replaces it without files |
 
 ```bash
 mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/replace -d '{"old":"stop"}'
@@ -541,7 +727,7 @@ inherits labels and `autostart`, and records `replaces` → only then, with
 
 **200 response** (`ReplaceVMResponse`): `{"replacement": VMResponse, "old":
 VMResponse}` (`old` absent when destroyed) · **400** malformed request or
-unknown template (nothing changed) · **404** unknown VM or snapshot · **409**
+unknown or unbootable template or image (nothing changed) · **404** unknown VM or snapshot · **409**
 another VM already serves the function (replacing the same VM twice cannot
 boot two VMs), the VM serves on no network, has volumes, or is busy · **503** /
 **500** if the replacement could not boot.
@@ -664,6 +850,10 @@ restored from it running (they have their own copies/hardlinks). **204** on dele
 "labels": {…}}`. The fork inherits neither the name nor the labels of the VM
 the snapshot came from: a quarantined copy of a sensor's VM taken for forensics
 must not claim that sensor, so whoever forks says what the fork is.
+Throughput is the exception: the fork keeps the source VM's `io_limits`, and an
+`io_limits` in the body can only lower them (**400** above the daemon's
+ceiling). The restored VM is loaded paused, its limits are set, and only then
+does it resume.
 
 ```bash
 # Normal fork: requires the snapshot's IP free in its origin network
@@ -736,12 +926,14 @@ or chrony). It's Firecracker's documented behavior.
 
 **Body** (`ExecRequest`):
 
-| field | type   | required | description                          |
-|-------|--------|----------|----------------------------------------|
-| `cmd` | string | yes      | command to run with `sh -c` in the guest |
+| field        | type   | required | description                          |
+|--------------|--------|----------|----------------------------------------|
+| `cmd`        | string | yes      | command to run with `sh -c` in the guest |
+| `timeout_ms` | int    | no       | deadline for the whole exec (connect + run + full output), 1–600000; omitted or `0` = 30000 |
 
 ```bash
 mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/exec -d '{"cmd":"whoami && uname -a"}'
+mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/exec -d '{"cmd":"/opt/probe","timeout_ms":2000}'
 ```
 
 **200 response** (`ExecResponse`):
@@ -757,8 +949,15 @@ in the golden rootfs). If the template isn't prepared, or if you cloned it befor
 preparing it, it returns **500** with an error indicating the agent's exit marker is
 missing.
 
-**400** if `cmd` is missing · **404**/**500** if the VM doesn't exist or the vsock
-doesn't respond.
+**Deadline.** Past `timeout_ms` the daemon stops waiting, closes the vsock
+connection and answers **504**; any partial output is discarded, never returned
+as if it were the answer. The daemon does not kill the command inside the guest:
+the guest is untrusted, so the deadline is enforced on the host side only. If the
+API client disconnects first, the exec is abandoned the same way.
+
+**400** if `cmd` is missing or `timeout_ms` is out of range · **404** if the VM
+doesn't exist · **409** if it isn't running · **504** if the deadline passed ·
+**500** if the vsock channel fails (agent missing, malformed answer).
 
 ---
 
@@ -908,7 +1107,7 @@ never works on one channel and fails on the other:
 The control-character rule is a security boundary. The offline channel drives
 `debugfs` with a script of one command per line, so a newline in a path would
 add a command of its own, such as `dump` (write a host file) or `write` (read
-one), running as the jailer uid, which owns every VM's disk and every volume.
+one), running as the identity that owns the image being parsed.
 Paths often come from the guest itself (listing a sample's output and
 downloading each file), so it is the guest that would choose them.
 `storage.ValidateGuestPath` refuses them at the API, again in the manager, and
@@ -972,6 +1171,8 @@ disagreement. Read-only: it changes nothing. Operations in progress are listed i
 | `lease_orphan` / `volume_claim_orphan` | an IP lease / volume claim held for a VM that does not exist |
 | `record_interrupted` / `record_untracked` | a stored `creating` record (the next start undoes it) / a stored record the daemon does not track |
 | `ruleset_failed` | the last firewall install failed: the policy in force may not be the declared one |
+| `port_filter_failed` | the last install of the per-VM anti-spoofing filter failed: addresses may not be pinned, and no VM can join a network until it succeeds |
+| `disk_low` | the store has less free space than `--disk-reserve-mb` (or it cannot be read): launches, snapshots, volumes and imports are refused until space is freed |
 
 Restarting the daemon cleans everything above except the disks, clones and
 snapshot dirs with no owner, which are data and are only reported. `mh doctor`
@@ -1090,7 +1291,9 @@ data: {"epoch":"3f9a61c2","seq":42,"time":"…","type":"vm.died","vm":"a1b2c3d4"
 | `vm.replaced` | its function moved to another VM | `data.replacement`, `data.old` |
 | `vm.replace_failed` | cut off, but the replacement did not boot: **the function is down** | `reason` |
 | `vm.autostart_failed` | could not be booted again at startup | `reason` |
-| `network.ruleset_failed` | `nft -f` refused a ruleset: the policy in force may not be the declared one | `reason` |
+| `network.ruleset_failed` | `nft -f` refused a ruleset (the firewall or the per-VM port filter): the policy in force may not be the declared one | `reason` |
+| `host.disk_low` | the store fell under `--disk-reserve-mb` free (or its free space cannot be read); raised once per crossing | `reason`, `data.free_mb`, `data.reserve_mb` |
+| `host.disk_ok` | the store is back above the reserve, with a margin of a tenth of it | `reason`, `data.free_mb`, `data.reserve_mb` |
 | `reset` | you missed events you can no longer get: **re-read the state** | `reason` |
 
 `vm.*` events describe the VM as it was then (`name`, `labels`, `network` — for a

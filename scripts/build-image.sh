@@ -2,12 +2,14 @@
 # COMPLETE image pipeline, from zero to a usable template:
 #
 #   1. kernel  — downloads the Firecracker CI vmlinux for the architecture
-#   2. rootfs  — FLAVOR=alpine (default: busybox, ~10 MB) or FLAVOR=ubuntu
-#                (debootstrap noble, ~1 GiB); correct arch, cross with qemu
+#   2. rootfs  — FLAVOR=alpine (default: busybox, ~10 MB), FLAVOR=ubuntu
+#                (debootstrap noble, ~1 GiB) or FLAVOR=ubuntu-docker (noble +
+#                Docker Engine, a development template); correct arch, cross
+#                with qemu
 #   3. prepare — vsock exec listener + SSH + DNS (prepare-image.sh; ubuntu
 #                only — the Alpine build already ships with vsock + DNS ready)
 #   4. store   — installs golden + kernel into the CoW store (same FS: reflink)
-#   5. catalog — registers/updates the template in images/catalog.json
+#   5. catalog — registers/updates the template in /var/lib/microhosted/catalog.json
 #
 # Normal entry point: `make prepare-image` (accepts ARCH=, FLAVOR=, IMAGE_NAME=,
 # SIZE_MB=, KERNEL_VERSION=, EXTRA_PKGS=). Requires the host already configured
@@ -36,22 +38,37 @@ case "$FLAVOR" in
     IMAGE_NAME="${IMAGE_NAME:-base-alpine}"
     SIZE_MB="${SIZE_MB:-128}"
     DISK_MB="${DISK_MB:-512}"
+    VCPUS="${VCPUS:-1}"
+    MEM_MB="${MEM_MB:-128}"
     DESCRIPTION="Ultra-minimal Alpine, busybox init + vsock exec (make prepare-image)"
     ;;
   ubuntu)
     IMAGE_NAME="${IMAGE_NAME:-base-ubuntu-noble}"
     SIZE_MB="${SIZE_MB:-1024}"
     DISK_MB="${DISK_MB:-1024}"
+    VCPUS="${VCPUS:-1}"
+    MEM_MB="${MEM_MB:-128}"
     DESCRIPTION="Ubuntu noble (debootstrap, make prepare-image FLAVOR=ubuntu)"
     ;;
-  *) echo "ERROR: unsupported FLAVOR: $FLAVOR (use alpine or ubuntu)" >&2; exit 1 ;;
+  ubuntu-docker)
+    # Development template: dockerd + containerd idle at ~150 MB and images
+    # pile up quickly, so the defaults are sized for a workstation, not a
+    # service. The golden stays small; each clone grows to DISK_MB.
+    IMAGE_NAME="${IMAGE_NAME:-dev-ubuntu}"
+    SIZE_MB="${SIZE_MB:-2048}"
+    DISK_MB="${DISK_MB:-8192}"
+    VCPUS="${VCPUS:-2}"
+    MEM_MB="${MEM_MB:-1024}"
+    DESCRIPTION="Ubuntu noble + Docker Engine, development (make prepare-image FLAVOR=ubuntu-docker)"
+    ;;
+  *) echo "ERROR: unsupported FLAVOR: $FLAVOR (use alpine, ubuntu or ubuntu-docker)" >&2; exit 1 ;;
 esac
 
 KERNEL_VERSION="${KERNEL_VERSION:-6.1.102}"
 STORE="${INSTANCES_DIR:-/var/lib/microhosted/store}"
-CATALOG="${CATALOG:-images/catalog.json}"
-VCPUS="${VCPUS:-1}"
-MEM_MB="${MEM_MB:-128}"
+# The daemon's catalog: root-owned, as the daemon requires (see
+# scripts/install-service.sh). Written with sudo below.
+CATALOG="${CATALOG:-/var/lib/microhosted/catalog.json}"
 EXTRA_PKGS="${EXTRA_PKGS:-}"   # alpine only: extra apk packages in the golden
 SSH_PUBKEY="${SSH_PUBKEY:-}"   # alpine only: add sshd with this key
 
@@ -95,7 +112,9 @@ if [[ "$FLAVOR" == "alpine" ]]; then
     ${EXTRA_PKGS:+--add "$EXTRA_PKGS"} ${SSH_PUBKEY:+--ssh "$SSH_PUBKEY"}
 else
   echo "==> [2/5] Ubuntu rootfs (debootstrap, ${ARCH})..."
-  sudo ARCH="$ARCH" ./scripts/build-rootfs.sh "$ROOTFS_TMP" "$SIZE_MB"
+  WITH_DOCKER=0
+  [[ "$FLAVOR" == "ubuntu-docker" ]] && WITH_DOCKER=1
+  sudo ARCH="$ARCH" WITH_DOCKER="$WITH_DOCKER" ./scripts/build-rootfs.sh "$ROOTFS_TMP" "$SIZE_MB"
 fi
 
 # --- [3/5] Preparation (vsock + SSH + DNS) --------------------------------------
@@ -123,7 +142,7 @@ if [[ "$ARCH" != "$(uname -m)" ]]; then
   echo "    $KERNEL_DST"
   echo "    $ROOTFS_DST"
 else
-  python3 - "$CATALOG" "$IMAGE_NAME" "$KERNEL_DST" "$ROOTFS_DST" \
+  sudo python3 - "$CATALOG" "$IMAGE_NAME" "$KERNEL_DST" "$ROOTFS_DST" \
              "$DESCRIPTION" "$VCPUS" "$MEM_MB" "$DISK_MB" <<'PY'
 import json, os, sys
 
@@ -147,9 +166,15 @@ entry = {
 catalog = [t for t in catalog if t.get("name") != name]
 catalog.append(entry)
 
-with open(path, "w") as f:
+# Written to a temp file and renamed: the daemon never sees a half-written
+# catalog, and the result is root:root 0644 whatever the umask.
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
     json.dump(catalog, f, indent=2, ensure_ascii=False)
     f.write("\n")
+os.chown(tmp, 0, 0)
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
 print(f"  template '{name}' registered (vcpus={vcpus}, mem={mem_mb}MB, disk={disk_mb}MB)")
 PY
 

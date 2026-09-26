@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"microhosted/internal/labels"
 	"microhosted/pkg/types"
 )
 
@@ -63,8 +64,8 @@ func TestQuarantineRefusals(t *testing.T) {
 		t.Errorf("unknown VM = %v, want ErrVMNotFound", err)
 	}
 
-	full := make(map[string]string, maxLabels)
-	for i := 0; i < maxLabels; i++ {
+	full := make(map[string]string, labels.MaxLabels)
+	for i := 0; i < labels.MaxLabels; i++ {
 		full[string(rune('a'+i%26))+string(rune('a'+i/26))] = "v"
 	}
 	rec := &types.VM{

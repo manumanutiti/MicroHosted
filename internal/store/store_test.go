@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -168,7 +169,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d snapshots, want 1", len(got))
 	}
-	if *got[0] != *want {
+	if !reflect.DeepEqual(got[0], want) {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got[0], want)
 	}
 
@@ -216,7 +217,7 @@ func TestVolumeRoundTrip(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d volumes, want 1", len(got))
 	}
-	if *got[0] != *want {
+	if !reflect.DeepEqual(got[0], want) {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got[0], want)
 	}
 

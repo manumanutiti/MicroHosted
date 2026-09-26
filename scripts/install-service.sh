@@ -138,6 +138,61 @@ if [[ -x "$CLI_SRC" ]]; then
   install -o root -g root -m 0755 "$CLI_SRC" /usr/local/bin/mh
 fi
 
+# State lives under /var/lib/microhosted, owned by root: the database and the
+# catalog name the paths this root daemon truncates, deletes and boots, so
+# whoever can write them controls those operations — and the daemon refuses to
+# start if anyone but root can. Older installs kept both in the checkout, owned
+# by the user who cloned it; move them. 0711: the per-VM identities must still
+# traverse it to reach the store, but no one lists it.
+STATE_DIR="/var/lib/microhosted"
+OLD_DB="$REPO_ROOT/images/microhosted.db"
+NEW_DB="$STATE_DIR/microhosted.db"
+SEED_CATALOG="$REPO_ROOT/images/catalog.json"
+NEW_CATALOG="$STATE_DIR/catalog.json"
+RESTART_AFTER=0
+
+echo "==> State directory $STATE_DIR (root, 0711)..."
+install -d -o root -g root -m 0711 "$STATE_DIR"
+chown root:root "$STATE_DIR"
+chmod 0711 "$STATE_DIR"
+
+if [[ -f "$OLD_DB" ]]; then
+  if [[ -e "$NEW_DB" ]]; then
+    echo "  NOTE: $OLD_DB is ignored — the daemon uses $NEW_DB. Delete the old one once you no longer need it."
+  else
+    # Stop the daemon so the copy is consistent. Its VMs keep running
+    # (KillMode=process) and are re-adopted when it starts again below.
+    if systemctl is-active --quiet microhosted 2>/dev/null; then
+      echo "  stopping the daemon to move its database (VMs keep running)..."
+      systemctl stop microhosted
+      RESTART_AFTER=1
+    fi
+    for suffix in "" -wal -shm -journal; do
+      if [[ -f "${OLD_DB}${suffix}" ]]; then
+        install -o root -g root -m 0600 "${OLD_DB}${suffix}" "${NEW_DB}${suffix}"
+        mv "${OLD_DB}${suffix}" "${OLD_DB}${suffix}.migrated"
+      fi
+    done
+    echo "  database moved to $NEW_DB (the old copy is kept as ${OLD_DB}.migrated; delete it once the daemon is confirmed healthy)"
+  fi
+fi
+
+if [[ -e "$NEW_CATALOG" ]]; then
+  chown root:root "$NEW_CATALOG"
+  chmod 0644 "$NEW_CATALOG"
+  if [[ -f "$SEED_CATALOG" ]] && ! cmp -s "$SEED_CATALOG" "$NEW_CATALOG"; then
+    echo "  NOTE: $SEED_CATALOG differs from the catalog in use ($NEW_CATALOG); the repo copy is only the seed for new installs."
+  fi
+elif [[ -f "$SEED_CATALOG" ]]; then
+  install -o root -g root -m 0644 "$SEED_CATALOG" "$NEW_CATALOG"
+  echo "  catalog installed at $NEW_CATALOG (from $SEED_CATALOG)"
+else
+  echo "[]" > "$NEW_CATALOG"
+  chown root:root "$NEW_CATALOG"
+  chmod 0644 "$NEW_CATALOG"
+  echo "  empty catalog created at $NEW_CATALOG (make prepare-image registers templates in it)"
+fi
+
 if [[ ${#INHERITED[@]} -gt 0 ]]; then
   echo "==> Kept from the installed unit: ${INHERITED[*]}"
   echo "    (pass a new value to change one, or =none to remove it)"
@@ -150,6 +205,11 @@ sed -e "s#@BINARY@#${BIN_DST}#g" \
 
 echo "==> systemctl daemon-reload..."
 systemctl daemon-reload
+
+if [[ "$RESTART_AFTER" -eq 1 ]]; then
+  echo "==> Starting the daemon again (it re-adopts the running VMs)..."
+  systemctl start microhosted
+fi
 
 if [[ -n "$MANAGED_IFACE" ]]; then
   echo ""

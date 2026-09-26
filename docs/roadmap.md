@@ -216,6 +216,11 @@ into the engine:
    left is a quota per consumer — labels give it something to count by
    (`managed-by`) — so one orchestrator cannot starve another, and in push mode
    that is exactly the DoS `docs/iot-edge.md` already anticipates.
+   **Implemented (2026-09-26, not yet validated on test hardware):**
+   `--quota CONSUMER=vms:N,mem:MB` and `--quota-default` on the daemon, 429
+   over it, counted on running + launching VMs (quarantined included) and
+   their `mem_mb`; `managed-by` is fixed at create; usage in `GET /v1/system`
+   and `mh info`.
 
 Then the cut: `internal/engine` (what any orchestrator may use) against
 `internal/orchestrator/*`. The HTTP API becomes **one more consumer**, not the
@@ -238,7 +243,9 @@ holds for a real plant — that is no longer an estimate.
 
 The data half of this phase — how readings leave the VMs at 100–200 sensors
 without `/exec` in the data path (vsock DataPort stream, fd passing, journal,
-declarative registry) — is designed in `docs/ingestion.md`.
+declarative registry) — is designed in `docs/ingestion.md`. The control half —
+plant spec, lifetimes, redundancy and the VM budget — is being designed in
+`docs/orchestrator.md`.
 
 Exit criterion: N sensors unattended for 72 h on the target hardware, zero orphans (VM,
 network, tap, cgroup, chroot), and the loop survives killing the daemon
@@ -260,8 +267,14 @@ demonstrable. Two deliverables:
   VM, nor an undeclared network, that it cannot exhaust the daemon, and that a
   clean VM is serving ~100 ms later.
 
-This also absorbs the hardening left open in `SESSIONS.md`: validating seccomp
-and the actual *values* under `/sys/fs/cgroup/microhosted/<id>`.
+The hardening left open in `SESSIONS.md` is done: validating seccomp exposed
+that it was **off** in every VM (the Go SDK passes `--no-seccomp` by default);
+it is now on, checked at every boot (fail-closed) and by `mh doctor`, and
+`scripts/security-test.sh` asserts it together with the actual values under
+`/sys/fs/cgroup/microhosted/<id>`, identities, capabilities, jail contents,
+open descriptors and network isolation from inside guests. Still open here:
+a network namespace per VMM (Jailer `--netns`), which closes abstract Unix
+sockets (threat-model §7).
 
 Exit criterion: an external auditor reproduces it with a `make` target.
 
@@ -284,9 +297,9 @@ documented as a real risk in `docs/networking.md`). Fault injection plus the
 soak test still open as Stage 10.
 
 A noisy neighbour is a failure too. CPU, memory and PIDs are capped per VM
-(cgroup), but disk and network throughput are not: one compromised VM can
-saturate the storage device or its bridge for all the others. Firecracker has
-rate limiters for both (per drive, per interface); they are not wired yet. Two
+(cgroup), and since 2026-09-25 so are disk and network throughput
+(Firecracker's rate limiters per drive and per NIC direction, under a
+daemon-wide ceiling a VM may only lower). Two
 more found while writing the threat model (2026-09-23): the guest's console log
 on the host has no size cap (a guest printing forever fills the store), and a VM
 can claim another address of its own network towards the host (no per-TAP

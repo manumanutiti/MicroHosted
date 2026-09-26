@@ -8,11 +8,14 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"microhosted/internal/events"
+	"microhosted/internal/labels"
 	"microhosted/internal/network"
 	"microhosted/internal/storage"
 	"microhosted/internal/vm"
+	"microhosted/internal/vsock"
 	"microhosted/pkg/types"
 )
 
@@ -31,18 +34,16 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// 200/503 probe). See system.go.
 	registerSystemRoutes(mux, mgr, netmgr, sysCfg)
 
+	// The content-addressed image store (see images.go).
+	registerImageRoutes(mux, mgr)
+
 	mux.HandleFunc("GET /v1/templates", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mgr.Templates())
 	})
 
 	mux.HandleFunc("POST /v1/networks", func(w http.ResponseWriter, r *http.Request) {
 		var req types.CreateNetworkRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if req.Name == "" {
-			writeError(w, http.StatusBadRequest, errors.New("name is required"))
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		// A bad egress policy is the caller's fault (400), so vet it here;
@@ -61,13 +62,37 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		writeJSON(w, http.StatusCreated, types.NewNetworkResponse(n))
 	})
 
+	// ?label=k=v (repeatable, or comma-separated) keeps only the networks
+	// carrying every one of those labels, as GET /v1/vms does.
 	mux.HandleFunc("GET /v1/networks", func(w http.ResponseWriter, r *http.Request) {
+		sel, err := labels.ParseSelector(r.URL.Query()["label"])
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		nets := netmgr.List()
 		resp := make([]types.NetworkResponse, 0, len(nets))
 		for _, n := range nets {
-			resp = append(resp, types.NewNetworkResponse(n))
+			if sel.Matches(n.Labels) {
+				resp = append(resp, types.NewNetworkResponse(n))
+			}
 		}
 		writeJSON(w, http.StatusOK, resp)
+	})
+
+	// Labels: a merge patch, as on VMs — {"labels": {"k": "v", "gone": null}}.
+	// Metadata only: the ruleset and the attached VMs are not touched.
+	mux.HandleFunc("PATCH /v1/networks/{name}/labels", func(w http.ResponseWriter, r *http.Request) {
+		var req types.UpdateNetworkLabelsRequest
+		if !decodeJSON(w, r, &req, false) {
+			return
+		}
+		n, err := netmgr.SetLabels(r.PathValue("name"), req.Labels)
+		if err != nil {
+			writeError(w, networkErrStatus(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
 	})
 
 	mux.HandleFunc("GET /v1/networks/{name}", func(w http.ResponseWriter, r *http.Request) {
@@ -84,8 +109,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// (the forward chain matches statelessly — see internal/network).
 	mux.HandleFunc("PUT /v1/networks/{name}/egress", func(w http.ResponseWriter, r *http.Request) {
 		var req types.UpdateNetworkEgressRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if err := network.ValidateEgressPolicy(req.Egress, req.EgressIface, req.AllowedEgress, netmgr.ManagedIfaceNames()); err != nil {
@@ -98,7 +122,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		}
 		n, err := netmgr.UpdateEgress(r.PathValue("name"), req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, networkErrStatus(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, types.NewNetworkResponse(n))
@@ -109,8 +133,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// a rule cuts its live flows on their next packet.
 	mux.HandleFunc("PUT /v1/networks/{name}/ingress", func(w http.ResponseWriter, r *http.Request) {
 		var req types.UpdateNetworkIngressRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if err := network.ValidateIngressRules(req.AllowedIngress, netmgr.ManagedIfaceNames()); err != nil {
@@ -135,8 +158,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// tightening, a stale-reachable tap is a hole, not a detail.
 	mux.HandleFunc("PUT /v1/networks/{name}/intra", func(w http.ResponseWriter, r *http.Request) {
 		var req types.UpdateNetworkIntraRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if _, ok := netmgr.Get(r.PathValue("name")); !ok {
@@ -145,7 +167,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		}
 		n, err := netmgr.UpdateIntra(r.PathValue("name"), req.Intra)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, networkErrStatus(err), err)
 			return
 		}
 		if err := mgr.SyncTapIsolation(n.Name, !req.Intra); err != nil {
@@ -158,8 +180,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	mux.HandleFunc("DELETE /v1/networks/{name}", func(w http.ResponseWriter, r *http.Request) {
 		if err := netmgr.Delete(r.PathValue("name")); err != nil {
 			// A network that still has VMs attached is a client error (409),
-			// not a server fault — surface it as a conflict.
-			writeError(w, http.StatusConflict, err)
+			// not a server fault; an unknown one is 404.
+			writeError(w, networkErrStatus(err), err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -181,8 +203,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// artifacts and can be read back after the VM is gone.
 	mux.HandleFunc("POST /v1/volumes", func(w http.ResponseWriter, r *http.Request) {
 		var req types.CreateVolumeRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if req.Name == "" {
@@ -259,8 +280,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 
 	mux.HandleFunc("POST /v1/vms", func(w http.ResponseWriter, r *http.Request) {
 		var req types.CreateVMRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if req.Template == "" {
@@ -279,7 +299,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// ?label=k=v (repeatable, or comma-separated) keeps only the VMs carrying
 	// every one of those labels.
 	mux.HandleFunc("GET /v1/vms", func(w http.ResponseWriter, r *http.Request) {
-		sel, err := vm.ParseLabelSelector(r.URL.Query()["label"])
+		sel, err := labels.ParseSelector(r.URL.Query()["label"])
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -350,8 +370,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// removes gone, leaving every other label as it was.
 	mux.HandleFunc("PATCH /v1/vms/{id}/labels", func(w http.ResponseWriter, r *http.Request) {
 		var req types.UpdateVMLabelsRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		record, err := mgr.SetLabels(r.PathValue("id"), req.Labels)
@@ -379,11 +398,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// stopped or destroyed (see vm.Manager.Replace).
 	mux.HandleFunc("POST /v1/vms/{id}/replace", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ReplaceVMRequest
-		if r.ContentLength != 0 {
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
-			}
+		if !decodeJSON(w, r, &req, true) {
+			return
 		}
 		nv, old, err := mgr.Replace(r.Context(), r.PathValue("id"), req)
 		if err != nil {
@@ -400,8 +416,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 
 	mux.HandleFunc("PUT /v1/vms/{id}/autostart", func(w http.ResponseWriter, r *http.Request) {
 		var req types.UpdateVMAutostartRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		record, err := mgr.SetAutostart(r.PathValue("id"), req.Autostart)
@@ -420,8 +435,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	mux.HandleFunc("POST /v1/vms/{id}/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		var req types.CreateSnapshotRequest
 		// Body is optional (name only) — an empty body is a valid request.
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, true) {
 			return
 		}
 		snap, err := mgr.Snapshot(r.Context(), r.PathValue("id"), req.Name)
@@ -466,8 +480,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// difference is what you fork from.
 	mux.HandleFunc("POST /v1/snapshots/{id}/fork", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ForkVMRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, true) {
 			return
 		}
 		record, err := mgr.Fork(r.Context(), r.PathValue("id"), req)
@@ -484,8 +497,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// VM stays alive holding its IP, quarantine=true is the usual mode here.
 	mux.HandleFunc("POST /v1/vms/{id}/fork", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ForkVMRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, true) {
 			return
 		}
 		record, err := mgr.ForkVM(r.Context(), r.PathValue("id"), req)
@@ -501,8 +513,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// primitive between samples.
 	mux.HandleFunc("POST /v1/vms/{id}/restore", func(w http.ResponseWriter, r *http.Request) {
 		var req types.RestoreVMRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if req.Snapshot == "" {
@@ -519,8 +530,7 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 
 	mux.HandleFunc("POST /v1/vms/{id}/exec", func(w http.ResponseWriter, r *http.Request) {
 		var req types.ExecRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if !decodeJSON(w, r, &req, false) {
 			return
 		}
 		if req.Cmd == "" {
@@ -528,9 +538,20 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			return
 		}
 
-		output, exitCode, err := mgr.Exec(r.PathValue("id"), req.Cmd)
+		if req.TimeoutMS < 0 || time.Duration(req.TimeoutMS)*time.Millisecond > vsock.MaxExecTimeout {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("timeout_ms must be between 1 and %d (0 = default)", vsock.MaxExecTimeout.Milliseconds()))
+			return
+		}
+
+		output, exitCode, err := mgr.Exec(r.Context(), r.PathValue("id"), req.Cmd, time.Duration(req.TimeoutMS)*time.Millisecond)
+		if errors.Is(err, vsock.ErrTimeout) {
+			// Not a daemon fault: the guest did not answer in time. Distinct
+			// from 500 so a caller can tell a hung function from a broken host.
+			writeError(w, http.StatusGatewayTimeout, err)
+			return
+		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeVMOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, types.ExecResponse{Output: output, ExitCode: exitCode})
@@ -630,8 +651,8 @@ func writeError(w http.ResponseWriter, status int, err error) {
 // unknown VM or snapshot is 404, an operation invalid for the VM's current
 // state (stop on a stopped VM, start on a running one) or colliding with
 // current resources (forking onto a taken address, another operation on the
-// same VM in progress) is 409 Conflict, a host without room for another VM is
-// 503, anything else is 500.
+// same VM in progress) is 409 Conflict, a consumer at its quota is 429, a host
+// without room for another VM is 503, anything else is 500.
 func writeVMOpError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, vm.ErrInvalid):
@@ -640,6 +661,9 @@ func writeVMOpError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err)
 	case errors.Is(err, vm.ErrVMState), errors.Is(err, vm.ErrConflict):
 		writeError(w, http.StatusConflict, err)
+	case errors.Is(err, vm.ErrQuota):
+		// The host may have room; this consumer (managed-by) does not.
+		writeError(w, http.StatusTooManyRequests, err)
 	case errors.Is(err, vm.ErrCapacity):
 		// Nothing wrong with the request: the host is full right now.
 		writeError(w, http.StatusServiceUnavailable, err)
@@ -661,12 +685,19 @@ func bulkDeleteResponse(deleted []string, failedErrs map[string]error) types.Bul
 	return resp
 }
 
-// networkErrStatus maps a network-manager error to its status: an ingress
-// policy the caller got wrong (to_ip outside the subnet, a clash with another
-// network) is only detectable inside the manager, but it is still a 400.
+// networkErrStatus maps a network-manager error to its status. What the
+// caller got wrong is a 400 even when only the manager can tell — an ingress
+// policy with to_ip outside the subnet or clashing with another network's, a
+// bad name or label. An unknown network is 404; a name already taken or a
+// network still in use, 409. Anything else is the host's fault.
 func networkErrStatus(err error) int {
-	if errors.Is(err, network.ErrInvalidIngress) {
+	switch {
+	case errors.Is(err, network.ErrInvalidIngress), errors.Is(err, labels.ErrInvalid):
 		return http.StatusBadRequest
+	case errors.Is(err, network.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, network.ErrExists), errors.Is(err, network.ErrInUse):
+		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
 }

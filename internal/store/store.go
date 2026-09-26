@@ -58,6 +58,12 @@ func Open(path string) (*Store, error) {
 		// name is UNIQUE so the DB enforces one volume per name — the manager
 		// resolves attach requests by name and relies on this to keep them
 		// unambiguous, same as networks.
+		// Images are keyed by their content digest; tags live in the record
+		// (the image store keeps them unique).
+		`CREATE TABLE IF NOT EXISTS images (
+			digest TEXT PRIMARY KEY,
+			data   TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS volumes (
 			id   TEXT PRIMARY KEY,
 			name TEXT NOT NULL UNIQUE,
@@ -282,4 +288,51 @@ func (s *Store) ListNetworks() ([]*types.Network, error) {
 		nets = append(nets, &n)
 	}
 	return nets, rows.Err()
+}
+
+// SaveImage upserts an image record.
+func (s *Store) SaveImage(img *types.Image) error {
+	data, err := json.Marshal(img)
+	if err != nil {
+		return fmt.Errorf("marshaling image %s: %w", img.Digest, err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO images (digest, data) VALUES (?, ?)
+		 ON CONFLICT(digest) DO UPDATE SET data = excluded.data`,
+		img.Digest, string(data),
+	); err != nil {
+		return fmt.Errorf("saving image %s: %w", img.Digest, err)
+	}
+	return nil
+}
+
+// DeleteImage removes an image record by digest. Idempotent.
+func (s *Store) DeleteImage(digest string) error {
+	if _, err := s.db.Exec(`DELETE FROM images WHERE digest = ?`, digest); err != nil {
+		return fmt.Errorf("deleting image %s: %w", digest, err)
+	}
+	return nil
+}
+
+// ListImages returns every persisted image record.
+func (s *Store) ListImages() ([]*types.Image, error) {
+	rows, err := s.db.Query(`SELECT data FROM images`)
+	if err != nil {
+		return nil, fmt.Errorf("querying images: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*types.Image
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scanning image row: %w", err)
+		}
+		var img types.Image
+		if err := json.Unmarshal([]byte(data), &img); err != nil {
+			return nil, fmt.Errorf("unmarshaling image row: %w", err)
+		}
+		out = append(out, &img)
+	}
+	return out, rows.Err()
 }

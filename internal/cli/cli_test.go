@@ -260,6 +260,14 @@ func TestExecPropagatesExitCode(t *testing.T) {
 	if req.Cmd != "sh -c 'ps | wc -l'" {
 		t.Errorf("with --: cmd = %q", req.Cmd)
 	}
+
+	// mh's own flags go before the VM; the deadline travels as timeout_ms.
+	req = types.ExecRequest{}
+	f.run("", "exec", "-t", "1.5s", "a1b2", "sleep", "9")
+	json.Unmarshal(f.last("POST").body, &req)
+	if req.Cmd != "sleep 9" || req.TimeoutMS != 1500 {
+		t.Errorf("with -t: %+v, want cmd \"sleep 9\" and timeout_ms 1500", req)
+	}
 }
 
 func TestHealthDegradedIsAnAnswer(t *testing.T) {
@@ -577,5 +585,151 @@ func TestVMNamesAndLabels(t *testing.T) {
 	}
 	if code, _, _ := f.run("", "label", "ts01-a", "oops"); code == 0 {
 		t.Error("label with neither = nor a trailing - must refuse")
+	}
+}
+
+func TestNetworkLabels(t *testing.T) {
+	lab := types.NetworkResponse{Name: "ts-01", Subnet: "172.16.5.0/24", Labels: map[string]string{"managed-by": "mh-orchestrator"}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/networks", reply([]types.NetworkResponse{lab}))
+	mux.HandleFunc("POST /v1/networks", replyStatus(http.StatusCreated, lab))
+	mux.HandleFunc("PATCH /v1/networks/{name}/labels", reply(lab))
+	f := newFakeAPI(t, mux)
+
+	if code, out, errOut := f.run("", "network", "create", "ts-01", "-l", "managed-by=mh-orchestrator"); code != 0 {
+		t.Fatalf("create: exit %d, stderr %q", code, errOut)
+	} else if !strings.Contains(out, "LABELS") || !strings.Contains(out, "managed-by=mh-orchestrator") {
+		t.Errorf("a create with labels shows them:\n%s", out)
+	}
+	var req types.CreateNetworkRequest
+	if err := json.Unmarshal(f.last("POST").body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(req.Labels, map[string]string{"managed-by": "mh-orchestrator"}) {
+		t.Errorf("request labels %v", req.Labels)
+	}
+
+	f.run("", "network", "ls", "-l", "managed-by=mh-orchestrator")
+	if q := f.last("GET").query; q != "label=managed-by%3Dmh-orchestrator" {
+		t.Errorf("selector query %q", q)
+	}
+	if _, out, _ := f.run("", "network", "ls"); strings.Contains(out, "LABELS") {
+		t.Errorf("labels are opt-in on ls (-L):\n%s", out)
+	}
+	if _, out, _ := f.run("", "network", "ls", "-L"); !strings.Contains(out, "managed-by=mh-orchestrator") {
+		t.Errorf("ls -L shows labels:\n%s", out)
+	}
+
+	if code, _, errOut := f.run("", "network", "label", "ts-01", "zone=north", "managed-by-"); code != 0 {
+		t.Fatalf("label: exit %d, stderr %q", code, errOut)
+	}
+	patch := f.last("PATCH")
+	if patch.path != "/v1/networks/ts-01/labels" || strings.TrimSpace(string(patch.body)) != `{"labels":{"managed-by":null,"zone":"north"}}` {
+		t.Errorf("PATCH %s %s", patch.path, patch.body)
+	}
+	if code, _, _ := f.run("", "network", "label", "ts-01"); code == 0 {
+		t.Error("label without edits must refuse")
+	}
+}
+
+func TestImageCommands(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	img := types.ImageResponse{Digest: digest, Tags: []string{"parser:1.0"}, VCPUs: 1, MemMB: 64, SizeMB: 60, ImportedAt: "2026-09-25T10:00:00Z"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/images", replyStatus(http.StatusCreated, img))
+	mux.HandleFunc("GET /v1/images", reply([]types.ImageResponse{img}))
+	mux.HandleFunc("POST /v1/images/{ref}/verify", reply(types.ImageVerifyResponse{Digest: digest, OK: false, Error: "mismatch"}))
+	mux.HandleFunc("POST /v1/vms", replyStatus(http.StatusCreated, types.VMResponse{ID: "a1b2c3d4"}))
+	f := newFakeAPI(t, mux)
+
+	code, out, errOut := f.run("", "image", "import", "parser:1.0", "--kernel", "/store/vmlinux", "-r", "rootfs.ext4", "--mem", "64")
+	if code != 0 {
+		t.Fatalf("import: exit %d, stderr %q", code, errOut)
+	}
+	if out != "parser:1.0@"+digest+"\n" {
+		t.Errorf("import prints the pinned reference, got %q", out)
+	}
+	var req types.ImportImageRequest
+	if err := json.Unmarshal(f.last("POST").body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Name != "parser:1.0" || req.KernelPath != "/store/vmlinux" || !filepath.IsAbs(req.RootfsPath) || req.MemMB != 64 || req.VCPUs != 1 {
+		t.Errorf("import request %+v", req)
+	}
+	if code, _, _ := f.run("", "image", "import", "parser:1.0", "--kernel", "/k"); code == 0 {
+		t.Error("import without --rootfs must refuse")
+	}
+
+	if _, out, _ := f.run("", "image", "ls"); !strings.Contains(out, "parser:1.0") || !strings.Contains(out, "abababababab") {
+		t.Errorf("ls:\n%s", out)
+	}
+	if _, out, _ := f.run("", "image", "ls", "-q"); out != "parser:1.0@"+digest+"\n" {
+		t.Errorf("ls -q = %q", out)
+	}
+	if code, out, _ := f.run("", "image", "verify", "parser:1.0"); code == 0 || !strings.Contains(out, "FAILED") {
+		t.Errorf("a failed verify: exit %d, out %q", code, out)
+	}
+
+	// run: a reference with ':' is an image, anything else a template.
+	f.run("", "run", "parser:1.0@"+digest)
+	var create types.CreateVMRequest
+	if err := json.Unmarshal(f.last("POST").body, &create); err != nil {
+		t.Fatal(err)
+	}
+	if create.Image != "parser:1.0@"+digest || create.Template != "" {
+		t.Errorf("run IMAGE sent %+v", create)
+	}
+	f.run("", "run", "alpine-py")
+	create = types.CreateVMRequest{}
+	if err := json.Unmarshal(f.last("POST").body, &create); err != nil {
+		t.Fatal(err)
+	}
+	if create.Template != "alpine-py" || create.Image != "" {
+		t.Errorf("run TEMPLATE sent %+v", create)
+	}
+}
+
+// --file and --secret read the local file on the client side and carry its
+// content; replace without files sends null (the daemon decides), --no-files
+// an explicit empty list.
+func TestFileFlags(t *testing.T) {
+	vm := types.VMResponse{ID: "a1b2c3d4", Template: "alpine-py", State: types.VMStateRunning, CreatedAt: "2026-09-23T10:00:00Z"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{vm}))
+	mux.HandleFunc("POST /v1/vms", replyStatus(http.StatusCreated, vm))
+	mux.HandleFunc("POST /v1/vms/{id}/replace", reply(types.ReplaceVMResponse{Replacement: vm}))
+	f := newFakeAPI(t, mux)
+
+	dir := t.TempDir()
+	conf, key := filepath.Join(dir, "p.conf"), filepath.Join(dir, "k")
+	os.WriteFile(conf, []byte("port=502\n"), 0o600)
+	os.WriteFile(key, []byte("s3cret"), 0o600)
+
+	code, _, errOut := f.run("", "run", "alpine-py", "-f", "/etc/p.conf="+conf+",mode=0640,uid=10", "--secret", "/etc/k="+key)
+	if code != 0 {
+		t.Fatalf("run: exit %d, %s", code, errOut)
+	}
+	var req types.CreateVMRequest
+	json.Unmarshal(f.last("POST").body, &req)
+	want := []types.FileSpec{
+		{Path: "/etc/p.conf", Content: []byte("port=502\n"), Mode: "0640", UID: 10},
+		{Path: "/etc/k", Content: []byte("s3cret"), Secret: true},
+	}
+	if !reflect.DeepEqual(req.Files, want) {
+		t.Errorf("files = %+v", req.Files)
+	}
+	for _, bad := range []string{"/etc/x", "/etc/x=" + conf + ",owner=1", "/etc/x=" + filepath.Join(dir, "missing")} {
+		if code, _, _ := f.run("", "run", "alpine-py", "-f", bad); code == 0 {
+			t.Errorf("-f %q accepted", bad)
+		}
+	}
+
+	f.run("", "replace", "a1b2c3d4")
+	if body := string(f.last("POST").body); !strings.Contains(body, `"files":null`) {
+		t.Errorf("replace without files: %s", body)
+	}
+	f.run("", "replace", "a1b2c3d4", "--no-files")
+	if body := string(f.last("POST").body); !strings.Contains(body, `"files":[]`) {
+		t.Errorf("replace --no-files: %s", body)
 	}
 }

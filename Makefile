@@ -56,7 +56,8 @@ ifeq ($(GOARCH),)
 endif
 
 # Image pipeline parameters (make prepare-image).
-# FLAVOR: alpine (ultra-minimal, default) | ubuntu (noble, systemd + SSH).
+# FLAVOR: alpine (ultra-minimal, default) | ubuntu (noble, systemd + SSH) |
+#         ubuntu-docker (noble + Docker Engine, development template dev-ubuntu).
 # Empty IMAGE_NAME/IMAGE_SIZE_MB → the flavor's default (base-alpine 128MB /
 # base-ubuntu-noble 1024MB), resolved by build-image.sh.
 FLAVOR         ?= alpine
@@ -119,6 +120,7 @@ uninstall:
 #   make prepare-image
 #   make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py
 #   make prepare-image FLAVOR=ubuntu         # base-ubuntu-noble (systemd+SSH)
+#   make prepare-image FLAVOR=ubuntu-docker  # dev-ubuntu (noble + Docker)
 #   make prepare-image ARCH=aarch64          # image for ARM (cross with qemu)
 # ---------------------------------------------------------------------------
 prepare-image:

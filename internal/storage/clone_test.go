@@ -317,3 +317,27 @@ func TestPruneSizedGoldens(t *testing.T) {
 		t.Fatalf("pruning touched a golden: %v", err)
 	}
 }
+
+// A store image is 0444; its clone must still be writable by the VM (and by
+// it alone), whatever mode cp carried over from the source.
+func TestCloneOfReadOnlyGoldenIsPrivateAndWritable(t *testing.T) {
+	dir := t.TempDir()
+	golden := filepath.Join(dir, "golden.ext4")
+	if err := os.WriteFile(golden, []byte("read-only golden"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	clonePath, err := CloneRootfs(types.Template{Name: "img", RootfsPath: golden}, "vm-ro", filepath.Join(dir, "instances"), os.Getuid(), os.Getgid(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(clonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("clone mode %v, want 0600", fi.Mode().Perm())
+	}
+	if err := os.WriteFile(clonePath, []byte("guest write"), 0o600); err != nil {
+		t.Errorf("clone not writable by its owner: %v", err)
+	}
+}

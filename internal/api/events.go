@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"microhosted/internal/events"
-	"microhosted/internal/vm"
+	"microhosted/internal/labels"
 	"microhosted/pkg/types"
 )
 
@@ -35,7 +35,7 @@ const heartbeat = 15 * time.Second
 func registerEventRoutes(mux *http.ServeMux, bus *events.Bus) {
 	mux.HandleFunc("GET /v1/events", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		sel, err := vm.ParseLabelSelector(q["label"])
+		sel, err := labels.ParseSelector(q["label"])
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return

@@ -2,7 +2,10 @@ package types
 
 // CreateVMRequest is the payload accepted by POST /v1/vms.
 type CreateVMRequest struct {
-	Template string `json:"template"`
+	// Template names a catalog template; Image an image in the store
+	// ("name:version", "sha256:…" or "name:version@sha256:…"). Exactly one.
+	Template string `json:"template,omitempty"`
+	Image    string `json:"image,omitempty"`
 
 	// Name and Labels: see VMConfig.Name and VMConfig.Labels. Both optional.
 	Name   string            `json:"name,omitempty"`
@@ -44,6 +47,34 @@ type CreateVMRequest struct {
 	// Autostart boots the VM again when the daemon starts and finds it dead
 	// (host reboot, crash while the daemon was down). See VMConfig.Autostart.
 	Autostart bool `json:"autostart,omitempty"`
+
+	// IOLimits lowers this VM's disk and network throughput below the
+	// daemon's ceiling (400 if any field exceeds it); omitted or zero fields
+	// take the ceiling. See IOLimits.
+	IOLimits *IOLimits `json:"io_limits,omitempty"`
+
+	// Files are written into the VM's disk before its first boot (see
+	// FileSpec): the VM is born configured, with no agent involved.
+	Files []FileSpec `json:"files,omitempty"`
+}
+
+// FileSpec is a file written into a new VM's disk before it first boots —
+// per-function configuration, or a secret. The content travels in the request
+// (base64 in JSON): the daemon never reads a host path on a caller's behalf.
+type FileSpec struct {
+	// Path is absolute inside the guest. Parents are created (root, 0755);
+	// a file already there is replaced.
+	Path    string `json:"path"`
+	Content []byte `json:"content"`
+	// Mode is the octal permission bits, e.g. "0640" (no setuid, setgid or
+	// sticky). Default "0644", or "0400" for a secret.
+	Mode string `json:"mode,omitempty"`
+	// UID and GID own the file inside the guest; default root.
+	UID int `json:"uid,omitempty"`
+	GID int `json:"gid,omitempty"`
+	// Secret keeps the content's hash out of the VM's record, the API and
+	// the logs, and makes the default mode 0400.
+	Secret bool `json:"secret,omitempty"`
 }
 
 // UpdateVMAutostartRequest is the payload accepted by
@@ -58,10 +89,12 @@ type UpdateVMAutostartRequest struct {
 // and the old one is dealt with as Old says.
 type ReplaceVMRequest struct {
 	// Where the replacement comes from: a snapshot (forked at the function's
-	// address, so it must have been taken there) or a template (a cold boot
-	// with the old VM's shape). Neither: the old VM's template. Never both.
+	// address, so it must have been taken there), a template or a store image
+	// (a cold boot with the old VM's shape). None: the old VM's own image
+	// digest, or its template. At most one.
 	Snapshot string `json:"snapshot,omitempty"`
 	Template string `json:"template,omitempty"`
+	Image    string `json:"image,omitempty"`
 	// Old is what happens to the VM being replaced, which is always cut off
 	// its network first: "quarantine" (default — left running, reachable over
 	// vsock), "stop" (quarantined and powered off: the disk is kept for
@@ -71,6 +104,11 @@ type ReplaceVMRequest struct {
 	// the old one's). Labels are merged over the ones it inherits.
 	Name   string            `json:"name,omitempty"`
 	Labels map[string]string `json:"labels,omitempty"`
+	// Files for a replacement booted from a template or image (not allowed
+	// with a snapshot, whose disk already has its files). The daemon keeps no
+	// file contents, so replacing a VM that was created with files needs them
+	// again: omitted, that is a 400; an empty list replaces it without files.
+	Files []FileSpec `json:"files"`
 }
 
 // Old-VM dispositions for ReplaceVMRequest.Old.
@@ -100,6 +138,7 @@ type VMResponse struct {
 	Name     string            `json:"name,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
 	Template string            `json:"template"`
+	Image    string            `json:"image,omitempty"`
 	State    VMState           `json:"state"`
 	PID      int               `json:"pid,omitempty"`
 	// Shape: what the VM was promised at create time.
@@ -139,6 +178,11 @@ type VMResponse struct {
 	CreatedAt string          `json:"created_at"`
 	// LastExit: the VM's process last died on its own (see VM.LastExit).
 	LastExit *VMExitResponse `json:"last_exit,omitempty"`
+	// IOLimits is what the VM asked for below the daemon's ceiling; absent
+	// means the ceiling. In force is the lower of the two, per field.
+	IOLimits *IOLimits `json:"io_limits,omitempty"`
+	// Files written into the disk before the first boot (metadata only).
+	Files []InjectedFile `json:"files,omitempty"`
 }
 
 // VMExitResponse is the wire form of VMExit.
@@ -160,6 +204,9 @@ type BulkDeleteResponse struct {
 // ExecRequest is the payload accepted by POST /v1/vms/{id}/exec.
 type ExecRequest struct {
 	Cmd string `json:"cmd"`
+	// TimeoutMS bounds the whole exec, in milliseconds: past it the daemon
+	// stops waiting and answers 504. 0 or absent = 30 s; at most 600000.
+	TimeoutMS int64 `json:"timeout_ms,omitempty"`
 }
 
 // ExecResponse is the combined stdout+stderr and exit code of a command run
@@ -181,6 +228,7 @@ func NewVMResponse(vm *VM) VMResponse {
 		Name:            vm.Config.Name,
 		Labels:          vm.Config.Labels,
 		Template:        vm.Config.TemplateName,
+		Image:           vm.Config.Image,
 		State:           vm.State,
 		PID:             vm.PID,
 		VCPUs:           vm.Config.VCPUs,
@@ -198,6 +246,8 @@ func NewVMResponse(vm *VM) VMResponse {
 		RestoredFrom:    vm.Config.RestoredFrom,
 		Volumes:         newMountResponses(vm.Config.Volumes),
 		Autostart:       vm.Config.Autostart,
+		IOLimits:        vm.Config.IOLimits,
+		Files:           vm.Config.Files,
 		CreatedAt:       vm.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 }

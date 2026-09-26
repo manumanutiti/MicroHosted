@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	fc "github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
 
+	"microhosted/internal/network"
+	"microhosted/internal/storage"
 	"microhosted/pkg/types"
 )
 
@@ -38,6 +41,10 @@ var defaultNameservers = []string{"1.1.1.1", "8.8.8.8"}
 // for the API socket.
 const VsockDevicePath = "v.sock"
 
+// rootDriveID is the root drive's ID, in the boot config and so in every
+// vmstate taken from it — which is how a restore addresses it.
+const rootDriveID = "rootfs"
+
 // vsockGuestCID is the guest-side CID Firecracker's vsock device presents.
 // It's local to the VM's own vsock namespace (isolation on the host side
 // comes from which UDS path you dial, not from CID uniqueness), so every VM
@@ -47,7 +54,9 @@ const vsockGuestCID = 3
 // BuildConfig assembles the firecracker.Config for one VM: boot source, root
 // drive, machine sizing, network interface (if a TAP device was assigned)
 // and the jailer configuration that will actually launch it.
-func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
+// io is the VM's effective throughput limits (vm.EffectiveIO): every drive
+// and both directions of the NIC get a Firecracker rate limiter.
+func BuildConfig(vm types.VMConfig, io types.IOLimits, jcfg fc.JailerConfig) (fc.Config, error) {
 	cfg := fc.Config{
 		VMID:            vm.ID,
 		KernelImagePath: vm.Kernel,
@@ -60,7 +69,8 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 		// An empty (non-nil) slice disables forwarding entirely; the VM's
 		// lifetime is the manager's, ended only by an explicit Destroy.
 		ForwardSignals: []os.Signal{},
-		Drives:         buildDrives(vm),
+		Seccomp:        seccomp,
+		Drives:         buildDrives(vm, DiskRateLimiter(io)),
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  fc.Int64(vm.VCPUs),
 			MemSizeMib: fc.Int64(vm.MemMB),
@@ -110,6 +120,8 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 					Nameservers: defaultNameservers,
 				},
 			},
+			InRateLimiter:  NetRateLimiter(io),
+			OutRateLimiter: NetRateLimiter(io),
 		}}
 	}
 
@@ -123,12 +135,13 @@ func BuildConfig(vm types.VMConfig, jcfg fc.JailerConfig) (fc.Config, error) {
 // read-only volume is a read-only block device (is_read_only), so a sample
 // attached that way can't be altered by the guest inspecting it, not merely
 // mounted with -o ro.
-func buildDrives(vm types.VMConfig) []models.Drive {
+func buildDrives(vm types.VMConfig, rl *models.RateLimiter) []models.Drive {
 	drives := []models.Drive{{
-		DriveID:      fc.String("rootfs"),
+		DriveID:      fc.String(rootDriveID),
 		PathOnHost:   fc.String(vm.Rootfs),
 		IsRootDevice: fc.Bool(true),
 		IsReadOnly:   fc.Bool(false),
+		RateLimiter:  rl,
 	}}
 	for _, vol := range vm.Volumes {
 		drives = append(drives, models.Drive{
@@ -136,22 +149,23 @@ func buildDrives(vm types.VMConfig) []models.Drive {
 			PathOnHost:   fc.String(vol.HostPath),
 			IsRootDevice: fc.Bool(false),
 			IsReadOnly:   fc.Bool(vol.ReadOnly),
+			// Per drive: Firecracker has no budget shared across devices,
+			// so a VM with volumes gets this limit on each of them.
+			RateLimiter: rl,
 		})
 	}
 	return drives
 }
 
-// deriveMAC builds a locally-administered, unicast MAC from an IPv4 address:
-// 02:00 + the four IP octets (e.g. 172.16.1.2 -> 02:00:ac:10:01:02). Unique
-// per address within a deployment and stable across reboots. Falls back to a
-// fixed local MAC if ip isn't a valid IPv4 (shouldn't happen — the caller only
-// reaches here with a TAP configured).
+// deriveMAC is the NIC's MAC for a guest IP — network.GuestMAC, the same pair
+// the port filter pins the VM's TAP to. Falls back to a fixed local MAC if ip
+// isn't a valid IPv4 (shouldn't happen — the caller only reaches here with a
+// TAP configured, and the filter then passes nothing from it).
 func deriveMAC(ip net.IP) string {
-	v4 := ip.To4()
-	if v4 == nil {
-		return "02:00:00:00:00:01"
+	if mac := network.GuestMAC(ip); mac != "" {
+		return mac
 	}
-	return fmt.Sprintf("02:00:%02x:%02x:%02x:%02x", v4[0], v4[1], v4[2], v4[3])
+	return "02:00:00:00:00:01"
 }
 
 // Launch starts a new Firecracker microVM through Jailer (cfg.JailerCfg must
@@ -182,8 +196,9 @@ func BuildRestoreConfig(vmID, diskPath string, jcfg fc.JailerConfig) fc.Config {
 		// Same reasoning as BuildConfig: VMs outlive the daemon; never forward
 		// the daemon's signals to the Firecracker child.
 		ForwardSignals: []os.Signal{},
+		Seccomp:        seccomp,
 		Drives: []models.Drive{{
-			DriveID:      fc.String("rootfs"),
+			DriveID:      fc.String(rootDriveID),
 			PathOnHost:   fc.String(diskPath),
 			IsRootDevice: fc.Bool(true),
 			IsReadOnly:   fc.Bool(false),
@@ -204,14 +219,16 @@ const (
 // must be called inside the chroot, and which TAP the restored NIC lands on.
 type RestoreSpec struct {
 	// StatePath/MemPath are the host-side snapshot files (vmstate + guest
-	// memory). Never written to by a restore: the mem file is mapped
-	// copy-on-write, so many VMs can restore from the same pair concurrently.
+	// memory), sealed root-only. Hard-linked into the chroot with a read
+	// grant for JailGID that lasts only for the load (storage.ShareSnapshotFile).
 	StatePath string
 	MemPath   string
+	// JailGID is the new VM's identity (its gid; see jailer/identity.go).
+	JailGID int
 
 	// DiskPath is the host-side rootfs for the NEW VM — a private
-	// copy-on-write clone of the snapshot's disk, already chowned to the
-	// jailer uid/gid. DriveBase is the filename the snapshot's vmstate
+	// copy-on-write clone of the snapshot's disk, already owned by the VM's
+	// identity. DriveBase is the filename the snapshot's vmstate
 	// recorded for the drive (the ORIGIN VM's "<id>.ext4"), so the clone must
 	// appear inside the chroot under that exact name, whatever the new VM's
 	// own ID is.
@@ -219,9 +236,9 @@ type RestoreSpec struct {
 	DriveBase string
 
 	// ChrootDir is the host-side path of the new VM's chroot root
-	// (jailer.WorkspaceRoot) — where the artifacts above get hardlinked. All
-	// of them live on the same filesystem as the chroot by the store's
-	// invariant, or these links would fail with EXDEV.
+	// (jailer.WorkspaceRoot) — where the disk, state and memory get
+	// hardlinked. All of them live on the same filesystem as the chroot by
+	// the store's invariant, or the links fail with EXDEV.
 	ChrootDir string
 
 	// TapDevice is the host TAP backing the restored NIC; SnapshotTap is the
@@ -233,6 +250,10 @@ type RestoreSpec struct {
 	// TapDevice empty = the snapshot had no network device.
 	TapDevice   string
 	SnapshotTap string
+
+	// IO is the restored VM's throughput limits (vm.EffectiveIO), set on its
+	// devices between the load and the resume.
+	IO types.IOLimits
 }
 
 // LaunchFromSnapshot starts a Firecracker process through Jailer and, instead
@@ -286,15 +307,35 @@ func restoreHandler(spec RestoreSpec) fc.Handler {
 	return fc.Handler{
 		Name: "microhosted.RestoreSnapshot",
 		Fn: func(ctx context.Context, m *fc.Machine) error {
-			links := []struct{ src, base string }{
+			// State and memory: the snapshot's sealed inodes, shared by every
+			// restore so the page cache of untouched memory is shared too,
+			// with a read grant for this VM's group that lasts only until the
+			// load below has opened them (see storage.ShareSnapshotFile).
+			// Revoked on every path out of this handler, success or not.
+			shared := []struct{ src, base string }{
 				{spec.StatePath, snapshotStateBase},
 				{spec.MemPath, snapshotMemBase},
-				{spec.DiskPath, spec.DriveBase},
 			}
-			for _, l := range links {
-				if err := os.Link(l.src, filepath.Join(spec.ChrootDir, l.base)); err != nil {
-					return fmt.Errorf("linking %s into chroot: %w", l.src, err)
+			var revokes []func() error
+			defer func() {
+				for _, revoke := range revokes {
+					if err := revoke(); err != nil {
+						// Fail-safe either way: the grant is read-only, and
+						// the next daemon start clears every snapshot ACL.
+						log.Printf("restore: %v", err)
+					}
 				}
+			}()
+			for _, s := range shared {
+				revoke, err := storage.ShareSnapshotFile(s.src, filepath.Join(spec.ChrootDir, s.base), spec.JailGID)
+				revokes = append(revokes, revoke)
+				if err != nil {
+					return fmt.Errorf("sharing %s into chroot: %w", s.src, err)
+				}
+			}
+			// The disk is already this VM's own clone.
+			if err := os.Link(spec.DiskPath, filepath.Join(spec.ChrootDir, spec.DriveBase)); err != nil {
+				return fmt.Errorf("linking %s into chroot: %w", spec.DiskPath, err)
 			}
 
 			var overrides []NetworkOverride
@@ -306,10 +347,36 @@ func restoreHandler(spec RestoreSpec) fc.Handler {
 
 			// m.Cfg.SocketPath is the host-side socket path (jail() rewrote
 			// it); the snapshot paths are what chrooted Firecracker resolves.
-			return SnapshotLoad(ctx, m.Cfg.SocketPath,
-				"/"+snapshotStateBase, "/"+snapshotMemBase, overrides)
+			sock, uid := m.Cfg.SocketPath, JailUID(m)
+			if err := SnapshotLoad(ctx, sock, uid,
+				"/"+snapshotStateBase, "/"+snapshotMemBase, overrides); err != nil {
+				return err
+			}
+			// The vmstate carries the limiters of whatever VM was snapshotted
+			// — none, for a snapshot older than them. The guest runs no
+			// instruction before this VM's own are in place.
+			if rl := DiskRateLimiter(spec.IO); rl != nil {
+				if err := PatchDriveRateLimiter(ctx, sock, uid, rootDriveID, rl); err != nil {
+					return fmt.Errorf("limiting restored disk: %w", err)
+				}
+			}
+			if rl := NetRateLimiter(spec.IO); rl != nil && spec.TapDevice != "" {
+				if err := PatchNetRateLimiter(ctx, sock, uid, "1", rl); err != nil {
+					return fmt.Errorf("limiting restored network: %w", err)
+				}
+			}
+			return ResumeVM(ctx, sock, uid)
 		},
 	}
+}
+
+// JailUID is the uid a machine's Firecracker was jailed as, i.e. the owner its
+// sockets must have. -1 (which jailer.DialSocket refuses) if it isn't jailed.
+func JailUID(m *fc.Machine) int {
+	if m.Cfg.JailerCfg == nil || m.Cfg.JailerCfg.UID == nil {
+		return -1
+	}
+	return *m.Cfg.JailerCfg.UID
 }
 
 // Stop shuts a machine down. It attempts a graceful ACPI power-off first and
@@ -320,7 +387,9 @@ func Stop(ctx context.Context, m *fc.Machine) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	_ = m.Shutdown(shutdownCtx)
+	// Not m.Shutdown: the SDK's client would dial the socket path as is,
+	// following whatever the jailed process put there.
+	_ = SendCtrlAltDel(shutdownCtx, m.Cfg.SocketPath, JailUID(m))
 	_ = m.Wait(shutdownCtx)
 
 	return m.StopVMM()

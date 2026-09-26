@@ -54,7 +54,9 @@ make prepare-image
 
 By default it builds the **ultra-minimal Alpine** (`base-alpine`, ~10 MB
 real, busybox init without systemd, access via vsock exec): kernel + rootfs +
-installation into the CoW store + registration in the catalog. It's the
+installation into the CoW store + registration in the catalog
+(`/var/lib/microhosted/catalog.json`, root-owned; `images/catalog.json` in the
+repo is only the seed a fresh install starts from). It's the
 template designed for density at the edge (it decides how many microVMs fit on
 a host).
 
@@ -63,6 +65,7 @@ Variants:
 ```bash
 make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py   # Alpine + apk packages
 make prepare-image FLAVOR=ubuntu     # Ubuntu noble (~1 GiB, systemd + SSH): base-ubuntu-noble
+make prepare-image FLAVOR=ubuntu-docker  # noble + Docker Engine, dev workstation: dev-ubuntu
 make prepare-image ARCH=aarch64      # image for ARM (cross-compile with qemu-user-static)
 make prepare-image ARCH=x86_64       # the reverse, from an ARM machine
 ```

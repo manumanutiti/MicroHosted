@@ -7,6 +7,9 @@
 #
 # ALWAYS includes socat (required by the vsock listener that prepare-image.sh
 # installs) and openssh-server (the interactive access path).
+#
+# WITH_DOCKER=1 also installs Docker Engine (docker.io from universe) for the
+# development template (FLAVOR=ubuntu-docker in build-image.sh).
 
 set -euo pipefail
 
@@ -14,6 +17,7 @@ OUTPUT="${1:-images/rootfs/base.ext4}"
 SIZE_MB="${2:-1024}"
 DISTRO="${DISTRO:-noble}"   # Ubuntu 24.04
 INCLUDE="socat,openssh-server"
+WITH_DOCKER="${WITH_DOCKER:-0}"
 
 ARCH="${ARCH:-$(uname -m)}"
 case "$ARCH" in
@@ -64,7 +68,7 @@ fi
 TMP_DIR="$(mktemp -d)"
 MOUNT_DIR="${TMP_DIR}/rootfs"
 cleanup() {
-  sudo umount "$MOUNT_DIR" 2>/dev/null || true
+  sudo umount -R "$MOUNT_DIR" 2>/dev/null || true
   sudo rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -81,11 +85,11 @@ sudo mount -o loop "$OUTPUT" "$MOUNT_DIR"
 if [[ "$CROSS" -eq 0 ]]; then
   echo "==> debootstrap ${DISTRO}/${DEBARCH} (native)..."
   sudo debootstrap --arch="$DEBARCH" --include="$INCLUDE" \
-    "$DISTRO" "$MOUNT_DIR" "$MIRROR"
+    --components=main,universe "$DISTRO" "$MOUNT_DIR" "$MIRROR"
 else
   echo "==> debootstrap ${DISTRO}/${DEBARCH} (cross, two stages with qemu)..."
   sudo debootstrap --foreign --arch="$DEBARCH" --include="$INCLUDE" \
-    "$DISTRO" "$MOUNT_DIR" "$MIRROR"
+    --components=main,universe "$DISTRO" "$MOUNT_DIR" "$MIRROR"
   sudo cp "$QEMU_BIN" "$MOUNT_DIR/usr/bin/"
   sudo chroot "$MOUNT_DIR" /debootstrap/debootstrap --second-stage
 fi
@@ -105,6 +109,35 @@ sudo chroot "$MOUNT_DIR" /bin/bash -euo pipefail <<'CHROOT'
   systemctl disable --now snapd.service 2>/dev/null || true
   systemctl disable --now apt-daily.service 2>/dev/null || true
 CHROOT
+
+if [[ "$WITH_DOCKER" == "1" ]]; then
+  echo "==> Installing Docker Engine (docker.io)..."
+  # apt in the chroot needs /proc, /sys and /dev; policy-rc.d keeps the
+  # postinst scripts from trying to start daemons on the build host.
+  sudo mount -t proc proc "$MOUNT_DIR/proc"
+  sudo mount -t sysfs sysfs "$MOUNT_DIR/sys"
+  sudo mount --bind /dev "$MOUNT_DIR/dev"
+  printf '#!/bin/sh\nexit 101\n' | sudo tee "$MOUNT_DIR/usr/sbin/policy-rc.d" >/dev/null
+  sudo chmod 0755 "$MOUNT_DIR/usr/sbin/policy-rc.d"
+
+  sudo chroot "$MOUNT_DIR" /bin/bash -euo pipefail <<'CHROOT'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+      docker.io containerd runc iptables ca-certificates curl git
+    # The Firecracker guest kernel ships the legacy xtables modules but not
+    # nf_tables: noble's default iptables-nft backend would make dockerd fail
+    # to set up its bridge NAT.
+    update-alternatives --set iptables /usr/sbin/iptables-legacy
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+CHROOT
+
+  sudo rm -f "$MOUNT_DIR/usr/sbin/policy-rc.d"
+  sudo umount "$MOUNT_DIR/dev" "$MOUNT_DIR/sys" "$MOUNT_DIR/proc"
+  sudo systemctl --root="$MOUNT_DIR" enable containerd.service docker.service 2>/dev/null || true
+fi
 
 # SSH enabled on first boot (offline unit link; runs nothing from the guest)
 sudo systemctl --root="$MOUNT_DIR" enable ssh.service 2>/dev/null || true

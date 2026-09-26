@@ -11,6 +11,11 @@ type Network struct {
 	ID   string
 	Name string
 
+	// Labels are free key=value metadata, changeable at any time, with the
+	// same rules as a VM's. An orchestrator marks the networks it owns with
+	// them (managed-by=…) and never touches one without its mark.
+	Labels map[string]string
+
 	// Bridge is the Linux bridge device backing this network (mhbr<ID>).
 	Bridge string
 
@@ -119,7 +124,8 @@ type IngressRule struct {
 
 // CreateNetworkRequest is the payload accepted by POST /v1/networks.
 type CreateNetworkRequest struct {
-	Name string `json:"name"`
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
 	// Subnet is optional: if empty, a free /24 is auto-allocated from the pool.
 	Subnet string `json:"subnet,omitempty"`
 	Egress bool   `json:"egress,omitempty"`
@@ -160,24 +166,33 @@ type UpdateNetworkIntraRequest struct {
 	Intra bool `json:"intra"`
 }
 
+// UpdateNetworkLabelsRequest is the payload accepted by
+// PATCH /v1/networks/{name}/labels, a merge patch: a key with a value sets
+// it, a key with null removes it, keys not named are left as they are.
+type UpdateNetworkLabelsRequest struct {
+	Labels map[string]*string `json:"labels"`
+}
+
 // NetworkResponse is the JSON representation of a Network returned by the API.
 type NetworkResponse struct {
-	Name           string        `json:"name"`
-	Bridge         string        `json:"bridge"`
-	Subnet         string        `json:"subnet"`
-	Gateway        string        `json:"gateway"`
-	Egress         bool          `json:"egress"`
-	EgressIface    string        `json:"egress_iface,omitempty"`
-	AllowedEgress  []EgressRule  `json:"allowed_egress,omitempty"`
-	AllowedIngress []IngressRule `json:"allowed_ingress,omitempty"`
-	Intra          bool          `json:"intra"`
-	CreatedAt      string        `json:"created_at"`
+	Name           string            `json:"name"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	Bridge         string            `json:"bridge"`
+	Subnet         string            `json:"subnet"`
+	Gateway        string            `json:"gateway"`
+	Egress         bool              `json:"egress"`
+	EgressIface    string            `json:"egress_iface,omitempty"`
+	AllowedEgress  []EgressRule      `json:"allowed_egress,omitempty"`
+	AllowedIngress []IngressRule     `json:"allowed_ingress,omitempty"`
+	Intra          bool              `json:"intra"`
+	CreatedAt      string            `json:"created_at"`
 }
 
 // NewNetworkResponse builds the API DTO from an internal Network record.
 func NewNetworkResponse(n *Network) NetworkResponse {
 	return NetworkResponse{
 		Name:           n.Name,
+		Labels:         n.Labels,
 		Bridge:         n.Bridge,
 		Subnet:         n.Subnet,
 		Gateway:        n.Gateway,

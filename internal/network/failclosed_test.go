@@ -21,12 +21,23 @@ type fakeHost struct {
 	bridges   map[string]bool
 	applied   [][]types.Network
 	failApply bool
+	ports     [][]Port
+	failPorts bool
 }
 
 func withFakeHost(t *testing.T) *fakeHost {
 	t.Helper()
 	h := &fakeHost{bridges: make(map[string]bool)}
-	oldCreate, oldDelete, oldApply, oldFwd := createBridge, deleteBridge, applyNftables, ensureForwarding
+	oldCreate, oldDelete, oldApply, oldFwd, oldPorts := createBridge, deleteBridge, applyNftables, ensureForwarding, applyPorts
+	applyPorts = func(ports []Port) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.failPorts {
+			return errors.New("nft: simulated port filter failure")
+		}
+		h.ports = append(h.ports, ports)
+		return nil
+	}
 	ensureForwarding = func() {}
 	createBridge = func(name, _ string) error {
 		h.mu.Lock()
@@ -50,7 +61,7 @@ func withFakeHost(t *testing.T) *fakeHost {
 		return nil
 	}
 	t.Cleanup(func() {
-		createBridge, deleteBridge, applyNftables, ensureForwarding = oldCreate, oldDelete, oldApply, oldFwd
+		createBridge, deleteBridge, applyNftables, ensureForwarding, applyPorts = oldCreate, oldDelete, oldApply, oldFwd, oldPorts
 	})
 	return h
 }
@@ -85,7 +96,7 @@ func TestCreateRollsBackWhenApplyFails(t *testing.T) {
 	if len(h.bridges) != 0 {
 		t.Errorf("bridge left behind: %v", h.bridges)
 	}
-	if _, _, _, _, err := m.AttachVM("lab", "deadbeef"); err == nil {
+	if _, _, _, _, err := m.AttachVM("lab", "deadbeef", "tapdeadbeef"); err == nil {
 		t.Error("a VM could attach to a network whose rules never applied")
 	}
 
@@ -104,7 +115,7 @@ func TestCreateInstallsRulesBeforeAttachable(t *testing.T) {
 
 	var sawPendingAttach bool
 	applyNftables = func(nets []types.Network, _ []ManagedIface) error {
-		if _, _, _, _, err := m.AttachVM("lab", "deadbeef"); err == nil {
+		if _, _, _, _, err := m.AttachVM("lab", "deadbeef", "tapdeadbeef"); err == nil {
 			sawPendingAttach = true
 		}
 		h.applied = append(h.applied, nets)
@@ -121,7 +132,7 @@ func TestCreateInstallsRulesBeforeAttachable(t *testing.T) {
 	if len(last) != 1 || last[0].Bridge != n.Bridge {
 		t.Errorf("the applied ruleset does not list the new bridge: %+v", last)
 	}
-	if _, _, _, _, err := m.AttachVM("lab", "deadbeef"); err != nil {
+	if _, _, _, _, err := m.AttachVM("lab", "deadbeef", "tapdeadbeef"); err != nil {
 		t.Errorf("attach after create: %v", err)
 	}
 }

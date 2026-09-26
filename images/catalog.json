@@ -9,15 +9,6 @@
     "disk_mb": 1024
   },
   {
-    "name": "alpine-py",
-    "description": "Ultra-minimal Alpine busybox + python3 (vsock exec, no systemd)",
-    "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
-    "rootfs_path": "/var/lib/microhosted/store/rootfs/alpine-py.ext4",
-    "vcpus": 1,
-    "mem_mb": 128,
-    "disk_mb": 512
-  },
-  {
     "name": "base-ubuntu-noble",
     "description": "Ubuntu noble (debootstrap, make prepare-image)",
     "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
@@ -40,6 +31,15 @@
     "description": "Ultra-minimal Alpine, busybox init + vsock exec (make prepare-image)",
     "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
     "rootfs_path": "/var/lib/microhosted/store/rootfs/alpine_py.ext4",
+    "vcpus": 1,
+    "mem_mb": 128,
+    "disk_mb": 512
+  },
+  {
+    "name": "alpine-py",
+    "description": "Ultra-minimal Alpine, busybox init + vsock exec (make prepare-image)",
+    "kernel_path": "/var/lib/microhosted/store/kernels/vmlinux-6.1.102",
+    "rootfs_path": "/var/lib/microhosted/store/rootfs/alpine-py.ext4",
     "vcpus": 1,
     "mem_mb": 128,
     "disk_mb": 512

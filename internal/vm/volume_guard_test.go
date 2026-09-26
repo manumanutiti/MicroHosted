@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"microhosted/internal/jailer"
 	"microhosted/pkg/types"
 )
 
@@ -42,7 +43,7 @@ func TestAttachRejectedWhileVolumeBusy(t *testing.T) {
 	m.vols["vol1"] = &types.Volume{ID: "vol1", Name: "v", Path: "/nope.ext4"}
 	m.volIO["vol1"] = true
 
-	if _, err := m.attachVolumes("vm1", []types.VolumeAttachRequest{{Name: "v"}}); !errors.Is(err, ErrConflict) {
+	if _, err := m.attachVolumes("vm1", jailer.DefaultIDBase, []types.VolumeAttachRequest{{Name: "v"}}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("attachVolumes on busy volume = %v, want ErrConflict", err)
 	}
 	// The failed attach must not have left the volume marked attached.
@@ -53,23 +54,33 @@ func TestAttachRejectedWhileVolumeBusy(t *testing.T) {
 
 func TestBeginVolumeIOReservesAndReleases(t *testing.T) {
 	m := newTestManager(t)
-	m.vols["vol1"] = &types.Volume{ID: "vol1", Name: "v", Path: "/nope.ext4"}
+	m.vols["vol1"] = &types.Volume{ID: "vol1", Name: "v", Path: "/nope.ext4", UID: jailer.DefaultIDBase + 3}
 
-	path, err := m.beginVolumeIO("vol1")
+	path, uid, err := m.beginVolumeIO("vol1")
 	if err != nil {
 		t.Fatalf("beginVolumeIO: %v", err)
 	}
-	if path != "/nope.ext4" {
-		t.Fatalf("path = %q", path)
+	if path != "/nope.ext4" || uid != jailer.DefaultIDBase+3 {
+		t.Fatalf("path, uid = %q, %d", path, uid)
 	}
 	// A second reservation must fail while the first is held.
-	if _, err := m.beginVolumeIO("vol1"); !errors.Is(err, ErrConflict) {
+	if _, _, err := m.beginVolumeIO("vol1"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second beginVolumeIO = %v, want ErrConflict", err)
 	}
 	m.endVolumeIO("vol1")
 	// After release it's reservable again.
-	if _, err := m.beginVolumeIO("vol1"); err != nil {
+	if _, _, err := m.beginVolumeIO("vol1"); err != nil {
 		t.Fatalf("beginVolumeIO after release: %v", err)
+	}
+}
+
+// A volume without an identity (a record the startup could not migrate) is
+// never parsed: debugfs would have no one but root to run as.
+func TestBeginVolumeIORefusesVolumeWithoutIdentity(t *testing.T) {
+	m := newTestManager(t)
+	m.vols["vol1"] = &types.Volume{ID: "vol1", Name: "v", Path: "/nope.ext4"}
+	if _, _, err := m.beginVolumeIO("vol1"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("beginVolumeIO = %v, want ErrConflict", err)
 	}
 }
 

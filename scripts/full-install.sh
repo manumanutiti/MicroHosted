@@ -160,7 +160,7 @@ esac
 echo ""
 
 # Is there any usable template? (a catalog with existing kernel+rootfs)
-MISSING="$(python3 - images/catalog.json <<'PY' 2>/dev/null || true
+MISSING="$(python3 - /var/lib/microhosted/catalog.json <<'PY' 2>/dev/null || true
 import json, os, sys
 try:
     cat = json.load(open(sys.argv[1]))

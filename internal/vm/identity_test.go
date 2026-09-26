@@ -34,33 +34,6 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
-func TestValidateLabels(t *testing.T) {
-	for _, tc := range []struct {
-		labels map[string]string
-		ok     bool
-	}{
-		{nil, true},
-		{map[string]string{"sensor": "ts-01"}, true},
-		{map[string]string{"ot.plant/managed-by": "ot-orch"}, true},
-		{map[string]string{"role": ""}, true}, // present, empty value
-		{map[string]string{"Sensor": "x"}, false},
-		{map[string]string{"sensor": "has space"}, false},
-		{map[string]string{"sensor": "-x"}, false},
-		{map[string]string{"": "x"}, false},
-	} {
-		if err := ValidateLabels(tc.labels); (err == nil) != tc.ok {
-			t.Errorf("ValidateLabels(%v) = %v, want ok=%v", tc.labels, err, tc.ok)
-		}
-	}
-	many := make(map[string]string)
-	for i := 0; i <= maxLabels; i++ {
-		many[string(rune('a'+i%26))+string(rune('a'+i/26))] = "v"
-	}
-	if err := ValidateLabels(many); err == nil {
-		t.Errorf("%d labels accepted, the cap is %d", len(many), maxLabels)
-	}
-}
-
 // The shape is checked before anything else: a VM with -1 vCPUs must be a 400,
 // not a Firecracker failure after a clone and a TAP were made.
 func TestCreateRejectsInvalidRequestFirst(t *testing.T) {
@@ -180,29 +153,5 @@ func TestSetLabelsMergePatch(t *testing.T) {
 
 	if _, err := m.SetLabels("nope0000", nil); !errors.Is(err, ErrVMNotFound) {
 		t.Errorf("unknown VM = %v, want ErrVMNotFound", err)
-	}
-}
-
-func TestLabelSelector(t *testing.T) {
-	sel, err := ParseLabelSelector([]string{"sensor=ts-01", "role=parser,owner=ot"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !sel.Matches(map[string]string{"sensor": "ts-01", "role": "parser", "owner": "ot", "extra": "x"}) {
-		t.Error("a VM with every label (and more) must match")
-	}
-	if sel.Matches(map[string]string{"sensor": "ts-01", "role": "parser"}) {
-		t.Error("a VM missing one label must not match")
-	}
-	if empty, _ := ParseLabelSelector(nil); !empty.Matches(nil) {
-		t.Error("an empty selector selects everything")
-	}
-	for _, bad := range []string{"sensor", "Sensor=x", "sensor=a b"} {
-		if _, err := ParseLabelSelector([]string{bad}); !errors.Is(err, ErrInvalid) {
-			t.Errorf("selector %q = %v, want ErrInvalid", bad, err)
-		}
-	}
-	if _, err := ParseLabelSelector([]string{"sensor=a", "sensor=b"}); err == nil {
-		t.Error("a selector asking one key for two values can match nothing; refuse it")
 	}
 }

@@ -665,3 +665,19 @@ func TestIngressClash(t *testing.T) {
 		}
 	}
 }
+
+// A TAP is never created without an owner: an ownerless TAP can be attached
+// by any process that opens /dev/net/tun.
+func TestTuntapAddRequiresOwner(t *testing.T) {
+	if _, err := tuntapAdd("tapdeadbeef", 0); err == nil {
+		t.Fatal("ownerless TAP accepted")
+	}
+	args, err := tuntapAdd("tapdeadbeef", 1900000007)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ip tuntap add tapdeadbeef mode tap user 1900000007 group 1900000007"
+	if got := strings.Join(args, " "); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

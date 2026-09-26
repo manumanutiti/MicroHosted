@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	"microhosted/internal/jailer"
 )
 
 // This file talks to Firecracker's REST API directly over its Unix socket,
@@ -76,14 +78,21 @@ func SupportsNetworkOverrides(execFile string) bool {
 }
 
 // httpOverUDS returns an http.Client whose every request is dialed to the
-// given Unix socket, whatever the URL's host says.
-func httpOverUDS(socketPath string) *http.Client {
+// given Unix socket, whatever the URL's host says. The socket lives in the
+// VM's chroot, so it is reached without following anything the jailed
+// Firecracker could have planted there, and must be owned by uid, the VM's
+// jailed identity (see jailer.DialSocket).
+func httpOverUDS(socketPath string, uid int) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", socketPath)
+				return jailer.DialSocket(ctx, socketPath, uid)
 			},
+			// The peer is the jailed Firecracker process, which the daemon
+			// treats as compromisable: cap its response headers well below
+			// net/http's generous default. Bodies are already read through
+			// io.LimitReader.
+			MaxResponseHeaderBytes: 64 << 10,
 		},
 		Timeout: 30 * time.Second,
 	}
@@ -91,7 +100,7 @@ func httpOverUDS(socketPath string) *http.Client {
 
 // apiCall sends one JSON request to Firecracker's API socket and fails on any
 // non-2xx response, surfacing Firecracker's own fault message.
-func apiCall(ctx context.Context, socketPath, method, path string, body interface{}) error {
+func apiCall(ctx context.Context, socketPath string, uid int, method, path string, body interface{}) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshaling %s %s body: %w", method, path, err)
@@ -103,7 +112,7 @@ func apiCall(ctx context.Context, socketPath, method, path string, body interfac
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpOverUDS(socketPath).Do(req)
+	resp, err := httpOverUDS(socketPath, uid).Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s on %s: %w", method, path, socketPath, err)
 	}
@@ -118,19 +127,19 @@ func apiCall(ctx context.Context, socketPath, method, path string, body interfac
 
 // PauseVM freezes a running microVM's vCPUs. Required before snapshotting —
 // Firecracker rejects snapshot creation on a running VM.
-func PauseVM(ctx context.Context, socketPath string) error {
-	return apiCall(ctx, socketPath, http.MethodPatch, "/vm", map[string]string{"state": "Paused"})
+func PauseVM(ctx context.Context, socketPath string, uid int) error {
+	return apiCall(ctx, socketPath, uid, http.MethodPatch, "/vm", map[string]string{"state": "Paused"})
 }
 
 // ResumeVM unfreezes a paused microVM's vCPUs.
-func ResumeVM(ctx context.Context, socketPath string) error {
-	return apiCall(ctx, socketPath, http.MethodPatch, "/vm", map[string]string{"state": "Resumed"})
+func ResumeVM(ctx context.Context, socketPath string, uid int) error {
+	return apiCall(ctx, socketPath, uid, http.MethodPatch, "/vm", map[string]string{"state": "Resumed"})
 }
 
 // SnapshotCreate asks a (paused) VM to write a full snapshot: device/vCPU
 // state to statePath and guest memory to memPath, both chroot-relative.
-func SnapshotCreate(ctx context.Context, socketPath, statePath, memPath string) error {
-	return apiCall(ctx, socketPath, http.MethodPut, "/snapshot/create", map[string]string{
+func SnapshotCreate(ctx context.Context, socketPath string, uid int, statePath, memPath string) error {
+	return apiCall(ctx, socketPath, uid, http.MethodPut, "/snapshot/create", map[string]string{
 		"snapshot_type": "Full",
 		"snapshot_path": statePath,
 		"mem_file_path": memPath,
@@ -146,21 +155,30 @@ type NetworkOverride struct {
 }
 
 // SnapshotLoad restores a snapshot into a freshly started (not yet booted)
-// Firecracker process and resumes it. statePath/memPath are chroot-relative.
+// Firecracker process and leaves it PAUSED: the caller sets what the vmstate
+// cannot be trusted to carry (rate limiters) and then resumes it with
+// ResumeVM. statePath/memPath are chroot-relative.
 // The mem backend is File: guest pages are mapped copy-on-write from the file,
 // so the snapshot's memory is never written to — any number of restored VMs
 // can share one mem file.
-func SnapshotLoad(ctx context.Context, socketPath, statePath, memPath string, overrides []NetworkOverride) error {
+func SnapshotLoad(ctx context.Context, socketPath string, uid int, statePath, memPath string, overrides []NetworkOverride) error {
 	body := map[string]interface{}{
 		"snapshot_path": statePath,
 		"mem_backend": map[string]string{
 			"backend_type": "File",
 			"backend_path": memPath,
 		},
-		"resume_vm": true,
+		"resume_vm": false,
 	}
 	if len(overrides) > 0 {
 		body["network_overrides"] = overrides
 	}
-	return apiCall(ctx, socketPath, http.MethodPut, "/snapshot/load", body)
+	return apiCall(ctx, socketPath, uid, http.MethodPut, "/snapshot/load", body)
+}
+
+// SendCtrlAltDel asks the guest for an orderly power-off. Replaces the SDK's
+// Machine.Shutdown, whose client dials the API socket path as given — after
+// boot that path is in a chroot the guest-facing process controls.
+func SendCtrlAltDel(ctx context.Context, socketPath string, uid int) error {
+	return apiCall(ctx, socketPath, uid, http.MethodPut, "/actions", map[string]string{"action_type": "SendCtrlAltDel"})
 }

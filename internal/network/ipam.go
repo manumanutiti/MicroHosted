@@ -172,6 +172,17 @@ func (s *Subnet) ReserveExclusive(vmID, ipStr string) error {
 	return nil
 }
 
+// IPOf returns the address vmID holds, if any.
+func (s *Subnet) IPOf(vmID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.used[vmID]
+	if !ok {
+		return "", false
+	}
+	return uint32ToIP(v).String(), true
+}
+
 // Release frees the address held by vmID.
 func (s *Subnet) Release(vmID string) {
 	s.mu.Lock()

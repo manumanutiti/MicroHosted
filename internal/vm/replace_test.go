@@ -163,6 +163,9 @@ func TestReplaceRefusesBeforeTouchingAnything(t *testing.T) {
 	withVol := sensorVM()
 	withVol.ID, withVol.Name = "c0000001", ""
 	withVol.Volumes = []types.VolumeMount{{VolumeID: "v1"}}
+	withFiles := sensorVM()
+	withFiles.ID, withFiles.Name = "d0000001", ""
+	withFiles.Files = []types.InjectedFile{{Path: "/etc/parser.conf", Mode: "0644"}}
 
 	for _, tc := range []struct {
 		name string
@@ -176,6 +179,11 @@ func TestReplaceRefusesBeforeTouchingAnything(t *testing.T) {
 		{"unknown snapshot", sensorVM(), types.ReplaceVMRequest{Snapshot: "nope"}, ErrSnapshotNotFound},
 		{"no network", noNet, types.ReplaceVMRequest{}, ErrConflict},
 		{"volumes", withVol, types.ReplaceVMRequest{}, ErrConflict},
+		// The daemon has no contents to give the replacement: not silently
+		// born unconfigured.
+		{"files not given again", withFiles, types.ReplaceVMRequest{}, ErrInvalid},
+		{"files into a snapshot", sensorVM(), types.ReplaceVMRequest{Snapshot: "s", Files: []types.FileSpec{{Path: "/x"}}}, ErrInvalid},
+		{"bad file", sensorVM(), types.ReplaceVMRequest{Files: []types.FileSpec{{Path: "/x", Mode: "4755"}}}, ErrInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, f := newReplaceManager(t, tc.cfg)
@@ -251,5 +259,28 @@ func TestReplaceEvents(t *testing.T) {
 	}
 	if d := backlog[2].Data; d["replacement"] != nv.Config.ID || d["old"] != types.ReplaceOldDestroy {
 		t.Errorf("replaced data = %v", d)
+	}
+}
+
+// Files given again reach the replacement; an explicit empty list drops them.
+func TestReplacePassesFiles(t *testing.T) {
+	cfg := sensorVM()
+	cfg.Files = []types.InjectedFile{{Path: "/etc/parser.conf", Mode: "0644"}}
+	files := []types.FileSpec{{Path: "/etc/parser.conf", Content: []byte("port=502")}}
+
+	m, f := newReplaceManager(t, cfg)
+	if _, _, err := m.Replace(context.Background(), cfg.ID, types.ReplaceVMRequest{Files: files}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(f.calls[0].files, files) {
+		t.Errorf("launch files = %+v", f.calls[0].files)
+	}
+
+	m, f = newReplaceManager(t, cfg)
+	if _, _, err := m.Replace(context.Background(), cfg.ID, types.ReplaceVMRequest{Files: []types.FileSpec{}}); err != nil {
+		t.Fatalf("explicit empty list: %v", err)
+	}
+	if len(f.calls[0].files) != 0 {
+		t.Errorf("launch files = %+v, want none", f.calls[0].files)
 	}
 }

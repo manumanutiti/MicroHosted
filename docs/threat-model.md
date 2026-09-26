@@ -87,12 +87,23 @@ Ordered from the guest outwards: what an attacker inside a VM meets first.
   virtio-block, virtio-vsock, a serial console and the minimum needed to reset
   the machine — and nothing else: no USB, no PCI passthrough, no graphics. It is written in Rust
   and applies its **built-in seccomp filters** per thread, restricting the host
-  syscalls the VMM can make; the daemon never disables them.
-- **Where:** `internal/firecracker`.
+  syscalls the VMM can make.
+- **Where:** `internal/firecracker` (`seccomp.go`).
 - **Does not stop:** a bug in those devices. That is what Layer 3 is for.
-- **Verification status:** the seccomp filters are Firecracker's defaults and are
-  active unless `--no-seccomp` is passed (it never is); they have not yet been
-  independently verified on the running process (roadmap Phase 3).
+- **What the filter allows** (Firecracker v1.16.1 defaults, per thread): new
+  sockets only `AF_UNIX` stream — no IP, packet or netlink sockets, so no path
+  into the host's network stack; `kill` not at all, `tkill` only `SIGABRT` and
+  the vCPU kick signal (and only to threads its uid may signal); `openat`
+  unrestricted, within the chroot. `connect` is unrestricted on the VMM thread
+  (vsock needs it), which leaves abstract Unix sockets reachable — see §7.
+- **Verification status:** checked on the running process at every boot and
+  restore: every thread of the VMM must be in seccomp mode 2, or the VM is
+  killed before it runs (fail-closed); `mh doctor` reports a running VM
+  without filters (`seccomp_off`), and `scripts/security-test.sh` asserts it
+  for every running VM. This check exists because the filters were **off**
+  until 2026-09: the Firecracker Go SDK passes `--no-seccomp` unless seccomp is
+  enabled explicitly, which the daemon did not do, while this document said
+  otherwise. A VM started before the fix runs unfiltered until it boots again.
 
 ### Layer 3 — The jail around the VMM (Jailer)
 
@@ -101,7 +112,14 @@ Assume the guest has escaped into the Firecracker process. It is then:
 - **chrooted** (pivot_root) into `<store>/jailer/firecracker/<id>/root/`, which
   holds only that VM's kernel, disk, API socket and vsock socket (hard links on the
   store) — no host filesystem, no other VM's files;
-- running as an **unprivileged user** (uid 123, gid 100), not root;
+- running as an **unprivileged identity of its own** — a uid and gid from a
+  range reserved for the daemon (default 1900000000+), never shared with another
+  VM, a volume or any host account (the daemon refuses to start on a range that
+  overlaps `/etc/passwd`, `/etc/group` or `/etc/sub[ug]id`). It owns that VM's
+  disk and attached volumes and nothing else: not another VM's files, not their
+  processes, not their TAPs (each TAP is created with its VM's identity as
+  owner, so no other uid can attach to it). An identity returns to the pool only
+  once its VM is gone and is never reissued while any process runs as it;
 - inside a **per-VM cgroup** with hard limits written by the daemon on every
   boot: `cpu.max` = its vCPUs, `memory.max` = its memory + 64 MiB of VMM
   overhead with **swap disabled**, `pids.max` = vCPUs + small headroom
@@ -110,14 +128,40 @@ Assume the guest has escaped into the Firecracker process. It is then:
 - given `oom_score_adj = 0` while the daemon has `-900`: under host memory
   pressure the kernel kills a VM, never the daemon that holds all of them.
 
+The chroot belongs to the VM's identity, so everything in it — including the
+API and vsock sockets the daemon connects to — is under the escaped process's
+control. The daemon (root) therefore never connects to a path there as given:
+
+- the jail directory above the chroot must be root-owned and not group- or
+  world-writable;
+- the path inside the chroot is resolved with `openat2` refusing every symlink,
+  magic link, mount crossing and escape from the jail;
+- the result must be a socket **owned by that VM's identity** — which also rules
+  out a hard link to a host socket;
+- the connect goes through that very inode (`/proc/self/fd/N`), so nothing can
+  be swapped in between the check and the connect.
+
+A VMM that plants a link to a host socket (the daemon's API, systemd, a
+container runtime) gets a refused connection, not root talking to that socket.
+
 - **Where:** `internal/jailer/config.go`, `internal/jailer/cgroup.go`,
-  `internal/vm/manager.go` (`applyLimits`).
+  `internal/jailer/sockdial.go`, `internal/firecracker/ratelimit.go`,
+  `internal/vm/manager.go` (`applyLimits`), `internal/vm/iolimits.go`.
 - **Stops:** reading host files, acting as root, pinning every core, ballooning
-  memory, fork-bombing the host.
-- **Does not stop:** disk and network **throughput** (no I/O rate limits yet).
-  The jailed process is not given a network or PID namespace of its own (Jailer's
+  memory, fork-bombing the host, saturating the storage device or the network
+  for the other VMs, redirecting the daemon's connections to a host
+  socket.
+- Disk and network **throughput** are capped by Firecracker's rate limiters:
+  every drive and both directions of the NIC, at the lower of the VM's own
+  `io_limits` and the daemon's ceiling (on by default: 100 MiB/s and 4000 IOPS
+  per drive, 100 Mbit/s per direction). A VM can lower its limits, never raise
+  them; a restored VM gets its limits set before it runs a single instruction.
+- **Does not stop:** the jailed process is not given a network or PID namespace of its own (Jailer's
   `--netns` / `--new-pid-ns` are not used); what it can do in the host's
-  namespaces is bounded by its uid, its chroot and the seccomp filter.
+  namespaces is bounded by its uid, its chroot and the seccomp filter. In the
+  PID namespace that leaves nothing: it cannot `kill`, and `tkill` reaches only
+  threads its uid may signal. In the network namespace it leaves abstract Unix
+  sockets (see §7).
 
 ### Layer 4 — The network
 
@@ -134,6 +178,22 @@ the host:
   this is the only layer that can separate it.)
 - or attached to **nothing**, for a quarantined VM: every frame dies at the TAP.
 - or absent: a VM created with `no_network` has no NIC at all.
+
+Each bridge port is **pinned to its VM's addresses** (a `bridge microhosted`
+nftables table, separate from the one below because only the bridge family sees
+frames switched inside one bridge). A frame entering one of our bridges is
+accepted only if it is:
+
+- IPv4 with the port's own source MAC **and** source IP (the IP its network
+  leased, the MAC derived from it), or
+- Ethernet/IPv4 ARP whose frame source, sender hardware address and sender IP
+  are all the port's own.
+
+Everything else — another address, a forged ARP reply, IPv6, VLAN-tagged or
+any other ethertype — is dropped, and so is every frame from a port the table
+does not list. A lease is pinned **before** its TAP is created: if the filter
+cannot be installed, the attach fails and the address is released; a stopped
+VM does not rejoin its bridge until the filter is in force.
 
 **4b. What the host lets through** — one nftables table, `inet microhosted`,
 rendered in full from the declared state and applied atomically (`nft -f`):
@@ -182,14 +242,14 @@ when the VM holding it is destroyed or quarantined, an unrelated new VM cannot
 silently start receiving the traffic meant for the function. Only an explicit
 claim (a replacement) takes it.
 
-- **Where:** `internal/network/nftables.go`, `manager.go`, `bridge.go`, `ipam.go`.
+- **Where:** `internal/network/nftables.go`, `portfilter.go`, `manager.go`,
+  `bridge.go`, `ipam.go`.
 - **Verification:** isolation between VMs, between networks, guest→host, egress
   on/off and fine-grained, managed interfaces and ingress were validated on test
   hardware; the fail-closed paths were fault-injected (`scripts/fault-test.sh`),
   pinning by `scripts/replace-test.sh`.
-- **Does not stop:** see §7 — address spoofing *inside* one network, a device's
-  spoofed `src_ip`, and traffic between two devices on the same segment (which
-  never crosses the host).
+- **Does not stop:** see §7 — a device's spoofed `src_ip`, and traffic between
+  two devices on the same segment (which never crosses the host).
 
 ### Layer 5 — The control channel (vsock)
 
@@ -214,13 +274,54 @@ one-directional by construction:
 - **The host never mounts a guest filesystem.** Mounting an attacker-controlled
   ext4 image exposes the host kernel's filesystem parser. Files are copied into
   and out of a stopped VM or a volume with `debugfs`, a userspace tool, run as
-  the jailer's unprivileged uid: a malformed image can at worst crash that
-  process.
+  the identity that owns that image (the VM's, or the detached volume's own): a
+  malformed image can at worst compromise a process holding that one image's
+  permissions.
+- **Configuration goes in before the first boot** (`files` on create and
+  replace), through the same `debugfs` path as the VM's identity, and is read
+  back byte by byte before the VM boots: no agent inside the guest receives
+  it, and no VM runs half-configured. File contents are never kept in the
+  VM's record or logged; the record has path, mode, owner and size, plus a
+  SHA-256 for files that are not secrets. They are staged on the store (0600, removed at once)
+  and end up in the VM's disk, which is as private as any disk (0600, its VM's
+  identity).
 - **Read-only volumes are read-only at the block device** (`is_read_only` in
   Firecracker), not by a mount option the guest could change.
 - **Copy-on-write clones** mean no VM writes into a golden image or another VM's
-  disk.
-- **Where:** `internal/storage`.
+  disk. A clone is mode 0600, owned by its VM's identity: its VM's alone. A
+  volume belongs to the VM it is attached to, and to its own identity while
+  detached.
+- **The store is private.** Its directories are 0711 (traversable by the jailer
+  identity, listable by no one); disks, volumes and console logs are 0600. The
+  daemon enforces these modes at every start, so stores created by older
+  versions are migrated.
+- **The daemon's own state is root's alone.** The database and the template
+  catalog decide which paths the root daemon truncates, deletes and boots, so
+  they live in `/var/lib/microhosted`, owned by root (database 0600). The daemon
+  refuses to start if either file, or any directory above it, is owned by
+  anyone else or writable by group or others.
+- **Snapshots are sealed.** Memory image and vmstate are copied out of the
+  source VM's chroot into fresh root-only inodes (0400) — never renamed, so no
+  descriptor Firecracker kept open reaches them — in a 0700 directory. Every
+  restore or fork maps that same sealed inode (so forks share the page cache of
+  untouched memory), hard-linked into its chroot. The restoring VM's group gets
+  a read-only ACL entry only while Firecracker loads the snapshot; it is revoked
+  as soon as the load returns, and at every daemon start. No VMM can write the
+  snapshot, none keeps a standing grant, and a reissued identity inherits none.
+  On a filesystem without POSIX ACLs each restore gets a private copy instead.
+  A snapshot that fails these checks at startup is not offered for forks.
+- **Output from the host tools that parse guest images is bounded.** `debugfs`,
+  `e2fsck` and `resize2fs` output is capped at 1 MiB in the daemon's memory, as
+  are the vsock control lines (4 KiB) and exec responses (8 MiB).
+- **Images are content-addressed and immutable.** A store image's kernel and
+  rootfs are hashed once at import, over the store's own copy, and kept 0444
+  in a root-only directory; a new build is a new digest and a tag never moves.
+  A VM created by digest — and its replacement, which reuses the digest —
+  boots exactly the bytes that were validated, not whatever a path holds now.
+  Imports read only files under the daemon's store directory, so the API
+  cannot be used to copy an arbitrary host file into a VM. `mh doctor` flags a
+  store file gone missing or writable; `mh image verify` re-hashes on demand.
+- **Where:** `internal/storage`, `internal/images`.
 
 ### Layer 7 — The API
 
@@ -239,8 +340,12 @@ The API can do everything, so who can reach it is the question.
   interpolated into an `nft` script, so anything that is not a canonical IPv4
   address or CIDR, a known protocol, a numeric port and a managed interface is
   rejected before rendering (ruleset injection).
-- **Where:** `internal/api/listen.go`, `internal/network/nftables.go`
-  (`ValidateEgressRules`, `ValidateIngressRules`).
+- **Request bodies are parsed strictly**: unknown fields, a key given twice
+  (also with different case), anything but one JSON object, and bodies over
+  1 MiB are refused. A misspelt policy field cannot silently become "no rule",
+  and two readers of one body cannot disagree on what it says.
+- **Where:** `internal/api/listen.go`, `internal/api/decode.go`,
+  `internal/network/nftables.go` (`ValidateEgressRules`, `ValidateIngressRules`).
 
 ### Layer 8 — Host resources
 
@@ -248,6 +353,16 @@ The API can do everything, so who can reach it is the question.
   `--mem-reserve-mb` (512 MB) of the host's available memory, or exceed
   `--max-vms`; at most `--max-parallel-boots` launches run at once. A flood of
   create requests cannot push the host into its OOM killer.
+- **Per-consumer quotas:** `--quota CONSUMER=vms:N,mem:MB` caps what the VMs
+  labelled `managed-by=CONSUMER` hold at once (429 over it); the label is fixed
+  at create, so a VM cannot leave its quota. Set on the daemon only. Any API
+  client is root-equivalent, so this contains one consumer's bugs and floods,
+  not a malicious consumer.
+- **Store space:** disks are thin, so the store keeps `--disk-reserve-mb`
+  (1024 MB) free: a launch, snapshot, volume, image import or upload that would
+  leave less is refused (503), and `host.disk_low` is raised while the store is
+  under it. This bounds what the operator's actions can take, not what running
+  guests write (see §7).
 - **Per-VM caps** (Layer 3) bound what each running VM can take.
 - **The daemon survives memory pressure** (`OOMScoreAdjust=-900`), and systemd
   restarts it forever with a growing delay if it crashes — the VMs keep running
@@ -305,7 +420,7 @@ VM has a memory-safety bug; the attacker now has root in that VM. What next?
 | use the IN rule backwards (bind 1883 as a source port) | dropped: return leg only carries replies | L4b — `ct direction reply` |
 | exhaust the host (fork bomb, memory, CPU) | capped by its cgroup; its OOM kill is reported as `vm.died` | L3, L8 |
 | flood the daemon through vsock | answers capped at 8 MiB and 30 s; the guest cannot open the channel | L5 |
-| escape the VM through a Firecracker device bug | lands as uid 123 in a chroot with its own files only, capped by its cgroup, inside a seccomp filter | L2, L3 |
+| escape the VM through a Firecracker device bug | lands as that VM's own uid in a chroot with its own files only, capped by its cgroup, inside a seccomp filter | L2, L3 |
 | send forged readings | **not stopped by the engine** — the orchestrator's validation must notice; then quarantine + replace within a VM boot time, suspect kept for forensics | L9 |
 
 The last row is the honest one: isolation contains the attacker, it does not make
@@ -340,38 +455,55 @@ the operator:
 
 Stated plainly, most important first.
 
-1. **Address spoofing inside one network.** The engine does not pin a VM's source
-   IP or MAC to its TAP. A compromised VM can configure another address of its own
-   subnet and answer ARP for it; the host's neighbor cache may then send it
-   traffic meant for that address — including traffic from an IN rule. Isolated
-   ports stop VM↔VM frames, not VM↔host ARP. **Mitigation today:** one function
-   per network (the recommended topology), so there is no other address worth
-   stealing. **Planned:** per-TAP source filtering.
-2. **No disk or network throughput limits per VM.** CPU, memory and PIDs are
-   capped; I/O is not. A compromised VM can saturate the storage device or its
-   bridge and degrade the other VMs. Firecracker's per-drive and per-interface
-   rate limiters are not wired yet.
-3. **The console log has no size limit.** A guest's serial console is written to
-   `<store>/<id>.log` on the host (truncated at each boot). A guest printing
-   endlessly to its console grows that file until the store is full.
-   **Planned:** a cap.
-4. **The daemon runs as root.** It needs to create TAPs, bridges, cgroups and
+1. **VMs are not pinned while the port filter is down.** Each TAP is pinned to
+   its VM's MAC and IP (Layer 4), so a compromised VM cannot use another address
+   or answer ARP for one. If the filter cannot be installed at startup, the
+   daemon still starts; VMs already running keep the filter the previous run left
+   in the kernel, and no VM joins a bridge until it is in force (`port_filter_failed`
+   in `mh doctor`). After a host reboot there is no previous filter, so nothing
+   joins until the install succeeds.
+2. **Throughput limits are per device and not shared.** Firecracker has no
+   budget across devices: a VM with volumes gets the disk limit on each drive,
+   and N VMs together get N times the limit — the ceiling bounds one VM's share,
+   not the host's total. Size it for the storage and uplink in use, and lift a
+   limit (`0`) only knowingly: the daemon logs it. VMs keep the limits they
+   booted with until their next boot.
+3. **Running guests can fill the store.** Disks are thin: a clone or volume
+   takes space only as its guest writes, and together they may be larger than
+   the store. Admission keeps `--disk-reserve-mb` free against new work, but a
+   running guest can still write into that reserve, at most at its disk
+   throughput limit. If the store fills anyway, every VM on it gets I/O errors.
+   `host.disk_low` (event) and `disk_low` (`mh doctor`) fire when the reserve
+   is breached; size the reserve to cover the time needed to react, and keep
+   each VM's `disk_mb` no larger than it needs.
+4. **Console output is capped, not rate-limited.** Firecracker writes the
+   guest's serial console to a pipe the daemon drains into `<store>/<id>.log`
+   (mode 0600), rotated to `<id>.log.1` at 2 MiB: a VM costs at most 4 MiB of
+   console log however much it prints. Output printed while the daemon is
+   restarting is dropped; a VM started by an older daemon writes its log
+   directly and uncapped until its next boot.
+5. **The daemon runs as root.** It needs to create TAPs, bridges, cgroups and
    nftables rules. The layers above exist to keep the guest away from it; a bug
    in the daemon reachable from the guest's answers (vsock) would be serious —
    which is why that input is bounded and parsed minimally.
-5. **Side channels.** VMs sharing physical cores may leak data through
+6. **Side channels.** VMs sharing physical cores may leak data through
    speculative-execution side channels. Mitigate with up-to-date microcode and
    kernel mitigations and, where it matters, by disabling SMT or pinning VMs to
    dedicated cores. Not managed by the engine.
-6. **Seccomp and cgroup values not independently audited** on a running process;
-   they are Firecracker's defaults and the daemon's written limits, respectively
-   (roadmap Phase 3: an adversarial suite that asserts them).
-7. **Public DNS resolvers** are configured in guests; on networks without egress
+7. **Abstract Unix sockets on the host are reachable from an escaped VMM.**
+   They belong to the network namespace, not to the filesystem, so the chroot
+   does not hide them, and the VMM shares the host's namespace; its seccomp
+   filter allows `AF_UNIX` sockets and `connect`. A compromised VMM could reach
+   any service listening on one (`ss -xl | grep @`), as its own uid. Keep such
+   services off the host — notably containerd shims, the subject of
+   CVE-2020-15257 — until each VMM gets its own network namespace (Jailer
+   `--netns`; roadmap Phase 3).
+8. **Public DNS resolvers** are configured in guests; on networks without egress
    they are unreachable (DNS fails closed), with egress they are reached through
    the same NAT.
-8. **Events are in memory.** They are a notification channel, not an audit log; a
+9. **Events are in memory.** They are a notification channel, not an audit log; a
    daemon restart starts a new epoch. Durable state is the VM records.
-9. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
+10. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
    rules that let VM egress through Docker's forward drop; egress fails (closed)
    until the next network change or daemon restart.
 
@@ -386,9 +518,12 @@ Stated plainly, most important first.
 | event delivery, resume, reset | `sudo scripts/events-test.sh` |
 | drift right now | `mh doctor` |
 | the ruleset in force | `sudo nft list table inet microhosted` |
-| a VM's limits | `cat /sys/fs/cgroup/firecracker/<id>/{cpu.max,memory.max,pids.max}` |
+| every invariant of this document on the live host: daemon, store, every running VM's identity, capabilities, seccomp, cgroup, jail and descriptors, and isolation seen from inside test guests | `sudo scripts/security-test.sh` (without root the jail, descriptor and nftables checks are skipped) |
+| a VM's limits | `cat /sys/fs/cgroup/microhosted/<id>/{cpu.max,memory.max,memory.swap.max,pids.max}` |
+| jail sockets: symlinks and foreign owners refused | `sudo go test ./internal/jailer -run DialSocket -v` |
 | nothing listening for devices | `ss -ltnup` on the host shows no ingress port |
 
-Planned (roadmap Phase 3): an adversarial suite that runs a deliberately
-vulnerable parser, exploits it from the device side, and asserts every row of §5
+`scripts/security-test.sh` asserts the invariants; it does not attack. Planned
+(roadmap Phase 3): an adversarial suite that runs a deliberately vulnerable
+parser, exploits it from the device side, and asserts every row of §5
 automatically.

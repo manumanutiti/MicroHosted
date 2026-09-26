@@ -22,7 +22,9 @@ import (
 // newTestServer wires a real manager (temp store, temp catalog, no root, no
 // KVM use) behind the real mux — enough to exercise the observability
 // endpoints end-to-end without hardware.
-func newTestServer(t *testing.T) *httptest.Server {
+// newTestServer serves a manager with no VMs over a temp store. setup runs on
+// the manager before serving (e.g. to connect an image store).
+func newTestServer(t *testing.T, setup ...func(mgr *vm.Manager, st *store.Store, storeDir string)) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -50,6 +52,9 @@ func newTestServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	mgr := vm.NewManager(catalog, jcfg, storeDir, st, network.NewManager(st, nil))
+	for _, f := range setup {
+		f(mgr, st, storeDir)
+	}
 
 	srv := NewServer(mgr, network.NewManager(st, nil), events.NewBus(0), SystemConfig{
 		DBPath:      filepath.Join(dir, "state.db"),

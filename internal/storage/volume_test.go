@@ -121,36 +121,6 @@ func TestExtractMissingFileErrors(t *testing.T) {
 	}
 }
 
-func TestExtractDirPullsTree(t *testing.T) {
-	requireTool(t, "mkfs.ext4")
-	requireTool(t, "debugfs")
-
-	dir := t.TempDir()
-	path, err := CreateVolume(dir, "vol1", 32, os.Getuid(), os.Getgid())
-	if err != nil {
-		t.Fatalf("CreateVolume: %v", err)
-	}
-	oio := OfflineIO{StagingDir: dir}
-	if err := oio.InjectFile(path, "/arts/a.txt", bytes.NewReader([]byte("aaa"))); err != nil {
-		t.Fatalf("inject a: %v", err)
-	}
-	if err := oio.InjectFile(path, "/arts/b.txt", bytes.NewReader([]byte("bbb"))); err != nil {
-		t.Fatalf("inject b: %v", err)
-	}
-
-	dest := filepath.Join(dir, "extracted")
-	if err := oio.ExtractDir(path, "/arts", dest); err != nil {
-		t.Fatalf("ExtractDir: %v", err)
-	}
-	// rdump reproduces the tree under dest/arts.
-	if b, err := os.ReadFile(filepath.Join(dest, "arts", "a.txt")); err != nil || string(b) != "aaa" {
-		t.Fatalf("extracted a.txt = %q, err %v", b, err)
-	}
-	if b, err := os.ReadFile(filepath.Join(dest, "arts", "b.txt")); err != nil || string(b) != "bbb" {
-		t.Fatalf("extracted b.txt = %q, err %v", b, err)
-	}
-}
-
 // TestInjectExtractLargeFileStreams round-trips a file bigger than any internal
 // buffer through inject+extract, checked by hash. It's the regression guard for
 // the whole point of this layer: constant memory via streaming, not io.ReadAll.
@@ -275,9 +245,6 @@ func TestInjectionAttemptReachesNoHostFile(t *testing.T) {
 	if _, _, err := oio.ExtractFileStream(img, evil); err == nil {
 		t.Error("ExtractFileStream accepted a path carrying a newline")
 	}
-	if err := oio.ExtractDir(img, evil, filepath.Join(dir, "out")); err == nil {
-		t.Error("ExtractDir accepted a path carrying a newline")
-	}
 	if _, err := os.Stat(leak); !os.IsNotExist(err) {
 		t.Fatalf("a smuggled debugfs command wrote %s on the host (stat: %v)", leak, err)
 	}
@@ -301,13 +268,5 @@ func TestPathsWithSpacesRoundTrip(t *testing.T) {
 	}
 	if got := extractBytes(t, img, p, dir); string(got) != "spaced" {
 		t.Fatalf("extract %q = %q", p, got)
-	}
-
-	dest := filepath.Join(dir, "dest with space")
-	if err := oio.ExtractDir(img, "/out dir", dest); err != nil {
-		t.Fatalf("ExtractDir: %v", err)
-	}
-	if b, err := os.ReadFile(filepath.Join(dest, "out dir", "my artifact.bin")); err != nil || string(b) != "spaced" {
-		t.Fatalf("rdump result: %q, %v", b, err)
 	}
 }

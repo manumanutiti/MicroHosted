@@ -153,10 +153,13 @@ func snapFork(e *env, cmd *command, p string, args []string) error {
 	fs := newCmdFlags(e, p, cmd)
 	fs.boolVar(&req.Quarantine, "quarantine", "", "attach the new VM to no network (vsock only); allows many forks of one snapshot")
 	forkIdentityFlags(fs, &req, &labels)
+	var io types.IOLimits
+	ioLimitFlags(fs, &io)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
 	}
+	req.IOLimits = askedIOLimits(io)
 	if len(pos) != 1 {
 		return usagef(p, "expected exactly one SNAPSHOT")
 	}

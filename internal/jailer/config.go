@@ -13,11 +13,11 @@ import (
 // Defaults holds the operator-configured, host-wide Jailer settings — the
 // same for every VM launched by this daemon.
 type Defaults struct {
-	// UID/GID the jailed Firecracker process switches to. Firecracker's own
-	// getting-started docs use 123/100; the operator is responsible for
-	// making sure that uid/gid exists and can access /dev/kvm.
-	UID int
-	GID int
+	// IDBase/IDCount delimit the identities VMs run as: every VM gets its own
+	// uid (and a gid with the same number) from [IDBase, IDBase+IDCount), and
+	// so does every volume while it is detached. See identity.go.
+	IDBase  int
+	IDCount int
 
 	// ChrootBaseDir is the root under which Jailer builds
 	// <ChrootBaseDir>/<exec-file basename>/<id>/root/. Defaults to
@@ -56,8 +56,8 @@ func DetectCgroupVersion() string {
 // via flags in cmd/microhosted.
 func DefaultDefaults() Defaults {
 	return Defaults{
-		UID:           123,
-		GID:           100,
+		IDBase:        DefaultIDBase,
+		IDCount:       DefaultIDCount,
 		ChrootBaseDir: "/srv/jailer",
 		JailerBinary:  "/usr/local/bin/jailer",
 		ExecFile:      "/usr/local/bin/firecracker",
@@ -117,11 +117,13 @@ func RemoveInstanceDir(d Defaults, vmID string) error {
 // Firecracker process from the one the SDK spawned and is watching — the
 // SDK then loses track of it entirely (it looks like Firecracker exited
 // immediately and the API socket never gets created).
-func Build(vmID, kernelPath string, d Defaults, stdout, stderr io.Writer) fc.JailerConfig {
+//
+// uid is the VM's own identity (VMConfig.JailUID); its gid is the same number.
+func Build(vmID, kernelPath string, d Defaults, uid int, stdout, stderr io.Writer) fc.JailerConfig {
 	return fc.JailerConfig{
 		ID:             vmID,
-		UID:            fc.Int(d.UID),
-		GID:            fc.Int(d.GID),
+		UID:            fc.Int(uid),
+		GID:            fc.Int(uid),
 		NumaNode:       fc.Int(0),
 		ChrootBaseDir:  d.ChrootBaseDir,
 		JailerBinary:   d.JailerBinary,

@@ -72,15 +72,35 @@ func TapExists(name string) bool {
 	return exec.Command("ip", "link", "show", "dev", name).Run() == nil
 }
 
+// tuntapAdd returns the command creating a persistent TAP that only owner (as
+// uid and gid — a VM's identity uses the same number for both) may attach to.
+// An ownerless TAP can be attached by any process that opens /dev/net/tun,
+// which on most hosts is every local user: between the TAP's creation and
+// Firecracker's attach, or after Firecracker dies, anyone could grab the VM's
+// port on the bridge and speak as the VM. With an owner, the kernel refuses
+// every other uid without CAP_NET_ADMIN — including the other VMs' VMMs.
+func tuntapAdd(tap string, owner int) ([]string, error) {
+	if owner <= 0 {
+		return nil, fmt.Errorf("creating tap %s: no owner identity (refusing an ownerless TAP)", tap)
+	}
+	id := strconv.Itoa(owner)
+	return []string{"ip", "tuntap", "add", tap, "mode", "tap", "user", id, "group", id}, nil
+}
+
 // CreateTapQuarantined creates a TAP device enslaved to nothing, up but going
 // nowhere. Firecracker refuses to restore a snapshot that had a network device
 // unless a host TAP backs it, and a quarantined fork wants exactly that: the
 // guest wakes up believing it still has its network (IP/MAC frozen in the
 // restored memory) while every frame it emits dies at a TAP with no bridge —
 // no path to the host, other VMs, or the internet. vsock exec still works.
-func CreateTapQuarantined(tap string) error {
+// owner is the VM's identity; see tuntapAdd.
+func CreateTapQuarantined(tap string, owner int) error {
+	add, err := tuntapAdd(tap, owner)
+	if err != nil {
+		return err
+	}
 	steps := [][]string{
-		{"ip", "tuntap", "add", tap, "mode", "tap"},
+		add,
 		{"ip", "link", "set", tap, "up"},
 	}
 	for _, args := range steps {
@@ -104,9 +124,15 @@ func CreateTapQuarantined(tap string) error {
 // sibling VM. Same-bridge traffic never traverses nftables (it's pure L2
 // switching), so this is the layer where intra-network isolation must happen;
 // a forward-chain rule could not do it.
-func CreateTapEnslaved(tap, bridge string, isolated bool) error {
+//
+// owner is the VM's identity; see tuntapAdd.
+func CreateTapEnslaved(tap, bridge string, isolated bool, owner int) error {
+	add, err := tuntapAdd(tap, owner)
+	if err != nil {
+		return err
+	}
 	steps := [][]string{
-		{"ip", "tuntap", "add", tap, "mode", "tap"},
+		add,
 		{"ip", "link", "set", tap, "master", bridge},
 		{"ip", "link", "set", tap, "up"},
 	}
