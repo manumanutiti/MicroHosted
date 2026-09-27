@@ -68,12 +68,17 @@ agent_up() {
 }
 
 cleanup() {
-  for v in $("$MH" ps -a -q -l drtest=1 2>/dev/null); do "$MH" rm "$v" >/dev/null 2>&1 || true; done
-  "$MH" volume rm drtest-vol >/dev/null 2>&1 || true
+  # The drop-in goes first and nothing may interrupt the cleanup: left in
+  # place it keeps the daemon misconfigured after the test. A second Ctrl-C,
+  # or a `| tee` that died with the first one (SIGPIPE on the next echo),
+  # used to kill it before the rm.
+  trap '' INT TERM PIPE
   if [[ -f "$DROPIN" ]]; then
     rm -f "$DROPIN"
     restart || echo "WARNING: the daemon did not come back after removing $DROPIN" >&2
   fi
+  for v in $("$MH" ps -a -q -l drtest=1 2>/dev/null); do "$MH" rm "$v" >/dev/null 2>&1 || true; done
+  "$MH" volume rm drtest-vol >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 

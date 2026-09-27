@@ -59,20 +59,26 @@ FOLLOWER=$!
 sleep 1
 
 log "lifecycle"
-A=$("$MH" run "$TEMPLATE" --net "$NET" --name ev-a -l fn=ev 2>/dev/null)
+# --wait returns only once vm.ready is published, so A's readiness has a fixed
+# place in the stream; B's arrives after the replace, racing A's teardown, and
+# is checked on its own below.
+A=$("$MH" run "$TEMPLATE" --net "$NET" --name ev-a -l fn=ev --wait 2>/dev/null)
 "$MH" stop "$A" >/dev/null
-"$MH" start "$A" >/dev/null
+"$MH" start "$A" --wait >/dev/null
 "$MH" quarantine "$A" >/dev/null
-B=$("$MH" replace "$A" --old destroy --name ev-b 2>/dev/null)
+B=$("$MH" replace "$A" --old destroy --name ev-b --wait 2>/dev/null)
 wait_for "vm.destroyed:$A" || true
 
 want=$(printf '%s\n' \
-  "vm.created:$A" "vm.stopped:$A" "vm.started:$A" "vm.quarantined:$A" \
+  "vm.created:$A" "vm.ready:$A" "vm.stopped:$A" "vm.started:$A" "vm.ready:$A" "vm.quarantined:$A" \
   "vm.stopped:$A" "vm.created:$B" "vm.replaced:$A" "vm.destroyed:$A")
-got=$(seen | grep -v '^network\.')
+got=$(seen | grep -v '^network\.' | grep -vx "vm.ready:$B")
 if [[ "$got" == "$want" ]]; then pass "lifecycle events, in order"; else
   fail "lifecycle events"; diff <(echo "$want") <(echo "$got") | sed 's/^/      /'
 fi
+if wait_for "vm.ready:$B" && [[ "$(seen | grep -n -x -e "vm.created:$B" -e "vm.ready:$B" | cut -d: -f2 | paste -sd' ')" == "vm.created vm.ready" ]]; then
+  pass "the replacement's vm.ready follows its vm.created"
+else fail "no vm.ready for the replacement $B after its vm.created"; fi
 if jq -e --arg a "$A" --arg b "$B" 'select(.type=="vm.replaced" and .vm==$a) | .data.replacement==$b and .data.old=="destroy" and .network=="ev-net"' "$OUT" >/dev/null; then
   pass "vm.replaced names the replacement and the function's network"
 else fail "vm.replaced data"; fi

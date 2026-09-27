@@ -82,7 +82,15 @@ func checkShape(data []byte) error {
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return errors.New("must be a JSON object")
 	}
-	return walkObject(dec, "")
+	// The token reader reports a body cut off mid-object as a bare io.EOF,
+	// which would reach the client as "request body: EOF".
+	if err := walkObject(dec, ""); err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("unexpected end of JSON input")
+		}
+		return err
+	}
+	return nil
 }
 
 // walkObject consumes an object whose '{' was just read, up to its '}'.

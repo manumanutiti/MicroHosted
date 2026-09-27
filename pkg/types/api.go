@@ -178,6 +178,10 @@ type VMResponse struct {
 	CreatedAt string          `json:"created_at"`
 	// LastExit: the VM's process last died on its own (see VM.LastExit).
 	LastExit *VMExitResponse `json:"last_exit,omitempty"`
+	// AgentReadyAt: while running, when its guest agent first answered after
+	// the current boot; absent until it has (exec and file transfers wait for
+	// it; GET /v1/vms/{id}/ready blocks on it; vm.ready announces it).
+	AgentReadyAt string `json:"agent_ready_at,omitempty"`
 	// IOLimits is what the VM asked for below the daemon's ceiling; absent
 	// means the ceiling. In force is the lower of the two, per field.
 	IOLimits *IOLimits `json:"io_limits,omitempty"`
@@ -222,8 +226,13 @@ func NewVMResponse(vm *VM) VMResponse {
 	if vm.LastExit != nil {
 		lastExit = &VMExitResponse{At: vm.LastExit.At.Format("2006-01-02T15:04:05Z07:00"), Reason: vm.LastExit.Reason}
 	}
+	var agentReadyAt string
+	if vm.State == VMStateRunning && vm.AgentReadyAt != nil {
+		agentReadyAt = vm.AgentReadyAt.Format("2006-01-02T15:04:05.000Z07:00")
+	}
 	return VMResponse{
 		LastExit:        lastExit,
+		AgentReadyAt:    agentReadyAt,
 		ID:              vm.Config.ID,
 		Name:            vm.Config.Name,
 		Labels:          vm.Config.Labels,

@@ -733,3 +733,46 @@ func TestFileFlags(t *testing.T) {
 		t.Errorf("replace --no-files: %s", body)
 	}
 }
+
+// run --wait asks the daemon for readiness after the create, with the timeout
+// given; the ID is already on stdout, and a VM that never gets ready fails
+// the command (the daemon's error shown) without hiding which VM it was.
+func TestRunWait(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/vms", replyStatus(http.StatusCreated, types.VMResponse{ID: "deadbeef", Template: "base-alpine"}))
+	mux.HandleFunc("GET /v1/vms/deadbeef/ready", reply(types.VMResponse{ID: "deadbeef"}))
+	mux.HandleFunc("GET /v1/vms/badbad00/ready", replyStatus(http.StatusBadGateway, map[string]string{"error": "guest agent not answering"}))
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{{ID: "badbad00", State: types.VMStateStopped}}))
+	mux.HandleFunc("POST /v1/vms/badbad00/start", reply(nil))
+	f := newFakeAPI(t, mux)
+
+	code, out, errOut := f.run("", "run", "base-alpine", "--wait", "--wait-timeout", "5s")
+	if code != 0 || out != "deadbeef\n" {
+		t.Fatalf("exit %d stdout %q stderr %q", code, out, errOut)
+	}
+	if got := f.last("GET"); got.path != "/v1/vms/deadbeef/ready" || got.query != "timeout_ms=5000" {
+		t.Errorf("wait request %s?%s, want /v1/vms/deadbeef/ready?timeout_ms=5000", got.path, got.query)
+	}
+
+	// Without --wait nothing waits.
+	f.mu.Lock()
+	f.reqs = nil
+	f.mu.Unlock()
+	if code, _, _ := f.run("", "run", "base-alpine"); code != 0 {
+		t.Fatal("run without --wait failed")
+	}
+	for _, r := range f.reqs {
+		if r.method == "GET" && strings.HasSuffix(r.path, "/ready") {
+			t.Errorf("run without --wait made %s %s", r.method, r.path)
+		}
+	}
+
+	code, out, errOut = f.run("", "start", "badbad00", "--wait")
+	if code == 0 || out != "badbad00\n" || !strings.Contains(errOut, "guest agent not answering") {
+		t.Errorf("start --wait on an unready VM: exit %d stdout %q stderr %q; want a failure naming the VM on stdout and the reason", code, out, errOut)
+	}
+
+	if code, _, _ := f.run("", "run", "base-alpine", "--wait", "--wait-timeout", "11m"); code == 0 {
+		t.Error("--wait-timeout over 10m accepted")
+	}
+}

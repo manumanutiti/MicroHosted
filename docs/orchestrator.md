@@ -428,11 +428,12 @@ Found in the review; each blocks the milestone shown.
 
 | # | Engine change | Why | Blocks |
 |---|---|---|---|
-| E1 | Labels on networks (create, list/filter, patch) — **implemented, pending validation on test hardware** | ownership rule and pruning of networks | O1 |
-| E2 | Content-addressed, read-only image store; create by digest — **implemented, pending validation on test hardware** | a digest checked by the orchestrator and booted by path is TOCTOU; goldens are mutable today | O1 |
+| E1 | Labels on networks (create, list/filter, patch) — **done**, validated on x86_64 hardware (2026-09-27, `scripts/netlabels-test.sh` 17/17 as root) | ownership rule and pruning of networks | O1 |
+| E2 | Content-addressed, read-only image store; create by digest — **done**, validated on x86_64 hardware (2026-09-27, `scripts/image-test.sh` 17/17; the run caught and fixed a create-by-image refusal in the API) | a digest checked by the orchestrator and booted by path is TOCTOU; goldens are mutable today | O1 |
 | E3 | Per-request exec timeout (`timeout_ms`), abort at the deadline — **done**: 1 ms–10 min, 504 at the deadline, partial output discarded, abandoned if the client disconnects | transaction `timeout` and health timeouts are shorter than the fixed 30 s | O2 |
 | E4 | Offline file injection into a VM's disk at create — **done**: `files` on create and replace (content in the request, ≤ 64 files / 512 KiB, written with `debugfs` as the VM's identity and read back; record keeps SHA-256 except for secrets; replace of a VM with files requires them again) | per-function files and secrets | O4 (O1 may ship without `files:`) |
 | E5 | Per-orchestrator quota by `managed-by` — **done**: `--quota CONSUMER=vms:N,mem:MB` and `--quota-default` on the daemon (operator-owned, not settable through the API), 429 over it, usage in `GET /v1/system`; `managed-by` fixed at create | roadmap Phase 1 item 3 | O3 |
+| E6 | Readiness published by the engine — **done** (2026-09-27): after every boot the daemon probes the guest agent (host-dialed `CONNECT`, no command) and publishes `vm.ready` / `vm.agent_unready`, `agent_ready_at` on the VM, and `GET /v1/vms/{id}/ready` (blocking); exec and file transfers wait for it within their deadline | a function's first exec (health, task) right after a run or replace failed its handshake for ~100 ms and would read as "down"; each client would otherwise poll | O1 |
 
 Pending engine validations, carried over: daemon restart with a quarantined VM,
 and `nft -c` of the generated ruleset as root.

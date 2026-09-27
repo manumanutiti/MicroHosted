@@ -383,14 +383,20 @@ func JailUID(m *fc.Machine) int {
 // gives the guest a short window to take it, but always follows up with
 // StopVMM (SIGTERM to the jailed process) so the caller is guaranteed the
 // process is gone and its resources (chroot, socket) can be cleaned up.
+//
+// The window is only waited out when Firecracker accepted the request: on
+// aarch64 it has no SendCtrlAltDel at all and answers with an error, so there
+// is no power-off coming and waiting for one only stalls the caller (a stop,
+// or a replace whose function is down meanwhile) for the full 5 seconds.
 func Stop(ctx context.Context, m *fc.Machine) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Not m.Shutdown: the SDK's client would dial the socket path as is,
 	// following whatever the jailed process put there.
-	_ = SendCtrlAltDel(shutdownCtx, m.Cfg.SocketPath, JailUID(m))
-	_ = m.Wait(shutdownCtx)
+	if err := SendCtrlAltDel(shutdownCtx, m.Cfg.SocketPath, JailUID(m)); err == nil {
+		_ = m.Wait(shutdownCtx)
+	}
 
 	return m.StopVMM()
 }

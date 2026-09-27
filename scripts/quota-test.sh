@@ -52,7 +52,7 @@ run() { "$MH" run "$TEMPLATE" "$@" 2>/dev/null; }
 
 wait_ready() {
   for _ in $(seq 1 60); do
-    "$MH" health >/dev/null 2>&1 && return 0
+    "$MH" ps >/dev/null 2>&1 && return 0  # the API answering; health may be degraded for unrelated reasons
     sleep 0.5
   done
   return 1
@@ -63,11 +63,16 @@ restart() {
 }
 
 cleanup() {
-  for v in $("$MH" ps -a -q -l qtest=1 2>/dev/null); do "$MH" rm "$v" >/dev/null 2>&1 || true; done
+  # The drop-in goes first and nothing may interrupt the cleanup: left in
+  # place it keeps the daemon misconfigured after the test. A second Ctrl-C,
+  # or a `| tee` that died with the first one (SIGPIPE on the next echo),
+  # used to kill it before the rm.
+  trap '' INT TERM PIPE
   if [[ -f "$DROPIN" ]]; then
     rm -f "$DROPIN"
     restart || echo "WARNING: the daemon did not come back after removing $DROPIN" >&2
   fi
+  for v in $("$MH" ps -a -q -l qtest=1 2>/dev/null); do "$MH" rm "$v" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
 

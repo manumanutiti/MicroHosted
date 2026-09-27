@@ -317,3 +317,17 @@ func TestLoadSnapshotsSkipsUnsealable(t *testing.T) {
 		t.Errorf("snapshot dir not restricted: %v %v", fi, err)
 	}
 }
+
+// A VM born from a snapshot has its drive under the origin's name in the
+// chroot, and a snapshot of it must record that name, not its own clone's —
+// restoring it otherwise fails on a drive file that doesn't exist.
+func TestDriveBase(t *testing.T) {
+	cold := types.VMConfig{Rootfs: "/store/aaaa1111.ext4"}
+	if got := driveBase(cold); got != "aaaa1111.ext4" {
+		t.Errorf("cold boot: %q, want its own clone's name", got)
+	}
+	forked := types.VMConfig{Rootfs: "/store/bbbb2222.ext4", DriveBase: "aaaa1111.ext4"}
+	if got := driveBase(forked); got != "aaaa1111.ext4" {
+		t.Errorf("fork: %q, want the origin's name from its snapshot", got)
+	}
+}

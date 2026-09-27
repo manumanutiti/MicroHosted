@@ -153,7 +153,14 @@ Add the `fstab` line and the `docker.service` drop-in to
 Today it was only applied by hand inside one VM. Document the "first volume
 is Docker's" convention in `docs/volumes.md`.
 
-### B. Graceful stop on ARM64
+### B. Graceful stop on ARM64 — done (2026-09-27)
+
+Implemented as proposed below, for both architectures: `stop` asks the guest
+agent for `sync` + `reboot` over vsock and waits up to 10 s
+(`internal/vm/shutdown.go`). It turned out x86_64 needed it too: the Firecracker
+CI kernels have no i8042 driver, so `SendCtrlAltDel` was never delivered there
+either and every stop was a hard kill after 5 s. Destroy, restore and
+`replace --old destroy` kill at once.
 
 `Machine.Stop` (`internal/firecracker/machine.go`) sends `SendCtrlAltDel`,
 waits 5 s, then kills. Firecracker implements `SendCtrlAltDel` **only on

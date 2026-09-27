@@ -194,8 +194,10 @@ func (m *Manager) Replace(ctx context.Context, id string, req types.ReplaceVMReq
 		m.mu.Unlock()
 		if running {
 			// A failed power-off still leaves it cut off; the replacement
-			// matters more than a clean stop.
-			if _, err := m.stop(ctx, id); err != nil {
+			// matters more than a clean stop. A VM about to be destroyed is
+			// killed outright: its disk goes next, so an orderly shutdown
+			// would only keep the function down for its whole window.
+			if _, err := m.stop(ctx, id, disposition != types.ReplaceOldDestroy); err != nil {
 				log.Printf("replace: vm %s: powering it off: %v", id, err)
 			}
 		}

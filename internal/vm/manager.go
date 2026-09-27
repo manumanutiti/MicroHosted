@@ -49,6 +49,8 @@ var (
 type running struct {
 	machine *fc.Machine
 	logFile io.Closer
+	// agent watches this incarnation's guest agent come up (agent.go).
+	agent *agentWatch
 }
 
 // Manager owns the whole lifecycle of a VM: template lookup, disk cloning,
@@ -321,6 +323,9 @@ func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
 		}
 	}
 	log.Printf("reconcile: adopted running vm %s (pid %d)", id, rec.PID)
+	// Its agent is re-checked like after a boot: the record's readiness is
+	// from a previous daemon run.
+	m.watchAgent(id)
 	return true
 }
 
@@ -679,7 +684,7 @@ func (m *Manager) waitAgentReady(vsockPath string, uid int) error {
 	deadline := time.Now().Add(budget)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if _, _, err := vsock.Exec(vsockPath, uid, "true"); err == nil {
+		if err := agentProbe(context.Background(), vsockPath, uid, agentProbeTimeout); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -902,6 +907,7 @@ func (m *Manager) Create(ctx context.Context, req types.CreateVMRequest) (*types
 	log.Printf("vm %s created in %s (%s)", id, time.Since(start).Round(100*time.Microsecond), strings.Join(phases, ", "))
 
 	m.emit(types.EventVMCreated, record, "", map[string]string{"template": tpl.Name})
+	m.watchAgent(id)
 	return m.snapshotVM(record), nil
 }
 
@@ -966,6 +972,7 @@ func (m *Manager) boot(record *types.VM) error {
 	// chroot for us — build the host-side path ourselves using the same
 	// convention jailer.WorkspaceRoot encodes.
 	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
+	record.Config.DriveBase = "" // a cold boot attaches the drive under its own name
 	record.State = types.VMStateRunning
 	m.run[id] = &running{machine: machine, logFile: logFile}
 	m.mu.Unlock()
@@ -1005,13 +1012,7 @@ func (m *Manager) applyLimits(id string, pid int, cfg types.VMConfig) error {
 // state; the caller decides what state to record.
 func (m *Manager) powerOff(ctx context.Context, record *types.VM, r *running) error {
 	id := record.Config.ID
-	var stopErr error
-	switch {
-	case r != nil && r.machine != nil:
-		stopErr = firecracker.Stop(ctx, r.machine)
-	case record.PID > 0:
-		stopErr = stopByPID(record.PID)
-	}
+	stopErr := m.halt(ctx, record, r, true)
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
@@ -1044,19 +1045,9 @@ func (m *Manager) destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("%w: %s", ErrVMNotFound, id)
 	}
 
-	var stopErr error
-	switch {
-	case r != nil && r.machine != nil:
-		// Normal path: we own a live SDK handle from this daemon's lifetime.
-		// Kill, not Stop: the disk is deleted below, so there's nothing for a
-		// graceful guest power-off to protect, and skipping its 5s window is
-		// what keeps Destroy fast.
-		stopErr = firecracker.Kill(ctx, r.machine)
-	case record.PID > 0:
-		// Adopted VM: recovered from the store after a restart, so there's no
-		// SDK handle to drive a graceful shutdown — signal the process directly.
-		stopErr = stopByPID(record.PID)
-	}
+	// Not graceful: the disk is deleted below, so there's nothing for an
+	// orderly guest power-off to protect, and skipping it keeps Destroy fast.
+	stopErr := m.halt(ctx, record, r, false)
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
@@ -1108,11 +1099,14 @@ func (m *Manager) Stop(ctx context.Context, id string) (*types.VM, error) {
 		return nil, err
 	}
 	defer m.end(id)
-	return m.stop(ctx, id)
+	return m.stop(ctx, id, true)
 }
 
-// stop is Stop for a caller that already holds the VM's busy mark.
-func (m *Manager) stop(ctx context.Context, id string) (*types.VM, error) {
+// stop is Stop for a caller that already holds the VM's busy mark. graceful
+// asks the guest to shut down cleanly first (see halt); false kills the VMM
+// outright — for a caller that is about to discard the guest's state anyway
+// (replace --old destroy), where an orderly shutdown only prolongs the outage.
+func (m *Manager) stop(ctx context.Context, id string, graceful bool) (*types.VM, error) {
 	m.mu.Lock()
 	record, ok := m.vms[id]
 	r := m.run[id]
@@ -1124,16 +1118,7 @@ func (m *Manager) stop(ctx context.Context, id string) (*types.VM, error) {
 		return nil, fmt.Errorf("%w: vm %s is already stopped", ErrVMState, id)
 	}
 
-	var stopErr error
-	switch {
-	case r != nil && r.machine != nil:
-		// Normal path: we own a live SDK handle from this daemon's lifetime.
-		stopErr = firecracker.Stop(ctx, r.machine)
-	case record.PID > 0:
-		// Adopted VM (recovered after a restart): no SDK handle to drive a
-		// graceful shutdown — signal the process directly.
-		stopErr = stopByPID(record.PID)
-	}
+	stopErr := m.halt(ctx, record, r, graceful)
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
@@ -1240,6 +1225,7 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 	}
 
 	m.emit(types.EventVMStarted, record, "", nil)
+	m.watchAgent(id)
 	return m.snapshotVM(record), nil
 }
 
@@ -1411,7 +1397,7 @@ func (m *Manager) Snapshot(ctx context.Context, vmID, name string) (*types.Snaps
 		PrefixLen:    record.Config.PrefixLen,
 		HadNetwork:   record.Config.TapDevice != "",
 		TapDevice:    record.Config.TapDevice,
-		DriveBase:    filepath.Base(record.Config.Rootfs),
+		DriveBase:    driveBase(record.Config),
 		IOLimits:     cloneIOLimits(record.Config.IOLimits),
 		Files:        slices.Clone(record.Config.Files),
 		Dir:          dir,
@@ -1593,6 +1579,7 @@ func (m *Manager) Fork(ctx context.Context, snapID string, req types.ForkVMReque
 		return fail(fmt.Errorf("persisting vm record %s: %w", id, err))
 	}
 	m.emit(types.EventVMCreated, record, "", map[string]string{"snapshot": snapID})
+	m.watchAgent(id)
 
 	return m.snapshotVM(record), nil
 }
@@ -1688,16 +1675,11 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 
 	// Tear down the current incarnation the way Stop does — process, jail dir,
 	// TAP — but keep the IP reservation and VM record: the restored guest is
-	// the same machine at the same address.
+	// the same machine at the same address. Not graceful: the guest's memory
+	// and disk are about to be overwritten by the snapshot's, so an orderly
+	// power-off protects nothing and would only delay the restore.
 	if record.State == types.VMStateRunning {
-		var stopErr error
-		switch {
-		case r != nil && r.machine != nil:
-			stopErr = firecracker.Stop(ctx, r.machine)
-		case record.PID > 0:
-			stopErr = stopByPID(record.PID)
-		}
-		if stopErr != nil {
+		if stopErr := m.halt(ctx, record, r, false); stopErr != nil {
 			return nil, fmt.Errorf("stopping vm %s before restore: %w", vmID, stopErr)
 		}
 		if r != nil && r.logFile != nil {
@@ -1761,6 +1743,7 @@ func (m *Manager) Restore(ctx context.Context, vmID, snapID string) (*types.VM, 
 	}
 
 	m.emit(types.EventVMRestored, record, "", map[string]string{"snapshot": snapID})
+	m.watchAgent(vmID)
 	return m.snapshotVM(record), nil
 }
 
@@ -1817,11 +1800,26 @@ func (m *Manager) bootFromSnapshot(record *types.VM, snap *types.Snapshot) error
 	record.PID = pid
 	record.SocketPath = machine.Cfg.SocketPath
 	record.VsockPath = filepath.Join(jailer.WorkspaceRoot(m.jailerCfg, id), firecracker.VsockDevicePath)
+	// The vmstate keeps the drive under the name it had when the snapshot was
+	// taken, so that is the name this incarnation has it under — and the name
+	// a snapshot of it must record in turn.
+	record.Config.DriveBase = snap.DriveBase
 	record.State = types.VMStateRunning
 	m.run[id] = &running{machine: machine, logFile: logFile}
 	m.mu.Unlock()
 
 	return nil
+}
+
+// driveBase is the filename a running VM's Firecracker has its root drive under
+// inside the chroot, which is what its vmstate records: its own clone's name
+// after a cold boot, but for a VM born from a snapshot (a fork, a restore) the
+// name that snapshot recorded — the origin VM's "<id>.ext4".
+func driveBase(cfg types.VMConfig) string {
+	if cfg.DriveBase != "" {
+		return cfg.DriveBase
+	}
+	return filepath.Base(cfg.Rootfs)
 }
 
 // snapshotTapName returns the TAP name recorded in a snapshot's vmstate,
@@ -1981,7 +1979,17 @@ func (m *Manager) Exec(ctx context.Context, id, cmd string, timeout time.Duratio
 		return "", 0, fmt.Errorf("%w: vm %s is not running (state %s)", ErrVMState, id, record.State)
 	}
 
-	return vsock.ExecContext(ctx, record.VsockPath, record.Config.JailUID, cmd, timeout)
+	// Right after a boot the agent may not listen yet: wait for it within the
+	// same deadline instead of failing the handshake.
+	deadline := time.Now().Add(timeout)
+	if _, err := m.awaitAgent(ctx, id, deadline); err != nil {
+		return "", 0, err
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return "", 0, fmt.Errorf("%w after %s", vsock.ErrTimeout, timeout)
+	}
+	return vsock.ExecContext(ctx, record.VsockPath, record.Config.JailUID, cmd, remaining)
 }
 
 // stagingDir is where offline debugfs I/O stages its temp files: on the store,
@@ -2047,6 +2055,9 @@ func (m *Manager) PutFile(id, guestPath string, data io.Reader, size int64) erro
 
 	switch state {
 	case types.VMStateRunning:
+		if _, err := m.awaitAgent(context.Background(), id, time.Now().Add(vsock.DefaultExecTimeout)); err != nil {
+			return err
+		}
 		if size >= 0 {
 			return vsock.PutFile(vsockPath, uid, guestPath, data, size)
 		}
@@ -2138,6 +2149,9 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 
 	switch state {
 	case types.VMStateRunning:
+		if _, err := m.awaitAgent(context.Background(), id, time.Now().Add(vsock.DefaultExecTimeout)); err != nil {
+			return nil, 0, err
+		}
 		return vsock.GetFileStream(vsockPath, uid, guestPath)
 	case types.VMStateStopped:
 		// The debugfs read finishes inside ExtractFileStream (into an unlinked

@@ -583,6 +583,7 @@ mhcurl http://localhost/v1/vms/a1b2c3d4
 | `log_path`    | the file with this VM's serial console + Jailer/Firecracker logs            |
 | `created_at`  | RFC3339 timestamp                                                            |
 | `files`       | files written into the disk before the first boot: `{path, mode, uid, gid, size, sha256?, secret?}` — never the content; no `sha256` for a secret |
+| `agent_ready_at` | while running: when the guest agent first answered the host's probe after the current boot (RFC3339, ms). Absent until it has — see [Readiness](#readiness-get-v1vmsidready) |
 | `last_exit`   | `{at, reason}`: the last time the VM's process died **on its own** (not a stop/destroy/restore). The daemon notices within ~2 s, marks the VM `stopped` (disk, IP and volumes kept, like `stop`) and records why: `killed by the OOM killer (reached its cgroup memory.max)`, `killed by the host's OOM killer (host out of memory)`, or `process exited` (a Firecracker crash, or the guest rebooting — Firecracker exits on a guest reboot). It is **not** restarted: that is policy, the orchestrator's call |
 
 Note: `VMResponse` doesn't currently include `socket_path` or `vsock_path` (they
@@ -606,8 +607,8 @@ each take the VM for their duration; a second one on the same VM gets **409**
 naming the operation in progress, instead of racing it (two starts would launch
 two Firecrackers on one disk).
 
-Stops the machine (`firecracker.Stop`: ACPI graceful + SIGTERM backup, or a signal
-by PID if it's a VM adopted after a restart), deletes the TAP, frees the IP in its
+Kills the machine at once (no clean guest shutdown: the disk is deleted anyway;
+a signal by PID if it's a VM adopted after a restart), deletes the TAP, frees the IP in its
 network, deletes the rootfs clone + `.log`, the Jailer chroot directory, and the
 persisted record. Cleanup accumulates errors (`errors.Join`): a failure in one
 step doesn't skip the others.
@@ -627,7 +628,13 @@ mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/stop
 **200 response** with the `VMResponse` (now `state: "stopped"`, `pid` omitted) ·
 **404** if it doesn't exist · **409** if it was already stopped.
 
-Powers off the Firecracker process (frees CPU/RAM) and releases the TAP and the
+Shuts the guest down cleanly and then ends the Firecracker process (frees CPU/RAM):
+the daemon asks the guest agent over vsock for a `sync` and a `reboot` (Firecracker exits
+on a guest reboot, on x86_64 and aarch64 alike), waits up to 10 s for the guest to
+finish, and kills the process if it hasn't. A guest without the agent falls back
+to `SendCtrlAltDel` (x86_64 only, and only with an i8042-capable kernel) and then
+a kill — its unsynced writes are lost. The guest is untrusted: nothing it answers
+makes a stop take longer than those bounds. Then it releases the TAP and the
 Jailer chroot directory, but **keeps the rootfs clone** (the disk, with everything
 the guest wrote) and **keeps the IP reserved** in its network. It survives a daemon
 restart: `Reconcile` doesn't sweep it, it leaves it stopped and re-reserves its IP.
@@ -922,6 +929,36 @@ or chrony). It's Firecracker's documented behavior.
 
 ---
 
+### Readiness: `GET /v1/vms/{id}/ready`
+
+A create, start, fork, restore or replace returns as soon as Firecracker runs —
+~100 ms before the guest's init has the vsock agent listening. The daemon
+watches for the agent itself after every boot (and for VMs it adopts at startup)
+and publishes the answer, so no client has to guess:
+
+- the event **`vm.ready`** (`data.after_ms`: how long the agent took), or
+  **`vm.agent_unready`** (`reason`) if it did not answer within 30 s of boot;
+- the field **`agent_ready_at`** on the VM;
+- **exec and file transfers wait** for it within their own deadline instead of
+  failing the handshake (`reading CONNECT ack: EOF`);
+- this endpoint, which **blocks** until the agent answers.
+
+```bash
+mhcurl http://localhost/v1/vms/a1b2c3d4/ready                   # up to 30 s
+mhcurl 'http://localhost/v1/vms/a1b2c3d4/ready?timeout_ms=5000'
+```
+
+**200** with the `VMResponse` once ready · **504** past `timeout_ms` (1–600000,
+default 30000) · **502** if the agent gave no answer within 30 s of boot and
+still gives none (it is probed once more first: an agent that came up late
+counts) · **409** if the VM is not running · **404** if it doesn't exist.
+
+**Who probes.** The host: the probe is a vsock `CONNECT` to the agent's port
+that sends nothing after the handshake — no command runs in the guest. The guest
+never announces itself: that would need a listener on the host side of vsock,
+which the threat model rules out (Layer 5, "only the host dials"). The probe is
+every 20 ms for the first 2 s after a boot, every 250 ms after.
+
 ### `POST /v1/vms/{id}/exec` — run a command (vsock)
 
 **Body** (`ExecRequest`):
@@ -941,6 +978,10 @@ mhcurl -X POST http://localhost/v1/vms/a1b2c3d4/exec -d '{"cmd":"/opt/probe","ti
 ```json
 {"output": "root\nLinux ubuntu-fc-uvm 6.1.102 ...\n", "exit_code": 0}
 ```
+
+Right after a boot the exec **waits for the guest agent** (see
+[Readiness](#readiness-get-v1vmsidready)) within its own `timeout_ms`, instead
+of failing; past it, **504** naming how long ago the VM booted.
 
 `output` is stdout+stderr combined. It works with or without a network
 (`no_network` doesn't affect this endpoint) — it requires the template to have been
@@ -1286,6 +1327,8 @@ data: {"epoch":"3f9a61c2","seq":42,"time":"…","type":"vm.died","vm":"a1b2c3d4"
 | `vm.stopped` | powered off on purpose | |
 | `vm.died` | its process died on its own, or while the daemon was down | `reason` |
 | `vm.restored` | rewound in place | `data.snapshot` |
+| `vm.ready` | after a boot (create, start, fork, restore, or adoption at startup) the guest agent answered the host's probe: exec and file transfers work | `data.after_ms` |
+| `vm.agent_unready` | the guest agent did not answer within 30 s of a boot (no agent in the image, a guest that failed to boot) | `reason` |
 | `vm.destroyed` | gone, disk included | |
 | `vm.quarantined` | cut off its network in place | `network` = the one it left |
 | `vm.replaced` | its function moved to another VM | `data.replacement`, `data.old` |

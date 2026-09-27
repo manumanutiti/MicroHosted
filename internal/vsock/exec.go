@@ -254,6 +254,20 @@ func ExecContext(ctx context.Context, sockPath string, uid int, cmd string, time
 	return output, exitCode, nil
 }
 
+// Probe reports whether the guest agent is accepting connections: the CONNECT
+// handshake only succeeds once a listener inside the guest took the connection
+// (Firecracker acks after the guest accepts, and closes it when nothing listens
+// on the port). Nothing is sent after the handshake, so no command runs; the
+// agent sees an empty request and ends it. The host dials, as on every vsock
+// path — readiness never needs the guest to reach the host.
+func Probe(ctx context.Context, sockPath string, uid int, timeout time.Duration) error {
+	conn, _, err := dial(ctx, sockPath, uid, time.Now().Add(timeout))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
 // execAbort names why an exec stopped early: its own deadline (ErrTimeout), the
 // caller's cancellation (ctx's error), or err itself when neither applies.
 func execAbort(ctx context.Context, timeout time.Duration, err error) error {

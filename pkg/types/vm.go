@@ -32,8 +32,14 @@ type VMConfig struct {
 	Image  string
 	Kernel string
 	Rootfs string
-	VCPUs  int64
-	MemMB  int64
+	// DriveBase is the filename the running Firecracker has Rootfs under inside
+	// its chroot, when that is not Rootfs's own name: a VM restored from a
+	// snapshot (a fork, a restore) keeps the name the snapshot's vmstate
+	// recorded — the origin VM's. A snapshot of it must record that name again.
+	// Empty after a cold boot.
+	DriveBase string `json:",omitempty"`
+	VCPUs     int64
+	MemMB     int64
 	// DiskMB is the size the clone was grown to at Create time. Recorded for
 	// visibility (List/Get) and so a future resize path can tell what a VM
 	// already has; the actual growth happens once, in storage.CloneRootfs.
@@ -133,6 +139,11 @@ type VM struct {
 	// daemon marks such a VM stopped and does not restart it: whether to is
 	// policy, the orchestrator's call. Kept until the next such death.
 	LastExit *VMExit
+
+	// AgentReadyAt is when the guest agent of the current incarnation first
+	// answered the host's probe (see internal/vm/agent.go); nil until then,
+	// and meaningful only while running — every boot starts it over.
+	AgentReadyAt *time.Time `json:",omitempty"`
 }
 
 // IOLimits caps a VM's throughput with Firecracker's rate limiters. Disk

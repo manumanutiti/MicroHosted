@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"microhosted/internal/images"
@@ -77,6 +78,18 @@ func TestImageRoutes(t *testing.T) {
 	} {
 		if got, out := do(c.method, c.path, c.body); got != c.want {
 			t.Errorf("%s %s %s = %d, want %d (%s)", c.method, c.path, c.body, got, c.want, out)
+		}
+	}
+
+	// Those 400s must come from the image checks, not from a handler that
+	// insists on a template: a create by image names the image, and only a
+	// request with neither is refused for lacking a source.
+	for body, want := range map[string]string{
+		`{"image":"parser:9.9"}`: "parser:9.9",
+		`{}`:                     "a template or an image is required",
+	} {
+		if code, out := do("POST", "/v1/vms", body); code != http.StatusBadRequest || !strings.Contains(string(out), want) {
+			t.Errorf("POST /v1/vms %s = %d %s, want 400 naming %q", body, code, out, want)
 		}
 	}
 

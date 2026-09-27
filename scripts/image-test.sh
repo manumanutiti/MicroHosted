@@ -46,9 +46,17 @@ refused() { # refused LABEL COMMAND...: PASS if the command fails
   if "$@" >/dev/null 2>&1; then fail "$label"; else pass "$label"; fi
 }
 log() { printf '\n== %s\n' "$*"; }
-field() { "$MH" inspect "$1" 2>/dev/null | jq -r ".[0]$2"; }
+field() { "$MH" inspect "$1" 2>/dev/null | jq -r "$2"; }
 now_ms() { date +%s%3N; }
 median() { sort -n | awk '{a[NR]=$1} END {print (NR%2 ? a[(NR+1)/2] : int((a[NR/2]+a[NR/2+1])/2))}'; }
+# A create returns once the VMM is up, before the guest's agent listens.
+agent_up() {
+  for _ in $(seq 1 300); do
+    "$MH" exec "$1" true >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  return 1
+}
 test_vms() { "$MH" ps -a -q -l img-test=1 2>/dev/null; }
 
 cleanup() {
@@ -93,7 +101,9 @@ t_tpl=$(round "$TEMPLATE" | median)
 t_img=$(round "$TAG" | median)
 echo "      median create: template ${t_tpl} ms, image ${t_img} ms"
 # The noise of a single boot is tens of ms; the store adds none by design.
-if [[ -n "$t_tpl" && -n "$t_img" ]] && (( t_img <= t_tpl * 110 / 100 + 30 )); then
+# median prints 0 for an empty round, so every create by image failing would
+# read as "faster": the comparison only counts when both rounds booted.
+if [[ -n "$t_tpl" && -n "$t_img" ]] && (( t_tpl > 0 && t_img > 0 && t_img <= t_tpl * 110 / 100 + 30 )); then
   pass "booting by image is not slower than by template"
 else
   fail "booting by image is slower: ${t_img} ms vs ${t_tpl} ms"
@@ -103,10 +113,10 @@ log "boot a VM by image"
 VM=$("$MH" run "$ref" -l img-test=1 2>/dev/null)
 if [[ -n "$VM" ]]; then pass "created from the pinned reference"; else fail "create by image"; exit 1; fi
 if [[ "$(field "$VM" .image)" == "$digest" ]]; then pass "the VM records the image digest"; else fail "VM image: $(field "$VM" .image)"; fi
-check "exec answers" "$MH" exec "$VM" true
+check "exec answers" agent_up "$VM"
 check "stop" "$MH" stop "$VM"
 check "start again (kernel from the store)" "$MH" start "$VM"
-check "exec answers after the restart" "$MH" exec "$VM" true
+check "exec answers after the restart" agent_up "$VM"
 
 log "refused"
 refused "a tag pinned to another digest" "$MH" run "$TAG@sha256:$(printf '0%.0s' $(seq 1 64))" -l img-test=1

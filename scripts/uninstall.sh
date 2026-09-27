@@ -66,12 +66,19 @@ if systemctl list-unit-files microhosted.service &>/dev/null && \
 fi
 
 # The VMs are firecracker processes whose root (the Jailer chroot) lives inside
-# the store — that check avoids killing an unrelated firecracker. Jailers still
-# without an exec are also included (they're ephemeral and always ours).
+# the store — that check avoids killing an unrelated firecracker. Jailer
+# pivot_roots inside a mount namespace of its own, so /proc/PID/root reads as
+# "/" from here: a process is matched to a jail by the device and inode of its
+# root instead. Jailers still without an exec are also included (they're
+# ephemeral and always ours).
+declare -A JAIL_ROOTS=()
+for jail in "$INSTANCES_DIR"/jailer/firecracker/*/root; do
+  [[ -d "$jail" ]] && JAIL_ROOTS["$(stat -c '%d:%i' "$jail")"]=1
+done
 VM_PIDS=()
 for pid in $(pgrep -x firecracker 2>/dev/null || true); do
-  root="$(readlink "/proc/$pid/root" 2>/dev/null || true)"
-  if [[ "$root" == "$INSTANCES_DIR"/* ]]; then VM_PIDS+=("$pid"); fi
+  root="$(stat -L -c '%d:%i' "/proc/$pid/root/" 2>/dev/null || true)"
+  if [[ -n "$root" && -n "${JAIL_ROOTS[$root]:-}" ]]; then VM_PIDS+=("$pid"); fi
 done
 for pid in $(pgrep -x jailer 2>/dev/null || true); do
   VM_PIDS+=("$pid")

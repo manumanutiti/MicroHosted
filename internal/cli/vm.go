@@ -59,8 +59,13 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 	fileFlags(fs, &files, &secrets)
 	var io types.IOLimits
 	ioLimitFlags(fs, &io)
+	var wait waitOpt
+	waitFlags(fs, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
+		return err
+	}
+	if err := wait.check(p); err != nil {
 		return err
 	}
 	req.IOLimits = askedIOLimits(io)
@@ -99,7 +104,36 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 		return err
 	}
 	announceVM(e, "created", vm)
+	return wait.ready(c, vm.ID)
+}
+
+// waitOpt is --wait on a command that boots a VM: return once its guest agent
+// answers (exec and cp work) instead of as soon as Firecracker runs. The daemon
+// does the probing and publishes readiness (vm.ready); this only asks it.
+type waitOpt struct {
+	on      bool
+	timeout time.Duration
+}
+
+func waitFlags(fs *flagSet, w *waitOpt) {
+	fs.boolVar(&w.on, "wait", "", "return once the VM's guest agent answers (exec and cp work), not as soon as it boots")
+	fs.DurationVar(&w.timeout, "wait-timeout", 30*time.Second, "with --wait, give up after `DURATION` (at most 10m)")
+}
+
+func (w waitOpt) check(p string) error {
+	if w.timeout < time.Millisecond || w.timeout > 10*time.Minute {
+		return usagef(p, "--wait-timeout must be between 1ms and 10m")
+	}
 	return nil
+}
+
+// ready waits for VM id's agent, when --wait was given. The VM's ID is already
+// on stdout by then, so a script can still clean up a VM that never got ready.
+func (w waitOpt) ready(c *Client, id string) error {
+	if !w.on {
+		return nil
+	}
+	return c.Do("GET", fmt.Sprintf("/v1/vms/%s/ready?timeout_ms=%d", id, w.timeout.Milliseconds()), nil, nil)
 }
 
 // announceVM prints the new VM's ID on stdout — so VM=$(mh run base-alpine)
@@ -316,6 +350,14 @@ func vmStart(e *env, cmd *command, p string, args []string) error {
 	return vmAction(e, cmd, p, args, "start")
 }
 
+// vmActionFlags are the flags of a verb run by vmAction: start boots, so it
+// takes --wait.
+func vmActionFlags(fs *flagSet, verb string, w *waitOpt) {
+	if verb == "start" {
+		waitFlags(fs, w)
+	}
+}
+
 // vmReplace hands a VM's function over to a new VM. The new ID goes to stdout,
 // like run, so NEW=$(mh replace ts01-a) works.
 func vmReplace(e *env, cmd *command, p string, args []string) error {
@@ -332,8 +374,13 @@ func vmReplace(e *env, cmd *command, p string, args []string) error {
 	fileFlags(fs, &files, &secrets)
 	var noFiles bool
 	fs.boolVar(&noFiles, "no-files", "", "boot the replacement without the files the old VM was created with")
+	var wait waitOpt
+	waitFlags(fs, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
+		return err
+	}
+	if err := wait.check(p); err != nil {
 		return err
 	}
 	if len(pos) != 1 {
@@ -377,7 +424,7 @@ func vmReplace(e *env, cmd *command, p string, args []string) error {
 	} else {
 		fmt.Fprintf(e.stderr, "%s left %s, quarantined\n", id, resp.Old.State)
 	}
-	return nil
+	return wait.ready(c, resp.Replacement.ID)
 }
 
 // vmQuarantine cuts VMs off their network without stopping them: TAP off the
@@ -426,9 +473,16 @@ func vmUpdate(e *env, cmd *command, p string, args []string) error {
 
 func vmAction(e *env, cmd *command, p string, args []string, verb string) error {
 	fs := newCmdFlags(e, p, cmd)
+	var wait waitOpt
+	vmActionFlags(fs, verb, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
+	}
+	if wait.on {
+		if err := wait.check(p); err != nil {
+			return err
+		}
 	}
 	if len(pos) == 0 {
 		return usagef(p, "expected at least one VM")
@@ -446,7 +500,7 @@ func vmAction(e *env, cmd *command, p string, args []string, verb string) error 
 			return err
 		}
 		fmt.Fprintln(e.stdout, id)
-		return nil
+		return wait.ready(c, id)
 	})
 }
 
@@ -774,8 +828,13 @@ func vmFork(e *env, cmd *command, p string, args []string) error {
 	forkIdentityFlags(fs, &req, &labels)
 	var io types.IOLimits
 	ioLimitFlags(fs, &io)
+	var wait waitOpt
+	waitFlags(fs, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
+		return err
+	}
+	if err := wait.check(p); err != nil {
 		return err
 	}
 	req.IOLimits = askedIOLimits(io)
@@ -798,13 +857,18 @@ func vmFork(e *env, cmd *command, p string, args []string) error {
 		return err
 	}
 	announceVM(e, "forked", vm)
-	return nil
+	return wait.ready(c, vm.ID)
 }
 
 func vmRestore(e *env, cmd *command, p string, args []string) error {
 	fs := newCmdFlags(e, p, cmd)
+	var wait waitOpt
+	waitFlags(fs, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
+		return err
+	}
+	if err := wait.check(p); err != nil {
 		return err
 	}
 	if len(pos) != 2 {
@@ -826,7 +890,7 @@ func vmRestore(e *env, cmd *command, p string, args []string) error {
 		return err
 	}
 	fmt.Fprintln(e.stdout, id)
-	return nil
+	return wait.ready(c, id)
 }
 
 // ---------------------------------------------------------------------------

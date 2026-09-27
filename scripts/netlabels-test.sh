@@ -37,7 +37,7 @@ refused() { # refused LABEL COMMAND...: PASS if the command fails
   if "$@" >/dev/null 2>&1; then fail "$label"; else pass "$label"; fi
 }
 log() { printf '\n== %s\n' "$*"; }
-labels() { "$MH" network inspect "$NET" 2>/dev/null | jq -cS '.[0].labels // {}'; }
+labels() { "$MH" network inspect "$NET" 2>/dev/null | jq -cS '.labels // {}'; }
 listed() { "$MH" network ls -q "$@" 2>/dev/null | grep -qx "$NET"; }
 
 cleanup() { "$MH" network rm -f "$NET" >/dev/null 2>&1 || true; }

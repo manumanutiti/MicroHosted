@@ -259,7 +259,10 @@ one-directional by construction:
 
 - **Only the host dials.** The daemon has no vsock listener (there is no
   `net.Listen` on vsock anywhere in it). A guest cannot open a channel to the
-  host; it can only answer when asked.
+  host; it can only answer when asked. That includes readiness: the daemon
+  learns that a guest's agent is up by probing it (a `CONNECT` handshake, no
+  command), never from the guest announcing itself — a guest's claim would be
+  worth nothing anyway, and hearing it would need a listener.
 - **Answers are bounded.** One exec response is capped at 8 MiB; commands time
   out at 30 s, file transfers at 10 min. A guest that answers forever, or never,
   costs the daemon bounded memory and time.

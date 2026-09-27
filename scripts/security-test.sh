@@ -32,6 +32,7 @@
 #   UNIT        systemd unit of the daemon (default microhosted)
 #   STATE_DIR   daemon state dir (default /var/lib/microhosted)
 #   STORE       instances dir (default $STATE_DIR/store)
+#   JAIL_BASE   where the jails are (default $STORE/jailer/firecracker)
 #   SOCKET      API socket (default /run/microhosted.sock)
 #   ID_BASE     start of the reserved uid range (default 1900000000)
 #   ID_COUNT    size of the range (default 65536)
@@ -42,6 +43,9 @@ MH="${MH:-mh}"
 UNIT="${UNIT:-microhosted}"
 STATE_DIR="${STATE_DIR:-/var/lib/microhosted}"
 STORE="${STORE:-$STATE_DIR/store}"
+# The daemon's --chroot-base (default <instances-dir>/jailer) plus the exec
+# file's basename: jails are $JAIL_BASE/<vm-id>/root.
+JAIL_BASE="${JAIL_BASE:-$STORE/jailer/firecracker}"
 SOCKET="${SOCKET:-/run/microhosted.sock}"
 ID_BASE="${ID_BASE:-1900000000}"
 ID_COUNT="${ID_COUNT:-65536}"
@@ -159,8 +163,14 @@ for id in $("$MH" ps -q 2>/dev/null); do
   grep -q -- --no-seccomp /proc/"$pid"/cmdline 2>/dev/null && bad+=("launched with --no-seccomp")
   [[ "$(cat /proc/"$pid"/oom_score_adj)" == 0 ]] || bad+=("oom_score_adj $(cat /proc/"$pid"/oom_score_adj)")
 
-  cg=$(cat /proc/"$pid"/cgroup)
-  [[ "$cg" == "0::/microhosted/$id" ]] || bad+=("cgroup $cg")
+  # The v2 line is the VM's own group. A host may also mount v1 hierarchies
+  # (VPN clients mount net_cls for split tunnelling); the VM must sit at their
+  # root, never inside a group someone else manages.
+  cg=$(grep '^0::' /proc/"$pid"/cgroup)
+  [[ "$cg" == "0::/microhosted/$id" ]] || bad+=("cgroup ${cg:-none on v2}")
+  while IFS=: read -r _ ctrl path; do
+    [[ "$path" == / ]] || bad+=("inside v1 cgroup $ctrl:$path")
+  done < <(grep -v '^0::' /proc/"$pid"/cgroup)
   cgd=/sys/fs/cgroup/microhosted/$id
   [[ "$(cat $cgd/cpu.max 2>/dev/null)" == "$((vcpus * CPU_PERIOD)) $CPU_PERIOD" ]] || bad+=("cpu.max $(cat $cgd/cpu.max 2>/dev/null)")
   [[ "$(cat $cgd/memory.max 2>/dev/null)" == "$(((mem + MEM_OVERHEAD_MIB) << 20))" ]] || bad+=("memory.max $(cat $cgd/memory.max 2>/dev/null)")
@@ -179,30 +189,45 @@ for id in $("$MH" ps -q 2>/dev/null); do
   fi
 
   if root; then
-    chroot=$(readlink /proc/"$pid"/root)
-    [[ "$chroot" == */"$id"/root ]] || bad+=("root is $chroot, not its jail")
-    while IFS= read -r -d '' f; do
-      rel=${f#"$chroot"}
-      case "$(stat -c %F "$f")" in
-      "symbolic link") bad+=("symlink in jail: $rel") ;;
-      "character special file")
-        case "$rel" in /dev/kvm | /dev/net/tun | /dev/userfaultfd) ;; *) bad+=("device in jail: $rel") ;; esac ;;
-      "block special file") bad+=("block device in jail: $rel") ;;
-      esac
-      perm=$(stat -c %a "$f")
-      ((8#$perm & 8#6000)) && bad+=("setuid/setgid in jail: $rel")
-      [[ "$(stat -c %F "$f")" != "socket" ]] && ((8#$perm & 8#0002)) && bad+=("world-writable in jail: $rel")
-      owner=$(stat -c %u "$f")
-      [[ "$owner" == 0 || "$owner" == "$uid" ]] || bad+=("jail file $rel owned by $owner")
-    done < <(find "$chroot" -mindepth 1 -print0 2>/dev/null)
-    grep -q " $chroot" /proc/mounts && bad+=("something is mounted inside the jail")
-    for fd in /proc/"$pid"/fd/*; do
-      tgt=$(readlink "$fd" 2>/dev/null) || continue
-      case "$tgt" in
-      "$chroot"/* | socket:* | pipe:* | anon_inode:* | /dev/null) ;;
-      *) bad+=("fd ${fd##*/} -> $tgt (outside the jail)") ;;
-      esac
-    done
+    # Jailer pivot_roots into the jail inside a mount namespace of its own, so
+    # /proc/PID/root reads as "/" from the host: comparing or walking that path
+    # would walk (and judge) the host's whole filesystem. The jail is found by
+    # its host-side path instead, and the process's root is checked to BE that
+    # directory by device and inode, which holds across namespaces.
+    jail="$JAIL_BASE/$id/root"
+    if [[ ! -d "$jail" || "$(stat -L -c '%d:%i' /proc/"$pid"/root/ 2>/dev/null)" != "$(stat -c '%d:%i' "$jail")" ]]; then
+      bad+=("root is not its jail $jail")
+    else
+      declare -A jailinodes=(["$(stat -c '%d:%i' "$jail")"]=1)
+      while IFS= read -r -d '' f; do
+        rel=${f#"$jail"}
+        jailinodes["$(stat -c '%d:%i' "$f")"]=1
+        case "$(stat -c %F "$f")" in
+        "symbolic link") bad+=("symlink in jail: $rel") ;;
+        "character special file")
+          case "$rel" in /dev/kvm | /dev/net/tun | /dev/userfaultfd) ;; *) bad+=("device in jail: $rel") ;; esac ;;
+        "block special file") bad+=("block device in jail: $rel") ;;
+        esac
+        perm=$(stat -c %a "$f")
+        ((8#$perm & 8#6000)) && bad+=("setuid/setgid in jail: $rel")
+        [[ "$(stat -c %F "$f")" != "socket" ]] && ((8#$perm & 8#0002)) && bad+=("world-writable in jail: $rel")
+        owner=$(stat -c %u "$f")
+        [[ "$owner" == 0 || "$owner" == "$uid" ]] || bad+=("jail file $rel owned by $owner")
+      done < <(find "$jail" -xdev -mindepth 1 -print0 2>/dev/null)
+      # Its own namespace holds exactly one mount: the jail as its root.
+      nmounts=$(wc -l <"/proc/$pid/mountinfo")
+      [[ "$nmounts" == 1 ]] || bad+=("$nmounts mounts in its namespace: $(awk '{print $5}' "/proc/$pid/mountinfo" | paste -sd, -)")
+      # Every open file is one of the jail's (fd paths read relative to the
+      # jail's root, so they are matched by inode), or the host's /dev/null.
+      devnull=$(stat -c '%d:%i' /dev/null)
+      for fd in /proc/"$pid"/fd/*; do
+        tgt=$(readlink "$fd" 2>/dev/null) || continue
+        case "$tgt" in socket:* | pipe:* | anon_inode:*) continue ;; esac
+        ino=$(stat -L -c '%d:%i' "$fd" 2>/dev/null) || continue
+        [[ -n "${jailinodes[$ino]:-}" || "$ino" == "$devnull" ]] || bad+=("fd ${fd##*/} -> $tgt (outside the jail)")
+      done
+      unset jailinodes
+    fi
     envs=$(tr '\0' '\n' </proc/"$pid"/environ | grep -ciE 'pass|secret|token|key|credential')
     [[ "$envs" == 0 ]] || bad+=("environment carries $envs secret-looking variables")
   fi

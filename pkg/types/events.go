@@ -10,6 +10,8 @@ const (
 	EventVMStopped       = "vm.stopped"        // powered off on purpose (Stop)
 	EventVMDied          = "vm.died"           // its process died on its own; Reason says why, as far as the host can tell
 	EventVMRestored      = "vm.restored"       // rewound in place to one of its snapshots; Data: snapshot
+	EventVMReady         = "vm.ready"          // after a boot (create, start, fork, restore, or adoption at startup) the guest agent answered the host's probe; Data: after_ms
+	EventVMAgentUnready  = "vm.agent_unready"  // the guest agent did not answer within 30 s of a boot; Reason
 	EventVMDestroyed     = "vm.destroyed"      // gone, disk included
 	EventVMQuarantined   = "vm.quarantined"    // cut off its network in place; Network is the one it left
 	EventVMReplaced      = "vm.replaced"       // its function moved to another VM; Data: replacement, old (quarantine|stop|destroy)

@@ -76,7 +76,7 @@ never half-kept (see §9).
 
 | | process | TAP | IP reservation | disk | name | labels |
 |---|---|---|---|---|---|---|
-| `stop` | killed (graceful, ≤5 s) | removed | **kept** | kept | kept | kept |
+| `stop` | shut down by the guest (`sync` + `reboot` over vsock, ≤10 s), then killed | removed | **kept** | kept | kept | kept |
 | `start` | new | recreated | (still held) | same | same | same |
 | `quarantine` | **kept running** | kept, **off the bridge** | **released** | kept | kept | + `lease=quarantined` |
 | `destroy` (`rm`) | killed | removed | released | **deleted** | released | gone |
@@ -328,8 +328,8 @@ name of its own, and `replaces` pointing back for forensics. The IN rule for
 | value | old VM ends | why pick it |
 |---|---|---|
 | `quarantine` (default) | running, cut off, reachable over vsock | live forensics: inspect memory, processes, connections |
-| `stop` | quarantined **and powered off**, disk kept | keeps the evidence on disk but frees its RAM *before* the replacement boots — on a small host that is often the difference between a replacement and a 503. The graceful power-off can take up to ~5 s |
-| `destroy` | deleted, once the replacement is up | nothing to keep (a plain crash, not a suspicion) |
+| `stop` | quarantined **and powered off**, disk kept | keeps the evidence on disk but frees its RAM *before* the replacement boots — on a small host that is often the difference between a replacement and a 503. The guest shuts down cleanly first (over vsock, ~2-3 s on Alpine, ≤10 s), and the function stays down meanwhile |
+| `destroy` | killed at once (no clean shutdown: its disk goes next), deleted once the replacement is up | nothing to keep (a plain crash, not a suspicion) |
 
 **The order, and why:**
 
@@ -404,7 +404,7 @@ $ mh events
 ```
 
 That is the `replace --old stop` above, as it happened: the old VM cut off, then
-powered off (5 s of graceful shutdown), the replacement created, and the handover
+powered off (a clean guest shutdown over vsock), the replacement created, and the handover
 recorded.
 
 As a program reads them (`mh events --json`, one per line):

@@ -283,11 +283,8 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		if !decodeJSON(w, r, &req, false) {
 			return
 		}
-		if req.Template == "" {
-			writeError(w, http.StatusBadRequest, errors.New("template is required"))
-			return
-		}
-
+		// Template or image: Create validates which (resolveSource), so a
+		// request by image isn't refused here for lacking a template.
 		record, err := mgr.Create(r.Context(), req)
 		if err != nil {
 			writeVMOpError(w, err)
@@ -319,6 +316,29 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		record, ok := mgr.Get(id)
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("vm %q not found", id))
+			return
+		}
+		writeJSON(w, http.StatusOK, liveVMResponse(record))
+	})
+
+	// Blocks until the VM's guest agent answers the host's probe after its
+	// current boot — what `mh run --wait` uses. 200 with the VM once ready ·
+	// 504 past timeout_ms (default 30 s, at most 10 min) · 502 if the agent
+	// gave no answer within 30 s of boot and still gives none · 409 if the VM
+	// is not running.
+	mux.HandleFunc("GET /v1/vms/{id}/ready", func(w http.ResponseWriter, r *http.Request) {
+		timeout := vsock.DefaultExecTimeout
+		if v := r.URL.Query().Get("timeout_ms"); v != "" {
+			ms, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || ms <= 0 || time.Duration(ms)*time.Millisecond > vsock.MaxExecTimeout {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("timeout_ms must be between 1 and %d", vsock.MaxExecTimeout.Milliseconds()))
+				return
+			}
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+		record, err := mgr.WaitReady(r.Context(), r.PathValue("id"), timeout)
+		if err != nil {
+			writeVMOpError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, liveVMResponse(record))
@@ -667,6 +687,12 @@ func writeVMOpError(w http.ResponseWriter, err error) {
 	case errors.Is(err, vm.ErrCapacity):
 		// Nothing wrong with the request: the host is full right now.
 		writeError(w, http.StatusServiceUnavailable, err)
+	case errors.Is(err, vsock.ErrTimeout):
+		// The guest did not answer in time — a hung function, not a broken host.
+		writeError(w, http.StatusGatewayTimeout, err)
+	case errors.Is(err, vm.ErrAgentUnready):
+		// The guest is up but its agent never answered.
+		writeError(w, http.StatusBadGateway, err)
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}

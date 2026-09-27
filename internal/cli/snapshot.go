@@ -155,8 +155,13 @@ func snapFork(e *env, cmd *command, p string, args []string) error {
 	forkIdentityFlags(fs, &req, &labels)
 	var io types.IOLimits
 	ioLimitFlags(fs, &io)
+	var wait waitOpt
+	waitFlags(fs, &wait)
 	pos, err := fs.parse(args)
 	if err != nil {
+		return err
+	}
+	if err := wait.check(p); err != nil {
 		return err
 	}
 	req.IOLimits = askedIOLimits(io)
@@ -179,5 +184,5 @@ func snapFork(e *env, cmd *command, p string, args []string) error {
 		return err
 	}
 	announceVM(e, "forked", vm)
-	return nil
+	return wait.ready(c, vm.ID)
 }

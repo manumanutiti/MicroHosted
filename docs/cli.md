@@ -82,6 +82,8 @@ mh run base-alpine --no-net -v sample:/mnt/sample:ro -v output
 mh run alpine-py --name ts01-a -l sensor=ts-01 -l managed-by=ot
 mh run base-alpine --net ing53 --ip 172.16.20.3   # exact address: a replacement's, or an ingress to_ip
 VM=$(mh run base-alpine)                    # ID only on stdout; details go to stderr
+VM=$(mh run base-alpine --wait)             # return once its agent answers: exec/cp work at once
+mh run base-alpine --wait --wait-timeout 5s # (also on start, fork, snapshot fork, replace, restore)
 
 mh ps                                       # running VMs
 mh ps -a                                    # all, stopped included

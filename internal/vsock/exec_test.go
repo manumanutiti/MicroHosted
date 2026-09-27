@@ -373,3 +373,71 @@ func TestExecContextCancel(t *testing.T) {
 		t.Fatalf("took %s after cancel", d)
 	}
 }
+
+// TestProbeAgentUp: the handshake is acked, and nothing is sent after it — a
+// probe runs no command in the guest.
+func TestProbeAgentUp(t *testing.T) {
+	got := make(chan string, 1)
+	sock := serveOne(t, false, func(r *bufio.Reader, _ net.Conn) {
+		rest, _ := io.ReadAll(r)
+		got <- string(rest)
+	})
+	if err := Probe(context.Background(), sock, testUID, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if rest := <-got; rest != "" {
+		t.Errorf("probe sent %q after the handshake, want nothing", rest)
+	}
+}
+
+// TestProbeNoListener: Firecracker closes the connection without an ack when
+// nothing listens on the guest port yet (the guest still booting).
+func TestProbeNoListener(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "v.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = bufio.NewReader(conn).ReadString('\n')
+			conn.Close()
+		}
+	}()
+	if err := Probe(context.Background(), sock, testUID, time.Second); err == nil {
+		t.Fatal("probe succeeded with no guest listener")
+	}
+}
+
+// TestProbeAckNeverComes: a Firecracker that never answers the handshake
+// costs the probe its timeout, not more.
+func TestProbeAckNeverComes(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "v.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	start := time.Now()
+	if err := Probe(context.Background(), sock, testUID, 200*time.Millisecond); err == nil {
+		t.Fatal("probe succeeded without an ack")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %s, want about the 200ms timeout", d)
+	}
+}
