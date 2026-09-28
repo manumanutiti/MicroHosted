@@ -102,8 +102,8 @@ mh cp ./sample.bin a1b2:/root/              # upload (trailing / keeps the name)
 mh cp a1b2:/var/log/messages .              # download
 mh cp a1b2:/etc/os-release -                # to stdout
 
-mh logs a1b2 -n 50                          # console log (read from the host's disk)
-mh logs -f a1b2
+mh logs a1b2 -n 50                          # console log (through the API)
+mh logs -f a1b2                             # follow (read from the host's disk)
 
 mh stop a1b2 && mh start a1b2               # power off keeping disk + IP, boot again
 mh vm update a1b2 --autostart               # boot it again on its own after a host reboot
@@ -128,9 +128,11 @@ its cgroup caps it at that many cores and that memory (+64 MiB for Firecracker).
 `-v` takes `NAME[:GUEST_PATH][:ro]` — the volume is mounted at `/vol/NAME` unless
 you give a path. Sizes accept MiB (`512`) or a suffix (`512M`, `2G`).
 
-`mh logs` reads the VM's `log_path` from the local disk (the API reports where
-the log is, not its contents), so it only works on the daemon's host, and the
-file may need `sudo`.
+`mh logs` reads the end of the console through the API
+(`GET /v1/vms/{id}/console`, the last 4 MiB — all a VM keeps), so it needs
+neither root nor the daemon's host. `mh logs -f` follows the file at `log_path`
+on the local disk instead: it only works on the daemon's host, and the file may
+need `sudo`.
 
 ### Networks
 

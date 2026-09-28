@@ -344,6 +344,29 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 		writeJSON(w, http.StatusOK, liveVMResponse(record))
 	})
 
+	// The end of a VM's console log (serial console + Jailer/Firecracker
+	// messages), in any state until the VM is destroyed — so a client can
+	// read why a VM failed before it removes it. ?tail=N bytes (default
+	// 64 KiB). The bytes are the guest's: untrusted, served as plain data.
+	mux.HandleFunc("GET /v1/vms/{id}/console", func(w http.ResponseWriter, r *http.Request) {
+		n := int64(64 << 10)
+		if v := r.URL.Query().Get("tail"); v != "" {
+			var err error
+			if n, err = strconv.ParseInt(v, 10, 64); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("tail must be a number of bytes"))
+				return
+			}
+		}
+		data, err := mgr.ConsoleTail(r.PathValue("id"), n)
+		if err != nil {
+			writeVMOpError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		_, _ = w.Write(data)
+	})
+
 	mux.HandleFunc("DELETE /v1/vms/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		if err := mgr.Destroy(r.Context(), id); err != nil {

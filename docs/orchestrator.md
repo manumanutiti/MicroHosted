@@ -1,7 +1,8 @@
 # OT orchestrator — design
 
 > Status: **design, nothing implemented.** Started 2026-09-24; final design
-> review 2026-09-25 (see "Review log" at the end). Every decision is marked
+> review 2026-09-25, second round of decisions 2026-09-28 (see "Review log" at
+> the end). Every decision is marked
 > **Decided** (agreed), **Proposed** (recommended, awaiting agreement) or
 > **Open**.
 > Vocabulary follows `docs/roadmap.md`: the **engine** is MicroHosted (VMs,
@@ -67,7 +68,7 @@ not idempotent. `mh cp` and `mh exec` remain the diagnostic tools.
 
 ## 3. Process model
 
-**Proposed.**
+**Decided (2026-09-28).**
 
 - A separate binary, `cmd/mh-orchestrator`, run as its own systemd unit. It is a
   **client of the engine API** over the Unix socket and imports nothing from
@@ -122,16 +123,35 @@ base: alpine:3.22@sha256:…
 packages: [python3, py3-pymodbus]
 files:
   /opt/parser/: ./src/
-task: /opt/parser/read-once        # one-shot entry point (transaction mode)
-service: /opt/parser/serve         # long-running entry point (persistent/window)
-health: /opt/parser/healthcheck    # optional; exit 0 = healthy
+command: /opt/parser/read-once     # optional default command
+health: /opt/parser/healthcheck    # optional default health check; exit 0 = healthy
 vcpus: 1
 mem_mb: 64
 ```
 
-The image declares **what** it can do (`task`, `service`, `health`); the plant
-spec only declares **when** and **where**. `mh build` formalises what
-`scripts/build-rootfs-alpine.sh --add` does today.
+`mh build` formalises what `scripts/build-rootfs-alpine.sh --add` does today.
+
+**Decided (2026-09-28) — the command is configuration, like Docker's `CMD` and
+compose's `command:`.** An image *may* declare a default `command` and a default
+`health`; the plant spec may set or override either per function. There are no
+named entry points: an operator must be able to use an image without knowing
+anything about it. Allowing a free command in the plant spec does not weaken the
+host:
+
+- The plant spec is written by the operator, who already holds root-equivalent
+  access (the engine socket; `/exec` is a root shell in every guest).
+- The guest is untrusted by design. What protects the host and the network is
+  the Firecracker boundary (jailer, seccomp, per-VM uid) and the nftables rules,
+  none of which depend on what runs inside.
+- The digest still pins the software exactly; the command is versioned with the
+  plant spec.
+
+A command appears in plans and logs, so it must never carry a secret; secrets go
+through `secrets:` (§5).
+
+The image defaults live in the image manifest, covered by the digest (E8, §15).
+Until `mh build` exists (O4), images carry no defaults and the plant spec
+provides every command.
 
 ## 5. Plant spec
 
@@ -139,7 +159,7 @@ spec only declares **when** and **where**. `mh build` formalises what
 error) and validated in full before anything is applied. A mistyped policy line
 must never degrade silently into "no rule".
 
-**Proposed — network blocks reuse the engine's types verbatim**
+**Decided (2026-09-28) — network blocks reuse the engine's types verbatim**
 (`pkg/types.CreateNetworkRequest`: `allowed_egress[].ip/protocol/port`,
 `allowed_ingress[].iface/src_ip/protocol/port/to_ip`, `egress_iface`, `intra`).
 No second vocabulary to translate, and no translation bug between the spec and
@@ -147,29 +167,64 @@ the ruleset.
 
 ```yaml
 version: 1
-budget:
-  max_vms: 120
-  max_mem_mb: 6000
-  workers: 4
+
+budget:   { max_vms: 120, max_mem_mb: 6000, workers: 4 }
+limits:   { max_quarantined: 5, quarantine_disk_mb: 4096 }
+journal:  { max_mb: 256, max_age: 7d }
+
+defaults:
+  on_failure: { backoff: 5s..5m, degraded_after: 5, old: destroy }
+  keep_quarantined: 1
+
 networks:
-  ts-net:
+  backend:
     subnet: 172.16.10.0/24
-    allowed_ingress:
-      - { iface: wlan0, src_ip: 192.168.50.52, protocol: tcp, port: 8080, to_ip: 172.16.10.2 }
     allowed_egress:
-      - { ip: 192.168.50.52, protocol: tcp, port: 80 }
+      - { ip: 10.0.0.5, protocol: tcp, port: 5432 }
+  ingest:
+    subnet: 172.16.20.0/24
+    allowed_ingress:
+      - { iface: wlan0, src_ip: 192.168.50.52, protocol: tcp, port: 1883, to_ip: 172.16.20.2 }
+
 functions:
-  ts-01:
-    image: parser-modbus:1.2@sha256:ab12…
-    network: ts-net
-    ip: 172.16.10.2
-    labels: { sensor: ts-01 }
+  nightly-report:                      # disposable: one VM per run
+    image: tools:1.0@sha256:…
+    network: backend
+    command: /opt/report/run --since 24h
+    lifecycle: { mode: transaction, every: 24h, timeout: 10m }
+
+  web-up:                              # periodic check
+    image: netcheck:1.0@sha256:…
+    network: backend
+    command: curl -fsS http://10.0.0.5:8080/health
+    lifecycle: { mode: transaction, every: 1m, timeout: 10s }
+
+  sampler:                             # runs for a bounded time, then goes
+    image: sampler:0.4@sha256:…
+    network: backend
+    command: /opt/sampler/run --hz 1000
+    lifecycle: { mode: window, every: 15m, duration: 60s }
+
+  broker:                              # static: always on, never recycled
+    image: mosquitto:2.0@sha256:…
+    network: ingest
+    ip: 172.16.20.2                    # the ingress rule's to_ip
+    health: { command: "pgrep mosquitto", every: 10s, timeout: 2s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: never }
+
+  api:
+    image: api:3.2@sha256:…
+    network: backend
+    command: /opt/api/serve
+    health: { command: "wget -qO- localhost:8080/health", every: 10s, timeout: 2s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: 6h }
+    resources: { vcpus: 1, mem_mb: 256, disk_mib_s: 20, net_mbit: 10 }
+    labels: { tier: api }
     files:
-      /etc/parser.conf: { from: conf/ts-01.conf }
+      /etc/api.conf: { from: conf/api.conf }
     secrets:
-      /etc/parser.key: { from: /etc/microhosted/secrets/ts-01.key }
-    lifecycle: { mode: transaction, every: 30s, timeout: 5s }
-    on_failure: { backoff: 5s..5m, degraded_after: 5, old: quarantine }
+      /etc/api.token: { from: /etc/microhosted/secrets/api.token }
+    on_failure: { old: quarantine }    # this one is worth investigating
 ```
 
 ### Validation rules (all checked before any change)
@@ -182,6 +237,8 @@ functions:
   network declares `ip: X` (the address belongs to the function; automatic
   allocation never hands it out).
 - `timeout < every` for `transaction`; `duration < every` for `window`.
+- Every `transaction` and `window` function has a command: its own or the
+  image's default.
 - File sources exist and are regular files; secret sources are owned by root and
   not group/world-readable.
 - The static budget (§11) fits, and fits the host (§11).
@@ -223,11 +280,17 @@ ownership label and never an object it did not create.
 
 ## 7. Functions: lifetimes and the task contract
 
-| `mode` | VM lifetime | Uses | Parameters |
+**Decided (2026-09-28).** A VM is never reused or restarted: whenever one is
+needed, a fresh one is created from the pinned digest. The modes differ only in
+how long each VM lives.
+
+| `mode` | VM lifetime | Runs | Parameters |
 |---|---|---|---|
-| `transaction` | boot → run `task` once → destroy | image `task` | `every`, `timeout` |
-| `window` | boot → run `service` for a bounded time → destroy | image `service` | `every`, `duration` |
-| `persistent` | always on; recycled on a schedule and on failure | image `service` | `recycle` (e.g. `6h`) |
+| `transaction` | boot → run `command` once → destroy; the next cycle gets a new VM | `command` over the exec channel | `every`, `timeout` |
+| `window` | boot → run `command` for a bounded time → destroy | `command` | `every`, `duration` |
+| `persistent` | always on; a fresh VM takes its place on schedule and on failure | the image's init, or `command` if set (the VM is kept while it runs) | `recycle` (`6h`, … or `never`) |
+
+`persistent` with `recycle: never` is the static case: replaced only on failure.
 
 **Proposed — cold boot, not snapshot restore, in v1.** A snapshot freezes the
 guest's IP and MAC, so a "restore per cycle" design needs one snapshot per
@@ -239,14 +302,17 @@ Per-function snapshots stay a later optimisation for sub-second cadences.
 **Proposed — the task contract** (transaction mode):
 
 1. Boot the VM; wait for the agent (bounded by `timeout`).
-2. Run the image's `task` over the engine's exec channel.
+2. Run the function's `command` over the engine's exec channel.
 3. Exit code `0` = success; stdout (bounded by the engine's response cap) = the
    result.
 4. Destroy the VM. On timeout or non-zero exit the cycle is a **failure** (§8).
 5. Results go to an append-only local journal, one JSON line per cycle
-   (`function`, `generation`, `started`, `duration`, `exit`, `output`). This is
-   the v1 sink; `docs/ingestion.md`'s data stream replaces the exec path later
-   and the journal stays as the durable layer.
+   (`function`, `generation`, `started`, `duration`, `exit`, `output`), bounded
+   by `journal.max_mb` and `journal.max_age`. This is the v1 sink.
+
+**Decided (2026-09-28) — the vsock data stream (`docs/ingestion.md`) is a
+reference for later, not part of this design.** v1 moves results only as a
+command's output.
 
 The whole cycle, boot included, must fit in `timeout`; the engine must be able
 to abort an exec at that deadline (§15).
@@ -261,11 +327,17 @@ failure ends in the same action — a replacement from the pinned image takes th
 function's place. If the replacement fails, the suspect is **never**
 reconnected.
 
+**Decided (2026-09-28) — failure is a process signal, never a judgement on
+data.** The orchestrator is generic: it does not know what a function's output
+means, and the plant spec holds no data schemas. A function that wants to fail
+on bad data exits non-zero.
+
 **Proposed — health is checked over vsock only.** The host cannot reach guest
 networks by design, so there is no TCP/HTTP probe. Two levels:
 
 - Liveness: the agent answers a trivial exec within the timeout.
-- Readiness: the image's `health` command exits `0`, if the image declares one.
+- Readiness: the function's `health` command (its own or the image's default)
+  exits `0`, if there is one.
 
 Failure sources and what they mean:
 
@@ -273,7 +345,8 @@ Failure sources and what they mean:
 |---|---|
 | `vm.died` event (incl. OOM) | all modes |
 | health check fails `health.failures` times in a row (default 3) | `persistent`, `window` |
-| task timeout or non-zero exit | `transaction` |
+| `command` exits non-zero or passes `timeout` | `transaction` |
+| `command` ends (with any code) before `duration` | `window`; `persistent` with a `command` |
 | `vm.autostart_failed`, create/replace error | all modes |
 
 Per function, a state machine: `healthy → failing (back-off: 5 s, 10 s, … up to
@@ -287,9 +360,46 @@ state (§12), but back-off counters and *degraded* flags must survive its own
 restarts: otherwise an orchestrator in a crash loop resets every back-off to
 zero and becomes the flood it exists to prevent. A small state file
 (`/var/lib/microhosted/orchestrator/state.json`, atomic write + rename) holds
-only per-function failure counters and flags, counted in cycles rather than
-wall-clock timestamps (§9). A missing or unreadable file starts every function
-at the first back-off step, not at zero.
+only, per function, failure counters and flags (counted in cycles rather than
+wall-clock timestamps, §9), the last failure records (below) and, for updates,
+the last spec that ran successfully and the *held* flag (§13). A missing or
+unreadable file starts every function at the first back-off step, not at zero;
+a held function whose flag was lost gets one more update attempt, which reverts
+it again if it fails.
+
+**Decided (2026-09-28) — a failed VM is destroyed by default** (`on_failure.old:
+destroy`). A non-zero exit is almost always a bug or a dependency being down,
+not a suspected compromise; quarantining every failure would fill the host with
+suspects. Quarantine is opt-in per function (`old: quarantine`) or manual
+(`mh quarantine`); nothing in v1 quarantines on its own judgement. `old: stop`
+keeps the powered-off disk for a post-mortem, within the retention limits
+(§11).
+
+**Decided and implemented (2026-09-28) — why it failed survives the VM.**
+Destroying a failed VM deletes
+its disk and its console log, so the orchestrator captures the evidence
+**before** it asks for the destroy, and keeps it as a *failure record*:
+
+| Field | Source |
+|---|---|
+| `cause` | `exit` (with the code), `timeout`, `health`, `died` (with the engine's reason: OOM, process exited), `create` (the engine's error) |
+| `output` | the last 4 KiB of the command's stdout+stderr, when there is a command |
+| `console` | the last 16 KiB of the VM's serial console (kernel, init, the service's own messages) — E7, §15 |
+| `function`, `generation`, `vm`, `image`, `at`, `after` | identity and timing: `after` is the time from boot to failure, so "fails right after starting" is visible at a glance |
+
+Records are bounded: the last 5 per function, each field capped (about 20 KiB
+per record). They are kept in the orchestrator's state directory (one private
+file per function, rewritten atomically), so `mh-orchestrator status` shows the
+last failure of each function and `mh-orchestrator failures [FUNCTION]` the
+detail, even after the VM is gone and after an orchestrator restart. The state
+of a function removed from the spec is removed with it. Console text comes from
+the guest and is untrusted: it is stored and printed as data — control
+characters escaped, so a guest cannot drive the operator's terminal — never
+interpreted.
+
+Captured on: a cycle that fails (not one skipped because the host is full, nor
+one interrupted by the orchestrator stopping); a persistent VM that fails to
+start, dies, or fails its health threshold; a dead VM found by an apply.
 
 ## 9. Scheduler and work queue
 
@@ -322,8 +432,9 @@ expression would then fire everything at once or freeze.
 With coalescing, a fixed rate can never pile up, so a separate "fixed delay"
 (`after_completion`) mode is **not needed in v1**.
 
-Start-up order: `depends_on: [function]` delays a function until the named ones
-are healthy. Completion-triggered work ("run B when A finishes") is out of scope.
+**Decided (2026-09-28): no `depends_on` in v1.** Functions start in any order
+and a function whose dependency is not up yet fails and backs off like any
+other. Completion-triggered work ("run B when A finishes") is out of scope.
 
 ## 10. Redundancy
 
@@ -364,11 +475,33 @@ needs no priority classes: nothing is ever left waiting for RAM.
 
 ### Quarantine retention
 
-A quarantined VM keeps its RAM. **Proposed:** `keep_quarantined` per function,
-default 1. When a new suspect exceeds it, the oldest is powered off with its
-disk kept for forensics (`old: stop` semantics) and then destroyed once a
-disk-retention limit is reached. Suspects are never deleted silently: every
-removal is logged.
+A quarantined VM keeps its RAM. **Decided (2026-09-28):** `keep_quarantined` per
+function (default 1) and `limits.max_quarantined` for the whole plant. When a
+new suspect exceeds either, the oldest is powered off with its disk kept for
+forensics (`old: stop` semantics); powered-off disks are destroyed, oldest
+first, once they exceed `limits.quarantine_disk_mb`. Suspects are never deleted
+silently: every removal is logged.
+
+### No residue
+
+**Decided (2026-09-28).** Everything the orchestrator creates carries its
+ownership label, is accounted for by the plant spec, and has a bound. Whatever
+does not fit is removed on the next pass.
+
+| Possible residue | What removes or bounds it |
+|---|---|
+| a cycle's VM left behind by an orchestrator crash | on start, an owned `transaction`/`window` VM that is not in progress is destroyed |
+| VMs of a removed function | pruned on the next pass; quarantined ones: `mh apply` asks (§12) |
+| VMs of an older generation after an update | `generation` label mismatch → destroyed |
+| quarantined VMs | `keep_quarantined`, `limits.max_quarantined`, counted in the budget |
+| powered-off disks (`old: stop`) | `limits.quarantine_disk_mb` |
+| networks of removed functions | ownership label → pruned |
+| results and failure records | `journal.max_mb` / `journal.max_age`; 5 failure records per function, capped fields |
+| failure state of removed functions | pruned with the function |
+| a bug in the orchestrator itself | the engine's quota for its `managed-by` (E5): past it the engine answers 429, whatever the orchestrator asks |
+
+`mh orch status` reports these counts; "orphans: 0" is part of the O2 exit
+criterion.
 
 ### Runtime brakes, outermost first
 
@@ -391,22 +524,83 @@ removal is logged.
   changes **destructive** and `mh apply` refuses them without
   `--allow-destructive`.
 - **Host reboot.** Owned VMs have `autostart=false`; the engine finds them dead
-  and the orchestrator destroys the dead records and creates fresh instances in
-  `depends_on` order. One authority per object.
-- **Removed functions.** Serving instances are destroyed; quarantined ones are
-  kept (evidence does not disappear because configuration changed) and counted
-  in `keep_quarantined_orphans`.
+  and the orchestrator destroys the dead records and creates fresh instances.
+  One authority per object.
+- **Removed functions.** Serving instances are destroyed. **Decided
+  (2026-09-28):** for quarantined ones, `mh apply` lists them in the plan and
+  asks whether to keep or destroy them — evidence never disappears silently
+  because configuration changed, and never piles up without a decision. Kept
+  ones count in `keep_quarantined_orphans`. **Proposed:** without a terminal
+  (Ansible, scripts) the choice must be given as `--quarantined=keep|destroy`;
+  without it the whole apply is refused before any change.
 - **Objects it does not own** are never modified, even if they collide by name;
   a collision is a validation error.
 
 ## 13. Updates
 
-A changed image digest (or files, or memory) recreates the affected functions
-**one at a time**: new instance, wait for a healthy result (or one successful
-transaction), continue. At the first failure the roll-out **halts and alerts**;
-already-updated functions stay on the new digest and the rest on the old one.
-**Proposed:** no automatic rollback — in a plant, reverting is itself a change
-an operator decides.
+**Decided (2026-09-28).**
+
+What a change in the plant spec does:
+
+| Change | Effect |
+|---|---|
+| image digest, `command`, `health`, `files` / `secrets`, `resources` | the function's VM is recreated — one function at a time |
+| `labels` | patched in place |
+| a network's egress / ingress rules | updated in place |
+| a network's `subnet` | recreates the network and every VM on it: destructive, refused without `--allow-destructive` (§12) |
+
+**One at a time**, in the order the functions appear in the spec. Each update
+must succeed before the next one starts:
+
+| Mode | How it is updated | Success |
+|---|---|---|
+| `transaction`, `window` | nothing to replace: the next cycle runs the new spec | that cycle succeeds (exit `0`, within `timeout` / `duration`) |
+| `persistent` | engine `replace` with `old: destroy` — the new VM takes over the function's address | the `health` check passes; without one, the VM stays up for 30 s |
+
+A `persistent` function with a fixed address is down for about a second during
+its replace: the engine never lets two VMs serve one address. Accepted for v1;
+`standby` (O5, §10) removes the gap.
+
+**At the first failure, that function goes back to its previous version and
+the roll-out halts.** The orchestrator keeps, per function, the last spec that
+ran successfully (in its failure state, §8). Going back is another `replace`
+(or, for a cycle, the next cycle) with that spec: a fresh VM from the previous
+digest, about a second, never the failed VM reconnected. The function is then
+*held*:
+
+- it keeps running its previous version, and is not counted as failing — the
+  new version failed, not the function;
+- the failed attempt leaves a failure record (§8), so the operator sees why;
+- functions already updated stay on the new version; functions not reached yet
+  stay on the old one;
+- `mh orch status` and every plan show the roll-out as **not converged**: which
+  function is held, on which digest, and what the spec asks for;
+- the loop never retries a held function by itself, so a bad version cannot
+  turn into a boot loop.
+
+**Resuming is `mh apply`.** Applying the same file again retries the held
+function once and, if it succeeds, continues the roll-out; applying a corrected
+file converges to that one instead. There is no separate resume command.
+
+**Implemented (2026-09-28) and validated on test hardware** with the intranet
+example. `mh-orchestrator apply` on the file a `run` is using validates and plans
+it, shows it, and hands it over with SIGHUP (the lock file records the running
+orchestrator's pid and spec); `run` plans it again and refuses it whole if it
+does not plan. A cycle function is verified by one cycle run at once (not by
+waiting for its next scheduled one, which could be a day away); its scheduled
+cycles are paused meanwhile, so two versions never run side by side. A new
+persistent version whose command exits before its health check passes fails at
+once rather than after the whole health wait. Measured: a new app version rolled
+out in ~7 s; a broken one (a syntax error) detected in 2 s and the previous
+version back on a fresh VM 6 s later; a broken cycle version detected by its
+verification cycle in 1 s.
+
+**Known gap: held is not kept across an orchestrator restart.** The held flag
+and the previous version live in the running orchestrator; a restart converges
+to the file. With a broken file, a persistent function is then retried on the
+broken version (back-off, then *degraded*) instead of staying on its previous
+one. Keeping the last good version of each function in the state directory
+closes it (to be decided: that includes file and secret contents).
 
 ## 14. External triggers
 
@@ -434,6 +628,8 @@ Found in the review; each blocks the milestone shown.
 | E4 | Offline file injection into a VM's disk at create — **done**: `files` on create and replace (content in the request, ≤ 64 files / 512 KiB, written with `debugfs` as the VM's identity and read back; record keeps SHA-256 except for secrets; replace of a VM with files requires them again) | per-function files and secrets | O4 (O1 may ship without `files:`) |
 | E5 | Per-orchestrator quota by `managed-by` — **done**: `--quota CONSUMER=vms:N,mem:MB` and `--quota-default` on the daemon (operator-owned, not settable through the API), 429 over it, usage in `GET /v1/system`; `managed-by` fixed at create | roadmap Phase 1 item 3 | O3 |
 | E6 | Readiness published by the engine — **done** (2026-09-27): after every boot the daemon probes the guest agent (host-dialed `CONNECT`, no command) and publishes `vm.ready` / `vm.agent_unready`, `agent_ready_at` on the VM, and `GET /v1/vms/{id}/ready` (blocking); exec and file transfers wait for it within their deadline | a function's first exec (health, task) right after a run or replace failed its handshake for ~100 ms and would read as "down"; each client would otherwise poll | O1 |
+| E7 | Console tail over the API — **done**, validated on ARM64 test hardware (2026-09-28: failure records carry the console): `GET /v1/vms/{id}/console?tail=N` (default 64 KiB, at most 4 MiB), any state until destroy, raw bytes (guest-written, untrusted), no symlinks followed; `mh logs` uses it | failure records must say why a VM failed before it is destroyed; the orchestrator reads nothing from the host's filesystem | O2 |
+| E8 | Image defaults — **proposed**: optional `command` and `health` in the image manifest, covered by the digest | an image usable without knowing it | O4 |
 
 Pending engine validations, carried over: daemon restart with a quarantined VM,
 and `nft -c` of the generated ruleset as root.
@@ -442,11 +638,34 @@ and `nft -c` of the generated ruleset as root.
 
 Each slice is usable on its own and validated on test hardware before the next.
 
+**Status (2026-09-28):** a first cut spanning O1 and the basics of O2/O3 is in
+`orchestrator/` (`mh-orchestrator validate | plan | apply | run | status |
+down`, first example in `orchestrator/examples/first.yaml`). Unit-tested against
+an in-memory engine, and run on ARM64 test hardware (2026-09-28) with the first
+example: all three modes answered correctly (a transaction cycle, boot to
+result, in ~170 ms; a VM reaching the persistent function over its network),
+`down` left nothing behind. Failure round on the same hardware: a persistent VM
+destroyed from outside was replaced in 0.6 s, one that died (guest reboot) in
+4.6 s, one whose service stopped after 3 failed health checks (~25 s); a
+transaction exiting non-zero was reported with its output and its VM destroyed;
+a persistent function that never starts backed off (5, 10, 20, 40 s) and went
+*degraded* after 5 attempts; stopping the orchestrator mid-window destroyed the
+window's VM and reported the cycle as interrupted; a leftover cycle VM was
+removed by the next apply; a quarantined VM of a removed function was kept.
+Then `orchestrator/examples/intranet.yaml` (files: added to the orchestrator for
+it): three Python services on one intra segment plus clients; destroying the
+database (kv) was healed in ~6 s while the app answered 503 without failing;
+killing the app's process was healed after 3 failed checks, with a failure
+record carrying output and console; quarantining the log collector kept it
+running, isolated and inspectable over vsock while a fresh one took its
+address; the guest network never reached the office segment. What it does not do yet is listed in
+`orchestrator/README.md`.
+
 | # | Slice | Exit criterion |
 |---|---|---|
 | O0 | Engine prerequisites E1, E2 | networks carry labels; a VM boots only from a digest in the store |
 | O1 | `mh apply` + one reconcile pass: strict parse, validation, budget, plan, apply networks and `persistent` functions, prune owned objects | apply twice → empty plan; remove a function → fully cleaned; over-budget or destructive spec refused before any change |
-| O2 | `mh-orchestrator` loop: events, health, replace, back-off, *degraded*, persisted failure state (E3) | kill a VM, kill the orchestrator, reboot the host: every function back, zero orphans, back-off preserved |
+| O2 | `mh-orchestrator` loop: events, health, replace, back-off, *degraded*, persisted failure state and failure records (E3, E7) | kill a VM, kill the orchestrator, reboot the host: every function back, zero orphans, back-off preserved; `mh orch status` shows why each failure happened |
 | O3 | Scheduler + work queue: `transaction`, `window`, jitter, coalescing, `max_age`, workers, journal (E5) | 200 functions at 30 s for 72 h unattended: flat boot rate, peak VMs ≤ computed peak — roadmap Phase 2 exit |
 | O4 | `mh build` + image spec + `files`/`secrets` (E4) | same spec → same digest; a replacement boots configured |
 | O5 | `standby`, quarantine retention limits, rolling updates | failover without a gap; a failing function never exceeds its peak |
@@ -455,29 +674,42 @@ Each slice is usable on its own and validated on test hardware before the next.
 ## 17. Decisions and open questions
 
 Decided: YAML + strict parsing; ownership by label; three layers; build outside
-the plant; digest mandatory; two files; intervals only.
+the plant; digest mandatory; two files; intervals only. 2026-09-28: separate
+binary (§3); `command:` in the plant spec, optional image defaults, no named
+entry points (§4); engine field names for networks (§5); the three modes, with
+`recycle: never` (§7); failure is a process signal, no data schemas; `old:
+destroy` by default, quarantine opt-in (§8); no `depends_on` in v1 (§9);
+quarantine limits and the no-residue rule (§11); `mh apply` asks about
+quarantined VMs of removed functions (§12); updates one at a time, a failed
+update reverts that function and halts the roll-out, ~1 s gap accepted, resume
+with `mh apply` (§13); the data stream stays a reference (§7).
 
 Proposed in the review, awaiting agreement:
 
-1. Separate `mh-orchestrator` binary, engine API client (§3).
+1. ~~Separate `mh-orchestrator` binary, engine API client (§3).~~ **Decided 2026-09-28.**
 2. Engine-enforced digests via an image store (§4, E2) — **decided 2026-09-25**, implemented.
-3. Image declares `task` / `service` / `health`; plant spec declares when/where (§4).
-4. Network blocks reuse the engine's field names (§5).
+3. ~~Image declares `task` / `service` / `health`~~ — replaced 2026-09-28: `command:` in the plant spec, optional image defaults (§4).
+4. ~~Network blocks reuse the engine's field names (§5).~~ **Decided 2026-09-28.**
 5. Cold boot in v1, snapshots later (§7).
 6. Task contract + local JSON-lines journal as the v1 sink (§7).
 7. Health over vsock only (§8).
 8. Persisted failure state (§8).
 9. No `after_completion` in v1 (§9).
 10. Budget formula with `workers`; no priority classes in v1 (§11).
-11. Quarantined VMs survive the removal of their function (§12).
-12. Roll-outs halt and alert; no automatic rollback (§13).
+11. ~~Quarantined VMs survive the removal of their function (§12).~~ — replaced 2026-09-28: `mh apply` asks (§12).
+12. ~~Roll-outs halt and alert; no automatic rollback (§13).~~ — replaced
+    2026-09-28: the failed function reverts to its previous version, the
+    roll-out halts (§13).
 
 Open:
 
 1. Where *degraded* and other alerts are delivered (log only, an orchestrator
    event stream, upstream MQTT).
-2. `keep_quarantined` default and the forensic disk-retention limit.
+2. ~~`keep_quarantined` default and the forensic disk-retention limit.~~ Default
+   1 (decided 2026-09-28); the default of `limits.quarantine_disk_mb` is open.
 3. `health.failures` and `max_age` defaults.
+4. The 30-second settle time for a `persistent` function without a health check
+   (§13): fixed, or configurable per function.
 
 ## 18. Review log
 
@@ -500,3 +732,21 @@ code. Changes from the first draft:
   host-checked budget make them unnecessary (§9, §11).
 - Destructive changes, name collisions, prune of quarantined VMs and the single
   writer to the engine made explicit (§3, §12).
+
+**2026-09-28 — second round, from a generic workload's point of view.**
+
+- Named entry points declared by the image were too indirect for an operator
+  who does not know the image: replaced by `command:` in the plant spec with
+  optional image defaults. The host's isolation does not depend on the guest's
+  command (§4).
+- Data schemas removed from the plant spec: the orchestrator is generic, so
+  failure is an exit code, a timeout, a failed health check or a death (§8).
+- The default `old: quarantine` would have turned every ordinary failure into a
+  suspect and filled the host: the default is now `destroy`, quarantine is
+  opt-in and capped plant-wide (§8, §11).
+- With `destroy` the evidence went with the VM: failure records capture the
+  cause, the output and the console tail first (§8, E7).
+- Added the no-residue table (§11); dropped `depends_on` from v1 (§9).
+- Updates: "halt, no rollback" left a function down after a bad version. Now
+  the function that failed reverts to its last good spec with a fresh VM, the
+  roll-out halts and is resumed with `mh apply` (§13).

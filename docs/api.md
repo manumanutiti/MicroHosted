@@ -929,6 +929,29 @@ or chrony). It's Firecracker's documented behavior.
 
 ---
 
+### Console: `GET /v1/vms/{id}/console`
+
+The end of a VM's console log — its serial console plus the Jailer/Firecracker
+messages, the file at `log_path` — in **any state, until the VM is destroyed**.
+A VM that died keeps its log, so a client (an orchestrator) can read why before
+it removes the VM; after a destroy the log is gone with the disk.
+
+```bash
+mhcurl http://localhost/v1/vms/a1b2c3d4/console                 # last 64 KiB
+mhcurl 'http://localhost/v1/vms/a1b2c3d4/console?tail=4194304'  # all of it
+```
+
+**200** with the raw bytes (`text/plain`) · **400** if `tail` is not between 1
+and 4194304 (4 MiB: the live segment plus the rotated one, the most a VM ever
+keeps; across a rotation the end of the older segment comes first) · **404** if
+the VM doesn't exist.
+
+The content is written by the guest: untrusted, and it may carry whatever the
+guest printed, secrets included — the same exposure as `exec`, behind the same
+socket. Clients show it as data (escape control characters before printing it to
+a terminal). The daemon opens the file without following symlinks and reads at
+most `tail` bytes of what was there when the request arrived.
+
 ### Readiness: `GET /v1/vms/{id}/ready`
 
 A create, start, fork, restore or replace returns as soon as Firecracker runs —

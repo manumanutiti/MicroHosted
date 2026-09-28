@@ -1,0 +1,43 @@
+# The smallest useful service: one network, one VM serving a page — a new
+# random word on every refresh — reachable from the plant LAN.
+#
+#   device on 192.168.50.0/24 ──► gateway (its address on wlan0), tcp/8080
+#                                  │ DNAT, no listener on the host
+#                                  ▼
+#   network web-demo 172.30.30.0/24:  site  .10  python3 serve.py :8080
+#
+# From a phone or laptop on 192.168.50.0/24, open http://<gateway>:8080/
+#
+# Requirements: the engine manages wlan0 (--managed-iface wlan0); ingress
+# rules only exist on managed interfaces, whose policy is deny-by-default.
+#
+#   mh image import alpine-py:1.0 -k <kernel> -r <alpine-py.ext4>   # prints the digest
+#   mh-orchestrator run  -f website.yaml
+#   mh-orchestrator down -f website.yaml
+#
+# Edit website/index.html or website/serve.py and `mh-orchestrator apply -f
+# website.yaml` while it runs: the site is replaced by a VM with the new version
+# (about a second down).
+
+version: 1
+
+budget: { max_vms: 2, max_mem_mb: 256, workers: 1 }
+
+networks:
+  web-demo:
+    subnet: 172.30.30.0/24
+    # Only replies go back out: the VM cannot open anything towards the LAN.
+    allowed_ingress:
+      - { iface: wlan0, src_ip: 192.168.50.0/24, protocol: tcp, port: 8080, to_ip: 172.30.30.10 }
+
+functions:
+  site:
+    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    network: web-demo
+    ip: 172.30.30.10          # the ingress rule's to_ip
+    files:
+      /srv/www/index.html: { from: website/index.html }
+      /srv/www/serve.py:   { from: website/serve.py }
+    command: python3 /srv/www/serve.py 8080 /srv/www/index.html
+    health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/", every: 10s, timeout: 3s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: never }

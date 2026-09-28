@@ -3,6 +3,10 @@ CMD_DIR  := ./cmd/microhosted
 # mh: the docker-style CLI client (internal/cli, docs/cli.md).
 CLI      := mh
 CLI_DIR  := ./cmd/mh
+# mh-orchestrator: the declarative orchestrator, an engine API client
+# (orchestrator/, docs/orchestrator.md). Built, not installed: run it from build/.
+ORCH     := mh-orchestrator
+ORCH_DIR := ./orchestrator/cmd/mh-orchestrator
 BUILD_DIR := ./build
 
 # PINNED Firecracker/Jailer version: the one validated on hardware with this
@@ -78,6 +82,7 @@ build:
 	mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(BINARY) $(CMD_DIR)
 	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(CLI) $(CLI_DIR)
+	CGO_ENABLED=0 GOARCH=$(GOARCH) go build -o $(BUILD_DIR)/$(ORCH) $(ORCH_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -204,3 +204,25 @@ func TestReadyEndpointStatuses(t *testing.T) {
 		}
 	}
 }
+
+// GET /v1/vms/{id}/console: a bad tail is the caller's mistake, an unknown VM
+// is 404.
+func TestConsoleEndpointStatuses(t *testing.T) {
+	ts := newTestServer(t)
+	for path, want := range map[string]int{
+		"/v1/vms/deadbeef/console":               http.StatusNotFound,
+		"/v1/vms/deadbeef/console?tail=100":      http.StatusNotFound,
+		"/v1/vms/deadbeef/console?tail=x":        http.StatusBadRequest,
+		"/v1/vms/deadbeef/console?tail=0":        http.StatusBadRequest,
+		"/v1/vms/deadbeef/console?tail=99999999": http.StatusBadRequest,
+	} {
+		res, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Errorf("GET %s = %d, want %d", path, res.StatusCode, want)
+		}
+	}
+}

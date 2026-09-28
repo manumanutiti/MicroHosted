@@ -1,0 +1,107 @@
+# A small intranet: three machines on one segment that talk to each other, a
+# few clients that use them, and an outsider on another network that must not
+# get in. The services are plain Python (stdlib only) shipped with files:.
+#
+#   office 172.30.20.0/24 (intra: VMs see each other)
+#     kv    .10  in-memory key-value store (HTTP :6379)       ← the database
+#     app   .11  web app (HTTP :8080): counts visits in kv, logs to logs
+#     logs  .12  syslog collector (UDP :514), read over HTTP :8080 /tail
+#   guest  172.30.21.0/24 (a separate segment)
+#     outsider   checks that it cannot reach the office
+#
+#   mh image import alpine-py:1.0 -k <kernel> -r <alpine-py.ext4>   # prints the digest
+#   mh-orchestrator run      -f intranet.yaml
+#   mh-orchestrator status   -f intranet.yaml
+#   mh-orchestrator failures -f intranet.yaml FUNCTION
+#   mh-orchestrator down     -f intranet.yaml
+#
+# Things to try while it runs:
+#   mh rm kv-1          kv is replaced within seconds; its data is gone (the
+#                       visit counter starts over) and app answers 503 meanwhile
+#   mh exec app-1 'pkill python3'
+#                       app's health fails 3 times, then a fresh app replaces it
+#   mh quarantine logs-1
+#                       logs is cut off in place (kept for forensics) and a
+#                       fresh one takes its address
+#   mh exec kv-1 'wget -qO- http://172.30.20.12:8080/tail'
+#                       any office machine reaches any other
+
+version: 1
+
+budget:
+  max_vms: 8            # worst case: 3 services + 2 workers = 5 VMs
+  max_mem_mb: 1024      # 5 × 128 MB
+  workers: 2
+
+networks:
+  office:
+    subnet: 172.30.20.0/24
+    intra: true
+  guest:
+    subnet: 172.30.21.0/24
+
+functions:
+  # ── the three machines of the intranet (static) ──────────────────────
+  kv:
+    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    network: office
+    ip: 172.30.20.10
+    files:
+      /opt/intranet/kv.py: { from: intranet/kv.py }
+    command: python3 /opt/intranet/kv.py 6379
+    health: { command: "wget -qO- -T 2 http://127.0.0.1:6379/health", every: 10s, timeout: 3s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: never }
+    labels: { tier: data }
+
+  app:
+    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    network: office
+    ip: 172.30.20.11
+    files:
+      /opt/intranet/app.py: { from: intranet/app.py }
+    command: python3 /opt/intranet/app.py 8080 172.30.20.10:6379 172.30.20.12:514
+    health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/health", every: 10s, timeout: 3s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: never }
+    labels: { tier: web }
+
+  logs:
+    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    network: office
+    ip: 172.30.20.12
+    files:
+      /opt/intranet/logs.py: { from: intranet/logs.py }
+    command: python3 /opt/intranet/logs.py 8080
+    health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/health", every: 10s, timeout: 3s, failures: 3 }
+    lifecycle: { mode: persistent, recycle: never }
+    labels: { tier: ops }
+
+  # ── users of the intranet (disposable) ───────────────────────────────
+  # An employee opening the web app.
+  visitor:
+    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    network: office
+    command: wget -qO- -T 3 http://172.30.20.11:8080/
+    lifecycle: { mode: transaction, every: 20s, timeout: 10s }
+
+  # An auditor reading the database and the collected logs.
+  audit:
+    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    network: office
+    command: 'echo "kv: $(wget -qO- -T 3 http://172.30.20.10:6379/)"; wget -qO- -T 3 "http://172.30.20.12:8080/tail?n=5"'
+    lifecycle: { mode: transaction, every: 1m, timeout: 15s }
+
+  # A burst of traffic: 30 s of requests every 3 minutes. The command must
+  # still be running when the window ends, so it loops forever.
+  rush:
+    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    network: office
+    command: 'while true; do wget -qO- -T 2 http://172.30.20.11:8080/ >/dev/null 2>&1; sleep 0.2; done'
+    lifecycle: { mode: window, every: 3m, duration: 30s }
+
+  # Segmentation check: from the guest network the office must be
+  # unreachable. Succeeds (exit 0) only while it is.
+  outsider:
+    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    network: guest
+    command: 'for ip in 172.30.20.10:6379 172.30.20.11:8080 172.30.20.12:8080; do if wget -qO- -T 2 "http://$ip/health" >/dev/null 2>&1; then echo "BREACH: guest reached $ip"; exit 1; fi; done; echo "office unreachable from guest, as it should be"'
+    lifecycle: { mode: transaction, every: 1m, timeout: 20s }

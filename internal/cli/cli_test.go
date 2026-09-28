@@ -776,3 +776,17 @@ func TestRunWait(t *testing.T) {
 		t.Error("--wait-timeout over 10m accepted")
 	}
 }
+
+// logs without -f reads the console through the API (no root, no need to be
+// on the daemon's host) and keeps the last --tail lines.
+func TestLogsThroughAPI(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{{ID: "deadbeef", Name: "web"}}))
+	mux.HandleFunc("GET /v1/vms/deadbeef/console", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("boot\nline 2\nline 3\n"))
+	})
+	f := newFakeAPI(t, mux)
+	if code, out, errOut := f.run("", "logs", "web", "-n", "2"); code != 0 || out != "line 2\nline 3\n" {
+		t.Errorf("exit %d stdout %q stderr %q", code, out, errOut)
+	}
+}

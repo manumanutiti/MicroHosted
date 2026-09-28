@@ -34,12 +34,19 @@ const guestPowerOff = "sync; (sleep 0.2; reboot) </dev/null >/dev/null 2>&1 &"
 // agentExec runs a command through a VM's guest agent; tests replace it.
 var agentExec = vsock.ExecContext
 
+// The ways to end a VM this daemon launched; tests replace them.
+var (
+	vmmStop = firecracker.Stop
+	vmmKill = firecracker.Kill
+)
+
 // halt ends a VM's Firecracker process. graceful asks the guest to shut itself
 // down first, over its vsock agent: the only path that works on every guest
 // Firecracker runs — SendCtrlAltDel needs an i8042 keyboard the CI kernels do
 // not build and is not implemented on aarch64 at all. A guest without an agent
 // (or one that refuses) falls back to that ACPI path; a guest that accepts but
-// does not go down within gracefulWindow is killed. The guest is untrusted, so
+// does not go down within gracefulWindow is killed — not handed to the ACPI
+// path, whose own window would only extend the stop. The guest is untrusted, so
 // nothing it answers can make a stop take longer than those bounds.
 //
 // graceful false kills outright, for a caller that discards the guest's state
@@ -51,21 +58,27 @@ func (m *Manager) halt(ctx context.Context, record *types.VM, r *running, gracef
 	}
 	if graceful && record.VsockPath != "" {
 		start := time.Now()
-		if m.requestGuestPowerOff(ctx, record) && m.waitExit(ctx, record, r, gracefulWindow) {
-			log.Printf("vm %s: guest powered off cleanly in %s", record.Config.ID, time.Since(start).Round(time.Millisecond))
-			if owned {
-				// Already exited: StopVMM finds the process finished and
-				// returns nil; this only settles the SDK's handle.
-				return firecracker.Kill(ctx, r.machine)
+		if m.requestGuestPowerOff(ctx, record) {
+			if m.waitExit(ctx, record, r, gracefulWindow) {
+				log.Printf("vm %s: guest powered off cleanly in %s", record.Config.ID, time.Since(start).Round(time.Millisecond))
+				if owned {
+					// Already exited: StopVMM finds the process finished and
+					// returns nil; this only settles the SDK's handle.
+					return vmmKill(ctx, r.machine)
+				}
+				return nil
 			}
-			return nil
+			// The guest took the request and stayed up: it had its chance
+			// at a clean shutdown, so no ACPI window on top of this one.
+			log.Printf("vm %s: guest accepted the power-off but was still up after %s; killing it", record.Config.ID, gracefulWindow)
+			graceful = false
 		}
 	}
 	switch {
 	case owned && graceful:
-		return firecracker.Stop(ctx, r.machine)
+		return vmmStop(ctx, r.machine)
 	case owned:
-		return firecracker.Kill(ctx, r.machine)
+		return vmmKill(ctx, r.machine)
 	default:
 		// Adopted VM: no SDK handle, signal the process directly.
 		return stopByPID(record.PID)

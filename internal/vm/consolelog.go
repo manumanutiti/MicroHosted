@@ -180,3 +180,66 @@ func removeConsoleLog(path string) error {
 	}
 	return errors.Join(removeIfExists(path), removeIfExists(consoleLogRotated(path)))
 }
+
+// ConsoleTailMax bounds one console read over the API: the live segment and
+// the rotated one together never hold more.
+const ConsoleTailMax = 2 * consoleLogMax
+
+// ConsoleTail returns the last n bytes of a VM's console log, whatever its
+// state: a VM that died keeps its log until it is destroyed, which is what
+// lets a client read why it died before removing it. Across a rotation the
+// end of the previous segment comes first. The content is written by the
+// guest and is untrusted: callers treat it as data.
+func (m *Manager) ConsoleTail(id string, n int64) ([]byte, error) {
+	if n <= 0 || n > ConsoleTailMax {
+		return nil, fmt.Errorf("%w: tail must be between 1 and %d bytes", ErrInvalid, ConsoleTailMax)
+	}
+	m.mu.Lock()
+	rec, ok := m.vms[id]
+	var path string
+	if ok {
+		path = rec.LogPath
+	}
+	m.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrVMNotFound, id)
+	}
+	if path == "" {
+		return []byte{}, nil
+	}
+	live, err := readTail(path, n)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(live)) >= n {
+		return live, nil
+	}
+	prev, err := readTail(consoleLogRotated(path), n-int64(len(live)))
+	if err != nil {
+		return nil, err
+	}
+	return append(prev, live...), nil
+}
+
+// readTail reads the last n bytes of a log segment; a missing one is empty.
+// No symlink is followed: the file sits in the store next to every VM's disk.
+func readTail(path string, n int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return []byte{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("opening console log: %w", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("console log %s is not a regular file", path)
+	}
+	off := max(fi.Size()-n, 0)
+	// The writer may be appending meanwhile: read what was there at Stat.
+	return io.ReadAll(io.NewSectionReader(f, off, fi.Size()-off))
+}

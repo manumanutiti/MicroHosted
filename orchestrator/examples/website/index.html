@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hello from a microVM</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+           font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+    main { max-width: 36rem; padding: 2rem; text-align: center; }
+    h1   { font-size: 2rem; margin: 0 0 .5rem; }
+    .word { font-size: 3.5rem; font-weight: 700; color: #38bdf8; margin: 1.5rem 0; }
+    p    { line-height: 1.5; color: #94a3b8; }
+    code { background: #1e293b; padding: .1rem .35rem; border-radius: .25rem; color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Hello from a microVM</h1>
+    <div class="word">{{WORD}}</div>
+    <p>Refresh for another word.</p>
+    <p>This page is served by a Firecracker microVM that the MicroHosted
+       orchestrator keeps running. It is reachable only from
+       <code>192.168.50.0/24</code>, on port <code>8080</code> of the gateway;
+       the VM itself cannot open a connection to your device.</p>
+  </main>
+</body>
+</html>

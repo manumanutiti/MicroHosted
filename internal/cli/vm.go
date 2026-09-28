@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -33,7 +34,7 @@ var vmGroup = &group{
 		{name: "label", args: "VM KEY=VALUE... | KEY-...", summary: "Set (KEY=VALUE) or remove (KEY-) a VM's labels", run: vmLabel},
 		{name: "exec", args: "VM COMMAND...", summary: "Run a command inside a VM (over vsock)", run: vmExec},
 		{name: "cp", args: "VM:PATH LOCAL | LOCAL VM:PATH", summary: "Copy a file between a VM and the host", run: vmCopy},
-		{name: "logs", args: "VM", summary: "Show a VM's console log (same host only)", run: vmLogs},
+		{name: "logs", args: "VM", summary: "Show a VM's console log (-f: same host only)", run: vmLogs},
 		{name: "snapshot", args: "VM", summary: "Snapshot a running VM", run: vmSnapshot},
 		{name: "fork", args: "VM", summary: "Clone a running VM into a new one", run: vmFork},
 		{name: "restore", args: "VM SNAPSHOT", summary: "Rewind a VM in place to one of its snapshots", run: vmRestore},
@@ -698,6 +699,27 @@ func vmLogs(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
+	if !follow {
+		// The API serves the end of the log: no need to be on the daemon's
+		// host, nor root. An older daemon without it falls through to the file.
+		res, err := c.Raw("/v1/vms/" + id + "/console?tail=4194304")
+		if err != nil {
+			return err
+		}
+		defer res.Body.Close()
+		if res.StatusCode == http.StatusOK {
+			data, err := io.ReadAll(res.Body)
+			if err != nil {
+				return err
+			}
+			_, err = e.stdout.Write(lastLines(data, tail))
+			return err
+		}
+		if res.StatusCode != http.StatusNotFound && res.StatusCode != http.StatusMethodNotAllowed {
+			body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+			return fmt.Errorf("console log: %s: %s", res.Status, strings.TrimSpace(string(body)))
+		}
+	}
 	var vm types.VMResponse
 	if err := c.Do("GET", "/v1/vms/"+id, nil, &vm); err != nil {
 		return err
@@ -718,6 +740,21 @@ func vmLogs(e *env, cmd *command, p string, args []string) error {
 	return tailFile(e.stdout, f, tail, follow)
 }
 
+// lastLines keeps the last n lines of data (all of it when n <= 0).
+func lastLines(data []byte, n int64) []byte {
+	if n <= 0 {
+		return data
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if int64(len(lines)) > n {
+		lines = lines[int64(len(lines))-n:]
+	}
+	return []byte(strings.Join(lines, ""))
+}
+
 // tailFile prints the last n lines of f (all of it when n <= 0) and, with
 // follow, keeps polling for appended data.
 func tailFile(w io.Writer, f *os.File, n int64, follow bool) error {
@@ -725,17 +762,7 @@ func tailFile(w io.Writer, f *os.File, n int64, follow bool) error {
 	if err != nil {
 		return err
 	}
-	if n > 0 {
-		lines := strings.SplitAfter(string(data), "\n")
-		if lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
-		if int64(len(lines)) > n {
-			lines = lines[int64(len(lines))-n:]
-		}
-		data = []byte(strings.Join(lines, ""))
-	}
-	if _, err := w.Write(data); err != nil || !follow {
+	if _, err := w.Write(lastLines(data, n)); err != nil || !follow {
 		return err
 	}
 	// f is replaced when the log rotates; the caller closes only the original.

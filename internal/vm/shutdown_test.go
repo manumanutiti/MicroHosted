@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	fc "github.com/firecracker-microvm/firecracker-go-sdk"
+
 	"microhosted/pkg/types"
 )
 
@@ -130,5 +132,40 @@ func TestHaltForcedSkipsAgent(t *testing.T) {
 	}
 	if !exited(rec.PID, rec.Config.ID) {
 		t.Fatal("process still alive")
+	}
+}
+
+// A VM this daemon launched whose guest accepts the request and stays up is
+// killed at the end of the window, not handed to the ACPI stop, whose own
+// 5-second wait would push the stop past its documented bound.
+func TestHaltOwnedGuestIgnoresRequestIsKilled(t *testing.T) {
+	old := gracefulWindow
+	gracefulWindow = 200 * time.Millisecond
+	oldStop, oldKill := vmmStop, vmmKill
+	var stops, kills int
+	vmmStop = func(context.Context, *fc.Machine) error { stops++; return nil }
+	vmmKill = func(context.Context, *fc.Machine) error { kills++; return nil }
+	t.Cleanup(func() { gracefulWindow, vmmStop, vmmKill = old, oldStop, oldKill })
+	withAgent(t, func(string) (int, error) { return 0, nil })
+
+	rec := &types.VM{VsockPath: "/nonexistent/v.sock"}
+	rec.Config.ID = "haltowned1"
+	// A handle whose process never exits: Wait blocks until its context ends.
+	r := &running{machine: &fc.Machine{}}
+	if err := (&Manager{}).halt(context.Background(), rec, r, true); err != nil {
+		t.Fatal(err)
+	}
+	if stops != 0 || kills != 1 {
+		t.Fatalf("ACPI stops %d, kills %d; want 0 and 1", stops, kills)
+	}
+
+	// Without an agent the ACPI path is still the fallback.
+	stops, kills = 0, 0
+	withAgent(t, func(string) (int, error) { return 0, errors.New("connection refused") })
+	if err := (&Manager{}).halt(context.Background(), rec, r, true); err != nil {
+		t.Fatal(err)
+	}
+	if stops != 1 || kills != 0 {
+		t.Fatalf("no agent: ACPI stops %d, kills %d; want 1 and 0", stops, kills)
 	}
 }

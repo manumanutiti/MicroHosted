@@ -520,6 +520,19 @@ volumes attached cannot be snapshotted (its memory holds them mounted).
 
 Details and timings: [architecture.md § Snapshots and forking](architecture.md#snapshots-and-forking).
 
+**Known issue — ARM64 hosts with a GICv2 interrupt controller (found
+2026-09-28).** A VM loaded from a snapshot (restore or fork) comes back with its
+timer interrupt dead: the guest's `arch_timer` interrupt count freezes, every
+sleep and timeout inside it waits forever, and its vCPU spins at ~50% of a host
+core. The clock still advances and vsock `exec` still answers, so a check made
+only through `exec` does not notice. The VM that was snapshotted keeps working.
+It reproduces with a bare Firecracker v1.16.1 outside the engine and with every
+load path (resume at load, or paused load and resume), so it is below the
+engine; Firecracker's aarch64 support is validated on GICv3 hosts. Until it is
+resolved, do not rely on restore or fork on such hosts. To check a host:
+`sg kvm -c "python3 -u scripts/snapshot-timers-test.py"` (every line must say
+`SLEEP_OK`). Pending: the same check on x86_64.
+
 ## 8. Files and volumes
 
 ```bash
