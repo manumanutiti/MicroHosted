@@ -35,14 +35,17 @@ type FunctionStatus struct {
 // Status reports every function of the spec and, separately, what the
 // orchestrator owns that the spec does not declare (should be nothing).
 func (o *Orchestrator) Status(ctx context.Context) ([]FunctionStatus, []string, error) {
-	vms, err := o.eng.ListVMs(ctx, owned())
+	vms, err := o.myVMs(ctx, o.spec)
 	if err != nil {
 		return nil, nil, err
 	}
-	nets, err := o.eng.ListNetworks(ctx, owned())
+	nets, err := o.myNetworks(ctx, o.spec)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Health checks and commands the images declare, for the probes; a
+	// function whose image does not resolve is probed with what it has.
+	o.resolveDefaults(ctx, o.spec)
 	byFn := map[string][]types.VMResponse{}
 	for _, v := range vms {
 		byFn[v.Labels[LabelFunction]] = append(byFn[v.Labels[LabelFunction]], v)
@@ -112,7 +115,7 @@ func (o *Orchestrator) probe(ctx context.Context, id string, f *spec.Function) s
 // are evidence and stay until an operator deletes them. It returns what it
 // kept.
 func (o *Orchestrator) Down(ctx context.Context) ([]string, error) {
-	vms, err := o.eng.ListVMs(ctx, owned())
+	vms, err := o.myVMs(ctx, o.spec)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +131,7 @@ func (o *Orchestrator) Down(ctx context.Context) ([]string, error) {
 			errs = append(errs, err)
 		}
 	}
-	nets, err := o.eng.ListNetworks(ctx, owned())
+	nets, err := o.myNetworks(ctx, o.spec)
 	if err != nil {
 		return kept, errors.Join(append(errs, err)...)
 	}

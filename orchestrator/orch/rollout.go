@@ -200,13 +200,13 @@ func (o *Orchestrator) update(ctx context.Context, name string, cur, nf *spec.Fu
 
 // destroyServing destroys a function's VMs that are not quarantined.
 func (o *Orchestrator) destroyServing(ctx context.Context, name, why string) {
-	vms, err := o.eng.ListVMs(ctx, map[string]string{LabelManagedBy: Owner, LabelFunction: name})
+	vms, err := o.myVMs(ctx, o.desired())
 	if err != nil {
 		o.log.Printf("function %s: listing its VMs: %v", name, err)
 		return
 	}
 	for _, v := range vms {
-		if !v.Quarantine {
+		if v.Labels[LabelFunction] == name && !v.Quarantine {
 			o.destroy(v.ID, why)
 		}
 	}

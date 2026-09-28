@@ -35,13 +35,44 @@ brought back automatically. The engine reports; the orchestrator decides.
 
 | Object | What it is | Identity |
 |---|---|---|
-| **Template** | a kernel + a golden rootfs + default shape (`vcpus`, `mem_mb`, `disk_mb`) | name (`base-alpine`) |
-| **VM** | one microVM: a CoW clone of a template's disk, a Firecracker process, maybe a TAP on a network | 8-hex ID (`b5195576`), optional unique **name**, free **labels** |
+| **Template** | a name for two file paths (a kernel + a golden rootfs) + default shape (`vcpus`, `mem_mb`, `disk_mb`), in the catalog. No digest: rebuilding changes what it boots | name (`base-alpine`) |
+| **Image** | the same kind of pair, **copied into the engine's image store** and hashed once, read-only: a tag that never moves to other bytes | tag `name:version` (`alpine-py:1.0`) → **digest** `sha256:…` |
+| **VM** | one microVM: a CoW clone of a template's or image's disk, a Firecracker process, maybe a TAP on a network | 8-hex ID (`b5195576`), optional unique **name**, free **labels** |
 | **Network** | an L2 segment: bridge + subnet + IPAM + a firewall policy | name (`doc-demo`) |
 | **Snapshot** | a frozen VM: memory + device state + disk at one instant | ID, optional name |
 | **Volume** | a persistent ext4 disk that outlives the VMs it is attached to | ID, name |
 | **Function** | not an object in the API: *the job a VM does*, which is its **network address** plus its **labels** (and the firewall rules that point at the address). It is what survives when the VM serving it is replaced. | address + labels |
 | **Event** | something that happened, pushed to subscribers | `epoch:seq` |
+
+### Template or image?
+
+Both boot the same files; they differ in what a name promises.
+
+```
+make prepare-image ──► kernel + rootfs.ext4 in the store ──► template "alpine-py"  (paths; rebuilt in place)
+                                         │
+                              mh image import alpine-py:1.1   (make prepare-image does it as its last step)
+                                         ▼
+                        image alpine-py:1.1@sha256:4a4d…       (a hashed, read-only copy)
+```
+
+- **Template** — `mh run alpine-py`, listed by `mh template ls` (alias `mh
+  images`, which lists templates, not images). Handy by hand; a rebuild
+  silently changes what it boots.
+- **Image** — `mh run alpine-py:1.1` (a `:` makes it an image reference), or
+  pinned `alpine-py:1.1@sha256:…`, refused if tag and digest disagree. Listed by
+  `mh image ls`; `mh image ls -q` prints the pinned references. **The
+  orchestrator accepts only pinned images**: a replacement must boot exactly
+  the bytes that were validated.
+- The **digest** is not the rootfs file's hash: it covers the kernel's and the
+  rootfs's hashes and the image's default shape. The same files imported with
+  other defaults are another image.
+- A **tag** names one build forever: rebuilding needs a new version. One image
+  can carry several tags; `mh image rm name:version` removes that tag only,
+  and the image goes with its last tag (or when removed by digest).
+- Templates and images do not refer to each other. Any number of templates may
+  point at the same file, and any number of VMs boot from one image at once
+  (each on its own CoW clone).
 
 Everything is driven through the HTTP API on `/run/microhosted.sock`; `mh` is a
 thin client over it. Every `mh` example below has an API equivalent in

@@ -36,18 +36,28 @@ const (
 const NoNetwork = "none"
 
 // Labels the orchestrator sets itself and a spec may not.
-var ReservedLabels = []string{"managed-by", "function", "generation", "spec"}
+var ReservedLabels = []string{"managed-by", "project", "function", "generation", "spec"}
 
 // Spec is a parsed, validated plant spec.
 type Spec struct {
-	Version   int                  `yaml:"version"`
+	Version int `yaml:"version"`
+	// Name is the project's name: what the orchestrator creates for this
+	// spec carries it, and it only ever sees and changes its own project's
+	// objects — several specs run side by side, as docker compose projects
+	// do. Optional: Load defaults it to the spec's directory name.
+	Name      string               `yaml:"name"`
 	Budget    Budget               `yaml:"budget"`
 	Networks  map[string]*Network  `yaml:"networks"`
 	Functions map[string]*Function `yaml:"functions"`
 
+	// Project is Name, or what Load derived from the directory.
+	Project string `yaml:"-"`
 	// FunctionOrder lists the functions as they appear in the file: updates
 	// go one at a time in this order.
 	FunctionOrder []string `yaml:"-"`
+	// Vars are the ${NAME} variables the file used, by where each value came
+	// from (FromEnvironment, FromEnvFile, FromDefault).
+	Vars map[string]string `yaml:"-"`
 }
 
 // File is a file written into a function's VM disk before its first boot
@@ -104,12 +114,21 @@ type IngressRule struct {
 type Function struct {
 	// Image is name:version@sha256:<digest>; the digest is mandatory.
 	Image string `yaml:"image"`
+	// Build is an image spec to build the image from instead: a build.yml,
+	// or a directory holding one (relative to the plant spec). The
+	// orchestrator runs mh build on it and uses the reference it prints —
+	// built once per set of inputs (see ResolveBuilds).
+	Build string `yaml:"build"`
+	// BuildFile is Build resolved by Load: the image spec's absolute path.
+	BuildFile string `yaml:"-"`
 	// Network is a network of this spec, or "none".
 	Network string `yaml:"network"`
 	// IP pins the function's address on its network.
 	IP string `yaml:"ip"`
 	// Command runs inside the VM: once per cycle (transaction), for the
 	// window (window), or detached for the VM's life (persistent, optional).
+	// Empty takes the image's default command, if it declares one; so does
+	// an absent Health (persistent functions only).
 	Command   string            `yaml:"command"`
 	Health    *Health           `yaml:"health"`
 	Lifecycle Lifecycle         `yaml:"lifecycle"`
@@ -119,6 +138,10 @@ type Function struct {
 	// never appears in a plan, a log or the engine's record.
 	Files   map[string]*File `yaml:"files"`
 	Secrets map[string]*File `yaml:"secrets"`
+
+	// FromImage lists what the image's defaults filled in ("command",
+	// "health"), once the orchestrator has resolved the image.
+	FromImage []string `yaml:"-"`
 }
 
 // Health is a command run inside a persistent VM; exit 0 means healthy.
@@ -127,6 +150,26 @@ type Health struct {
 	Every    Duration `yaml:"every"`
 	Timeout  Duration `yaml:"timeout"`
 	Failures int      `yaml:"failures"`
+}
+
+// Health check defaults: what a check that leaves them out gets.
+const (
+	DefaultHealthEvery    = 10 * time.Second
+	DefaultHealthTimeout  = 2 * time.Second
+	DefaultHealthFailures = 3
+)
+
+// SetDefaults fills what h leaves out.
+func (h *Health) SetDefaults() {
+	if h.Every == 0 {
+		h.Every = Duration(DefaultHealthEvery)
+	}
+	if h.Timeout == 0 {
+		h.Timeout = Duration(DefaultHealthTimeout)
+	}
+	if h.Failures == 0 {
+		h.Failures = DefaultHealthFailures
+	}
 }
 
 // Lifecycle says how long each of a function's VMs lives.
@@ -194,19 +237,81 @@ func (r Recycle) D() time.Duration { return time.Duration(r) }
 
 // Load reads and validates the spec at path, and reads the content of every
 // file and secret it declares (relative paths from the spec's directory).
+// ${NAME} in its values is replaced from the environment or the .env file
+// next to it (see interpolate).
 func Load(path string) (*Spec, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	envFile, err := ReadEnvFile(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	data, vars, err := interpolate(data, EnvLookup(envFile))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	s, err := Parse(data)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	s.Vars = vars
+	if s.Project == "" {
+		s.Project = DefaultProject(filepath.Dir(path))
+	}
 	if err := s.ReadFiles(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	if err := s.findBuilds(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	return s, nil
+}
+
+// File names looked for when a path names a directory: the plant spec
+// mh-orchestrator reads without -f, and the image spec build: points at.
+var (
+	PlantFiles = []string{"microse.yml", "microse.yaml"}
+	BuildFiles = []string{"build.yml", "build.yaml"}
+)
+
+// FindIn returns the first of names that exists in dir, or dir/names[0].
+func FindIn(dir string, names []string) string {
+	for _, n := range names {
+		if _, err := os.Stat(filepath.Join(dir, n)); err == nil {
+			return filepath.Join(dir, n)
+		}
+	}
+	return filepath.Join(dir, names[0])
+}
+
+// findBuilds resolves every function's build: to the image spec it names.
+func (s *Spec) findBuilds(dir string) error {
+	var errs []error
+	for _, name := range s.FunctionOrder {
+		f := s.Functions[name]
+		if f == nil || f.Build == "" {
+			continue
+		}
+		p := f.Build
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(dir, p)
+		}
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			p = FindIn(p, BuildFiles)
+		}
+		abs, err := filepath.Abs(p)
+		if err == nil {
+			_, err = os.Stat(abs)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("functions.%s.build: %w", name, err))
+			continue
+		}
+		f.BuildFile = abs
+	}
+	return errors.Join(errs...)
 }
 
 // Engine limits on the files of one VM (see the engine's CreateVMRequest).
@@ -326,8 +431,30 @@ var (
 	imageRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$`)
 )
 
-// MaxFunctionName leaves room for "-<generation>" in a 63-character VM name.
-const MaxFunctionName = 50
+// A VM is named <project>-<function>-<generation> in at most 63 characters.
+const (
+	MaxProjectName  = 20
+	MaxFunctionName = 36
+)
+
+var nonName = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// DefaultProject is the project name of a spec in dir that sets no name:
+// the directory's name made a DNS label, as docker compose names a project.
+func DefaultProject(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	n := strings.Trim(nonName.ReplaceAllString(strings.ToLower(filepath.Base(abs)), "-"), "-")
+	if len(n) > MaxProjectName {
+		n = strings.Trim(n[:MaxProjectName], "-")
+	}
+	if n == "" {
+		n = "default"
+	}
+	return n
+}
 
 // MaxCommand bounds a command line; the guest agent reads one line.
 const MaxCommand = 4096
@@ -340,6 +467,12 @@ func (s *Spec) validate() error {
 
 	if s.Version != Version {
 		add("version: must be %d", Version)
+	}
+	if s.Name != "" {
+		if !nameRE.MatchString(s.Name) || len(s.Name) > MaxProjectName {
+			add("name: the project's name: lowercase letters, digits and '-', at most %d characters", MaxProjectName)
+		}
+		s.Project = s.Name
 	}
 	if s.Budget.MaxVMs <= 0 {
 		add("budget.max_vms: required, > 0")
@@ -436,8 +569,12 @@ func (s *Spec) validate() error {
 		if !nameRE.MatchString(name) || len(name) > MaxFunctionName {
 			add("%s: name must be a DNS label of at most %d characters", where, MaxFunctionName)
 		}
-		if !imageRE.MatchString(f.Image) {
-			add("%s.image: name:version@sha256:<digest> — the digest is mandatory", where)
+		switch {
+		case f.Build != "" && f.Image != "":
+			add("%s: image and build are exclusive: build: makes the image", where)
+		case f.Build != "":
+		case !imageRE.MatchString(f.Image):
+			add("%s.image: name:version@sha256:<digest> — the digest is mandatory (or build: a build.yml to make it)", where)
 		}
 		var subnet netip.Prefix
 		switch {
@@ -502,9 +639,6 @@ func (s *Spec) validate() error {
 		default:
 			add("%s.lifecycle.mode: %q: want %s, %s or %s", where, lc.Mode, ModeTransaction, ModeWindow, ModePersistent)
 		}
-		if (lc.Mode == ModeTransaction || lc.Mode == ModeWindow) && f.Command == "" {
-			add("%s.command: required for %s", where, lc.Mode)
-		}
 
 		if h := f.Health; h != nil {
 			if lc.Mode != ModePersistent {
@@ -515,18 +649,10 @@ func (s *Spec) validate() error {
 			} else if err := checkCommand(h.Command); err != nil {
 				add("%s.health.command: %v", where, err)
 			}
-			if h.Every == 0 {
-				h.Every = Duration(10 * time.Second)
-			}
-			if h.Timeout == 0 {
-				h.Timeout = Duration(2 * time.Second)
-			}
-			if h.Failures == 0 {
-				h.Failures = 3
-			}
 			if h.Failures < 0 {
 				add("%s.health.failures: must be > 0", where)
 			}
+			h.SetDefaults()
 			if h.Timeout >= h.Every {
 				add("%s.health: timeout must be shorter than every", where)
 			}

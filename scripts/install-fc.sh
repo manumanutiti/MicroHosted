@@ -8,6 +8,7 @@
 # Example: ./scripts/install-fc.sh v1.16.1 /usr/local/bin
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/pinned.sh"
 
 FC_VERSION="${1:-v1.16.1}"
 INSTALL_DIR="${2:-/usr/local/bin}"
@@ -47,7 +48,12 @@ echo "==> Downloading Firecracker ${FC_VERSION} for ${ARCH}..."
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# Only a pinned release is installed ("latest" included: it must resolve to a
+# version already in scripts/checksums.sha256). The jailer runs as root.
+PIN_KEY="firecracker/${ARCH}/${TARBALL}"
+[[ -n "$(pinned_sha256 "$PIN_KEY")" ]] || { verify_pinned "$PIN_KEY" /dev/null; exit 1; }
 curl -fsSL "${RELEASE_URL}/${TARBALL}" -o "${TMP_DIR}/${TARBALL}"
+verify_pinned "$PIN_KEY" "${TMP_DIR}/${TARBALL}"
 tar -xzf "${TMP_DIR}/${TARBALL}" -C "$TMP_DIR"
 
 # The tarball contains release-v*/firecracker-v*-x86_64 and release-v*/jailer-v*-x86_64

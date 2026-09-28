@@ -72,7 +72,6 @@ func TestParseRejects(t *testing.T) {
 		"window over every":    {"duration: 20s", "duration: 2m", "duration must be shorter"},
 		"no mode":              {"mode: transaction, ", "", "lifecycle.mode: required"},
 		"bad mode":             {"mode: transaction", "mode: cron", `"cron"`},
-		"no command":           {"    command: whoami\n", "", "command: required for transaction"},
 		"multi-line command":   {"command: whoami", "command: \"who\\nami\"", "single line"},
 		"reserved label":       {"network: none\n", "network: none\n    labels: { function: x }\n", "set by the orchestrator"},
 		"health on a cycle":    {"command: whoami\n", "command: whoami\n    health: { command: true }\n", "only persistent"},
@@ -101,16 +100,62 @@ func TestParseRejects(t *testing.T) {
 	}
 }
 
-// The examples shipped with the orchestrator stay valid.
+// The examples shipped with the orchestrator stay valid, and every build:
+// names an image spec that exists.
 func TestExamplesValid(t *testing.T) {
 	files, _ := filepath.Glob("../examples/*.yaml")
-	if len(files) == 0 {
+	plants, _ := filepath.Glob("../examples/*/microse.yml")
+	if len(files) == 0 || len(plants) == 0 {
 		t.Fatal("no examples found")
 	}
-	for _, f := range files {
-		if _, err := Load(f); err != nil {
+	for _, f := range append(files, plants...) {
+		s, err := Load(f)
+		if err != nil {
 			t.Errorf("%v", err)
+			continue
 		}
+		for name, fn := range s.Functions {
+			if fn.Build != "" && filepath.Base(fn.BuildFile) != "build.yml" {
+				t.Errorf("%s: functions.%s.build resolved to %s", f, name, fn.BuildFile)
+			}
+		}
+	}
+}
+
+// build: takes a directory (its build.yml) or a file; image and build are
+// exclusive, and a missing spec fails the load.
+func TestBuildField(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "web"), 0o755)
+	os.WriteFile(filepath.Join(dir, "web", "build.yml"), []byte("base: alpine:3.22\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "other.yml"), []byte("base: alpine:3.22\n"), 0o644)
+	plant := func(fn string) string {
+		return "version: 1\nbudget: { max_vms: 2, max_mem_mb: 256 }\nfunctions:\n  a:\n    network: none\n    lifecycle: { mode: persistent }\n" + fn
+	}
+	for build, want := range map[string]string{"web": "web/build.yml", "web/": "web/build.yml", "other.yml": "other.yml"} {
+		p := filepath.Join(dir, "microse.yml")
+		os.WriteFile(p, []byte(plant("    build: "+build+"\n")), 0o644)
+		s, err := Load(p)
+		if err != nil {
+			t.Fatalf("build: %s: %v", build, err)
+		}
+		if got := s.Functions["a"].BuildFile; got != filepath.Join(dir, want) {
+			t.Errorf("build: %s resolved to %s", build, got)
+		}
+	}
+	for name, fn := range map[string]string{
+		"both":    "    build: web\n    image: a:1@" + digest + "\n",
+		"missing": "    build: nowhere\n",
+		"neither": "",
+	} {
+		p := filepath.Join(dir, "microse.yml")
+		os.WriteFile(p, []byte(plant(fn)), 0o644)
+		if _, err := Load(p); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if got := FindIn(dir, PlantFiles); got != filepath.Join(dir, "microse.yml") {
+		t.Errorf("FindIn = %s", got)
 	}
 }
 

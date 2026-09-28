@@ -252,6 +252,105 @@ network, tap, cgroup, chroot), and the loop survives killing the daemon
 mid-cycle — `Reconcile` exists, it has never been exercised under an
 orchestrator.
 
+### Open: a plant spec that works on another host (noted 2026-09-28)
+
+**The problem, as a newcomer meets it.** Someone clones the repo and tries
+`orchestrator/examples/website.yaml`. Its `image:` carries the digest of the
+author's build, which no other host has, and the first thing they see is
+
+```
+functions.site: image alpine-py:1.0@sha256:cf6c…: engine 409: image conflict:
+alpine-py:1.0 is sha256:fe7f…, not sha256:cf6c…
+```
+
+(or *not found*), with nothing saying what to do. The same happens to any spec
+moved between two plant hosts.
+
+**The cause is not the digest.** A digest covers only content — the kernel's
+and rootfs's hashes and the default shape, never the host, path or import time
+— so the same files imported anywhere give the same digest. What breaks it:
+
+- every host **builds** its images (`quick-setup.md`), and builds are not
+  reproducible (`mkfs.ext4` UUID and timestamps, apk installing current
+  package versions: threat-model gap 8), so every host gets another digest;
+- there is **no way to move an image** between hosts: only copying the exact
+  `.ext4` and kernel by hand and importing them with the same shape;
+- a digest is per **architecture**: an x86_64 spec cannot run on aarch64.
+
+Dropping the digest is not the fix: it is what makes the same spec mean the
+same bytes everywhere — without it `alpine-py:1.0` would silently be different
+software on every host. The design already says images are built **once,
+outside the plant** (`docs/orchestrator.md` §4); the missing piece is carrying
+them.
+
+**Plan, most frustration removed first:**
+
+1. **Examples and errors that say what to do.** **Examples done (2026-09-28):**
+   they carry no digest any more — `build: images/alpine` — so a fresh clone
+   runs them with `mh-orchestrator run`: the first plan builds the image
+   (`sudo` once) and later ones reuse it. Still open: `plan` answering an unknown or mismatched
+   image with the fix instead of a bare engine 409.
+2. **`mh image export NAME:VERSION -o FILE.tar` / `mh image load FILE.tar`**: a
+   bundle of kernel + rootfs + manifest; `load` re-hashes and refuses a bundle
+   whose content does not match the digest it declares. Build once, ship the
+   file, and the spec works unchanged on every host of that architecture.
+3. **Published example images**: the example images built once and attached to
+   a release (per architecture), so the digests in `orchestrator/examples/` are
+   real everywhere: `mh image load` + `mh-orchestrator run` works on a fresh
+   clone.
+4. **Multi-architecture references**: an index binding `name:version` to one
+   digest per architecture (as OCI image indexes do), so one spec serves x86_64
+   and aarch64 gateways.
+5. **Reproducible builds** (optional once 2 exists): pinned apk versions, a fixed
+   filesystem UUID and hash seed, `SOURCE_DATE_EPOCH`. It lets anyone rebuild
+   and check a published digest, rather than being what makes specs portable.
+   `mh build` is where it lands (it already pins the base and kernel, and a
+   spec may pin package versions); ext4 inode times and the readdir order
+   `mkfs.ext4 -d` copies in are what is left.
+
+Exit criterion: on a fresh clone of the repo, the website example runs on
+x86_64 and aarch64 with no edit to its YAML.
+
+### Open: build and projects, where they stand (noted 2026-09-28)
+
+Done on 2026-09-28, uncommitted at the end of the session: `mh build` (Alpine
+and Ubuntu bases, `build.yml`, fingerprint cache, `--no-cache`/`--no-build`),
+image defaults `command`/`health` (E8), `mh run` starting an image's command,
+`${VAR}`/`.env` and `build:` in plant specs, projects (`project=` label,
+adoption of older objects) and the compose verbs `mh up [-d]`, `down`, `plan`,
+`apply`, `status`, `failures`, `validate`; examples moved to `build.yml` +
+`microse.yml`; `docs/uses.md` (a static website, with measured capacity).
+
+Validated on the x86_64 host: an Alpine + nginx image built with `mh build`,
+run by the orchestrator (image defaults, ~1 s to serving), load-tested; an
+existing deployment adopted as a project with labels only; two projects side
+by side; `mh down` of one leaving the other intact.
+
+Still open, in the order they matter:
+
+1. **Validate on hardware what only tests cover:** an Ubuntu build
+   (`orchestrator/examples/app-ubuntu`: debootstrap, apt, systemd agent); the
+   fingerprint cache end to end (`mh build` twice → the second builds nothing,
+   no sudo); `build:` through `mh plan`/`mh up` with a real build; a changed
+   build context rolled out by `mh apply` to a running `mh up -d`.
+2. **`replicas: N`** for a persistent function (compose's `deploy.replicas`):
+   N VMs `<project>-<function>-<i>`, addresses automatic or `ips: [...]`, kept
+   at N by the supervisor, updated one at a time so one always serves. Traffic
+   is not spread by having N VMs: document a host proxy `upstream` over their
+   addresses; an ingress rule to several `to_ip` is an engine change, later.
+   Today: two functions with the same `build:` do the same by hand.
+3. **`mh up -d` across reboots:** a systemd unit per project (or one that
+   starts every project's `up`), so a background `up` survives a host restart;
+   `full-install` installing `mh-orchestrator` too.
+4. **Reproducible builds** (see "a plant spec that works on another host", 5):
+   the fingerprint already gives the same *tag* on every host; the same
+   *digest* needs fixed ext4 inode times, readdir order and pinned packages.
+5. **Default nginx settings worth a build-time warning:** Alpine's nginx ships
+   `gzip` off and an `access_log` on the root disk; on a 64 MB VM, ~100
+   concurrent large responses exhaust guest TCP memory (`TCPAbortOnMemory`).
+   Measured and documented in `docs/uses.md`; the examples set gzip on, the
+   log off and 128 MB.
+
 ## Phase 3 — Demonstrability
 
 In OT the guarantee *is* the product, and right now it is arguable but not
@@ -313,6 +412,71 @@ rule — **if the network policy cannot be applied, the VM does not start.**
 Push mode (DNAT + NFQUEUE trigger + anti-DoS, which now has something to stand
 on thanks to Phase 1's admission control), the blind RS-485→vsock serial bridge,
 and a mass pool from a shared snapshot as a first-class operation.
+
+## Cross-cutting — Installation and usage experience (noted 2026-09-28)
+
+The engine's guarantees hold, but getting to a first working result takes
+knowing things the tools do not say. Each friction point below was hit in a
+real session, trying to serve a page from a microVM to the LAN. The rule for
+all of them: **an error or a missing step says what to do next**, and the
+secure path is the easy one; no security property is traded for convenience.
+
+**Installation**
+
+- `mh-orchestrator` is installed with `mh` by `make install-cli` (2026-09-28;
+  `mh up`/`down`/`plan`… run it) and `mh up -d` keeps a project running in the
+  background — but not across a reboot: there is no systemd unit yet.
+  `full-install` still installs `mh` only.
+- The API socket has no group by default (`SOCKET_GROUP` empty), so every `mh`
+  call needs `sudo` until the user reconfigures. `full-install` should offer
+  the group, add the user and say that a re-login is needed.
+- `make prepare-image` ends with a template **and** an image (done 2026-09-28),
+  but the catalog seed still lists templates that are never built on a fresh
+  host (`base-ubuntu`, …), shown as `NOT BUILT`. List only what exists, or say
+  in one line how to build each.
+- One command from clone to a running example: `full-install` + the example
+  images + a first `mh-orchestrator run`, checked by `make check`.
+- Version bumps (Firecracker, kernel, Alpine) now stop at `no pinned SHA-256`
+  (threat-model Layer 11). Right, but the steps to add a pin are in a file
+  header: a `make pin` helper that fetches, verifies (signature where the
+  publisher offers one) and prints the line to review.
+
+**Usage**
+
+- **Templates vs images** is the main confusion: two stores, near-identical
+  names (`alpine-py` / `alpine-py:1.0`), and `mh images` is an alias for
+  `mh template ls`. Documented (`docs/engine.md`, "Template or image?"); still
+  to decide: rename or drop the alias, and whether templates stay user-facing.
+- **Examples that run on a fresh clone** — see "a plant spec that works on
+  another host" (Phase 2): today they fail with a bare `engine 409`.
+- **Errors that name the fix.** Engine refusals reach the user raw (`engine
+  409: image conflict: …`). The orchestrator and `mh` should translate the
+  common ones: image missing or mismatched → how to build/load it and where to
+  paste `mh image ls -q`; name rules → the rule and a valid example.
+- **Subnet collisions with the host.** The orchestrator checks a spec's
+  subnets against each other and the engine's networks, not the host's routes:
+  `website.yaml`'s `172.30.30.0/24` sits inside a Docker network
+  (`172.30.0.0/16`) on a typical developer host, silently. `plan` should warn
+  about any overlap with a host route.
+- **Reaching a service from the LAN.** Ingress rules only exist on a managed
+  interface, which the engine then owns entirely (deny-by-default). On a PC
+  whose LAN interface is not managed, the only way today is a reverse proxy on
+  the host (e.g. nginx with host networking to the VM's address). Document that
+  path next to the managed-interface one, with the trade-off: the proxy is a
+  listener on the host, which ingress rules deliberately avoid.
+- **Listing what a spec needs.** `mh image ls` shows a short digest; the hint
+  towards `-q` and `--no-trunc` exist (2026-09-28). Same review for every
+  command a spec author uses: each should print, or point to, the exact value
+  the YAML takes.
+- **Transient states read as errors.** An import racing a build still being
+  written failed with `lstat …: no such file or directory`; an operation during
+  a daemon restart fails with a socket error. Say "not ready yet" and, where
+  safe, wait.
+
+Exit criterion: a person new to the project goes from `git clone` to the
+website example served on their LAN following `quick-setup.md` only, without
+`sudo` after install, without editing a YAML, and every error they hit on the
+way names its fix.
 
 ## Deliberately not yet
 

@@ -115,21 +115,69 @@ Hence an engine-side image store (E2, §15; API in `docs/api.md` § Images):
 - Imports read only files under the daemon's store directory, so the import
   endpoint cannot be used to read arbitrary host files.
 
-Image spec (sketch, field names not final):
+**Implemented (2026-09-28) — the image spec and `mh build`.** Format and
+behaviour in `docs/cli.md` § Building an image; the essentials:
 
 ```yaml
-# parser-modbus.image.yaml  →  mh build  →  parser-modbus:1.2@sha256:…
-base: alpine:3.22@sha256:…
+# parser-modbus/build.yml  →  mh build parser-modbus/  →  parser-modbus:sha-3f2a9c1e7b04@sha256:…
+base: alpine:3.22                  # pinned minirootfs
 packages: [python3, py3-pymodbus]
 files:
-  /opt/parser/: ./src/
+  /opt/parser/: src/               # a directory's contents (Docker's COPY)
+run: ["adduser -D parser"]         # Docker's RUN, in a chroot of the image
 command: /opt/parser/read-once     # optional default command
-health: /opt/parser/healthcheck    # optional default health check; exit 0 = healthy
+health: { command: /opt/parser/healthcheck, every: 30s }   # optional default health check
 vcpus: 1
 mem_mb: 64
 ```
 
-`mh build` formalises what `scripts/build-rootfs-alpine.sh --add` does today.
+Bases: `alpine:3.22` (minirootfs, apk, busybox init) and `ubuntu:24.04`
+(debootstrap, apt, systemd). It follows Docker where Docker has an answer: `-t`, `-f`, a build context that
+file sources cannot leave, `-q` printing only the reference, `COPY`/`RUN`
+semantics. It runs on the engine's host as root through `sudo` (the rootfs is
+written into the daemon's store and imported from there), with the base and
+kernel pinned by SHA-256. The build is **not bit-reproducible** yet (ext4
+timestamps and UUIDs; unpinned package versions): the O4 criterion "same spec →
+same digest" is still open — see `docs/roadmap.md`, reproducible builds.
+
+**How a plant spec gets the reference: compose's interpolation (2026-09-28).**
+`${NAME}` in a plant spec's values comes from the environment, else from the
+`.env` file next to the spec (`${NAME:-default}`, `${NAME:?message}`; a bare
+`$NAME` is left alone, so guest shell commands need no escaping). The digest
+stays mandatory — it is checked after interpolation — but it no longer has to
+be pasted:
+
+```bash
+echo "PARSER=$(mh build -q -t parser-modbus parser-modbus/)" >> .env   # image: ${PARSER}
+mh-orchestrator apply -f plant.yaml
+```
+
+A running orchestrator reloads the file with its own environment, so `apply`
+refuses to hand it a spec whose variables only the caller's shell holds:
+they belong in `.env`.
+
+**Or the plant spec builds it (2026-09-28): `build:`, compose's `build:`.** A
+function names a `build.yml` (or its directory) instead of an image;
+`plan`/`apply`/`run` run `mh build` on it and pin the reference printed. The
+build is cached by fingerprint — `mh build` versions an image
+`name:sha-<fingerprint of the spec and its files>` and reuses a tag the store
+holds — so an unchanged context builds nothing and a changed one is a new
+digest, rolled out as any change. Pinning still holds: what boots is the
+digest `mh build` printed. The orchestrator stays an API client: it runs the
+`mh` binary. File names follow compose: `mh build` reads `./build.yml`,
+`mh-orchestrator` reads `./microse.yml` without `-f`.
+
+**Projects and `mh up` (2026-09-28), compose's model.** The desired state is no
+longer one file per host: each plant spec is a project (its `name:`, else its
+directory), everything created carries `project=<name>`, and a spec sees and
+prunes only its own project — several run side by side, each with its own
+lock, state and background `run`. VMs are `<project>-<function>-<n>`; network
+names stay host-wide (a clash is refused, naming the owning project). Objects
+from before projects are adopted by the spec that declares them (labels
+patched, nothing recreated). `mh up [-d]`, `down`, `plan`, `apply`, `status`,
+`failures`, `validate` hand the verb to `mh-orchestrator` (`up` is `run`;
+`up -d` applies, then leaves a `run` in the background; `down` stops it first),
+which stays a separate program (§3).
 
 **Decided (2026-09-28) — the command is configuration, like Docker's `CMD` and
 compose's `command:`.** An image *may* declare a default `command` and a default
@@ -150,8 +198,11 @@ A command appears in plans and logs, so it must never carry a secret; secrets go
 through `secrets:` (§5).
 
 The image defaults live in the image manifest, covered by the digest (E8, §15).
-Until `mh build` exists (O4), images carry no defaults and the plant spec
-provides every command.
+A function that sets no `command` takes the image's; a persistent function
+without `health` takes the image's check (a check's missing `every`, `timeout`
+or `failures` get the plant spec's defaults). `plan` says which functions run
+what the image declared. A cycle function with no command in either is refused
+at plan time.
 
 ## 5. Plant spec
 
@@ -629,7 +680,7 @@ Found in the review; each blocks the milestone shown.
 | E5 | Per-orchestrator quota by `managed-by` — **done**: `--quota CONSUMER=vms:N,mem:MB` and `--quota-default` on the daemon (operator-owned, not settable through the API), 429 over it, usage in `GET /v1/system`; `managed-by` fixed at create | roadmap Phase 1 item 3 | O3 |
 | E6 | Readiness published by the engine — **done** (2026-09-27): after every boot the daemon probes the guest agent (host-dialed `CONNECT`, no command) and publishes `vm.ready` / `vm.agent_unready`, `agent_ready_at` on the VM, and `GET /v1/vms/{id}/ready` (blocking); exec and file transfers wait for it within their deadline | a function's first exec (health, task) right after a run or replace failed its handshake for ~100 ms and would read as "down"; each client would otherwise poll | O1 |
 | E7 | Console tail over the API — **done**, validated on ARM64 test hardware (2026-09-28: failure records carry the console): `GET /v1/vms/{id}/console?tail=N` (default 64 KiB, at most 4 MiB), any state until destroy, raw bytes (guest-written, untrusted), no symlinks followed; `mh logs` uses it | failure records must say why a VM failed before it is destroyed; the orchestrator reads nothing from the host's filesystem | O2 |
-| E8 | Image defaults — **proposed**: optional `command` and `health` in the image manifest, covered by the digest | an image usable without knowing it | O4 |
+| E8 | Image defaults — **done** (2026-09-28): optional `command` and `health` in the image manifest, covered by the digest (absent fields leave older digests unchanged), durations stored canonical; `mh image import --command/--health-*` and `mh build` set them | an image usable without knowing it | O4 |
 
 Pending engine validations, carried over: daemon restart with a quarantined VM,
 and `nft -c` of the generated ruleset as root.
@@ -667,7 +718,7 @@ address; the guest network never reached the office segment. What it does not do
 | O1 | `mh apply` + one reconcile pass: strict parse, validation, budget, plan, apply networks and `persistent` functions, prune owned objects | apply twice → empty plan; remove a function → fully cleaned; over-budget or destructive spec refused before any change |
 | O2 | `mh-orchestrator` loop: events, health, replace, back-off, *degraded*, persisted failure state and failure records (E3, E7) | kill a VM, kill the orchestrator, reboot the host: every function back, zero orphans, back-off preserved; `mh orch status` shows why each failure happened |
 | O3 | Scheduler + work queue: `transaction`, `window`, jitter, coalescing, `max_age`, workers, journal (E5) | 200 functions at 30 s for 72 h unattended: flat boot rate, peak VMs ≤ computed peak — roadmap Phase 2 exit |
-| O4 | `mh build` + image spec + `files`/`secrets` (E4) | same spec → same digest; a replacement boots configured |
+| O4 | `mh build` + image spec + `files`/`secrets` (E4) — **in progress**: `mh build` (fingerprint cache), `build:` in plant specs, image defaults (E8), `${VAR}`/`.env`, `files`/`secrets` done; not yet validated on hardware, builds not reproducible | same spec → same digest; a replacement boots configured |
 | O5 | `standby`, quarantine retention limits, rolling updates | failover without a gap; a failing function never exceeds its peak |
 | O6 | Triggers: local socket, then outbound MQTT | a flood of triggers changes neither the peak nor the budget |
 

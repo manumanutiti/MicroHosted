@@ -132,6 +132,12 @@ digest. A VM created from an image boots exactly the bytes that were hashed.
 | `vcpus`       | int    | yes      | default vCPUs of its VMs, 1–32 |
 | `mem_mb`      | int    | yes      | default memory, at least 32 |
 | `disk_mb`     | int    | no       | default disk size its VMs are grown to |
+| `command`     | string | no       | default command of its VMs, one line of at most 4096 characters. The engine runs no command: this is for whoever starts the VMs (the orchestrator runs it when a plant spec sets none) |
+| `health`      | object | no       | default health check `{command, every?, timeout?, failures?}`: `command` required, durations such as `"10s"` (timeout shorter than every), stored in canonical form (`"1m0s"`) |
+
+The digest covers the defaults: the same files with another command are another
+image. An image without `command` or `health` hashes exactly as it did before
+these fields existed.
 
 ```bash
 mhcurl -X POST http://localhost/v1/images -d '{"name":"parser:1.0",
@@ -149,7 +155,8 @@ request, a path outside the store directory, not a regular file, or empty ·
 
 `{ref}` is `name:version`, `sha256:<hex>` or `name:version@sha256:<hex>`
 (URL-escape the `@`). **Shape of `ImageResponse`:** `digest`, `tags`, `kernel`
-and `rootfs` (the files' digests), `vcpus`, `mem_mb`, `disk_mb`, `size_mb`,
+and `rootfs` (the files' digests), `vcpus`, `mem_mb`, `disk_mb`, `command` and
+`health` (when the image declares them), `size_mb`,
 `imported_at`, and `missing` (a file gone from the store; the image cannot boot).
 **404** unknown · **400** malformed · **409** tag and digest disagree.
 
@@ -160,9 +167,13 @@ Slow, explicit, never part of a boot. **200** `{"digest", "ok", "error"?}`.
 
 ### `DELETE /v1/images/{ref}`
 
-Removes the image, all its tags, and every file no other image uses (a kernel
-shared by several images stays). **204** · **404** · **409** while any VM (in
-any state — a stopped VM restarts from the image's kernel) or snapshot uses it.
+A bare tag (`name:version`) of an image that has other tags removes **only
+that tag**: the image stays under the others, whoever boots from it. Its last
+tag, or a reference with a digest (`sha256:…`, `name:version@sha256:…`),
+removes the image, all its tags, and every file no other image uses (a kernel
+shared by several images stays). **200** `{"digest", "untagged": [tags removed],
+"deleted": bool}` · **404** · **409** deleting an image while any VM (in any
+state — a stopped VM restarts from the image's kernel) or snapshot uses it.
 
 ---
 

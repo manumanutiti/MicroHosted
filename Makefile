@@ -4,7 +4,7 @@ CMD_DIR  := ./cmd/microhosted
 CLI      := mh
 CLI_DIR  := ./cmd/mh
 # mh-orchestrator: the declarative orchestrator, an engine API client
-# (orchestrator/, docs/orchestrator.md). Built, not installed: run it from build/.
+# (orchestrator/, docs/orchestrator.md). make install-cli installs it with mh.
 ORCH     := mh-orchestrator
 ORCH_DIR := ./orchestrator/cmd/mh-orchestrator
 BUILD_DIR := ./build
@@ -64,8 +64,12 @@ endif
 #         ubuntu-docker (noble + Docker Engine, development template dev-ubuntu).
 # Empty IMAGE_NAME/IMAGE_SIZE_MB → the flavor's default (base-alpine 128MB /
 # base-ubuntu-noble 1024MB), resolved by build-image.sh.
+# IMAGE_VERSION: the image tag's version; empty → the build time. IMPORT=0
+# stops at the template (no image, no digest).
 FLAVOR         ?= alpine
 IMAGE_NAME     ?=
+IMAGE_VERSION  ?=
+IMPORT         ?= 1
 IMAGE_SIZE_MB  ?=
 KERNEL_VERSION ?= 6.1.102
 EXTRA_PKGS     ?=
@@ -87,9 +91,11 @@ build:
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Installs only the mh client (install-service already does it too).
+# Installs the clients: mh, and mh-orchestrator, which mh up/down/plan… run
+# (install-service installs mh too).
 install-cli: build
 	sudo install -o root -g root -m 0755 $(BUILD_DIR)/$(CLI) /usr/local/bin/$(CLI)
+	sudo install -o root -g root -m 0755 $(BUILD_DIR)/$(ORCH) /usr/local/bin/$(ORCH)
 
 # ---------------------------------------------------------------------------
 # One-step full installation (x86_64 or aarch64, auto-detected):
@@ -119,11 +125,12 @@ uninstall:
 # ---------------------------------------------------------------------------
 # Complete image pipeline: kernel + rootfs (correct arch, cross with qemu) +
 # preparation (vsock/SSH/DNS) + installation into the CoW store + registration
-# in the catalog. Requires the host already configured (make full-install or
+# in the catalog + import into the image store, which prints the pinned
+# reference (name:version@sha256:…) a plant spec needs. Requires the host already configured (make full-install or
 # setup-host). By default it builds the ultra-minimal Alpine (base-alpine,
 # ~10 MB, vsock exec, no systemd); FLAVOR=ubuntu for the classic noble.
 #   make prepare-image
-#   make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py
+#   make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py IMAGE_VERSION=1.1
 #   make prepare-image FLAVOR=ubuntu         # base-ubuntu-noble (systemd+SSH)
 #   make prepare-image FLAVOR=ubuntu-docker  # dev-ubuntu (noble + Docker)
 #   make prepare-image ARCH=aarch64          # image for ARM (cross with qemu)
@@ -131,7 +138,7 @@ uninstall:
 prepare-image:
 	chmod +x scripts/*.sh
 	ARCH=$(ARCH) FLAVOR=$(FLAVOR) IMAGE_NAME=$(IMAGE_NAME) SIZE_MB=$(IMAGE_SIZE_MB) \
-	KERNEL_VERSION=$(KERNEL_VERSION) EXTRA_PKGS="$(EXTRA_PKGS)" ./scripts/build-image.sh
+	IMAGE_VERSION=$(IMAGE_VERSION) IMPORT=$(IMPORT) KERNEL_VERSION=$(KERNEL_VERSION) EXTRA_PKGS="$(EXTRA_PKGS)" ./scripts/build-image.sh
 
 install-fc:
 	chmod +x scripts/install-fc.sh

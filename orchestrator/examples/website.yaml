@@ -11,15 +11,17 @@
 # Requirements: the engine manages wlan0 (--managed-iface wlan0); ingress
 # rules only exist on managed interfaces, whose policy is deny-by-default.
 #
-#   mh image import alpine-py:1.0 -k <kernel> -r <alpine-py.ext4>   # prints the digest
-#   mh-orchestrator run  -f website.yaml
-#   mh-orchestrator down -f website.yaml
+#   (the image is built by mh build the first time plan/apply/run needs it:
+#    build: images/alpine-py below; sudo once)
+#   mh up  -f website.yaml
+#   mh down -f website.yaml
 #
-# Edit website/index.html or website/serve.py and `mh-orchestrator apply -f
+# Edit website/index.html or website/serve.py and `mh apply -f
 # website.yaml` while it runs: the site is replaced by a VM with the new version
 # (about a second down).
 
 version: 1
+name: website             # the project: this directory holds three specs, each its own
 
 budget: { max_vms: 2, max_mem_mb: 256, workers: 1 }
 
@@ -32,7 +34,7 @@ networks:
 
 functions:
   site:
-    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    build: images/alpine-py
     network: web-demo
     ip: 172.30.30.10          # the ingress rule's to_ip
     files:

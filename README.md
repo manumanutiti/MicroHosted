@@ -25,6 +25,7 @@ through an HTTP API.
 | **[docs/engine.md](docs/engine.md)** | **Start here.** The engine by example: commands with real output, exceptions, how addresses, quarantine, replace and events work, and how a function is kept alive |
 | **[docs/threat-model.md](docs/threat-model.md)** | Threat model and blast radius: what is protected, from whom, the security layers and their known gaps |
 | [docs/cli.md](docs/cli.md) | `mh`, the command-line client: every command and flag |
+| [docs/uses.md](docs/uses.md) | Uses, by example: step-by-step procedures with measured results (a static website behind nginx) |
 | [docs/architecture.md](docs/architecture.md) | Architecture and the lifecycle of a microVM |
 | [docs/layers.md](docs/layers.md) | Layer map, bottom to top |
 | [docs/api.md](docs/api.md) | Complete HTTP API reference (VMs, networks, exec, snapshots/forks, volumes) |

@@ -1,0 +1,34 @@
+# Runs the image build.yml (next to this file) makes: nginx serving site/.
+# No image to build or paste by hand — build: points at it:
+#
+#   cd orchestrator/examples/alpine-nginx
+#   mh plan          # ./microse.yml; builds the image the first time (sudo)
+#   mh up -d         # keep it running in the background (mh up: in this terminal)
+#   curl http://172.30.50.10:8080/
+#   mh status        # what is running, its health
+#   mh down          # stop it and remove what it created
+#
+# Edit site/ or nginx.conf and mh apply: the fingerprint changes, mh build makes
+# a new image, and the running orchestrator replaces the VM with one from it.
+# Nothing changed, nothing is built.
+#
+# To reach it from the LAN: an allowed_ingress rule on a managed interface
+# (see ../website.yaml), or a reverse proxy on the host (docs/uses.md).
+
+version: 1
+
+budget:
+  max_vms: 2            # the VM, plus its replacement during an update
+  max_mem_mb: 256       # 2 × 128, the image's default
+
+networks:
+  nginx-demo:
+    subnet: 172.30.50.0/24
+
+functions:
+  web:
+    build: .            # this directory's build.yml; or image: name:version@sha256:…
+    network: nginx-demo
+    ip: 172.30.50.10
+    # No command or health: the image declares them (nginx, a wget of /).
+    lifecycle: { mode: persistent }

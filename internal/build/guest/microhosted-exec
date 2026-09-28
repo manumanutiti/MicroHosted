@@ -1,0 +1,27 @@
+#!/bin/sh
+IFS= read -r line
+verb=${line%% *}
+case "$verb" in
+  PUT)
+    rest=${line#PUT }
+    path=${rest% *}
+    len=${rest##* }
+    mkdir -p "$(dirname "$path")" 2>/dev/null
+    head -c "$len" > "$path"
+    echo "___MICROHOSTED_EXIT___:$?"
+    ;;
+  GET)
+    path=${line#GET }
+    if [ -f "$path" ]; then
+      len=$(wc -c < "$path")
+      printf 'OK %s\n' "$len"
+      cat "$path"
+    else
+      printf 'ERR no such file: %s\n' "$path"
+    fi
+    ;;
+  *)
+    sh -c "$line" 2>&1
+    echo "___MICROHOSTED_EXIT___:$?"
+    ;;
+esac

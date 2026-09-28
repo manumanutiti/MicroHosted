@@ -1,16 +1,20 @@
 # First plant spec: the three lifecycle modes on a plain Alpine image.
 #
-#   mh image import alpine:1.0 -k <kernel> -r <base-alpine.ext4>   # once; prints the digest
-#   mh-orchestrator validate -f first.yaml
-#   mh-orchestrator plan     -f first.yaml
-#   mh-orchestrator run      -f first.yaml      # Ctrl-C to stop; results on stdout
-#   mh-orchestrator status   -f first.yaml
-#   mh-orchestrator down     -f first.yaml      # remove everything it created
+#   (the image is built by mh build the first time plan/apply/run needs it:
+#    build: images/alpine below; sudo once)
+#   mh validate -f first.yaml
+#   mh plan     -f first.yaml
+#   mh up      -f first.yaml      # Ctrl-C to stop; results on stdout
+#   mh status   -f first.yaml
+#   mh down     -f first.yaml      # remove everything it created
 #
-# Replace the digest below with the one your import printed: the digest is
-# what the engine boots, so a spec never runs other bytes than the ones named.
+# build: images/alpine makes the image from images/alpine/build.yml; the
+# orchestrator then pins what mh build printed (alpine:sha-…@sha256:…): the
+# digest is what the engine boots, so a spec never runs other bytes than the
+# ones named. image: name:version@sha256:… names an existing image instead.
 
 version: 1
+name: first             # the project: this directory holds three specs, each its own
 
 budget:
   max_vms: 6            # worst case here: 1 persistent + 2 workers = 3 VMs
@@ -25,7 +29,7 @@ networks:
 functions:
   # Static: always on, replaced if it dies or fails its health check.
   server:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: demo
     ip: 172.30.10.2
     command: 'while true; do printf "HTTP/1.0 200 OK\r\n\r\nhello from %s, running as %s\n" "$(hostname)" "$(whoami)" | nc -l -p 8080 >/dev/null; done'
@@ -34,21 +38,21 @@ functions:
 
   # Disposable: a fresh VM every 30 s runs one command and is destroyed.
   whoami:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: none       # no network at all; reachable over vsock only
     command: 'echo "$(whoami) on Alpine $(cat /etc/alpine-release), $(uname -m), up $(cut -d" " -f1 /proc/uptime)s"'
     lifecycle: { mode: transaction, every: 30s, timeout: 10s }
 
   # Disposable, talking to the static one over the network.
   probe:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: demo
     command: wget -qO- -T 3 http://172.30.10.2:8080/
     lifecycle: { mode: transaction, every: 30s, timeout: 10s }
 
   # Disposable with a duration: runs 20 s every 2 minutes, then goes.
   ticker:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: none
     command: 'while true; do date -u +%T; sleep 5; done'
     lifecycle: { mode: window, every: 2m, duration: 20s }

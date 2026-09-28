@@ -339,7 +339,7 @@ func (o *Orchestrator) supervise(ctx context.Context, state map[string]*persiste
 		if len(state) == 0 {
 			continue
 		}
-		vms, err := o.eng.ListVMs(ctx, owned())
+		vms, err := o.myVMs(ctx, o.desired())
 		if err != nil {
 			o.log.Printf("supervise: listing VMs: %v", err)
 			continue

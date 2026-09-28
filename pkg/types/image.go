@@ -32,6 +32,23 @@ type ImageManifest struct {
 	VCPUs  int64  `json:"vcpus"`
 	MemMB  int64  `json:"mem_mb"`
 	DiskMB int64  `json:"disk_mb"`
+	// Command and Health are what the image says it runs and how to check
+	// it, for whoever starts its VMs (the orchestrator; the engine runs
+	// neither). Omitted when unset, so images without them keep the digest
+	// they had before these fields existed.
+	Command string       `json:"command,omitempty"`
+	Health  *ImageHealth `json:"health,omitempty"`
+}
+
+// ImageHealth is an image's default health check: Command run inside the VM,
+// exit 0 healthy, every Every, given Timeout, unhealthy after Failures in a
+// row. Durations are Go durations in canonical form ("10s", "1m30s"); empty
+// or zero leaves the consumer's default.
+type ImageHealth struct {
+	Command  string `json:"command"`
+	Every    string `json:"every,omitempty"`
+	Timeout  string `json:"timeout,omitempty"`
+	Failures int    `json:"failures,omitempty"`
 }
 
 // ImportImageRequest is the payload accepted by POST /v1/images: the daemon
@@ -47,19 +64,24 @@ type ImportImageRequest struct {
 	VCPUs  int64 `json:"vcpus"`
 	MemMB  int64 `json:"mem_mb"`
 	DiskMB int64 `json:"disk_mb,omitempty"`
+	// Optional defaults for whoever runs the image (see ImageManifest).
+	Command string       `json:"command,omitempty"`
+	Health  *ImageHealth `json:"health,omitempty"`
 }
 
 // ImageResponse is the JSON representation of an Image.
 type ImageResponse struct {
-	Digest     string   `json:"digest"`
-	Tags       []string `json:"tags"`
-	Kernel     string   `json:"kernel"`
-	Rootfs     string   `json:"rootfs"`
-	VCPUs      int64    `json:"vcpus"`
-	MemMB      int64    `json:"mem_mb"`
-	DiskMB     int64    `json:"disk_mb"`
-	SizeMB     int64    `json:"size_mb"`
-	ImportedAt string   `json:"imported_at"`
+	Digest     string       `json:"digest"`
+	Tags       []string     `json:"tags"`
+	Kernel     string       `json:"kernel"`
+	Rootfs     string       `json:"rootfs"`
+	VCPUs      int64        `json:"vcpus"`
+	MemMB      int64        `json:"mem_mb"`
+	DiskMB     int64        `json:"disk_mb"`
+	Command    string       `json:"command,omitempty"`
+	Health     *ImageHealth `json:"health,omitempty"`
+	SizeMB     int64        `json:"size_mb"`
+	ImportedAt string       `json:"imported_at"`
 	// Missing names a file of the image that is not in the store any more:
 	// the image cannot boot until it is imported again.
 	Missing string `json:"missing,omitempty"`
@@ -70,4 +92,13 @@ type ImageVerifyResponse struct {
 	Digest string `json:"digest"`
 	OK     bool   `json:"ok"`
 	Error  string `json:"error,omitempty"`
+}
+
+// ImageDeleteResponse is what DELETE /v1/images/{ref} returns: the tags it
+// removed and whether the image itself went with them (Deleted false: only
+// the tag was removed, the image stays under its other tags).
+type ImageDeleteResponse struct {
+	Digest   string   `json:"digest"`
+	Untagged []string `json:"untagged"`
+	Deleted  bool     `json:"deleted"`
 }

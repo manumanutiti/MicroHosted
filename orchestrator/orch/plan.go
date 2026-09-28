@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"microhosted/orchestrator/spec"
@@ -119,6 +120,10 @@ func (o *Orchestrator) planFor(ctx context.Context, s *spec.Spec) (*Plan, error)
 			errs = append(errs, fmt.Errorf("networks.%s: a network with that name exists and is not the orchestrator's: rename one of them", name))
 			continue
 		}
+		if ok && !o.mine(have.Labels, true) {
+			errs = append(errs, fmt.Errorf("networks.%s: the network belongs to project %s: network names are shared by the whole host, rename one of them", name, have.Labels[LabelProject]))
+			continue
+		}
 		if !ok {
 			wp := netip.MustParsePrefix(want.Subnet)
 			for _, n := range all {
@@ -126,7 +131,7 @@ func (o *Orchestrator) planFor(ctx context.Context, s *spec.Spec) (*Plan, error)
 					errs = append(errs, fmt.Errorf("networks.%s: subnet %s overlaps the engine's network %s (%s)", name, want.Subnet, n.Name, n.Subnet))
 				}
 			}
-			req := createNetworkRequest(name, want)
+			req := createNetworkRequest(o.project, name, want)
 			p.Actions = append(p.Actions, Action{Verb: "create", Object: "network " + name, Why: want.Subnet, kind: kindNetwork,
 				run: func(ctx context.Context) error { return o.eng.CreateNetwork(ctx, req) }})
 			continue
@@ -136,10 +141,16 @@ func (o *Orchestrator) planFor(ctx context.Context, s *spec.Spec) (*Plan, error)
 			continue
 		}
 		p.Actions = append(p.Actions, networkUpdates(o.eng, name, have, want)...)
+		if have.Labels[LabelProject] != o.project {
+			// Made before projects: this project adopts it.
+			patch := map[string]*string{LabelProject: &o.project}
+			p.Actions = append(p.Actions, Action{Verb: "update", Object: "network " + name, Why: "adopted by project " + o.project, kind: kindNetwork,
+				run: func(ctx context.Context) error { return o.eng.PatchNetworkLabels(ctx, name, patch) }})
+		}
 	}
 
 	// VMs.
-	vms, err := o.eng.ListVMs(ctx, owned())
+	vms, err := o.myVMs(ctx, s)
 	if err != nil {
 		return nil, err
 	}
@@ -184,10 +195,7 @@ func (o *Orchestrator) planFor(ctx context.Context, s *spec.Spec) (*Plan, error)
 
 	// Owned networks no longer in the spec go last, once their VMs are gone.
 	for _, n := range all {
-		if n.Labels[LabelManagedBy] != Owner {
-			continue
-		}
-		if _, ok := s.Networks[n.Name]; ok {
+		if _, ok := s.Networks[n.Name]; ok || !o.mine(n.Labels, false) {
 			continue
 		}
 		name := n.Name
@@ -205,18 +213,19 @@ func (o *Orchestrator) planFor(ctx context.Context, s *spec.Spec) (*Plan, error)
 // (docs/orchestrator.md §11): every persistent function's VM, plus one VM per
 // worker for cycles. It also checks that every image is in the store.
 func (o *Orchestrator) budget(ctx context.Context, s *spec.Spec, p *Plan) error {
-	var errs []error
+	// Every image resolved and its defaults applied first: a function's
+	// command is part of what its VM is born with (SpecHash).
+	errs := o.resolveDefaults(ctx, s)
+	failed := len(errs) > 0
 	cycles := 0
 	var cycleMem int64
 	for _, name := range s.FunctionOrder {
 		f := s.Functions[name]
 		mem, err := o.memOf(ctx, f)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("functions.%s: %w", name, err))
-			continue
-		}
-		if _, err := o.image(ctx, f.Image); err != nil {
-			errs = append(errs, fmt.Errorf("functions.%s: %w", name, err))
+			if !failed {
+				errs = append(errs, fmt.Errorf("functions.%s: %w", name, err))
+			}
 			continue
 		}
 		if f.Lifecycle.Mode == spec.ModePersistent {
@@ -286,7 +295,7 @@ func (o *Orchestrator) persistentActions(name string, f *spec.Function, have []t
 		acts = append(acts, o.destroyAction(v, why))
 	}
 	if keep == nil {
-		acts = append(acts, Action{Verb: "create", Object: "function " + name, Why: f.Lifecycle.Mode + ", " + f.Image, function: name, kind: kindFunction,
+		acts = append(acts, Action{Verb: "create", Object: "function " + name, Why: createWhy(f), function: name, kind: kindFunction,
 			run: func(ctx context.Context) error {
 				vm, err := o.startPersistent(ctx, name, f)
 				if err != nil {
@@ -300,7 +309,7 @@ func (o *Orchestrator) persistentActions(name string, f *spec.Function, have []t
 	// Labels the spec sets but the VM lacks (or has with another value), or
 	// the VM carries but the spec no longer sets: patched in place.
 	patch := map[string]*string{}
-	want := functionLabels(name, f, 0)
+	want := functionLabels(o.project, name, f, 0)
 	for k, v := range want {
 		if k == LabelGeneration {
 			continue
@@ -338,10 +347,10 @@ func toIngress(rules []spec.IngressRule) []types.IngressRule {
 	return out
 }
 
-func createNetworkRequest(name string, n *spec.Network) types.CreateNetworkRequest {
+func createNetworkRequest(project, name string, n *spec.Network) types.CreateNetworkRequest {
 	return types.CreateNetworkRequest{
 		Name:           name,
-		Labels:         map[string]string{LabelManagedBy: Owner},
+		Labels:         map[string]string{LabelManagedBy: Owner, LabelProject: project},
 		Subnet:         n.Subnet,
 		Egress:         n.Egress,
 		EgressIface:    n.EgressIface,
@@ -408,4 +417,14 @@ func (o *Orchestrator) Apply(ctx context.Context, p *Plan) error {
 		}
 	}
 	return nil
+}
+
+// createWhy says what a function's new VM runs, and what of it the image
+// declared.
+func createWhy(f *spec.Function) string {
+	why := f.Lifecycle.Mode + ", " + f.Image
+	if len(f.FromImage) > 0 {
+		why += ", " + strings.Join(f.FromImage, " and ") + " from the image"
+	}
+	return why
 }

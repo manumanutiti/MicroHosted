@@ -45,6 +45,17 @@ esac
 CROSS=0
 [[ "$DEBARCH" != "$NATIVE_DEBARCH" ]] && CROSS=1
 
+# The archive's Release file is verified against this keyring, and every
+# package against the Release file: the mirror can be plain http. Named
+# explicitly, so a host without it fails instead of debootstrap warning and
+# going on unverified.
+KEYRING="${KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}"
+if [[ ! -f "$KEYRING" ]]; then
+  echo "ERROR: no Ubuntu archive keyring at $KEYRING: install ubuntu-keyring" >&2
+  echo "       (or point KEYRING= at it); without it nothing debootstrap fetches is verified." >&2
+  exit 1
+fi
+
 if ! command -v debootstrap &>/dev/null; then
   echo "==> Installing debootstrap..."
   sudo apt-get install -y debootstrap
@@ -84,11 +95,11 @@ sudo mount -o loop "$OUTPUT" "$MOUNT_DIR"
 
 if [[ "$CROSS" -eq 0 ]]; then
   echo "==> debootstrap ${DISTRO}/${DEBARCH} (native)..."
-  sudo debootstrap --arch="$DEBARCH" --include="$INCLUDE" \
+  sudo debootstrap --keyring="$KEYRING" --arch="$DEBARCH" --include="$INCLUDE" \
     --components=main,universe "$DISTRO" "$MOUNT_DIR" "$MIRROR"
 else
   echo "==> debootstrap ${DISTRO}/${DEBARCH} (cross, two stages with qemu)..."
-  sudo debootstrap --foreign --arch="$DEBARCH" --include="$INCLUDE" \
+  sudo debootstrap --keyring="$KEYRING" --foreign --arch="$DEBARCH" --include="$INCLUDE" \
     --components=main,universe "$DISTRO" "$MOUNT_DIR" "$MIRROR"
   sudo cp "$QEMU_BIN" "$MOUNT_DIR/usr/bin/"
   sudo chroot "$MOUNT_DIR" /debootstrap/debootstrap --second-stage

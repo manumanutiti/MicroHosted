@@ -62,6 +62,8 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 	ioLimitFlags(fs, &io)
 	var wait waitOpt
 	waitFlags(fs, &wait)
+	var noCommand bool
+	fs.boolVar(&noCommand, "no-command", "", "from an image that declares a command: boot without starting it")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -100,12 +102,51 @@ func vmCreate(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The image's command, as docker run starts an image's CMD: the engine
+	// runs nothing itself, so the client starts it once the agent answers.
+	var command string
+	if req.Image != "" && !noCommand {
+		img, err := getImage(c, req.Image)
+		if err != nil {
+			return err
+		}
+		command = img.Command
+	}
 	var vm types.VMResponse
 	if err := c.Do("POST", "/v1/vms", req, &vm); err != nil {
 		return err
 	}
 	announceVM(e, "created", vm)
-	return wait.ready(c, vm.ID)
+	if command == "" {
+		return wait.ready(c, vm.ID)
+	}
+	wait.on = true
+	if err := wait.ready(c, vm.ID); err != nil {
+		return fmt.Errorf("the VM's agent did not answer, so the image's command was not started: %w", err)
+	}
+	var res types.ExecResponse
+	if err := c.Do("POST", "/v1/vms/"+vm.ID+"/exec", types.ExecRequest{Cmd: launchCommand(command), TimeoutMS: 10000}, &res); err != nil {
+		return fmt.Errorf("starting the image's command: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("starting the image's command: exit %d: %s", res.ExitCode, strings.TrimSpace(res.Output))
+	}
+	fmt.Fprintf(e.stderr, "started the image's command: %s  (output: mh exec %s cat %s)\n", command, vm.ID, commandLog)
+	return nil
+}
+
+// Where a command started by mh run writes its output and pid inside the
+// guest: the same files the orchestrator's launched commands use.
+const (
+	commandLog = "/var/log/mh-function.log"
+	commandPID = "/run/mh-function.pid"
+)
+
+// launchCommand starts cmd detached from the agent's connection — its own
+// session, stdin from /dev/null, output to commandLog — so the exec returns
+// at once and the command outlives it.
+func launchCommand(cmd string) string {
+	return "setsid sh -c '" + strings.ReplaceAll(cmd, "'", `'\''`) + "' </dev/null >" + commandLog + " 2>&1 & echo $! >" + commandPID
 }
 
 // waitOpt is --wait on a command that boots a VM: return once its guest agent

@@ -640,7 +640,33 @@ func TestImageCommands(t *testing.T) {
 	mux.HandleFunc("GET /v1/images", reply([]types.ImageResponse{img}))
 	mux.HandleFunc("POST /v1/images/{ref}/verify", reply(types.ImageVerifyResponse{Digest: digest, OK: false, Error: "mismatch"}))
 	mux.HandleFunc("POST /v1/vms", replyStatus(http.StatusCreated, types.VMResponse{ID: "a1b2c3d4"}))
+	mux.HandleFunc("GET /v1/images/{ref}", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.PathValue("ref"), "web:") {
+			reply(types.ImageResponse{Digest: digest, Command: "nginx -g 'daemon off;'"})(w, r)
+			return
+		}
+		reply(img)(w, r)
+	})
+	mux.HandleFunc("GET /v1/vms/{id}/ready", reply(map[string]bool{"ready": true}))
+	mux.HandleFunc("POST /v1/vms/{id}/exec", reply(types.ExecResponse{}))
 	f := newFakeAPI(t, mux)
+
+	// run IMAGE starts the image's command once the agent answers, as
+	// docker run starts CMD; --no-command boots without it.
+	if code, out, errOut := f.run("", "run", "web:1.0"); code != 0 || out != "a1b2c3d4\n" || !strings.Contains(errOut, "started the image's command") {
+		t.Fatalf("run web:1.0: exit %d, out %q, err %q", code, out, errOut)
+	}
+	var ex types.ExecRequest
+	if err := json.Unmarshal(f.last("POST").body, &ex); err != nil {
+		t.Fatal(err)
+	}
+	if want := `setsid sh -c 'nginx -g '\''daemon off;'\''' </dev/null >` + commandLog; !strings.HasPrefix(ex.Cmd, want) {
+		t.Errorf("launch = %q, want prefix %q", ex.Cmd, want)
+	}
+	f.run("", "run", "--no-command", "web:1.0")
+	if last := f.last("POST"); last.path != "/v1/vms" {
+		t.Errorf("--no-command still ran %s", last.path)
+	}
 
 	code, out, errOut := f.run("", "image", "import", "parser:1.0", "--kernel", "/store/vmlinux", "-r", "rootfs.ext4", "--mem", "64")
 	if code != 0 {
@@ -660,8 +686,12 @@ func TestImageCommands(t *testing.T) {
 		t.Error("import without --rootfs must refuse")
 	}
 
-	if _, out, _ := f.run("", "image", "ls"); !strings.Contains(out, "parser:1.0") || !strings.Contains(out, "abababababab") {
-		t.Errorf("ls:\n%s", out)
+	if _, out, errOut := f.run("", "image", "ls"); !strings.Contains(out, "parser:1.0") || !strings.Contains(out, "abababababab") ||
+		strings.Contains(out, digest) || !strings.Contains(errOut, "mh image ls -q") {
+		t.Errorf("ls: short digest on stdout, the hint on stderr:\n%s\n%s", out, errOut)
+	}
+	if _, out, _ := f.run("", "image", "ls", "--no-trunc"); !strings.Contains(out, digest) {
+		t.Errorf("ls --no-trunc:\n%s", out)
 	}
 	if _, out, _ := f.run("", "image", "ls", "-q"); out != "parser:1.0@"+digest+"\n" {
 		t.Errorf("ls -q = %q", out)

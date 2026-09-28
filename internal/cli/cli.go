@@ -31,7 +31,10 @@ type env struct {
 	stdout io.Writer
 	stderr io.Writer
 	host   string
-	client *Client
+	// hostFlag is -H as given (empty: the environment or the default decide,
+	// for mh-orchestrator too).
+	hostFlag string
+	client   *Client
 }
 
 func (e *env) api() (*Client, error) {
@@ -92,6 +95,7 @@ var shortcuts = []shortcut{
 	{"quarantine", "vm", "quarantine"},
 	{"replace", "vm", "replace"},
 	{"images", "template", "ls"},
+	{"build", "image", "build"},
 	{"health", "system", "health"},
 	{"info", "system", "info"},
 	{"doctor", "system", "doctor"},
@@ -135,6 +139,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	e.host = ResolveHost(host)
+	e.hostFlag = host
 	args = fs.Args()
 	if len(args) == 0 {
 		printHelp(stdout, fs)
@@ -196,6 +201,9 @@ func dispatch(e *env, args []string, global *flagSet) error {
 	if s := findShortcut(name); s != nil {
 		return runCommand(e, findGroup(s.group), s.cmd, args[1:], "mh "+s.name)
 	}
+	if isProjectVerb(name) {
+		return runProject(e, e.hostFlag, name, args[1:])
+	}
 	return usagef("mh", "unknown command %q", name)
 }
 
@@ -253,6 +261,7 @@ Common commands (VMs):
 		fmt.Fprintf(tw, "  %s\t%s\n", s.name, g.find(s.cmd).summary)
 	}
 	tw.Flush()
+	printProjectHelp(w)
 	fmt.Fprint(w, "\nManagement commands:\n")
 	for _, g := range groups {
 		fmt.Fprintf(tw, "  %s\t%s\n", g.name, g.summary)

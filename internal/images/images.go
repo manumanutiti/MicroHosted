@@ -51,6 +51,9 @@ const (
 	maxVersion = 63
 	maxVCPUs   = 32
 	minMemMB   = 32
+	// maxCommand is a default command's or health check's length: they run
+	// through the guest agent, which reads one line.
+	maxCommand = 4096
 )
 
 var (
@@ -198,6 +201,10 @@ func (s *Store) Import(req types.ImportImageRequest) (*types.Image, error) {
 	if req.DiskMB < 0 {
 		return nil, fmt.Errorf("%w: disk_mb %d is negative", labels.ErrInvalid, req.DiskMB)
 	}
+	health, err := checkDefaults(req.Command, req.Health)
+	if err != nil {
+		return nil, err
+	}
 	kernelSrc, err := s.checkSource(req.KernelPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: kernel_path: %v", labels.ErrInvalid, err)
@@ -242,6 +249,7 @@ func (s *Store) Import(req types.ImportImageRequest) (*types.Image, error) {
 	m := types.ImageManifest{
 		Schema: manifestSchema, Kernel: kernel, Rootfs: rootfs,
 		VCPUs: req.VCPUs, MemMB: req.MemMB, DiskMB: req.DiskMB,
+		Command: req.Command, Health: health,
 	}
 	digest, err := manifestDigest(m)
 	if err != nil {
@@ -275,6 +283,57 @@ func (s *Store) Import(req types.ImportImageRequest) (*types.Image, error) {
 	s.mu.Unlock()
 	done = true
 	return &next, nil
+}
+
+// checkDefaults validates an image's default command and health check and
+// returns the health check in canonical form (durations as time.Duration
+// prints them), so two spellings of the same check give the same digest.
+func checkDefaults(command string, h *types.ImageHealth) (*types.ImageHealth, error) {
+	if err := checkCommand("command", command); err != nil {
+		return nil, err
+	}
+	if h == nil {
+		return nil, nil
+	}
+	if h.Command == "" {
+		return nil, fmt.Errorf("%w: health.command: required", labels.ErrInvalid)
+	}
+	if err := checkCommand("health.command", h.Command); err != nil {
+		return nil, err
+	}
+	if h.Failures < 0 {
+		return nil, fmt.Errorf("%w: health.failures %d is negative", labels.ErrInvalid, h.Failures)
+	}
+	out := *h
+	var every, timeout time.Duration
+	for _, d := range []struct {
+		name string
+		v    *string
+		dst  *time.Duration
+	}{{"every", &out.Every, &every}, {"timeout", &out.Timeout, &timeout}} {
+		if *d.v == "" {
+			continue
+		}
+		v, err := time.ParseDuration(*d.v)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("%w: health.%s %q: a positive duration such as 10s", labels.ErrInvalid, d.name, *d.v)
+		}
+		*d.v, *d.dst = v.String(), v
+	}
+	if every > 0 && timeout >= every {
+		return nil, fmt.Errorf("%w: health: timeout must be shorter than every", labels.ErrInvalid)
+	}
+	return &out, nil
+}
+
+func checkCommand(field, c string) error {
+	if len(c) > maxCommand {
+		return fmt.Errorf("%w: %s: longer than %d characters", labels.ErrInvalid, field, maxCommand)
+	}
+	if strings.ContainsAny(c, "\n\r\x00") {
+		return fmt.Errorf("%w: %s: must be a single line", labels.ErrInvalid, field)
+	}
+	return nil
 }
 
 // checkSource resolves p and returns the real path to copy from. It must be a
@@ -471,30 +530,53 @@ func firstTag(img *types.Image) string {
 	return img.Digest
 }
 
-// Delete removes the image ref names, with all its tags, and every stored
-// file no remaining image needs. inUse reports who still boots from a digest
-// (a VM, a snapshot); anything it names makes the delete ErrConflict.
-func (s *Store) Delete(ref string, inUse func(digest string) string) (*types.Image, error) {
+// Delete removes what ref names. A bare tag ("name:version") of an image
+// that has other tags names only that tag: it is removed and the image stays,
+// whoever boots from it. Its last tag, or a reference with a digest
+// ("sha256:…", "name:version@sha256:…"), names the image: it goes with all
+// its tags and every stored file no remaining image needs. inUse reports who
+// still boots from a digest (a VM, a snapshot); anything it names makes
+// deleting the image ErrConflict.
+func (s *Store) Delete(ref string, inUse func(digest string) string) (types.ImageDeleteResponse, error) {
 	s.importMu.Lock()
 	defer s.importMu.Unlock()
 	img, err := s.Resolve(ref)
 	if err != nil {
-		return nil, err
+		return types.ImageDeleteResponse{}, err
+	}
+	bareTag := !strings.Contains(ref, "@") && !strings.HasPrefix(ref, digestPrefix)
+	if bareTag && len(img.Tags) > 1 {
+		return s.untag(img, ref)
 	}
 	if user := inUse(img.Digest); user != "" {
-		return nil, fmt.Errorf("%w: %s is used by %s", ErrConflict, firstTag(img), user)
+		return types.ImageDeleteResponse{}, fmt.Errorf("%w: %s is used by %s", ErrConflict, firstTag(img), user)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.db.DeleteImage(img.Digest); err != nil {
-		return nil, err
+		return types.ImageDeleteResponse{}, err
 	}
 	delete(s.images, img.Digest)
 	for _, t := range img.Tags {
 		delete(s.tags, t)
 	}
 	s.gcBlobsLocked()
-	return img, nil
+	return types.ImageDeleteResponse{Digest: img.Digest, Untagged: slices.Clone(img.Tags), Deleted: true}, nil
+}
+
+// untag removes tag from img, which keeps its other tags and its files.
+// Callers hold importMu.
+func (s *Store) untag(img *types.Image, tag string) (types.ImageDeleteResponse, error) {
+	next := *img
+	next.Tags = slices.DeleteFunc(slices.Clone(img.Tags), func(t string) bool { return t == tag })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.db.SaveImage(&next); err != nil {
+		return types.ImageDeleteResponse{}, fmt.Errorf("recording image %s: %w", img.Digest, err)
+	}
+	s.images[img.Digest] = &next
+	delete(s.tags, tag)
+	return types.ImageDeleteResponse{Digest: img.Digest, Untagged: []string{tag}}, nil
 }
 
 // gcBlobs removes stored files no image names (a failed import's, a deleted
@@ -538,6 +620,8 @@ func (s *Store) Response(img *types.Image) types.ImageResponse {
 		VCPUs:      img.Manifest.VCPUs,
 		MemMB:      img.Manifest.MemMB,
 		DiskMB:     img.Manifest.DiskMB,
+		Command:    img.Manifest.Command,
+		Health:     img.Manifest.Health,
 		SizeMB:     (size + (1<<20 - 1)) >> 20,
 		ImportedAt: img.ImportedAt.Format(time.RFC3339),
 		Missing:    s.Missing(img),

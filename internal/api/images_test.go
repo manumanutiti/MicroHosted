@@ -104,4 +104,19 @@ func TestImageRoutes(t *testing.T) {
 	if code, out := do("DELETE", "/v1/images/parser:1.0", ""); code != http.StatusConflict {
 		t.Errorf("delete in use = %d %s, want 409", code, out)
 	}
+
+	// A second tag of the same image: deleting it only untags, even in use.
+	stable, _ := json.Marshal(types.ImportImageRequest{Name: "parser:stable",
+		KernelPath: filepath.Join(storeDir, "vmlinux"), RootfsPath: filepath.Join(storeDir, "rootfs.ext4"), VCPUs: 1, MemMB: 64})
+	if code, out := do("POST", "/v1/images", string(stable)); code != http.StatusCreated {
+		t.Fatalf("import second tag = %d %s", code, out)
+	}
+	code, out = do("DELETE", "/v1/images/parser:stable", "")
+	var res types.ImageDeleteResponse
+	if code != http.StatusOK || json.Unmarshal(out, &res) != nil || res.Deleted || len(res.Untagged) != 1 || res.Untagged[0] != "parser:stable" {
+		t.Errorf("untag in use = %d %s, want 200 untagging parser:stable only", code, out)
+	}
+	if code, out := do("GET", "/v1/images/parser:1.0", ""); code != http.StatusOK {
+		t.Errorf("remaining tag = %d %s", code, out)
+	}
 }

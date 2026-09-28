@@ -26,6 +26,7 @@
 # (CloneRootfs grows them per VM with offline resize2fs).
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/pinned.sh"
 
 OUTPUT="images/rootfs/alpine.ext4"
 SIZE_MB=128
@@ -86,10 +87,21 @@ trap cleanup EXIT
 
 mkdir -p "$(dirname "$OUTPUT")" "$CACHE_DIR"
 
+# Pinned whatever mirror MINIROOTFS_URL names, and checked on every build, the
+# cached copy too: its /etc/apk/keys are what every apk package below is
+# verified against.
+PIN_KEY="alpine/${ARCH}/${TARBALL}"
 if [[ ! -f "$CACHE_DIR/$TARBALL" ]]; then
+  [[ -n "$(pinned_sha256 "$PIN_KEY")" ]] || { verify_pinned "$PIN_KEY" /dev/null; exit 1; }
   echo "==> Downloading $TARBALL..."
   curl -fL -o "$CACHE_DIR/$TARBALL.tmp" "$URL"
+  if ! verify_pinned "$PIN_KEY" "$CACHE_DIR/$TARBALL.tmp"; then
+    rm -f "$CACHE_DIR/$TARBALL.tmp"
+    exit 1
+  fi
   mv "$CACHE_DIR/$TARBALL.tmp" "$CACHE_DIR/$TARBALL"
+else
+  verify_pinned "$PIN_KEY" "$CACHE_DIR/$TARBALL"
 fi
 
 echo "==> Creating a ${SIZE_MB} MB ext4 at $OUTPUT..."

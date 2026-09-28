@@ -66,17 +66,19 @@ func registerImageRoutes(mux *http.ServeMux, mgr *vm.Manager) {
 		writeJSON(w, http.StatusOK, s.Response(img))
 	})
 
-	// Refused (409) while any VM or snapshot boots from the image.
+	// A bare tag of an image with other tags removes only that tag. Deleting
+	// the image itself is refused (409) while any VM or snapshot boots from it.
 	mux.HandleFunc("DELETE /v1/images/{ref}", func(w http.ResponseWriter, r *http.Request) {
 		s := store(w)
 		if s == nil {
 			return
 		}
-		if _, err := s.Delete(r.PathValue("ref"), mgr.ImageInUse); err != nil {
+		res, err := s.Delete(r.PathValue("ref"), mgr.ImageInUse)
+		if err != nil {
 			writeError(w, imageErrStatus(err), err)
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
+		writeJSON(w, http.StatusOK, res)
 	})
 
 	// Verify re-hashes the image's files: slow, explicit, never on the boot

@@ -1,0 +1,69 @@
+# A small Python service on Ubuntu 24.04 — every build.yml field, with what
+# it does. Ubuntu when the software only exists as .deb or expects glibc;
+# otherwise Alpine is ~10x smaller (../alpine-nginx/build.yml). microse.yml,
+# next to it, runs it.
+#
+# Build (on the engine's host; needs debootstrap and ubuntu-keyring there, and
+# sudo; the first build downloads the release, later ones reuse the cached
+# .debs). The build context is this directory:
+#
+#   mh build orchestrator/examples/app-ubuntu     # prints app-ubuntu:sha-…@sha256:…
+#
+# Unchanged, a second run builds nothing: the version is the fingerprint of
+# this file and of app/. --no-cache rebuilds (newer packages).
+
+# The image's name (default: the directory's name).
+name: app-ubuntu
+
+# ubuntu:24.04 (= ubuntu:noble): laid down by debootstrap, verified against
+# the Ubuntu archive's signing keyring; apt then uses the release, -updates
+# and -security pockets (the build upgrades to their current state). systemd
+# is the init and starts the engine's agent. No SSH: access is mh exec (add
+# openssh-server below if you want it).
+base: ubuntu:24.04
+
+# The guest kernel (Firecracker CI build, pinned by SHA-256); optional.
+kernel: 6.1.102
+
+# Installed with apt-get install --no-install-recommends, after the base is
+# upgraded. A version pins one (python3=3.12.3-0ubuntu2). Services the
+# packages ship are not started during the build. socat is always added.
+packages:
+  - python3
+  - ca-certificates
+  - curl                        # for the health check below
+
+# Docker's COPY: guest path ← source in the build context (this directory),
+# as root, modes kept. A directory's contents go into a guest path ending in
+# "/"; sources cannot leave the context.
+files:
+  /opt/app/: app/
+
+# Docker's RUN: shell commands in the image, in order, after packages and
+# files, as root, with the build host's network — in a chroot, which does not
+# confine root: build only specs you trust.
+run:
+  - useradd --system --home /opt/app --shell /usr/sbin/nologin app
+  - python3 -m py_compile /opt/app/server.py     # a syntax error fails the build
+
+# What the image's VMs run and how they are checked. mh run starts the
+# command (as docker run starts CMD; --no-command skips it); the orchestrator
+# uses both when a plant spec's function sets none; the engine runs neither.
+# The command runs as root through the agent; setpriv drops to the app user.
+command: setpriv --reuid=app --regid=app --init-groups python3 /opt/app/server.py 8080
+health:
+  command: curl -fsS -m 2 http://127.0.0.1:8080/health
+  every: 15s
+  timeout: 3s
+  failures: 3
+
+# Default resources of each VM; a plant spec's resources: overrides them.
+# systemd and Python idle at ~100 MB: give Ubuntu images more than Alpine.
+vcpus: 1
+mem_mb: 256
+disk_mb: 0                      # grow each VM's disk to this many MB; 0: the rootfs's size
+
+# Root filesystem size in MB; 0 sizes it to its content plus a quarter and
+# 32 MB (a few hundred MB for Ubuntu). What a VM writes is lost when it is
+# replaced; lasting data goes in a volume (docs/volumes.md).
+size_mb: 0

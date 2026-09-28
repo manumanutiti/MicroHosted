@@ -17,6 +17,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ const Owner = "mh-orchestrator"
 // Labels the orchestrator sets on what it creates.
 const (
 	LabelManagedBy  = "managed-by"
+	LabelProject    = "project"
 	LabelFunction   = "function"
 	LabelGeneration = "generation"
 	LabelSpec       = "spec"
@@ -43,6 +45,7 @@ type Engine interface {
 	WaitReady(ctx context.Context, id string, timeout time.Duration) error
 	Exec(ctx context.Context, id, cmd string, timeout time.Duration) (*types.ExecResponse, error)
 	PatchVMLabels(ctx context.Context, id string, labels map[string]*string) error
+	PatchNetworkLabels(ctx context.Context, name string, labels map[string]*string) error
 	ListNetworks(ctx context.Context, labels map[string]string) ([]types.NetworkResponse, error)
 	CreateNetwork(ctx context.Context, req types.CreateNetworkRequest) error
 	DeleteNetwork(ctx context.Context, name string) error
@@ -57,7 +60,10 @@ type Engine interface {
 type Orchestrator struct {
 	eng  Engine
 	spec *spec.Spec
-	log  *log.Logger
+	// project is the spec's project: the orchestrator sees and changes only
+	// objects labelled with it (and the unlabelled ones it adopts, see mine).
+	project string
+	log     *log.Logger
 	// out receives one line per finished cycle (the v1 result sink).
 	out io.Writer
 	// state keeps failure records and degraded flags; nil keeps nothing.
@@ -80,7 +86,11 @@ func New(eng Engine, s *spec.Spec, logger *log.Logger, out io.Writer, state *Sta
 	for name, f := range s.Functions {
 		eff[name] = f
 	}
-	return &Orchestrator{eng: eng, spec: s, log: logger, out: out, state: state, gen: map[string]int{}, effective: eff, images: map[string]*types.ImageResponse{}}
+	project := s.Project
+	if project == "" {
+		project = "default"
+	}
+	return &Orchestrator{eng: eng, spec: s, project: project, log: logger, out: out, state: state, gen: map[string]int{}, effective: eff, images: map[string]*types.ImageResponse{}}
 }
 
 // fn returns the version a function runs now; nil once it is removed.
@@ -139,8 +149,60 @@ func (o *Orchestrator) recordFailure(name string, f *spec.Function, vm *types.VM
 	}
 }
 
-// owned is the selector for everything this orchestrator created.
+// owned is the selector for everything any project of the orchestrator
+// created; mine narrows it to this one.
 func owned() map[string]string { return map[string]string{LabelManagedBy: Owner} }
+
+// mine reports whether an object the orchestrator created belongs to this
+// project: its project label says so, or — made before projects existed — it
+// has none and s declares it (a network by name, a VM by its function). Such
+// an object is adopted: the next apply labels it. Everything else is another
+// project's, never touched.
+func (o *Orchestrator) mine(labels map[string]string, declared bool) bool {
+	if labels[LabelManagedBy] != Owner {
+		return false
+	}
+	if p, ok := labels[LabelProject]; ok {
+		return p == o.project
+	}
+	return declared
+}
+
+// myVMs lists this project's VMs (s says which unlabelled ones it adopts).
+func (o *Orchestrator) myVMs(ctx context.Context, s *spec.Spec) ([]types.VMResponse, error) {
+	all, err := o.eng.ListVMs(ctx, owned())
+	if err != nil {
+		return nil, err
+	}
+	var out []types.VMResponse
+	for _, v := range all {
+		if o.mine(v.Labels, s.Functions[v.Labels[LabelFunction]] != nil) {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// myNetworks lists this project's networks.
+func (o *Orchestrator) myNetworks(ctx context.Context, s *spec.Spec) ([]types.NetworkResponse, error) {
+	all, err := o.eng.ListNetworks(ctx, owned())
+	if err != nil {
+		return nil, err
+	}
+	var out []types.NetworkResponse
+	for _, n := range all {
+		if o.mine(n.Labels, s.Networks[n.Name] != nil) {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// VMName is what a function's VM is called: <project>-<function>-<generation>,
+// so two projects' functions of the same name never collide.
+func (o *Orchestrator) VMName(function string, gen int) string {
+	return fmt.Sprintf("%s-%s-%d", o.project, function, gen)
+}
 
 // SpecHash is the short digest of what a function's VM is born with: a change
 // in any of it needs a new VM. Labels and health are changed without one.
@@ -182,12 +244,13 @@ func fileSpecs(f *spec.Function) []types.FileSpec {
 }
 
 // functionLabels is the full label set of a function's VM.
-func functionLabels(name string, f *spec.Function, gen int) map[string]string {
+func functionLabels(project, name string, f *spec.Function, gen int) map[string]string {
 	l := make(map[string]string, len(f.Labels)+4)
 	for k, v := range f.Labels {
 		l[k] = v
 	}
 	l[LabelManagedBy] = Owner
+	l[LabelProject] = project
 	l[LabelFunction] = name
 	l[LabelGeneration] = strconv.Itoa(gen)
 	l[LabelSpec] = SpecHash(f)
@@ -223,6 +286,11 @@ func (o *Orchestrator) image(ctx context.Context, ref string) (*types.ImageRespo
 	if ok {
 		return img, nil
 	}
+	at := strings.LastIndex(ref, "@sha256:")
+	if at < 0 || len(ref)-at != len("@sha256:")+64 {
+		// A function with build: whose image was not built (status, down).
+		return nil, fmt.Errorf("image %q: not a pinned reference (a build: not built yet? plan or apply builds it)", ref)
+	}
 	img, err := o.eng.GetImage(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("image %s: %w", ref, err)
@@ -234,6 +302,62 @@ func (o *Orchestrator) image(ctx context.Context, ref string) (*types.ImageRespo
 	o.images[ref] = img
 	o.mu.Unlock()
 	return img, nil
+}
+
+// withImageDefaults fills what f leaves to its image (docs/orchestrator.md
+// §4): an empty command takes the image's default command, and a persistent
+// function without a health check the image's check. Idempotent: it fills
+// f once, and a later call finds f complete. A cycle function must end up
+// with a command, from the spec or from the image.
+func withImageDefaults(f *spec.Function, img *types.ImageResponse) error {
+	if f.Command == "" && img.Command != "" {
+		f.Command = img.Command
+		f.FromImage = append(f.FromImage, "command")
+	}
+	if f.Health == nil && img.Health != nil && f.Lifecycle.Mode == spec.ModePersistent {
+		h := &spec.Health{Command: img.Health.Command, Failures: img.Health.Failures}
+		for _, d := range []struct {
+			v   string
+			dst *spec.Duration
+		}{{img.Health.Every, &h.Every}, {img.Health.Timeout, &h.Timeout}} {
+			if d.v == "" {
+				continue
+			}
+			v, err := time.ParseDuration(d.v)
+			if err != nil || v <= 0 {
+				return fmt.Errorf("image %s: health duration %q", f.Image, d.v)
+			}
+			*d.dst = spec.Duration(v)
+		}
+		h.SetDefaults()
+		if h.Timeout >= h.Every {
+			return fmt.Errorf("image %s: its health check's timeout %s is not shorter than every %s", f.Image, h.Timeout.D(), h.Every.D())
+		}
+		f.Health = h
+		f.FromImage = append(f.FromImage, "health")
+	}
+	if f.Command == "" && f.Lifecycle.Mode != spec.ModePersistent {
+		return fmt.Errorf("command: required for %s, and image %s declares none", f.Lifecycle.Mode, f.Image)
+	}
+	return nil
+}
+
+// resolveDefaults applies every function's image defaults to s, as far as
+// the images resolve; the errors are those of the functions that could not
+// be completed.
+func (o *Orchestrator) resolveDefaults(ctx context.Context, s *spec.Spec) []error {
+	var errs []error
+	for _, name := range s.FunctionOrder {
+		f := s.Functions[name]
+		img, err := o.image(ctx, f.Image)
+		if err == nil {
+			err = withImageDefaults(f, img)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("functions.%s: %w", name, err))
+		}
+	}
+	return errs
 }
 
 // memOf is what one VM of f is promised: the budget counts it, not what the

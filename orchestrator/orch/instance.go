@@ -64,13 +64,14 @@ func tail(s string) string {
 	return s[len(s)-OutputTail:]
 }
 
-// createVM creates one instance of a function, named <function>-<generation>.
+// createVM creates one instance of a function, named
+// <project>-<function>-<generation>.
 func (o *Orchestrator) createVM(ctx context.Context, name string, f *spec.Function) (*types.VMResponse, error) {
 	gen := o.nextGeneration(name)
 	req := types.CreateVMRequest{
 		Image:  f.Image,
-		Name:   fmt.Sprintf("%s-%d", name, gen),
-		Labels: functionLabels(name, f, gen),
+		Name:   o.VMName(name, gen),
+		Labels: functionLabels(o.project, name, f, gen),
 		VCPUs:  f.Resources.VCPUs,
 		MemMB:  f.Resources.MemMB,
 		DiskMB: f.Resources.DiskMB,

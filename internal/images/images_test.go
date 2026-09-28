@@ -330,3 +330,134 @@ func TestImportConfinedToStore(t *testing.T) {
 		t.Errorf("symlink inside: %v, %v", got, err)
 	}
 }
+
+// A bare tag of an image with other tags removes only that tag, even while
+// a VM boots from the image; its last tag deletes the image.
+func TestDeleteUntags(t *testing.T) {
+	f := newFixture(t)
+	a, err := f.s.Import(f.req("parser:1.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.Import(f.req("parser:stable")); err != nil {
+		t.Fatal(err)
+	}
+	before := f.blobs(t)
+
+	res, err := f.s.Delete("parser:stable", func(string) string { return "vm a1b2c3d4" })
+	if err != nil {
+		t.Fatalf("untag in use = %v, want it allowed", err)
+	}
+	if res.Deleted || res.Digest != a.Digest || len(res.Untagged) != 1 || res.Untagged[0] != "parser:stable" {
+		t.Errorf("untag = %+v", res)
+	}
+	if _, err := f.s.Resolve("parser:stable"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("removed tag resolves: %v", err)
+	}
+	if img, err := f.s.Resolve("parser:1.0"); err != nil || len(img.Tags) != 1 || img.Tags[0] != "parser:1.0" {
+		t.Errorf("remaining tag = %+v, %v", img, err)
+	}
+	if after := f.blobs(t); len(after) != len(before) {
+		t.Errorf("untag removed files: %v → %v", before, after)
+	}
+
+	// The untag is persisted.
+	s2, err := Open(f.dir, f.st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img, err := s2.Resolve("parser:1.0"); err != nil || len(img.Tags) != 1 {
+		t.Errorf("after reopen = %+v, %v", img, err)
+	}
+	if _, err := s2.Resolve("parser:stable"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("removed tag after reopen = %v", err)
+	}
+
+	// The last tag deletes the image, and is refused while it is in use.
+	if _, err := f.s.Delete("parser:1.0", func(string) string { return "vm a1b2c3d4" }); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete last tag in use = %v, want ErrConflict", err)
+	}
+	res, err = f.s.Delete("parser:1.0", func(string) string { return "" })
+	if err != nil || !res.Deleted || len(res.Untagged) != 1 {
+		t.Fatalf("delete last tag = %+v, %v", res, err)
+	}
+	if n := len(f.blobs(t)); n != 0 {
+		t.Errorf("%d files after delete, want 0", n)
+	}
+}
+
+// A reference with a digest names the image: it goes with all its tags.
+func TestDeleteByDigestRemovesAllTags(t *testing.T) {
+	for _, ref := range []string{"digest", "parser:1.0@digest"} {
+		f := newFixture(t)
+		a, err := f.s.Import(f.req("parser:1.0"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.s.Import(f.req("parser:stable")); err != nil {
+			t.Fatal(err)
+		}
+		ref = strings.Replace(ref, "digest", a.Digest, 1)
+		res, err := f.s.Delete(ref, func(string) string { return "" })
+		if err != nil || !res.Deleted || len(res.Untagged) != 2 {
+			t.Fatalf("delete %s = %+v, %v", ref, res, err)
+		}
+		if len(f.s.List()) != 0 {
+			t.Errorf("delete %s left images", ref)
+		}
+	}
+}
+
+// An image's default command and health check are part of what its digest
+// covers; spelling a duration differently is the same image, and an image
+// without defaults hashes as it did before they existed.
+func TestDefaultsAreCovered(t *testing.T) {
+	f := newFixture(t)
+	plain, err := f.s.Import(f.req("web:1.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := manifestDigest(types.ImageManifest{Schema: manifestSchema, Kernel: plain.Manifest.Kernel,
+		Rootfs: plain.Manifest.Rootfs, VCPUs: 1, MemMB: 64})
+	if plain.Digest != want {
+		t.Errorf("an image without defaults hashes to %s, want %s", plain.Digest, want)
+	}
+
+	r := f.req("web:1.1")
+	r.Command = "nginx -g 'daemon off;'"
+	r.Health = &types.ImageHealth{Command: "wget -qO- http://127.0.0.1/", Every: "60s", Timeout: "2000ms", Failures: 3}
+	img, err := f.s.Import(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Digest == plain.Digest {
+		t.Error("a default command did not change the digest")
+	}
+	if h := img.Manifest.Health; h.Every != "1m0s" || h.Timeout != "2s" {
+		t.Errorf("health durations stored as %q/%q, want canonical 1m0s/2s", h.Every, h.Timeout)
+	}
+	r.Name = "web:1.1-again"
+	r.Health = &types.ImageHealth{Command: "wget -qO- http://127.0.0.1/", Every: "1m", Timeout: "2s", Failures: 3}
+	if again, err := f.s.Import(r); err != nil || again.Digest != img.Digest {
+		t.Errorf("same defaults spelled differently = %v, %v; want digest %s", again, err, img.Digest)
+	}
+	if resp := f.s.Response(img); resp.Command != r.Command || resp.Health == nil {
+		t.Errorf("Response lost the defaults: %+v", resp)
+	}
+
+	for name, mut := range map[string]func(*types.ImportImageRequest){
+		"multi-line command": func(r *types.ImportImageRequest) { r.Command = "a\nb" },
+		"health w/o command": func(r *types.ImportImageRequest) { r.Health = &types.ImageHealth{Every: "10s"} },
+		"bad duration":       func(r *types.ImportImageRequest) { r.Health = &types.ImageHealth{Command: "true", Every: "often"} },
+		"timeout over every": func(r *types.ImportImageRequest) {
+			r.Health = &types.ImageHealth{Command: "true", Every: "5s", Timeout: "5s"}
+		},
+		"negative failures": func(r *types.ImportImageRequest) { r.Health = &types.ImageHealth{Command: "true", Failures: -1} },
+	} {
+		r := f.req("bad:1.0")
+		mut(&r)
+		if _, err := f.s.Import(r); !errors.Is(err, labels.ErrInvalid) {
+			t.Errorf("%s: %v, want ErrInvalid", name, err)
+		}
+	}
+}

@@ -1,0 +1,69 @@
+# A static website served by nginx on Alpine — every build.yml field, with
+# what it does. Walkthrough and measured capacity: docs/uses.md. microse.yml,
+# next to it, runs it.
+#
+# Build (on the engine's host; asks for sudo once). The build context is the
+# directory holding build.yml, so file sources below are relative to it:
+#
+#   mh build orchestrator/examples/alpine-nginx         # prints alpine-nginx:sha-…@sha256:…
+#   cd orchestrator/examples/alpine-nginx && mh build   # the same: ./build.yml
+#
+# Run again with nothing changed, it builds nothing and prints the same
+# reference: the version is the fingerprint of this file and of every file
+# it copies. mh up / mh plan do exactly that for build: in microse.yml.
+
+# The image's name; its version is that fingerprint (or -t NAME:VERSION).
+# Optional: the default is the build context directory's name.
+name: alpine-nginx
+
+# The distribution to start from. alpine:3.22 (= alpine:3.22.0) is the pinned
+# minirootfs: ~3 MB downloaded, checked against its SHA-256, busybox init.
+# The other choice is ubuntu:24.04 (see ../app-ubuntu/build.yml).
+base: alpine:3.22
+
+# The guest kernel (Firecracker CI build, pinned by SHA-256). Optional: the
+# default is the one make prepare-image uses.
+kernel: 6.1.102
+
+# Installed with apk before files and run. A version pins one exactly
+# (nginx=1.28.0-r3); without it the build takes the branch's current one.
+# socat (the engine's agent) is always added.
+packages:
+  - nginx
+
+# Docker's COPY: guest path ← source in the build context. Copied as root,
+# modes kept. A directory source copies its contents and its guest path ends
+# in "/"; a file goes to the guest path (into it when the path ends in "/").
+# Sources cannot leave the context, not even through a symlink.
+files:
+  /srv/www/: site/
+  /etc/nginx/http.d/default.conf: nginx.conf
+
+# Docker's RUN: shell commands run in the image, in order, after packages and
+# files, as root, with the build host's network. They run in a chroot, which
+# does not confine root on the build host: build only specs you trust.
+run:
+  - mkdir -p /run/nginx
+  - nginx -t                    # a broken configuration fails the build, not the deploy
+
+# What the image's VMs run and how they are checked. mh run starts the
+# command (as docker run starts CMD; --no-command skips it); the orchestrator
+# uses both when a plant spec's function sets no command / health; the engine
+# itself runs neither. Both are covered by the image's digest. nginx listens
+# on 8080 (nginx.conf): curl http://<VM IP>:8080/.
+command: nginx -g 'daemon off;'
+health:
+  command: wget -qO- -T 2 http://127.0.0.1:8080/ >/dev/null   # exit 0 = healthy
+  every: 10s                    # default 10s
+  timeout: 3s                   # default 2s; shorter than every
+  failures: 3                   # checks failed in a row before the VM is replaced; default 3
+
+# Default resources of each VM; a plant spec's resources: overrides them.
+vcpus: 1                        # default 1
+mem_mb: 128                     # default 128; the guest's TCP buffers scale with it (docs/uses.md)
+disk_mb: 0                      # grow each VM's disk to this many MB at creation; 0: the rootfs's size
+
+# Size of the root filesystem in MB. 0 (the default) sizes it to its content
+# plus a quarter and 32 MB. Anything written inside a VM is lost when it is
+# replaced: lasting data goes in a volume (docs/volumes.md).
+size_mb: 0

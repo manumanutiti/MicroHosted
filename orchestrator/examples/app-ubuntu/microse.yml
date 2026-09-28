@@ -1,0 +1,25 @@
+# Runs the image build.yml (next to this file) makes: a Python service on
+# Ubuntu 24.04. build: points at it, so plan/apply/run build it when needed.
+#
+#   cd orchestrator/examples/app-ubuntu
+#   mh plan          # the first time: debootstrap + apt, a few minutes (sudo)
+#   mh up -d
+#   curl http://172.30.51.10:8080/          # {"host": …, "python": …, "os": "Ubuntu 24.04…"}
+#   mh down
+
+version: 1
+
+budget:
+  max_vms: 2
+  max_mem_mb: 512       # 2 × 256, the image's default
+
+networks:
+  ubuntu-demo:
+    subnet: 172.30.51.0/24
+
+functions:
+  app:
+    build: .
+    network: ubuntu-demo
+    ip: 172.30.51.10
+    lifecycle: { mode: persistent }

@@ -9,11 +9,12 @@
 #   guest  172.30.21.0/24 (a separate segment)
 #     outsider   checks that it cannot reach the office
 #
-#   mh image import alpine-py:1.0 -k <kernel> -r <alpine-py.ext4>   # prints the digest
-#   mh-orchestrator run      -f intranet.yaml
-#   mh-orchestrator status   -f intranet.yaml
-#   mh-orchestrator failures -f intranet.yaml FUNCTION
-#   mh-orchestrator down     -f intranet.yaml
+#   (the images are built by mh build the first time plan/apply/run needs them:
+#    build: images/alpine-py and images/alpine below; sudo once)
+#   mh up      -f intranet.yaml
+#   mh status   -f intranet.yaml
+#   mh failures -f intranet.yaml FUNCTION
+#   mh down     -f intranet.yaml
 #
 # Things to try while it runs:
 #   mh rm kv-1          kv is replaced within seconds; its data is gone (the
@@ -27,6 +28,7 @@
 #                       any office machine reaches any other
 
 version: 1
+name: intranet             # the project: this directory holds three specs, each its own
 
 budget:
   max_vms: 8            # worst case: 3 services + 2 workers = 5 VMs
@@ -43,7 +45,7 @@ networks:
 functions:
   # ── the three machines of the intranet (static) ──────────────────────
   kv:
-    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    build: images/alpine-py
     network: office
     ip: 172.30.20.10
     files:
@@ -54,7 +56,7 @@ functions:
     labels: { tier: data }
 
   app:
-    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    build: images/alpine-py
     network: office
     ip: 172.30.20.11
     files:
@@ -65,7 +67,7 @@ functions:
     labels: { tier: web }
 
   logs:
-    image: alpine-py:1.0@sha256:cf6c240ccbf7a73c2760a05bcac5afe5d08f1f6f7abf32f94d2bfe016861952d
+    build: images/alpine-py
     network: office
     ip: 172.30.20.12
     files:
@@ -78,14 +80,14 @@ functions:
   # ── users of the intranet (disposable) ───────────────────────────────
   # An employee opening the web app.
   visitor:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: office
     command: wget -qO- -T 3 http://172.30.20.11:8080/
     lifecycle: { mode: transaction, every: 20s, timeout: 10s }
 
   # An auditor reading the database and the collected logs.
   audit:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: office
     command: 'echo "kv: $(wget -qO- -T 3 http://172.30.20.10:6379/)"; wget -qO- -T 3 "http://172.30.20.12:8080/tail?n=5"'
     lifecycle: { mode: transaction, every: 1m, timeout: 15s }
@@ -93,7 +95,7 @@ functions:
   # A burst of traffic: 30 s of requests every 3 minutes. The command must
   # still be running when the window ends, so it loops forever.
   rush:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: office
     command: 'while true; do wget -qO- -T 2 http://172.30.20.11:8080/ >/dev/null 2>&1; sleep 0.2; done'
     lifecycle: { mode: window, every: 3m, duration: 30s }
@@ -101,7 +103,7 @@ functions:
   # Segmentation check: from the guest network the office must be
   # unreachable. Succeeds (exit 0) only while it is.
   outsider:
-    image: alpine:1.0@sha256:953f4731f227a6dfe82ae5f69a1f80ba2029558bd9120327cf7e0ffa41fc650e
+    build: images/alpine
     network: guest
     command: 'for ip in 172.30.20.10:6379 172.30.20.11:8080 172.30.20.12:8080; do if wget -qO- -T 2 "http://$ip/health" >/dev/null 2>&1; then echo "BREACH: guest reached $ip"; exit 1; fi; done; echo "office unreachable from guest, as it should be"'
     lifecycle: { mode: transaction, every: 1m, timeout: 20s }

@@ -251,16 +251,139 @@ mh image import parser:1.0 \
 
 mh image ls                                  # tags, short digest, defaults, size
 mh image ls -q                               # pinned references, for scripts and specs
-mh run parser:1.0                            # a reference with ':' is an image
+mh image ls --no-trunc                       # the full digest in the table
+mh run parser:1.0                            # a reference with ':' is an image; its command, if it declares one, is started
+mh run --no-command parser:1.0               # boot it without starting the image's command
 mh run parser:1.0@sha256:…                   # pinned: refused if the tag says otherwise
 mh image verify parser:1.0                   # re-hash its files (slow, explicit)
-mh image rm parser:1.0                       # refused while a VM or snapshot uses it
+mh image rm parser:stable                    # the image has other tags: removes only this one
+mh image rm parser:1.0                       # its last tag: deletes the image; refused while a VM or snapshot uses it
+mh image rm sha256:…                         # a digest: deletes the image with all its tags
 mh replace ts01-a                            # a VM from an image is replaced from ITS digest
 ```
 
 Files are imported from the daemon's store directory only. A tag is bound once:
 rebuilding under the same `name:version` is refused — import it as a new
-version.
+version. `--command` and `--health-cmd`/`--health-interval`/`--health-timeout`/
+`--health-retries` record the image's default command and health check, as
+`mh build` does from a spec.
+
+### Building an image: `mh build`
+
+`mh build` (also `mh image build`) is to a `build.yml` what `docker build` is to
+a Dockerfile: it builds the image, imports it into the store and prints its
+pinned reference. That reference is the **only** thing it prints on stdout —
+progress goes to stderr, and `-q` hides it.
+
+```bash
+mh build                                     # ./build.yml, context .
+mh build web/                                # web/build.yml, context web/
+mh build -q -f web/build.yml                 # just the reference: web:sha-3f2a9c1e7b04@sha256:…
+mh build -t web:1.0 web/                     # an explicit tag
+mh build --no-cache web/                     # build again even if nothing changed (newer packages)
+mh build --no-build web/                     # only look: the reference, or exit 3 if not built
+```
+
+**Naming and the build cache.** Without `-t`, the image is named by the spec's
+`name:` (else the context directory's name) and versioned by the
+**fingerprint** of everything the build takes in: the parsed spec (not its
+comments) and every file it copies — paths, modes, contents. When the store
+already has that tag, nothing is built and no `sudo` is asked: the existing
+reference is printed. Change a copied file and the next build is a new
+version. The fingerprint cannot see what the package repositories serve:
+unpinned packages stay as they were built until `--no-cache`.
+
+**From a plant spec.** A function says `build: DIR` (the directory holding a
+`build.yml`) or `build: path/to/build.yml` instead of `image:`, and
+`mh-orchestrator plan`/`apply`/`run` run `mh build` on it — building only what
+changed — and pin the reference it prints. `validate`, `status`, `down` and a
+running orchestrator's reload never build. The other way, when the image comes
+from elsewhere, is `image:` with a pinned reference, typed or through
+`${VAR}` from `.env`:
+
+```bash
+echo "WEB=$(mh build -q web/)" >> .env       # microse.yml: image: ${WEB}
+```
+
+The image spec, one YAML document parsed strictly (an unknown field is an
+error). Commented, buildable examples, each next to a `microse.yml` that runs
+it: `orchestrator/examples/alpine-nginx` and `orchestrator/examples/app-ubuntu`.
+
+```yaml
+name: web                    # optional; default: the build context directory's name
+base: alpine:3.22            # pinned Alpine minirootfs (alpine:3.22.0), or ubuntu:24.04 (ubuntu:noble)
+kernel: 6.1.102              # optional; pinned Firecracker CI kernel
+packages: [nginx]            # apk (Alpine) or apt (Ubuntu), optionally pinned: nginx=1.28.0-r3
+files:                       # COPY: guest path ← source in the build context
+  /srv/www/: out/            #   a directory: its contents, into the path (write it with a /)
+  /etc/nginx/http.d/default.conf: nginx.conf   # a file (into the path when it ends in /)
+run:                         # RUN: shell commands in the image, after packages and files
+  - mkdir -p /run/nginx
+# Defaults of its VMs. command and health are for whoever runs them — mh run
+# starts the command (docker run's CMD), the orchestrator uses both when a plant
+# spec leaves them out; the engine itself runs neither.
+command: nginx -g 'daemon off;'
+health: { command: "wget -qO- -T 2 http://127.0.0.1/", every: 10s, timeout: 2s, failures: 3 }
+vcpus: 1                     # default 1
+mem_mb: 64                   # default 128
+disk_mb: 0                   # disk its VMs are grown to; 0: the rootfs's size
+size_mb: 0                   # rootfs size; 0: its content plus a quarter and 32 MB
+```
+
+- **Where it runs.** On the engine's host: it writes the root filesystem under
+  the daemon's store (`GET /v1/system` tells where) and imports it from there,
+  then removes its working files. It works as root through `sudo` (it asks
+  once, up front): unpacking the base, `apk add`, the copies and the `run`
+  steps happen in a chroot of the image. A chroot does not confine root —
+  build only specs you trust, as with any Dockerfile.
+- **Bases.** `alpine:3.22`: the minirootfs, `apk`, busybox init — a ~10 MB
+  image idling at ~10 MB of RAM. `ubuntu:24.04`: `debootstrap` (needs
+  `debootstrap` and `ubuntu-keyring` on the build host), `apt` with the
+  `-updates` and `-security` pockets, systemd starting the agent — hundreds
+  of MB and ~100 MB of RAM idle, for software that only exists as `.deb` or
+  expects glibc. No SSH in either: access is `mh exec` (add `openssh-server`
+  to `packages` if you want it). Ubuntu's packages are verified by the
+  archive's signature, not pinned by hash; its `.deb`s are cached between
+  builds.
+- **What goes in.** The Alpine base and the kernel are downloaded once to
+  `~/.cache/microhosted` and refused unless their SHA-256 matches the pins in
+  `scripts/checksums.sha256` (kept equal to `internal/build/pins.go` by a test).
+  Every image gets the engine's agent (vsock exec on port 52) and busybox init,
+  as `make prepare-image` builds them. File sources cannot leave the build
+  context, through a symlink either; every write into the image is resolved
+  inside the chroot, so a symlink in the image never points a write at the
+  host.
+- **Tags never move.** `-t NAME:VERSION` of a tag that exists is refused
+  before building; the fingerprint tag is reused, never rebuilt; `--no-cache`
+  tags with the build time.
+- **Not bit-reproducible yet.** Two hosts building the same `build.yml` get the
+  same *tag* (the fingerprint is of the inputs) but not the same *digest*:
+  unpinned packages may differ, and ext4 timestamps and UUIDs do. Share the
+  `build.yml` and its files — everyone builds the image with one command, or
+  lets `build:` do it — rather than the digest, or share the image itself
+  (`docs/roadmap.md`, "a plant spec that works on another host").
+
+### Projects: `mh up`, `mh down`
+
+A plant spec (`microse.yml`, see `orchestrator/README.md`) is run with docker
+compose's verbs, on `./microse.yml` unless `-f FILE` says otherwise. `mh` hands
+them to `mh-orchestrator` (installed with it by `make install-cli`), a separate
+program with the same API access.
+
+```bash
+mh up                  # build what is missing, apply, keep it running in this terminal
+mh up -d               # the same in the background: "Project web is up: pid …, logs: …"
+mh plan                # what would change (builds missing images first)
+mh apply               # converge once, or hand changes to the project's running up
+mh status              # the project's functions, VMs and health
+mh failures [FUNCTION] # why its VMs failed
+mh down                # stop its up, remove its VMs and networks (asks; -y does not)
+mh validate            # the file on its own
+```
+
+Each spec is a **project** — its `name:`, or its directory's name — and sees
+only its own VMs and networks: `mh up` in two directories runs both. Its VMs
+are named `<project>-<function>-<n>`.
 
 ### Platform
 

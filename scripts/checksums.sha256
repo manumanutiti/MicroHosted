@@ -1,0 +1,30 @@
+# Pinned SHA-256 of every file the host and image pipelines download.
+# A download whose hash is not listed here, or does not match, is refused:
+# changing a version is a reviewed change to this file, never a side effect of
+# what a server returns that day. Checked by scripts/lib/pinned.sh.
+#
+# Format: <sha256>  <source>/<arch>/<file name>
+#
+# How each entry was established (redo it when adding a version):
+#   alpine      — the release's detached GPG signature (.asc), verified with
+#                 Alpine's release key ncopa.asc from alpinelinux.org/keys,
+#                 fingerprint 0482 D840 22F5 2DF1 C4E7 CD43 293A CD09 07D9 495A.
+#   kernel      — Firecracker CI publishes no checksum or signature: trust on
+#                 first use. x86_64 matched the kernel this project's first
+#                 host downloaded at install time; the S3 object is unchanged
+#                 since 2024-11-05.
+#   firecracker — the release's .sha256.txt on GitHub; the x86_64 binaries
+#                 match the ones validated on the project's hardware.
+# Established 2026-09-28.
+
+# Alpine minirootfs 3.22.0 (scripts/build-rootfs-alpine.sh)
+18879884e35b0718f017a50ff85b5e6568279e97233fc42822229585feb2fa4d  alpine/x86_64/alpine-minirootfs-3.22.0-x86_64.tar.gz
+74eaa1f80aceb35a69f26a7772cd22848a51921323a32b2ae057b2a4c8188fd5  alpine/aarch64/alpine-minirootfs-3.22.0-aarch64.tar.gz
+
+# Firecracker CI guest kernel 6.1.102 (scripts/build-kernel.sh)
+49ba99a5299444ac59dda2efc3569cc2d58a5d72ea6475a6bfc37aa0bf322e54  kernel/x86_64/vmlinux-6.1.102
+bb1f50912d63a8ca5e92d488984875e1177eb9283050ffa592a8cb455cada52d  kernel/aarch64/vmlinux-6.1.102
+
+# Firecracker + jailer v1.16.1 release tarballs (scripts/install-fc.sh)
+382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6  firecracker/x86_64/firecracker-v1.16.1-x86_64.tgz
+8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e  firecracker/aarch64/firecracker-v1.16.1-aarch64.tgz

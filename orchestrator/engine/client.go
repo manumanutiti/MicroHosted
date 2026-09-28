@@ -176,6 +176,11 @@ func (c *Client) PatchVMLabels(ctx context.Context, id string, labels map[string
 	return c.do(ctx, "PATCH", "/v1/vms/"+url.PathEscape(id)+"/labels", types.UpdateVMLabelsRequest{Labels: labels}, nil)
 }
 
+// PatchNetworkLabels merges labels into a network's (nil removes a key).
+func (c *Client) PatchNetworkLabels(ctx context.Context, name string, labels map[string]*string) error {
+	return c.do(ctx, "PATCH", "/v1/networks/"+url.PathEscape(name)+"/labels", types.UpdateNetworkLabelsRequest{Labels: labels}, nil)
+}
+
 // ListNetworks returns the networks carrying every one of labels.
 func (c *Client) ListNetworks(ctx context.Context, labels map[string]string) ([]types.NetworkResponse, error) {
 	var out []types.NetworkResponse

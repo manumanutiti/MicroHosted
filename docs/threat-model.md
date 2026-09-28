@@ -46,7 +46,8 @@ by more than one.
 | **A local unprivileged user** on the host | a shell without root, not in the API socket's group | yes |
 | **A network attacker** on the host's other networks | can reach the host's IPs | yes |
 | **The operator's own mistakes** | a typo in a rule, a half-applied change, a crash mid-operation | yes — a policy that silently differs from the declared one is treated as a security failure |
-| **Root on the host**, physical access, a malicious Firecracker/kernel build | — | **out of scope**: at that point there is nothing left to defend |
+| **A tampered download**: a compromised mirror or CDN, an altered cache, a man in the middle of the build host | serves other bytes under a pinned name (Firecracker, the guest kernel, the Alpine base, Ubuntu packages) | yes — Layer 11 |
+| **Root on the host**, physical access, a malicious upstream (Firecracker, the kernel, Alpine or Ubuntu signing a bad release) | — | **out of scope**: at that point there is nothing left to defend; pinning only stops *other* bytes, not bad ones that were pinned |
 
 ---
 
@@ -407,6 +408,45 @@ A policy the daemon believes in but the host does not enforce is a silent hole.
   reality (processes, TAPs, bridges, cgroups, disks, leases, the last ruleset
   apply) and reports every difference.
 
+### Layer 11 — What boots: the supply chain and the image store
+
+Every layer above assumes that Firecracker, the jailer and the guest kernel are
+the builds they claim to be. They are downloaded, and so is the base of every
+guest; a download that could be swapped would make the rest moot.
+
+**Every download is pinned.** `scripts/checksums.sha256` lists the SHA-256 of
+each file the host and image pipelines fetch; `scripts/lib/pinned.sh` checks it
+before the file is used, and a file whose hash is **not listed** is refused like
+a mismatch, before it is even fetched. Changing a version is a reviewed change
+to that file, never a side effect of what a server returns that day.
+
+| Download | Used as | How its pin was established | Checked |
+|---|---|---|---|
+| Firecracker + jailer release tarball (GitHub) | the VMM and the jailer, which runs as **root** | the release's `.sha256.txt`, and the binaries validated on the project's hardware | at install (`install-fc.sh`); `FC_VERSION=latest` only installs if it resolves to a pinned version |
+| Guest kernel `vmlinux` (Firecracker CI, S3) | every VM's kernel | **trust on first use**: no checksum or signature is published (gap 7) | at download and on every image build, including the copy already in the store |
+| Alpine minirootfs | the base of every Alpine guest, **including `/etc/apk/keys`** | its detached GPG signature, verified with Alpine's release key (fingerprint `0482 D840 22F5 2DF1 C4E7 CD43 293A CD09 07D9 495A`) | at download and on every build, the cached copy too |
+| apk packages (`EXTRA_PKGS`, `socat`) | added to an Alpine guest | signed by Alpine; apk verifies each against the keys of the pinned base, and nothing uses `--allow-untrusted` | by apk, at build |
+| Ubuntu packages (debootstrap, apt) | Ubuntu guests | the archive's `Release` signature against `ubuntu-archive-keyring.gpg`, named explicitly: a host without it **fails** instead of debootstrap warning and going on unverified; the mirror may be plain http | by debootstrap/apt, at build |
+
+**What boots is what was imported.** The image store (`mh image import`, run by
+`make prepare-image` as its last step) copies the kernel and the rootfs into a
+root-only directory, keeps them 0444 and hashes them once. An image's digest
+covers both files' digests and its default shape; a VM created from
+`name:version@sha256:…` boots those exact bytes, and a tag that disagrees with
+the digest is refused by the engine itself, not by its client — no gap between
+checking a file and booting it by path. A replacement reuses the old VM's
+digest. The orchestrator accepts only pinned images. `mh image verify` re-hashes
+on demand, and `mh doctor` reports an image file made writable or removed.
+
+**Catalog templates are outside this guarantee:** a template is a name for two
+paths, rebuilt in place, and `mh run TEMPLATE` boots whatever is at those paths
+now. Fine by hand on a development host; production functions boot images.
+
+**What a digest proves, and what it does not.** It proves that a VM runs the
+bytes that were imported — the ones that were validated. It does not prove that
+those bytes were trustworthy when they were built: that is what the pins above
+are for, and where they stop is listed in gaps 7 and 8.
+
 ---
 
 ## 5. A worked attack
@@ -493,7 +533,28 @@ Stated plainly, most important first.
    speculative-execution side channels. Mitigate with up-to-date microcode and
    kernel mitigations and, where it matters, by disabling SMT or pinning VMs to
    dedicated cores. Not managed by the engine.
-7. **Abstract Unix sockets on the host are reachable from an escaped VMM.**
+7. **The guest kernel is pinned on trust on first use.** Firecracker CI
+   publishes no checksum or signature for its kernels, so the pin records what
+   was downloaded (cross-checked against an earlier install and the object's
+   unchanged date), not a publisher's statement. Building the kernel from
+   source with a reviewed config would close it (`docs/architecture.md`).
+8. **Image builds are not reproducible.** apk and apt install each package's
+   current version, verified by signature but not pinned: two builds of the same
+   spec differ, and a package that was bad but correctly signed is not stopped.
+   The image digest pins the result — test that result, then deploy that digest;
+   a rebuild is a new version to test again. `mh build` narrows it (an image
+   spec may pin `pkg=version`) without closing it. Its `run:` steps execute as
+   root on the build host inside a chroot, which does not confine root: an
+   image spec is code the operator runs, like a Dockerfile — build only specs
+   you trust. Its copies are resolved inside the chroot, so a symlink in the
+   image cannot aim a write at the host, and file sources cannot leave the
+   build context.
+9. **A removed tag can be bound again.** Tags never move while they exist, but
+   once `mh image rm` removes a tag (or its image), the same `name:version` can
+   be imported with other bytes. A pinned reference is refused if its tag
+   disagrees, so the orchestrator is not affected; a bare `mh run name:version`
+   boots the new bytes. Pin the digest wherever it matters.
+10. **Abstract Unix sockets on the host are reachable from an escaped VMM.**
    They belong to the network namespace, not to the filesystem, so the chroot
    does not hide them, and the VMM shares the host's namespace; its seccomp
    filter allows `AF_UNIX` sockets and `connect`. A compromised VMM could reach
@@ -501,12 +562,12 @@ Stated plainly, most important first.
    services off the host — notably containerd shims, the subject of
    CVE-2020-15257 — until each VMM gets its own network namespace (Jailer
    `--netns`; roadmap Phase 3).
-8. **Public DNS resolvers** are configured in guests; on networks without egress
+11. **Public DNS resolvers** are configured in guests; on networks without egress
    they are unreachable (DNS fails closed), with egress they are reached through
    the same NAT.
-9. **Events are in memory.** They are a notification channel, not an audit log; a
+12. **Events are in memory.** They are a notification channel, not an audit log; a
    daemon restart starts a new epoch. Durable state is the VM records.
-10. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
+13. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
    rules that let VM egress through Docker's forward drop; egress fails (closed)
    until the next network change or daemon restart.
 
@@ -520,6 +581,8 @@ Stated plainly, most important first.
 | pinning, quarantine, replace | `scripts/replace-test.sh` |
 | event delivery, resume, reset | `sudo scripts/events-test.sh` |
 | drift right now | `mh doctor` |
+| an image still has the bytes it was imported with | `mh image verify NAME:VERSION` |
+| the pinned downloads | a file altered in `images/cache/` or the store makes the next `make prepare-image` stop with `is not the pinned …`; an unlisted version stops with `no pinned SHA-256` |
 | the ruleset in force | `sudo nft list table inet microhosted` |
 | every invariant of this document on the live host: daemon, store, every running VM's identity, capabilities, seccomp, cgroup, jail and descriptors, and isolation seen from inside test guests | `sudo scripts/security-test.sh` (without root the jail, descriptor and nftables checks are skipped) |
 | a VM's limits | `cat /sys/fs/cgroup/microhosted/<id>/{cpu.max,memory.max,memory.swap.max,pids.max}` |

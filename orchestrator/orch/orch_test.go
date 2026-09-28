@@ -36,6 +36,10 @@ type fakeEngine struct {
 	createErr error
 	// lastCreate is the last create request.
 	lastCreate types.CreateVMRequest
+	// image, when set, is what GetImage answers (Digest is filled in).
+	image *types.ImageResponse
+	// execs records every command run in a VM.
+	execs []string
 }
 
 func newFake() *fakeEngine {
@@ -102,6 +106,7 @@ func (f *fakeEngine) Exec(_ context.Context, id, cmd string, _ time.Duration) (*
 	f.mu.Lock()
 	v, ok := f.vms[id]
 	h := f.exec
+	f.execs = append(f.execs, cmd)
 	f.mu.Unlock()
 	if !ok {
 		return nil, &engine.Error{Status: 404, Msg: "no vm"}
@@ -120,6 +125,23 @@ func (f *fakeEngine) PatchVMLabels(_ context.Context, id string, patch map[strin
 			delete(f.vms[id].Labels, k)
 		} else {
 			f.vms[id].Labels[k] = *v
+		}
+	}
+	return nil
+}
+
+func (f *fakeEngine) PatchNetworkLabels(_ context.Context, name string, patch map[string]*string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.nets[name]
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	for k, v := range patch {
+		if v == nil {
+			delete(n.Labels, k)
+		} else {
+			n.Labels[k] = *v
 		}
 	}
 	return nil
@@ -184,6 +206,11 @@ func (f *fakeEngine) SetIntra(_ context.Context, name string, intra bool) error 
 func (f *fakeEngine) GetImage(_ context.Context, ref string) (*types.ImageResponse, error) {
 	if !strings.HasSuffix(ref, digest) {
 		return nil, &engine.Error{Status: 404, Msg: "no such image"}
+	}
+	if f.image != nil {
+		img := *f.image
+		img.Digest = digest
+		return &img, nil
 	}
 	return &types.ImageResponse{Digest: digest, MemMB: 128}, nil
 }
@@ -282,7 +309,7 @@ func TestApplyCreatesThenConverges(t *testing.T) {
 		t.Fatalf("%d VMs, want the one persistent function's", len(vms))
 	}
 	v := vms[0]
-	if v.Name != "server-1" || v.GuestIP != "172.30.10.2" || v.Labels[LabelFunction] != "server" || v.Labels[LabelSpec] == "" || v.Image != "alpine:1.0@"+digest {
+	if v.Name != "default-server-1" || v.GuestIP != "172.30.10.2" || v.Labels[LabelFunction] != "server" || v.Labels[LabelSpec] == "" || v.Image != "alpine:1.0@"+digest {
 		t.Errorf("vm %+v", v)
 	}
 	if p2, err := o.Plan(context.Background()); err != nil || len(p2.Actions) != 0 {
@@ -324,7 +351,7 @@ func TestApplyPrunes(t *testing.T) {
 	o, _ := newOrch(t, f, plant)
 	applyOnce(t, o)
 	f.vms["quar0001"] = &types.VMResponse{ID: "quar0001", Name: "server-0", Quarantine: true, State: types.VMStateRunning,
-		Labels: map[string]string{LabelManagedBy: Owner, LabelFunction: "server"}}
+		Labels: map[string]string{LabelManagedBy: Owner, LabelProject: "default", LabelFunction: "server"}}
 
 	smaller := `
 version: 1
@@ -401,7 +428,7 @@ func TestTransactionCycle(t *testing.T) {
 	o, out := newOrch(t, f, plant)
 	fn := o.spec.Functions["whoami"]
 	r := o.cycle(context.Background(), "whoami", fn)
-	if !r.OK || r.Output != "root\n" || *r.Exit != 0 || r.VM != "whoami-1" {
+	if !r.OK || r.Output != "root\n" || *r.Exit != 0 || r.VM != "default-whoami-1" {
 		t.Errorf("result %+v", r)
 	}
 	if f.count(owned()) != 0 {
@@ -486,7 +513,7 @@ func TestRunReplacesDeadVM(t *testing.T) {
 	f.mu.Unlock()
 	waitFor(t, func() bool {
 		vms, _ := f.ListVMs(ctx, server)
-		return len(vms) == 1 && vms[0].Name == "server-2" && vms[0].State == types.VMStateRunning
+		return len(vms) == 1 && vms[0].Name == "default-server-2" && vms[0].State == types.VMStateRunning
 	})
 
 	cancel()
@@ -615,10 +642,10 @@ func TestFailureRecords(t *testing.T) {
 		t.Fatalf("%d failures, want 1", len(fs))
 	}
 	r := fs[0]
-	if r.Cause != "exit 3" || *r.Exit != 3 || r.Output != "about to fail\n" || r.VM != "whoami-2" || r.Image != fn.Image {
+	if r.Cause != "exit 3" || *r.Exit != 3 || r.Output != "about to fail\n" || r.VM != "default-whoami-2" || r.Image != fn.Image {
 		t.Errorf("record %+v", r)
 	}
-	if !strings.Contains(r.Console, "console of whoami-2") {
+	if !strings.Contains(r.Console, "console of default-whoami-2") {
 		t.Errorf("console %q: not captured before the destroy", r.Console)
 	}
 
@@ -626,8 +653,8 @@ func TestFailureRecords(t *testing.T) {
 	for range FailuresKept + 2 {
 		o.cycle(context.Background(), "whoami", fn)
 	}
-	if fs := o.state.Get("whoami").Failures; len(fs) != FailuresKept || fs[len(fs)-1].VM != "whoami-9" {
-		t.Errorf("kept %d failures, newest %s; want %d, whoami-9", len(fs), fs[len(fs)-1].VM, FailuresKept)
+	if fs := o.state.Get("whoami").Failures; len(fs) != FailuresKept || fs[len(fs)-1].VM != "default-whoami-9" {
+		t.Errorf("kept %d failures, newest %s; want %d, default-whoami-9", len(fs), fs[len(fs)-1].VM, FailuresKept)
 	}
 
 	// A create the engine refuses is recorded without a VM; a full host
@@ -665,7 +692,7 @@ func TestDeathRecorded(t *testing.T) {
 	cancel()
 	<-done
 	r := o.state.Get("server").Failures[0]
-	if r.Cause != "died: killed by the OOM killer" || r.VM != "server-1" || !strings.Contains(r.Console, "console of server-1") {
+	if r.Cause != "died: killed by the OOM killer" || r.VM != "default-server-1" || !strings.Contains(r.Console, "console of default-server-1") {
 		t.Errorf("record %+v", r)
 	}
 }
@@ -797,7 +824,7 @@ func TestRolloutRevertsAndHalts(t *testing.T) {
 	reload <- mustSpec(t, y)
 	waitFor(t, func() bool { return o.state.Get("server").Held })
 	waitFor(t, func() bool { v := servingVM(f, "server"); return v != nil && v.Labels[LabelSpec] == oldHash })
-	if v := servingVM(f, "server"); v.Name == "server-1" {
+	if v := servingVM(f, "server"); v.Name == "default-server-1" {
 		t.Error("the previous version is the old VM, not a fresh one")
 	}
 	if o.fn("whoami") != oldWhoami {
@@ -895,5 +922,123 @@ func TestStartFailsFastWhenCommandExits(t *testing.T) {
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("took %s: waited out the health check", d)
+	}
+}
+
+// A function that leaves its command and health check out runs the image's;
+// what the spec sets wins. A cycle function needs a command from one of
+// the two.
+func TestImageDefaults(t *testing.T) {
+	fastTimers(t)
+	f := newFake()
+	f.image = &types.ImageResponse{MemMB: 64, Command: "nginx -g 'daemon off;'",
+		Health: &types.ImageHealth{Command: "wget -qO- http://127.0.0.1/", Every: "30s"}}
+	o, _ := newOrch(t, f, `
+version: 1
+budget: { max_vms: 5, max_mem_mb: 1024 }
+functions:
+  site:
+    image: site:1.0@`+digest+`
+    network: none
+    lifecycle: { mode: persistent }
+  other:
+    image: site:1.0@`+digest+`
+    network: none
+    command: httpd -f
+    lifecycle: { mode: persistent }
+`)
+	p := applyOnce(t, o)
+	site, other := o.spec.Functions["site"], o.spec.Functions["other"]
+	if site.Command != "nginx -g 'daemon off;'" || site.Health == nil || site.Health.Every.D() != 30*time.Second ||
+		site.Health.Timeout.D() != spec.DefaultHealthTimeout || site.Health.Failures != spec.DefaultHealthFailures {
+		t.Errorf("site = command %q, health %+v", site.Command, site.Health)
+	}
+	if other.Command != "httpd -f" || other.Health == nil || other.Health.Command != "wget -qO- http://127.0.0.1/" {
+		t.Errorf("other = command %q, health %+v: the spec's command wins, the image's health still applies", other.Command, other.Health)
+	}
+	if !strings.Contains(p.Actions[0].Why, "command and health from the image") {
+		t.Errorf("plan says %q", p.Actions[0].Why)
+	}
+	launched := false
+	for _, c := range f.execs {
+		launched = launched || strings.Contains(c, "nginx -g")
+	}
+	if !launched {
+		t.Errorf("the image's command was not launched: %q", f.execs)
+	}
+	if p2, err := o.Plan(context.Background()); err != nil || len(p2.Actions) != 0 {
+		t.Errorf("second plan: %v %v, want no changes", p2, err)
+	}
+
+	f2 := newFake()
+	f2.image = &types.ImageResponse{MemMB: 64}
+	o2, _ := newOrch(t, f2, `
+version: 1
+budget: { max_vms: 5, max_mem_mb: 1024 }
+functions:
+  job:
+    image: site:1.0@`+digest+`
+    network: none
+    lifecycle: { mode: transaction, every: 30s, timeout: 5s }
+`)
+	if _, err := o2.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "functions.job: command: required for transaction") {
+		t.Errorf("a cycle without a command anywhere: %v", err)
+	}
+}
+
+// Projects: each spec sees and changes only its own objects, so two run side
+// by side; what was made before projects is adopted by the spec declaring it.
+func TestProjects(t *testing.T) {
+	fastTimers(t)
+	f := newFake()
+	// Made before projects: no project label.
+	f.nets["legacy"] = &types.NetworkResponse{Name: "legacy", Subnet: "172.30.60.0/24", Labels: map[string]string{LabelManagedBy: Owner}}
+	f.vms["old00001"] = &types.VMResponse{ID: "old00001", Name: "site-2", State: types.VMStateRunning, Image: "alpine:1.0@" + digest, Network: "legacy",
+		Labels: map[string]string{LabelManagedBy: Owner, LabelFunction: "site", LabelGeneration: "2"}}
+
+	a, _ := newOrch(t, f, "version: 1\nname: alpha\nbudget: { max_vms: 4, max_mem_mb: 1024 }\nnetworks:\n  a-net: { subnet: 172.30.61.0/24 }\nfunctions:\n  web:\n    image: alpine:1.0@"+digest+"\n    network: a-net\n    lifecycle: { mode: persistent }\n")
+	b, _ := newOrch(t, f, "version: 1\nname: beta\nbudget: { max_vms: 4, max_mem_mb: 1024 }\nnetworks:\n  b-net: { subnet: 172.30.62.0/24 }\nfunctions:\n  web:\n    image: alpine:1.0@"+digest+"\n    network: b-net\n    lifecycle: { mode: persistent }\n")
+	applyOnce(t, a)
+	pb := applyOnce(t, b)
+	for _, act := range pb.Actions {
+		if act.Verb == "destroy" || act.Verb == "delete" {
+			t.Errorf("project beta planned %s on alpha's or legacy objects", act)
+		}
+	}
+	if f.count(map[string]string{LabelProject: "alpha"}) != 1 || f.count(map[string]string{LabelProject: "beta"}) != 1 {
+		t.Fatal("each project should have its own VM")
+	}
+	if servingVM(f, "web") == nil || f.nets["legacy"] == nil || f.vms["old00001"] == nil {
+		t.Fatal("an apply removed another project's or a legacy object")
+	}
+	names := map[string]bool{}
+	for _, v := range f.vms {
+		names[v.Name] = true
+	}
+	if !names["alpha-web-1"] || !names["beta-web-1"] {
+		t.Errorf("VM names %v, want alpha-web-1 and beta-web-1", names)
+	}
+	if kept, err := b.Down(context.Background()); err != nil || len(kept) != 0 || f.count(map[string]string{LabelProject: "alpha"}) != 1 || f.nets["a-net"] == nil || f.nets["b-net"] != nil {
+		t.Errorf("down of beta: kept %v, %v; alpha must be untouched and b-net gone", kept, err)
+	}
+
+	// The spec that declares the legacy objects adopts them: labels, no
+	// recreation.
+	c, _ := newOrch(t, f, "version: 1\nname: gamma\nbudget: { max_vms: 4, max_mem_mb: 1024 }\nnetworks:\n  legacy: { subnet: 172.30.60.0/24 }\nfunctions:\n  site:\n    image: alpine:1.0@"+digest+"\n    network: legacy\n    lifecycle: { mode: persistent }\n")
+	// It was made from this very function: same spec hash.
+	f.vms["old00001"].Labels[LabelSpec] = SpecHash(c.spec.Functions["site"])
+	p := applyOnce(t, c)
+	for _, act := range p.Actions {
+		if act.Verb != "update" {
+			t.Errorf("adoption planned %s", act)
+		}
+	}
+	if f.nets["legacy"].Labels[LabelProject] != "gamma" || f.vms["old00001"].Labels[LabelProject] != "gamma" {
+		t.Errorf("legacy objects not adopted: net %v, vm %v", f.nets["legacy"].Labels, f.vms["old00001"].Labels)
+	}
+	// Once labelled, a network of the same name is refused to another project.
+	d, _ := newOrch(t, f, "version: 1\nname: delta\nbudget: { max_vms: 4, max_mem_mb: 1024 }\nnetworks:\n  legacy: { subnet: 172.30.60.0/24 }\nfunctions:\n  x:\n    image: alpine:1.0@"+digest+"\n    network: legacy\n    lifecycle: { mode: persistent }\n")
+	if _, err := d.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "belongs to project gamma") {
+		t.Errorf("another project's network: %v", err)
 	}
 }

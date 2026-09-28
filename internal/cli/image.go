@@ -15,11 +15,12 @@ var imageGroup = &group{
 	aliases: []string{"img"},
 	summary: "Manage the content-addressed image store",
 	cmds: []*command{
+		{name: "build", args: "[CONTEXT]", summary: "Build an image from an image spec, import it and print its pinned reference", help: imageBuildHelp, examples: imageBuildExamples, run: imageBuild},
 		{name: "import", args: "NAME:VERSION", summary: "Copy a kernel and a rootfs into the store under their digest", help: imageImportHelp, run: imageImport},
 		{name: "ls", aliases: []string{"list"}, summary: "List stored images", run: imageList},
 		{name: "inspect", aliases: []string{"show"}, args: "IMAGE...", summary: "Show an image's full detail as JSON", run: imageInspect},
 		{name: "verify", args: "IMAGE...", summary: "Re-hash an image's files and check they still match its digest", run: imageVerify},
-		{name: "rm", aliases: []string{"remove", "delete"}, args: "IMAGE...", summary: "Delete images no VM or snapshot uses", run: imageRemove},
+		{name: "rm", aliases: []string{"remove", "delete"}, args: "IMAGE...", summary: "Remove a tag, or delete an image no VM or snapshot uses", help: imageRemoveHelp, run: imageRemove},
 	},
 }
 
@@ -27,6 +28,11 @@ const imageImportHelp = `The files must be on the daemon's host, under its store
 make prepare-image builds them). They are copied once and hashed; the tag then
 names those bytes forever: a rebuild needs a new version. Create VMs with
   mh run NAME:VERSION        or, pinned,   mh run NAME:VERSION@sha256:…`
+
+const imageRemoveHelp = `NAME:VERSION of an image that has other tags removes only that tag; the
+image stays under the others, and VMs booted from it are not affected.
+Its last tag, or a reference with a digest (sha256:… or NAME:VERSION@sha256:…),
+deletes the image with all its tags — refused while a VM or snapshot uses it.`
 
 func imageImport(e *env, cmd *command, p string, args []string) error {
 	var req types.ImportImageRequest
@@ -36,6 +42,13 @@ func imageImport(e *env, cmd *command, p string, args []string) error {
 	fs.int64Var(&req.VCPUs, "cpus", "c", "default vCPUs of its VMs (default 1)")
 	fs.Var((*mbValue)(&req.MemMB), "mem", "default memory `SIZE` of its VMs, e.g. 128 or 1G (default 128)")
 	fs.Var((*mbValue)(&req.DiskMB), "disk", "default disk `SIZE` its VMs are grown to, e.g. 512 (default: the rootfs's)")
+	var health types.ImageHealth
+	var retries int64
+	fs.stringVar(&req.Command, "command", "", "", "default `COMMAND` its VMs run (mh run starts it, the orchestrator uses it; the engine runs none)")
+	fs.stringVar(&health.Command, "health-cmd", "", "", "default health check `COMMAND`, exit 0 healthy")
+	fs.stringVar(&health.Every, "health-interval", "", "", "time between health checks, e.g. 10s")
+	fs.stringVar(&health.Timeout, "health-timeout", "", "", "time a health check may take, e.g. 2s")
+	fs.int64Var(&retries, "health-retries", "", "failed checks in a row that make a VM unhealthy")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -52,6 +65,10 @@ func imageImport(e *env, cmd *command, p string, args []string) error {
 	}
 	if req.MemMB == 0 {
 		req.MemMB = 128
+	}
+	health.Failures = int(retries)
+	if health != (types.ImageHealth{}) {
+		req.Health = &health
 	}
 	// The daemon reads the paths on its host; relative ones are the caller's.
 	for _, p := range []*string{&req.KernelPath, &req.RootfsPath} {
@@ -72,9 +89,10 @@ func imageImport(e *env, cmd *command, p string, args []string) error {
 }
 
 func imageList(e *env, cmd *command, p string, args []string) error {
-	var quiet, asJSON bool
+	var quiet, noTrunc, asJSON bool
 	fs := newCmdFlags(e, p, cmd)
-	fs.boolVar(&quiet, "quiet", "q", "print pinned references only (NAME:VERSION@DIGEST)")
+	fs.boolVar(&quiet, "quiet", "q", "print pinned references only (NAME:VERSION@DIGEST), one per tag: what a plant spec's image: takes")
+	fs.boolVar(&noTrunc, "no-trunc", "", "print the full digest")
 	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
 	pos, err := fs.parse(args)
 	if err != nil {
@@ -112,12 +130,20 @@ func imageList(e *env, cmd *command, p string, args []string) error {
 		if img.DiskMB > 0 {
 			disk = fmtMB(img.DiskMB)
 		}
+		digest := shortDigest(img.Digest)
+		if noTrunc {
+			digest = img.Digest
+		}
 		rows = append(rows, []string{
-			strings.Join(img.Tags, ","), shortDigest(img.Digest), strconv.FormatInt(img.VCPUs, 10),
+			strings.Join(img.Tags, ","), digest, strconv.FormatInt(img.VCPUs, 10),
 			fmtMB(img.MemMB), disk, fmtMB(img.SizeMB), status, fmtAgo(img.ImportedAt),
 		})
 	}
 	table(e.stdout, []string{"IMAGE", "DIGEST", "VCPU", "MEM", "DISK", "SIZE", "STATUS", "IMPORTED"}, rows)
+	if len(imgs) > 0 {
+		// On stderr, like template ls's notes: the table stays parseable.
+		fmt.Fprintf(e.stderr, "\nFor a plant spec's image: (name:version@sha256:…, the digest in full): mh image ls -q\n")
+	}
 	return nil
 }
 
@@ -206,10 +232,20 @@ func imageRemove(e *env, cmd *command, p string, args []string) error {
 		return err
 	}
 	for _, ref := range pos {
-		if err := c.Do("DELETE", "/v1/images/"+url.PathEscape(ref), nil, nil); err != nil {
+		var res types.ImageDeleteResponse
+		if err := c.Do("DELETE", "/v1/images/"+url.PathEscape(ref), nil, &res); err != nil {
 			return err
 		}
-		fmt.Fprintln(e.stdout, ref)
+		if res.Digest == "" { // a daemon that answers 204, before untag existed
+			fmt.Fprintln(e.stdout, ref)
+			continue
+		}
+		for _, t := range res.Untagged {
+			fmt.Fprintf(e.stdout, "untagged %s\n", t)
+		}
+		if res.Deleted {
+			fmt.Fprintf(e.stdout, "deleted  %s\n", res.Digest)
+		}
 	}
 	return nil
 }

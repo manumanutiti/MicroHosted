@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,9 +25,11 @@ import (
 	"microhosted/orchestrator/spec"
 )
 
-const usage = `Usage: mh-orchestrator COMMAND -f PLANT.yaml [FLAGS] [FUNCTION]
+const usage = `Usage: mh-orchestrator COMMAND [-f PLANT.yml] [FLAGS] [FUNCTION]
 
 Commands:
+  up         apply, then keep it: run cycles, replace what dies or fails
+             (run in the foreground; up -d leaves it in the background)
   validate   check the spec on its own (no engine needed)
   plan       show what apply would change; changes nothing
   apply      converge once: networks, persistent functions, pruning. With a
@@ -37,16 +40,39 @@ Commands:
   status     every function, its VMs, their health and last failure
   failures   why a function's VMs failed (all functions, or FUNCTION): cause,
              output and console tail, captured before each VM was destroyed
-  down       remove everything the orchestrator owns (quarantined VMs stay)
+  down       stop the project's run, if any, and remove everything the
+             project owns (quarantined VMs stay)
 
 Flags:
-  -f FILE    the plant spec (required)
+  -f FILE    the plant spec (default ./microse.yml, or ./microse.yaml)
   -H SOCKET  the engine's API socket (default $MICROHOSTED_HOST, $MICROHOSTED_SOCKET or /run/microhosted.sock)
   -y         apply / down without asking (required when stdin is not a terminal)
+  -d         up: in the background (log in the project's state directory)
   -state DIR failure records and flags (default $XDG_STATE_HOME/mh-orchestrator
              or ~/.local/state/mh-orchestrator)
 
+Projects: each plant spec is a project — its name:, else its directory's
+name, as docker compose names them. What the orchestrator creates carries the
+project; a spec sees and changes only its own project's objects, so several
+run side by side. VMs are named PROJECT-FUNCTION-N; network names are shared
+by the whole host.
+
 run writes one JSON line per finished cycle to stdout; logs go to stderr.
+
+${NAME} in the spec's values is taken from the environment, else from the
+.env file next to the spec (docker compose's rules; ${NAME:-default},
+${NAME:?message}; a bare $NAME is left for the guest's shell). It carries
+what mh build prints:
+  echo "SITE=$(mh build -q -t site ./site)" >> .env    # image: ${SITE}
+A running orchestrator reloads the file with its own environment: keep such
+variables in .env.
+
+A function may say build: DIR (or a build.yml) instead of image:. plan,
+apply and run run mh build on it and use the image it makes; mh build tags
+by the fingerprint of the spec and its files, so an unchanged build: builds
+nothing. A change to the build context is a new image, rolled out like any
+other change. A running orchestrator never builds on reload: apply does it
+before handing the spec over.
 `
 
 func main() {
@@ -64,12 +90,23 @@ func main() {
 	host := fs.String("H", "", "engine socket")
 	yes := fs.Bool("y", false, "do not ask")
 	stateDir := fs.String("state", orch.DefaultStateDir(), "state directory")
+	detach := fs.Bool("d", false, "up: apply, then keep it running in the background")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		os.Exit(2)
 	}
-	if *file == "" || fs.NArg() > 1 || (fs.NArg() == 1 && cmd != "failures") {
+	if *file == "" {
+		*file = spec.FindIn(".", spec.PlantFiles)
+	}
+	if fs.NArg() > 1 || (fs.NArg() == 1 && cmd != "failures") {
 		fs.Usage()
 		os.Exit(2)
+	}
+	if *detach && cmd != "up" {
+		fs.Usage()
+		os.Exit(2)
+	}
+	if cmd == "up" && !*detach {
+		cmd = "run" // up in the foreground is run
 	}
 	if err := run(cmd, *file, *host, *stateDir, fs.Arg(0), *yes); err != nil {
 		fmt.Fprintf(os.Stderr, "mh-orchestrator %s: %v\n", cmd, err)
@@ -86,13 +123,29 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		fmt.Printf("%s: valid — %d networks, %d functions\n", file, len(s.Networks), len(s.Functions))
 		return nil
 	}
+	// build: functions get their image: plan, apply and run build what is
+	// missing (mh build skips what the store already has); the others only
+	// look, and leave a function not built without an image.
+	switch cmd {
+	case "plan", "apply", "run", "up":
+		if _, err := resolveBuilds(s, host, buildMissing); err != nil {
+			return err
+		}
+	default:
+		if _, err := resolveBuilds(s, host, lookOnly); err != nil {
+			return err
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := log.New(os.Stderr, "", log.LstdFlags)
-	state, err := orch.OpenState(stateDir)
+	// Each project keeps its failure records apart, and has its own lock:
+	// projects run side by side.
+	projectDir := filepath.Join(stateDir, s.Project)
+	state, err := orch.OpenState(projectDir)
 	if err != nil {
-		return fmt.Errorf("state directory %s: %w", stateDir, err)
+		return fmt.Errorf("state directory %s: %w", projectDir, err)
 	}
 	o := orch.New(engine.New(engine.ResolveSocket(host)), s, logger, os.Stdout, state)
 
@@ -102,17 +155,21 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		if err != nil {
 			return err
 		}
-		if h := lockHolder(); h != nil && h.path == absPath(file) {
+		if h := lockHolder(s.Project); h != nil && h.path == absPath(file) {
 			printRollout(os.Stdout, p, h)
 			return nil
 		}
 		printPlan(os.Stdout, p)
 		return nil
 
-	case "apply":
-		unlock, h, err := lock(file)
+	case "apply", "up":
+		// up -d: apply without asking, then leave a run supervising it.
+		if cmd == "up" {
+			yes = true
+		}
+		unlock, h, err := lock(s.Project, file)
 		if h != nil {
-			return handOver(ctx, o, file, h, yes)
+			return handOver(ctx, o, s, file, h, yes)
 		}
 		if err != nil {
 			return err
@@ -123,26 +180,31 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 			return err
 		}
 		printPlan(os.Stdout, p)
-		if len(p.Actions) == 0 {
-			return nil
+		if len(p.Actions) > 0 {
+			if ok, err := confirm("Apply these changes?", yes); !ok {
+				return err
+			}
 		}
-		if ok, err := confirm("Apply these changes?", yes); !ok {
-			return err
+		if len(p.Actions) > 0 {
+			if err := o.Apply(ctx, p); err != nil {
+				return err
+			}
+			fmt.Println("Applied.")
 		}
-		if err := o.Apply(ctx, p); err != nil {
-			return err
+		if cmd == "up" {
+			unlock()
+			return startDetached(file, host, stateDir, projectDir, s.Project)
 		}
-		fmt.Println("Applied.")
 		return nil
 
 	case "run":
-		unlock, _, err := lock(file)
+		unlock, _, err := lock(s.Project, file)
 		if err != nil {
 			return err
 		}
 		defer unlock()
-		logger.Printf("running %s (stop with Ctrl-C: cycles in flight are cleaned up, persistent functions keep running; SIGHUP or mh-orchestrator apply reloads it)", file)
-		return o.Run(ctx, reloads(ctx, file, logger))
+		logger.Printf("project %s: running %s (stop with Ctrl-C: cycles in flight are cleaned up, persistent functions keep running; SIGHUP or mh-orchestrator apply reloads it)", s.Project, file)
+		return o.Run(ctx, reloads(ctx, file, host, logger))
 
 	case "status":
 		fns, orphans, err := o.Status(ctx)
@@ -164,14 +226,19 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		return nil
 
 	case "down":
-		unlock, _, err := lock(file)
+		if ok, err := confirm(fmt.Sprintf("Destroy every VM and network of project %s?", s.Project), yes); !ok {
+			return err
+		}
+		// A run keeping this project up stops first, or it would bring back
+		// what down removes.
+		if err := stopRunner(s.Project); err != nil {
+			return err
+		}
+		unlock, _, err := lock(s.Project, file)
 		if err != nil {
 			return err
 		}
 		defer unlock()
-		if ok, err := confirm("Destroy every VM and network the orchestrator owns?", yes); !ok {
-			return err
-		}
 		kept, err := o.Down(ctx)
 		for _, k := range kept {
 			fmt.Println("kept:", k)
@@ -181,12 +248,14 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 	return fmt.Errorf("unknown command %q (see mh-orchestrator --help)", cmd)
 }
 
-func lockPath() string {
+// lockPath is the project's lock: one run, apply or down at a time per
+// project; different projects run side by side.
+func lockPath(project string) string {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	return filepath.Join(dir, "mh-orchestrator.lock")
+	return filepath.Join(dir, "mh-orchestrator-"+project+".lock")
 }
 
 // holder is the process that holds the lock, as it recorded itself.
@@ -207,8 +276,8 @@ func absPath(p string) string {
 // writes its pid and spec into the lock file, so an apply can hand a new spec
 // to a running orchestrator instead of fighting it. When the lock is taken,
 // the holder is returned along with the error.
-func lock(spec string) (func(), *holder, error) {
-	path := lockPath()
+func lock(project, spec string) (func(), *holder, error) {
+	path := lockPath(project)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, nil, err
@@ -216,7 +285,7 @@ func lock(spec string) (func(), *holder, error) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, lockHolder(), fmt.Errorf("another mh-orchestrator (run, apply or down) holds %s", path)
+			return nil, lockHolder(project), fmt.Errorf("another mh-orchestrator (run, apply or down) of project %s holds %s", project, path)
 		}
 		return nil, nil, err
 	}
@@ -226,8 +295,8 @@ func lock(spec string) (func(), *holder, error) {
 }
 
 // lockHolder reads who holds the lock; nil when nobody does.
-func lockHolder() *holder {
-	f, err := os.Open(lockPath())
+func lockHolder(project string) *holder {
+	f, err := os.Open(lockPath(project))
 	if err != nil {
 		return nil
 	}
@@ -253,9 +322,26 @@ func lockHolder() *holder {
 // handOver gives a new spec to the orchestrator running on this file: it is
 // validated and planned here, shown, and — confirmed — sent as SIGHUP; the
 // running orchestrator plans it again and rolls it out.
-func handOver(ctx context.Context, o *orch.Orchestrator, file string, h *holder, yes bool) error {
+func handOver(ctx context.Context, o *orch.Orchestrator, s *spec.Spec, file string, h *holder, yes bool) error {
 	if h.path != absPath(file) {
 		return fmt.Errorf("an mh-orchestrator (pid %d) is running %s: change that file and apply it, or stop it first", h.pid, h.path)
+	}
+	// The running orchestrator reloads the file itself, with its own
+	// environment: a value only this shell has would not reach it.
+	envFile, err := spec.ReadEnvFile(filepath.Dir(file))
+	if err != nil {
+		return err
+	}
+	var shell []string
+	for name, src := range s.Vars {
+		if v, inFile := envFile[name]; src == spec.FromEnvironment && (!inFile || v != os.Getenv(name)) {
+			shell = append(shell, name)
+		}
+	}
+	if len(shell) > 0 {
+		sort.Strings(shell)
+		return fmt.Errorf("the spec takes %s from this shell's environment, which the running orchestrator (pid %d) does not see when it reloads the file: put them in %s next to the spec (e.g. mh build -q … | sed 's/^/NAME=/' > %s), then apply",
+			strings.Join(shell, ", "), h.pid, filepath.Join(filepath.Dir(file), spec.EnvFile), spec.EnvFile)
 	}
 	p, err := o.Plan(ctx)
 	if err != nil {
@@ -275,7 +361,7 @@ func handOver(ctx context.Context, o *orch.Orchestrator, file string, h *holder,
 // reloads turns each SIGHUP into a freshly loaded spec for the running
 // orchestrator; a file that does not load is logged and the running spec
 // kept. Only the latest spec waits if a roll-out is still going on.
-func reloads(ctx context.Context, file string, logger *log.Logger) <-chan *spec.Spec {
+func reloads(ctx context.Context, file, host string, logger *log.Logger) <-chan *spec.Spec {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	out := make(chan *spec.Spec, 1)
@@ -288,6 +374,15 @@ func reloads(ctx context.Context, file string, logger *log.Logger) <-chan *spec.
 			case <-hup:
 			}
 			s, err := spec.Load(file)
+			if err == nil {
+				// A reload never builds (no terminal for sudo): apply builds
+				// before it hands the spec over, so the images are there.
+				var missing []string
+				missing, err = resolveBuilds(s, host, lookOnly)
+				if err == nil && len(missing) > 0 {
+					err = fmt.Errorf("functions %s: image not built; mh-orchestrator apply builds it", strings.Join(missing, ", "))
+				}
+			}
 			if err != nil {
 				logger.Printf("reload refused, the previous spec keeps running: %v", err)
 				continue
