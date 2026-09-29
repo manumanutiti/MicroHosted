@@ -113,6 +113,10 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	}
 	writeSet(&b, "mhsame", "ifname . ifname", pairs)
 
+	// Private and special destinations, closed to full-egress networks unless
+	// they opt in (EgressPrivate): see PrivateRanges.
+	fmt.Fprintf(&b, "\tset mhprivate {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n", strings.Join(PrivateRanges, ", "))
+
 	// guest → host: drop new connections coming in from any bridge, but let
 	// established/related through so host-initiated flows (e.g. SSH into a VM)
 	// still get their replies. Matched by prefix, not by @mhbridges: a bridge
@@ -270,6 +274,12 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 			// a non-bridge that is not that interface — the LAN behind a
 			// second NIC, a VPN, a Docker bridge — dies here.
 			fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges oifname != %q drop\n", n.Bridge, n.EgressIface)
+			// And through that interface, the internet only: on a host whose
+			// one NIC carries both the internet and the LAN, the interface
+			// alone would let the VM reach the router and every device.
+			if !n.EgressPrivate {
+				fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges ip daddr @mhprivate drop\n", n.Bridge)
+			}
 			continue
 		}
 		for _, r := range n.AllowedEgress {
@@ -310,6 +320,34 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 
 	b.WriteString("}\n")
 	return b.String()
+}
+
+// PrivateRanges are the IPv4 destinations a full-egress network does not
+// reach unless it sets EgressPrivate: what is not "the internet" — private
+// networks (RFC 1918), CGNAT, loopback, link-local (and the cloud metadata
+// service in it), the IETF and benchmarking blocks, multicast and the
+// reserved space up to the broadcast address.
+var PrivateRanges = []string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.0.0.0/24",
+	"192.168.0.0/16",
+	"198.18.0.0/15",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+}
+
+// ValidateEgressPrivate refuses EgressPrivate on a network without full
+// egress, where it would mean nothing.
+func ValidateEgressPrivate(egress, private bool) error {
+	if private && !egress {
+		return fmt.Errorf("egress_private only widens egress: it needs egress (and egress_iface)")
+	}
+	return nil
 }
 
 // egressOpen reports whether a network gets full egress. Egress with no

@@ -148,7 +148,8 @@ Everything not listed is dropped, both ways. (The API calls these
 
 ```bash
 mh network create lab                       # isolated: nothing in or out, VMs can't see each other
-mh network create build --internet eth0     # ALL outbound, through eth0 only (NAT)
+mh network create build --internet eth0     # the internet, through eth0 only (NAT); not the LAN
+mh network create dev --internet eth0 --private   # the LAN behind eth0 too
 mh network create lab2 --intra --subnet 10.10.0.0/24
 mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
 mh network create ot-52 --out tcp:192.168.50.52:502@wlan0
@@ -282,15 +283,22 @@ mh build -q -f web/build.yml                 # just the reference: web:sha-3f2a9
 mh build -t web:1.0 web/                     # an explicit tag
 mh build --no-cache web/                     # build again even if nothing changed (newer packages)
 mh build --no-build web/                     # only look: the reference, or exit 3 if not built
+mh build --adopt web/                        # trust a store image of these inputs you have no record of building
 ```
 
 **Naming and the build cache.** Without `-t`, the image is named by the spec's
 `name:` (else the context directory's name) and versioned by the
 **fingerprint** of everything the build takes in: the parsed spec (not its
-comments) and every file it copies — paths, modes, contents. When the store
-already has that tag, nothing is built and no `sudo` is asked: the existing
-reference is printed. Change a copied file and the next build is a new
-version. The fingerprint cannot see what the package repositories serve:
+comments), the pins its base and kernel resolve to, the guest agent, and every
+file it copies — paths, modes, contents. When the store already has that tag
+**and this user's record** (`$XDG_STATE_HOME/microhosted/builds/NAME/VERSION`,
+written by the build that imported it) names the same digest, nothing is built
+and no `sudo` is asked: the existing reference is printed. A tag is not proof on
+its own — once removed, anyone with the API can import other bytes under it —
+so a tag whose digest differs from the record is refused, and one with no
+record (built by another user, or the record lost) is refused until
+`mh build --adopt` takes it after you checked it. Change a copied file, or a
+pin in the code, and the next build is a new version. The fingerprint cannot see what the package repositories serve:
 unpinned packages stay as they were built until `--no-cache`.
 
 **From a plant spec.** A function says `build: DIR` (the directory holding a

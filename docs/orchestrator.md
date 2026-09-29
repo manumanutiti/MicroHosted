@@ -161,7 +161,8 @@ function names a `build.yml` (or its directory) instead of an image;
 `plan`/`apply`/`run` run `mh build` on it and pin the reference printed. The
 build is cached by fingerprint — `mh build` versions an image
 `name:sha-<fingerprint of the spec and its files>` and reuses a tag the store
-holds — so an unchanged context builds nothing and a changed one is a new
+holds only while it still names the digest this user's build imported under
+it (a per-user record; a rebound tag is refused) — so an unchanged context builds nothing and a changed one is a new
 digest, rolled out as any change. Pinning still holds: what boots is the
 digest `mh build` printed. The orchestrator stays an API client: it runs the
 `mh` binary. File names follow compose: `mh build` reads `./build.yml`,
@@ -212,7 +213,8 @@ must never degrade silently into "no rule".
 
 **Decided (2026-09-28) — network blocks reuse the engine's types verbatim**
 (`pkg/types.CreateNetworkRequest`: `allowed_egress[].ip/protocol/port`,
-`allowed_ingress[].iface/src_ip/protocol/port/to_ip`, `egress_iface`, `intra`).
+`allowed_ingress[].iface/src_ip/protocol/port/to_ip`, `egress_iface`,
+`egress_private`, `intra`).
 No second vocabulary to translate, and no translation bug between the spec and
 the ruleset.
 
@@ -308,6 +310,27 @@ path with mode `0400` and sources restricted to a root-only directory, and is
 diff can tell whether a VM has the declared content, but not a secret's: the
 orchestrator keeps the hash of the secrets it applied in its own state.
 
+**A secret minted per VM (2026-09-29): `command:` instead of `from:`.** A
+secret may name a shell command, run on the orchestrator's host in the spec's
+directory each time one of the function's VMs is created (a replacement and
+every cycle's VM included), with `MH_PROJECT`, `MH_FUNCTION` and `MH_VM_NAME`
+in its environment. Its standard output (at most 512 KiB, not empty) is the
+secret; a failure fails that create — a start failure like any other, with
+back-off — and reports the command's last line of stderr, so a command must
+not print the secret there. It runs with the orchestrator's user and
+environment, as code the operator wrote: plant specs are trusted like image
+specs. Because every VM gets different content, the spec hash covers the
+command, not its output: a fresh credential is not a spec change. The use is a
+credential that must not outlive the VM — a GitHub runner's just-in-time
+config (`orchestrator/examples/github-runner`): the long-lived token that
+mints it stays on the host, and the VM holds only what is worthless after it.
+
+```yaml
+    secrets:
+      /var/lib/mh-runner/jit:
+        command: ./jit-config.py '${GITHUB_SCOPE}'
+```
+
 ## 6. Objects, names and ownership
 
 **Decided (2026-09-19):** the orchestrator only touches objects carrying its
@@ -342,6 +365,17 @@ how long each VM lives.
 | `persistent` | always on; a fresh VM takes its place on schedule and on failure | the image's init, or `command` if set (the VM is kept while it runs) | `recycle` (`6h`, … or `never`) |
 
 `persistent` with `recycle: never` is the static case: replaced only on failure.
+
+**`on_exit: replace` (persistent, 2026-09-29): a VM that does one piece of
+work.** By default a persistent command should never end, and its exit is a
+failure (recorded, with back-off). With `on_exit: replace` an exit **0** is the
+work done: the orchestrator checks the command on every supervision pass (2 s,
+not the health schedule), destroys the VM and starts a fresh one at once, with
+nothing recorded; any other code is still a failure. The command's exit code is
+written in the guest (`/run/mh-function.exit`) by the shell that launches it,
+also when the command execs. Made for a CI runner that takes one job and exits
+(`orchestrator/examples/github-runner`). Opt-in because it has no back-off on
+exit 0: a server that exits 0 by mistake would be replaced in a loop.
 
 **Proposed — cold boot, not snapshot restore, in v1.** A snapshot freezes the
 guest's IP and MAC, so a "restore per cycle" design needs one snapshot per

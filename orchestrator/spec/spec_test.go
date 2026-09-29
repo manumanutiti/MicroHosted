@@ -61,29 +61,32 @@ func TestParseValid(t *testing.T) {
 // Every mistake is refused, and named — none degrades into a default.
 func TestParseRejects(t *testing.T) {
 	for name, tc := range map[string]struct{ from, to, want string }{
-		"unknown field":        {"    ip: 172.30.1.10\n", "    ip: 172.30.1.10\n    replicas: 2\n", "replicas"},
-		"typo in a rule":       {"protocol: icmp }", "protocl: icmp }", "protocl"},
-		"no digest":            {"alpine:1.0@" + digest + "\n    network: none", "alpine:1.0\n    network: none", "digest is mandatory"},
-		"unknown network":      {"network: none", "network: nope", `"nope" is not declared`},
-		"ip outside subnet":    {"    ip: 172.30.1.10", "    ip: 172.30.2.10", "not a usable guest address"},
-		"ip is the gateway":    {"    ip: 172.30.1.10", "    ip: 172.30.1.1\n", "not a usable guest address"},
-		"ingress to nobody":    {"to_ip: 172.30.1.10", "to_ip: 172.30.1.11", "no function on web declares ip: 172.30.1.11"},
-		"timeout over every":   {"every: 30s, timeout: 10s", "every: 30s, timeout: 30s", "timeout must be shorter"},
-		"window over every":    {"duration: 20s", "duration: 2m", "duration must be shorter"},
-		"no mode":              {"mode: transaction, ", "", "lifecycle.mode: required"},
-		"bad mode":             {"mode: transaction", "mode: cron", `"cron"`},
-		"multi-line command":   {"command: whoami", "command: \"who\\nami\"", "single line"},
-		"reserved label":       {"network: none\n", "network: none\n    labels: { function: x }\n", "set by the orchestrator"},
-		"health on a cycle":    {"command: whoami\n", "command: whoami\n    health: { command: true }\n", "only persistent"},
-		"bad duration":         {"every: 30s", "every: 30 seconds", "want e.g. 30s"},
-		"recycle too short":    {"recycle: 6h", "recycle: 10s", "at least 1m"},
-		"duplicate key":        {"  check:\n", "  server:\n", "already"},
-		"version":              {"version: 1", "version: 2", "version: must be 1"},
-		"egress without iface": {"    subnet: 172.30.1.0/24\n", "    subnet: 172.30.1.0/24\n    egress: true\n", "needs egress_iface"},
-		"no budget":            {"budget: { max_vms: 10, max_mem_mb: 2048, workers: 2 }", "", "max_vms: required"},
-		"uppercase name":       {"  check:", "  Check:", "DNS label"},
-		"subnet not a network": {"172.30.1.0/24", "172.30.1.5/24", "subnet"},
-		"second document":      {"version: 1", "version: 1\n---\nversion: 1", "more than one YAML document"},
+		"unknown field":          {"    ip: 172.30.1.10\n", "    ip: 172.30.1.10\n    replicas: 2\n", "replicas"},
+		"typo in a rule":         {"protocol: icmp }", "protocl: icmp }", "protocl"},
+		"no digest":              {"alpine:1.0@" + digest + "\n    network: none", "alpine:1.0\n    network: none", "digest is mandatory"},
+		"unknown network":        {"network: none", "network: nope", `"nope" is not declared`},
+		"ip outside subnet":      {"    ip: 172.30.1.10", "    ip: 172.30.2.10", "not a usable guest address"},
+		"ip is the gateway":      {"    ip: 172.30.1.10", "    ip: 172.30.1.1\n", "not a usable guest address"},
+		"ingress to nobody":      {"to_ip: 172.30.1.10", "to_ip: 172.30.1.11", "no function on web declares ip: 172.30.1.11"},
+		"timeout over every":     {"every: 30s, timeout: 10s", "every: 30s, timeout: 30s", "timeout must be shorter"},
+		"window over every":      {"duration: 20s", "duration: 2m", "duration must be shorter"},
+		"no mode":                {"mode: transaction, ", "", "lifecycle.mode: required"},
+		"bad mode":               {"mode: transaction", "mode: cron", `"cron"`},
+		"multi-line command":     {"command: whoami", "command: \"who\\nami\"", "single line"},
+		"reserved label":         {"network: none\n", "network: none\n    labels: { function: x }\n", "set by the orchestrator"},
+		"health on a cycle":      {"command: whoami\n", "command: whoami\n    health: { command: true }\n", "only persistent"},
+		"bad duration":           {"every: 30s", "every: 30 seconds", "want e.g. 30s"},
+		"recycle too short":      {"recycle: 6h", "recycle: 10s", "at least 1m"},
+		"bad on_exit":            {"recycle: 6h", "recycle: 6h, on_exit: restart", `on_exit: "restart"`},
+		"on_exit on a cycle":     {"mode: transaction, ", "mode: transaction, on_exit: replace, ", "on_exit do not apply"},
+		"duplicate key":          {"  check:\n", "  server:\n", "already"},
+		"version":                {"version: 1", "version: 2", "version: must be 1"},
+		"egress without iface":   {"    subnet: 172.30.1.0/24\n", "    subnet: 172.30.1.0/24\n    egress: true\n", "needs egress_iface"},
+		"private without egress": {"    subnet: 172.30.1.0/24\n", "    subnet: 172.30.1.0/24\n    egress_private: true\n", "egress_private without egress"},
+		"no budget":              {"budget: { max_vms: 10, max_mem_mb: 2048, workers: 2 }", "", "max_vms: required"},
+		"uppercase name":         {"  check:", "  Check:", "DNS label"},
+		"subnet not a network":   {"172.30.1.0/24", "172.30.1.5/24", "subnet"},
+		"second document":        {"version: 1", "version: 1\n---\nversion: 1", "more than one YAML document"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if !strings.Contains(valid, tc.from) {
@@ -109,6 +112,22 @@ func TestExamplesValid(t *testing.T) {
 		t.Fatal("no examples found")
 	}
 	for _, f := range append(files, plants...) {
+		// An example that needs variables ships them in env.example, the
+		// .env its user copies and fills in.
+		vars, err := ReadEnvFile(filepath.Dir(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ex, err := os.ReadFile(filepath.Join(filepath.Dir(f), "env.example")); err == nil {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, EnvFile), ex, 0o600)
+			if vars, err = ReadEnvFile(dir); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for k, v := range vars {
+			t.Setenv(k, v)
+		}
 		s, err := Load(f)
 		if err != nil {
 			t.Errorf("%v", err)
@@ -183,6 +202,16 @@ func TestLoadFiles(t *testing.T) {
 		t.Errorf("contents not read: %+v %+v", f.Files, f.Secrets)
 	}
 
+	// A secret from a command is not run at load: it runs per VM, where the
+	// spec is.
+	s, err = Load(write("    secrets: { /etc/jit: { command: ./mint.sh } }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src := s.Functions["check"].Secrets["/etc/jit"]; src.Dir != dir || src.Content != nil {
+		t.Errorf("command secret at load: %+v", src)
+	}
+
 	for name, tc := range map[string]struct{ files, want string }{
 		"missing":          {"    files: { /etc/x: { from: nope } }\n", "no such file"},
 		"open secret":      {"    secrets: { /etc/t: { from: open-token } }\n", "readable by group or others"},
@@ -192,6 +221,8 @@ func TestLoadFiles(t *testing.T) {
 		"no from":          {"    files: { /etc/x: { mode: \"0644\" } }\n", "from: required"},
 		"file and secret":  {"    files: { /etc/x: { from: token } }\n    secrets: { /etc/x: { from: token } }\n", "also declared"},
 		"directory source": {"    files: { /etc/x: { from: conf } }\n", "not a regular file"},
+		"command file":     {"    files: { /etc/x: { command: echo hi } }\n", "only a secret"},
+		"command and from": {"    secrets: { /etc/x: { from: token, command: echo hi } }\n", "exclusive"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(write(tc.files)); err == nil || !strings.Contains(err.Error(), tc.want) {

@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,8 +13,9 @@ import (
 
 // Inside the guest: where a detached command writes its output and its pid.
 const (
-	guestLog = "/var/log/mh-function.log"
-	guestPID = "/run/mh-function.pid"
+	guestLog  = "/var/log/mh-function.log"
+	guestPID  = "/run/mh-function.pid"
+	guestExit = "/run/mh-function.exit"
 )
 
 // Bounds on what the orchestrator waits for and keeps.
@@ -45,13 +47,20 @@ func shellQuote(s string) string {
 
 // launchCmd starts cmd detached from the agent's connection — its own session,
 // stdin from /dev/null, output to guestLog — and records its pid, so the
-// exec returns at once and the command outlives it.
+// exec returns at once and the command outlives it. The command runs in a
+// shell of its own under one that writes its exit code to guestExit when it
+// ends: the command may exec, the outer shell does not, and it is the pid
+// recorded, so the code is written before the pid stops answering.
 func launchCmd(cmd string) string {
-	return "setsid sh -c " + shellQuote(cmd) + " </dev/null >" + guestLog + " 2>&1 & echo $! >" + guestPID
+	inner := "sh -c " + shellQuote(cmd) + "; echo $? >" + guestExit
+	return "rm -f " + guestExit + "; setsid sh -c " + shellQuote(inner) + " </dev/null >" + guestLog + " 2>&1 & echo $! >" + guestPID
 }
 
 // aliveCmd exits 0 while the launched command runs.
 const aliveCmd = `kill -0 "$(cat ` + guestPID + `)" 2>/dev/null`
+
+// exitCmd prints the launched command's exit code, once it has ended.
+const exitCmd = `cat ` + guestExit + ` 2>/dev/null`
 
 // tailCmd prints the end of the launched command's output.
 var tailCmd = fmt.Sprintf("tail -c %d %s 2>/dev/null", OutputTail, guestLog)
@@ -68,14 +77,25 @@ func tail(s string) string {
 // <project>-<function>-<generation>.
 func (o *Orchestrator) createVM(ctx context.Context, name string, f *spec.Function) (*types.VMResponse, error) {
 	gen := o.nextGeneration(name)
+	vmName := o.VMName(name, gen)
+	files := fileSpecs(f)
+	for i := range files {
+		if src := f.Secrets[files[i].Path]; files[i].Secret && src != nil && src.Command != "" {
+			out, err := runSecretCommand(ctx, src, []string{"MH_PROJECT=" + o.project, "MH_FUNCTION=" + name, "MH_VM_NAME=" + vmName})
+			if err != nil {
+				return nil, fmt.Errorf("secrets[%s]: %w", files[i].Path, err)
+			}
+			files[i].Content = out
+		}
+	}
 	req := types.CreateVMRequest{
 		Image:  f.Image,
-		Name:   o.VMName(name, gen),
+		Name:   vmName,
 		Labels: functionLabels(o.project, name, f, gen),
 		VCPUs:  f.Resources.VCPUs,
 		MemMB:  f.Resources.MemMB,
 		DiskMB: f.Resources.DiskMB,
-		Files:  fileSpecs(f),
+		Files:  files,
 	}
 	if f.Network == spec.NoNetwork {
 		req.NoNetwork = true
@@ -166,6 +186,23 @@ func (o *Orchestrator) commandAlive(ctx context.Context, id string) (bool, strin
 		return true, ""
 	}
 	return false, o.commandOutput(ctx, id)
+}
+
+// commandRunning reports whether the launched command still runs.
+func (o *Orchestrator) commandRunning(ctx context.Context, id string) bool {
+	res, err := o.eng.Exec(ctx, id, aliveCmd, 5*time.Second)
+	return err == nil && res.ExitCode == 0
+}
+
+// commandExit returns the ended command's exit code; known is false when it
+// left none (a VM launched before codes were recorded, a guest that lost it).
+func (o *Orchestrator) commandExit(ctx context.Context, id string) (code int, known bool) {
+	res, err := o.eng.Exec(ctx, id, exitCmd, 5*time.Second)
+	if err != nil || res.ExitCode != 0 {
+		return 0, false
+	}
+	code, err = strconv.Atoi(strings.TrimSpace(res.Output))
+	return code, err == nil
 }
 
 // commandOutput returns the end of the launched command's output.

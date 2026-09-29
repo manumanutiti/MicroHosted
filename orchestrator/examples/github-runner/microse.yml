@@ -1,0 +1,58 @@
+# One GitHub Actions runner kept ready in a microVM, one job per VM: the
+# runner takes a job, runs it (Docker included) and exits; the VM is
+# destroyed and a clean one registers in its place.
+#
+# Each VM registers with a just-in-time config minted for it on this host by
+# jit-config.py (secrets: command: below). It is single-use: what a job could
+# steal from the VM registers nothing else. The token that mints it stays on
+# the host: jit-config.py reads it from .env itself, so it is never on a
+# command line, in this spec or in the orchestrator's logs.
+#
+#   cd orchestrator/examples/github-runner
+#   cp env.example .env && chmod 600 .env && $EDITOR .env
+#                    # GITHUB_SCOPE, EGRESS_IFACE and GITHUB_TOKEN: .env is
+#                    # the token's only copy on disk, so readable only by you
+#   mh plan          # builds the image the first time (sudo; several minutes)
+#   mh up -d
+#   mh status        # the runner appears in GitHub: Settings → Actions → Runners
+#   mh down
+#
+# A workflow uses it with:
+#
+#   runs-on: [self-hosted, microhosted]
+#
+# The network has full egress: GitHub, package registries and Docker Hub sit
+# behind CDNs, where allowed_egress rules by IP do not hold. Full egress is the
+# internet only: a job cannot reach the LAN behind egress_iface (the router,
+# other machines) — egress_private stays off. DNS is the guest's (1.1.1.1,
+# 8.8.8.8, from the engine). Nothing reaches the VM from outside: the runner
+# only connects out.
+#
+# on_exit: replace — a job ends with the runner exiting 0: the orchestrator
+# sees it within seconds, destroys the VM and starts a fresh one, recording
+# nothing. A runner that exits with an error is a failure (mh failures), with
+# back-off as any other.
+
+version: 1
+
+budget:
+  max_vms: 2            # the runner, and its replacement while it boots
+  max_mem_mb: 4096
+
+networks:
+  runners:
+    subnet: 172.30.60.0/24
+    egress: true
+    egress_iface: ${EGRESS_IFACE:?set EGRESS_IFACE in .env to the host interface that reaches the internet (ip route get 1.1.1.1)}
+
+functions:
+  runner:
+    build: .
+    network: runners
+    lifecycle: { mode: persistent, on_exit: replace }
+    secrets:
+      # Run on this host, in this directory, for each VM created; its output
+      # is the file. The VM's command reads and deletes it before the job.
+      /var/lib/mh-runner/jit:
+        command: ./jit-config.py '${GITHUB_SCOPE:?set GITHUB_SCOPE in .env to OWNER/REPO or ORG}' '${RUNNER_LABELS:-microhosted}'
+        mode: "0400"

@@ -347,6 +347,9 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 	if err := ValidateEgressPolicy(req.Egress, req.EgressIface, req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
 	}
+	if err := ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
+		return nil, err
+	}
 	if err := ValidateIngressRules(req.AllowedIngress, m.ManagedIfaceNames()); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidIngress, err)
 	}
@@ -407,6 +410,7 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 		Gateway:        subnet.Gateway(),
 		Egress:         req.Egress,
 		EgressIface:    req.EgressIface,
+		EgressPrivate:  req.EgressPrivate,
 		AllowedEgress:  req.AllowedEgress,
 		AllowedIngress: req.AllowedIngress,
 		Intra:          req.Intra,
@@ -482,9 +486,13 @@ func (m *Manager) UpdateEgress(name string, req types.UpdateNetworkEgressRequest
 	if err := ValidateEgressPolicy(req.Egress, req.EgressIface, req.AllowedEgress, m.ManagedIfaceNames()); err != nil {
 		return nil, err
 	}
+	if err := ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
+		return nil, err
+	}
 	return m.updatePolicy(name, func(n *types.Network) error {
 		n.Egress = req.Egress
 		n.EgressIface = req.EgressIface
+		n.EgressPrivate = req.EgressPrivate
 		n.AllowedEgress = req.AllowedEgress
 		return nil
 	})

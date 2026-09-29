@@ -30,7 +30,9 @@ func (nopRunner) Output(context.Context, string, ...string) ([]byte, error) {
 // version it tags by fingerprint, and a fingerprint the store holds is not
 // built again.
 func TestImageBuild(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	digest := "sha256:" + strings.Repeat("cd", 32)
+	served := map[string]string{} // a tag bound again: the digest it now names
 	built := map[string]bool{"site:0.9": true}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/images/{ref}", func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +40,11 @@ func TestImageBuild(t *testing.T) {
 			replyStatus(http.StatusNotFound, map[string]string{"error": "image not found"})(w, r)
 			return
 		}
-		reply(types.ImageResponse{Digest: digest})(w, r)
+		d := digest
+		if s, ok := served[r.PathValue("ref")]; ok {
+			d = s
+		}
+		reply(types.ImageResponse{Digest: d})(w, r)
 	})
 	mux.HandleFunc("GET /v1/system", reply(types.SystemResponse{Daemon: types.DaemonInfo{Paths: types.DaemonPaths{Store: "/store", Kernels: "/store/kernels"}}}))
 	mux.HandleFunc("POST /v1/images", func(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +113,34 @@ func TestImageBuild(t *testing.T) {
 	}
 	if code, out2, _ := f.run("", "build", "-q", dir); code != 0 || out2 == out || builds != 2 {
 		t.Errorf("changed file: exit %d, %q, %d builds", code, out2, builds)
+	}
+
+	// The tag removed and imported again with other bytes: refused, not
+	// taken as the cached build — by --no-build too.
+	_, out, _ = f.run("", "build", "-q", dir)
+	ref, _, _ = strings.Cut(strings.TrimSpace(out), "@")
+	served[ref] = "sha256:" + strings.Repeat("ee", 32)
+	for _, args := range [][]string{{"build", "-q", dir}, {"build", "--no-build", dir}} {
+		if code, out2, errOut := f.run("", args...); code == 0 || out2 != "" || !strings.Contains(errOut, "imported again with other bytes") || builds != 2 {
+			t.Errorf("%v of a rebound tag: exit %d, stdout %q, stderr %q, %d builds", args, code, out2, errOut, builds)
+		}
+	}
+	// A tag this user has no record of building: refused until adopted.
+	rec, err := buildRecordPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(rec); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errOut := f.run("", "build", "-q", dir); code == 0 || !strings.Contains(errOut, "--adopt") {
+		t.Errorf("unrecorded tag: exit %d, stderr %q", code, errOut)
+	}
+	if code, out2, _ := f.run("", "build", "-q", "--adopt", dir); code != 0 || !strings.HasSuffix(out2, "@"+served[ref]+"\n") || builds != 2 {
+		t.Errorf("--adopt: exit %d, %q, %d builds", code, out2, builds)
+	}
+	if code, _, errOut := f.run("", "build", "-q", dir); code != 0 {
+		t.Errorf("after --adopt: exit %d, %s", code, errOut)
 	}
 
 	// An explicit tag that exists is refused before building.

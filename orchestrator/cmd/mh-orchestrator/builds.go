@@ -74,14 +74,20 @@ func mhBuild(file, host string, build bool) (string, error) {
 	cmd.Stdout = &out
 	// The build's progress and sudo's prompt reach the terminal; only the
 	// reference is read.
+	// Looking only, "not built" is not news; any other message (a tag that
+	// names bytes this user did not build) is kept for the error.
+	var stderr bytes.Buffer
 	cmd.Stdin, cmd.Stderr = os.Stdin, os.Stderr
 	if !build {
-		cmd.Stderr = nil
+		cmd.Stderr = &stderr
 	}
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if !build && errors.As(err, &ee) && ee.ExitCode() == exitNotBuilt {
 			return "", nil
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("mh build -f %s: %s", file, msg)
 		}
 		return "", fmt.Errorf("mh build -f %s: %w", file, err)
 	}

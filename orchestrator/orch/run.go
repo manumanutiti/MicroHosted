@@ -392,6 +392,27 @@ func (o *Orchestrator) superviseOne(ctx context.Context, name string, f *spec.Fu
 		}
 	}
 
+	// A VM that does one piece of work and ends: its command's exit is seen
+	// on every pass, not on the health schedule, and an exit 0 is the work
+	// done — a fresh VM takes its place now, with nothing recorded.
+	if cur != nil && f.Lifecycle.OnExit == spec.OnExitReplace && f.Command != "" && !o.commandRunning(ctx, cur.ID) {
+		born, _ := time.Parse(time.RFC3339, cur.CreatedAt)
+		code, known := o.commandExit(ctx, cur.ID)
+		if known && code == 0 {
+			o.log.Printf("function %s: vm %s finished (command exited 0 after %s): replacing it with a fresh one", name, cur.Name, time.Since(born).Round(time.Second))
+			o.destroy(cur.ID, "finished")
+		} else {
+			why := "command exited"
+			if known {
+				why = fmt.Sprintf("command exited %d", code)
+			}
+			o.log.Printf("function %s: vm %s failed: %s", name, cur.Name, why)
+			o.recordFailure(name, f, cur, born, why, nil, o.commandOutput(ctx, cur.ID))
+			o.destroy(cur.ID, why)
+		}
+		cur, st.healthFailures = nil, 0
+	}
+
 	if cur != nil {
 		every, check := 10*time.Second, func() error { return nil }
 		switch {

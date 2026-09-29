@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // agent is the guest's vsock listener: the same script
@@ -119,12 +120,6 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 		return nil, err
 	}
 
-	step("KERNEL %s", s.Kernel)
-	kernel := filepath.Join(o.Kernels, "vmlinux-"+s.Kernel)
-	if err := installKernel(ctx, r, o.Fetch, o.CacheDir, kernel, KernelURL(s.Kernel, o.Arch), kernelSum); err != nil {
-		return nil, err
-	}
-
 	buildDir := filepath.Join(o.Store, "build")
 	if err := r.Run(ctx, nil, "mkdir", "-p", "-m", "0700", buildDir); err != nil {
 		return nil, err
@@ -153,7 +148,13 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 	if err := r.Run(ctx, nil, "mkdir", tree); err != nil {
 		return nil, err
 	}
-	b := &builder{ctx: ctx, r: r, tree: tree, o: o, base: base}
+	b := &builder{ctx: ctx, r: r, tree: tree, work: work, o: o, base: base}
+
+	step("KERNEL %s", s.Kernel)
+	kernel := filepath.Join(o.Kernels, "vmlinux-"+s.Kernel)
+	if err := b.installKernel(kernel, KernelURL(s.Kernel, o.Arch), kernelSum); err != nil {
+		return nil, err
+	}
 
 	step("FROM %s (%s)", s.Base, o.Arch)
 	if err := d.bootstrap(b); err != nil {
@@ -255,6 +256,7 @@ type builder struct {
 	ctx  context.Context
 	r    Runner
 	tree string
+	work string // root's working directory; tree is inside it
 	o    Options
 	base Base
 }
@@ -418,10 +420,34 @@ func cached(ctx context.Context, fetch func(context.Context, string, string) err
 	return os.Rename(tmp, dst)
 }
 
+// pinned makes the pinned file at url available to root: downloaded into
+// the user's cache (or kept from there), then copied into the build's
+// working directory, which only root can write, and hashed again there. What
+// root then reads is that copy: the cache can change after its check, the
+// copy cannot.
+func (b *builder) pinned(url, name, sum string) (string, error) {
+	local := filepath.Join(b.o.CacheDir, name)
+	if err := cached(b.ctx, b.o.Fetch, url, local, sum); err != nil {
+		return "", err
+	}
+	dst := filepath.Join(b.work, "downloads", name)
+	if err := b.r.Run(b.ctx, nil, "install", "-D", "-m", "0600", local, dst); err != nil {
+		return "", err
+	}
+	out, err := b.r.Output(b.ctx, "sha256sum", dst)
+	if err != nil {
+		return "", err
+	}
+	if f := strings.Fields(string(out)); len(f) == 0 || f[0] != sum {
+		return "", fmt.Errorf("%s changed after it was checked: the copy is not the pinned file (want sha256 %s)", local, sum)
+	}
+	return dst, nil
+}
+
 // installKernel makes sure the pinned kernel is at dst, in the engine's
 // kernel directory (root's: checked and written through the runner).
-func installKernel(ctx context.Context, r Runner, fetch func(context.Context, string, string) error, cacheDir, dst, url, sum string) error {
-	if out, err := r.Output(ctx, "sh", "-c", `[ ! -e "$1" ] || sha256sum "$1"`, "sh", dst); err != nil {
+func (b *builder) installKernel(dst, url, sum string) error {
+	if out, err := b.r.Output(b.ctx, "sh", "-c", `[ ! -e "$1" ] || sha256sum "$1"`, "sh", dst); err != nil {
 		return err
 	} else if f := strings.Fields(string(out)); len(f) > 0 {
 		if f[0] != sum {
@@ -429,11 +455,11 @@ func installKernel(ctx context.Context, r Runner, fetch func(context.Context, st
 		}
 		return nil
 	}
-	local := filepath.Join(cacheDir, filepath.Base(dst))
-	if err := cached(ctx, fetch, url, local, sum); err != nil {
+	src, err := b.pinned(url, filepath.Base(dst), sum)
+	if err != nil {
 		return err
 	}
-	return r.Run(ctx, nil, "install", "-D", "-o", "root", "-g", "root", "-m", "0644", local, dst)
+	return b.r.Run(b.ctx, nil, "install", "-D", "-o", "root", "-g", "root", "-m", "0644", src, dst)
 }
 
 func hashFile(p string) (string, error) {
@@ -449,12 +475,15 @@ func hashFile(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// fetchClient bounds a download: the largest, a guest kernel, is tens of MB.
+var fetchClient = &http.Client{Timeout: 10 * time.Minute}
+
 func httpFetch(ctx context.Context, url, dst string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := fetchClient.Do(req)
 	if err != nil {
 		return err
 	}

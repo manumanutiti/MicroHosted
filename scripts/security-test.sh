@@ -69,7 +69,7 @@ status_field() { awk -v k="$2:" '$1 == k { $1 = ""; sub(/^ +/, ""); print; exit 
 
 cleanup() {
   for v in $("$MH" ps -a -q -l sectest=1 2>/dev/null); do "$MH" rm "$v" >/dev/null 2>&1 || true; done
-  for n in sect-a sect-b sect-i; do "$MH" network rm -f "$n" >/dev/null 2>&1 || true; done
+  for n in sect-a sect-b sect-i sect-e; do "$MH" network rm -f "$n" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
 command -v jq >/dev/null || { echo "needs jq" >&2; exit 1; }
@@ -114,10 +114,19 @@ log "setup: test networks and VMs"
 "$MH" network create sect-a -l sectest=1 >/dev/null || { echo "cannot create sect-a" >&2; exit 1; }
 "$MH" network create sect-b -l sectest=1 >/dev/null || { echo "cannot create sect-b" >&2; exit 1; }
 "$MH" network create sect-i -l sectest=1 --intra >/dev/null || { echo "cannot create sect-i" >&2; exit 1; }
+# Full egress through the default route's interface — which, on a one-NIC
+# host, carries the LAN too: the internet must be reachable, the LAN not.
+wan_if=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+lan_gw=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "via") {print $(i+1); exit}}')
+E1=""
+if [[ -n "$wan_if" ]]; then
+  "$MH" network create sect-e -l sectest=1 --internet "$wan_if" >/dev/null || { echo "cannot create sect-e" >&2; exit 1; }
+fi
 mk() { "$MH" run "$TEMPLATE" -l sectest=1 "$@" 2>/dev/null; }
 A1=$(mk --net sect-a); A2=$(mk --net sect-a); B1=$(mk --net sect-b)
 I1=$(mk --net sect-i); I2=$(mk --net sect-i)
-for v in "$A1" "$A2" "$B1" "$I1" "$I2"; do
+[[ -n "$wan_if" ]] && E1=$(mk --net sect-e)
+for v in "$A1" "$A2" "$B1" "$I1" "$I2" ${wan_if:+"$E1"}; do
   [[ -n "$v" ]] || { echo "a test VM did not start" >&2; exit 1; }
 done
 agent_up() {
@@ -127,7 +136,7 @@ agent_up() {
   done
   return 1
 }
-for v in "$A1" "$A2" "$B1" "$I1" "$I2"; do agent_up "$v" || { echo "agent of $v silent" >&2; exit 1; }; done
+for v in "$A1" "$A2" "$B1" "$I1" "$I2" ${E1:+"$E1"}; do agent_up "$v" || { echo "agent of $v silent" >&2; exit 1; }; done
 echo "      sect-a: $A1 $A2 · sect-b: $B1 · sect-i (intra): $I1 $I2"
 
 # ---------------------------------------------------------------- every VM
@@ -266,6 +275,21 @@ reach "another network: no ping" "$A1" "ping -c 2 -W 2 $(ip_of "$B1")"
 reach "another network (intra): no ping" "$A1" "ping -c 2 -W 2 $(ip_of "$I1")"
 reach "no egress: internet unreachable (1.1.1.1 ping)" "$A1" "ping -c 2 -W 2 1.1.1.1"
 reach "no egress: internet unreachable (1.1.1.1:53)" "$A1" "nc -z -w 3 1.1.1.1 53"
+
+# Full egress is the internet, not the LAN behind the same interface.
+if [[ -z "$E1" ]]; then
+  skip "full egress: the host has no default route"
+elif ! gx "$E1" "nc -z -w 3 1.1.1.1 53"; then
+  skip "full egress: 1.1.1.1:53 unreachable from sect-e (no internet here?) — the LAN checks would prove nothing"
+else
+  pass "control: full egress reaches the internet (1.1.1.1:53)"
+  if [[ -n "$lan_gw" ]]; then
+    reach "full egress: the LAN's router $lan_gw unreachable (53)" "$E1" "nc -z -w 3 $lan_gw 53"
+    reach "full egress: the LAN's router $lan_gw unreachable (80)" "$E1" "nc -z -w 3 $lan_gw 80"
+    reach "full egress: the LAN's router $lan_gw does not answer ping" "$E1" "ping -c 2 -W 2 $lan_gw"
+  fi
+  reach "full egress: link-local metadata 169.254.169.254 unreachable" "$E1" "nc -z -w 3 169.254.169.254 80"
+fi
 
 ll2=$("$MH" exec "$I2" "ip -6 addr show dev eth0 scope link" 2>/dev/null | awk '/inet6/ {split($2, a, "/"); print a[1]; exit}')
 if [[ -n "$ll2" ]]; then

@@ -354,6 +354,7 @@ func createNetworkRequest(project, name string, n *spec.Network) types.CreateNet
 		Subnet:         n.Subnet,
 		Egress:         n.Egress,
 		EgressIface:    n.EgressIface,
+		EgressPrivate:  n.EgressPrivate,
 		AllowedEgress:  toEgress(n.AllowedEgress),
 		AllowedIngress: toIngress(n.AllowedIngress),
 		Intra:          n.Intra,
@@ -365,8 +366,8 @@ func createNetworkRequest(project, name string, n *spec.Network) types.CreateNet
 func networkUpdates(eng Engine, name string, have types.NetworkResponse, want *spec.Network) []Action {
 	var acts []Action
 	wantEgress := toEgress(want.AllowedEgress)
-	if have.Egress != want.Egress || have.EgressIface != want.EgressIface || !sameRules(have.AllowedEgress, wantEgress) {
-		req := types.UpdateNetworkEgressRequest{Egress: want.Egress, EgressIface: want.EgressIface, AllowedEgress: wantEgress}
+	if have.Egress != want.Egress || have.EgressIface != want.EgressIface || have.EgressPrivate != want.EgressPrivate || !sameRules(have.AllowedEgress, wantEgress) {
+		req := types.UpdateNetworkEgressRequest{Egress: want.Egress, EgressIface: want.EgressIface, EgressPrivate: want.EgressPrivate, AllowedEgress: wantEgress}
 		acts = append(acts, Action{Verb: "update", Object: "network " + name, Why: "egress", kind: kindNetwork,
 			run: func(ctx context.Context) error { return eng.SetEgress(ctx, name, req) }})
 	}

@@ -57,6 +57,14 @@ subnet** (per-network IPAM). The guest's gateway is the bridge's.
     Docker network) is dropped. A network stored before `egress_iface` existed
     is pinned at startup to the default route's interface; with none usable it
     is rendered closed and listed by the `egress_policy` health check.
+    **Through that interface, the internet only:** private and special
+    destinations (`10/8`, `172.16/12`, `192.168/16`, CGNAT `100.64/10`,
+    link-local `169.254/16` with cloud metadata, loopback, multicast, reserved)
+    are dropped (set `@mhprivate`). On a host whose one NIC carries both the
+    internet and the LAN, the interface alone would hand the VM the router and
+    every device. `egress_private: true` (CLI `--private`) opens them for a
+    network that must reach the LAN; a single LAN host is better reached with
+    `allowed_egress` instead of full egress.
   - `egress: false` → no NAT and FORWARD toward the WAN dropped. **Default**, for
     security (malware-safe): a sample doesn't call home unless explicitly asked.
   - `egress: false` + **`allowed_egress`** → fine-grained egress: only the listed

@@ -54,6 +54,10 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if err := network.ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		n, err := netmgr.Create(req)
 		if err != nil {
 			writeError(w, networkErrStatus(err), err)
@@ -113,6 +117,10 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			return
 		}
 		if err := network.ValidateEgressPolicy(req.Egress, req.EgressIface, req.AllowedEgress, netmgr.ManagedIfaceNames()); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := network.ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

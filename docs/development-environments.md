@@ -36,6 +36,20 @@ Implementation (`scripts/build-rootfs.sh`, `WITH_DOCKER=1`):
   up its bridge NAT;
 - `containerd.service` and `docker.service` are enabled.
 
+Found on x86_64 with Docker 29 (2026-09-29, `orchestrator/examples/github-runner`):
+
+- **No `raw` table.** Docker 28+ adds `raw PREROUTING` DROP rules for traffic
+  sent straight to a container's address; the kernel has no `CONFIG_IP_NF_RAW`,
+  so every container fails to start (`can't initialize iptables table 'raw'`).
+  `DOCKER_INSECURE_NO_IPTABLES_RAW=1` in dockerd's environment skips them.
+- **UDP from containers is dropped.** virtio-net leaves checksums to offload;
+  after Docker's NAT, a container's UDP leaves the VM with a bad checksum —
+  DNS inside containers times out while TCP works. `ethtool -K eth0 tx off`
+  before Docker starts fixes it.
+
+Both are set by the runner's `build.yml`; a guest kernel built with
+`CONFIG_IP_NF_RAW` would make the first unnecessary.
+
 Validated with the guest kernel as is:
 
 | Check | Result |
@@ -49,7 +63,8 @@ Validated with the guest kernel as is:
 ## Using it
 
 ```bash
-mh network create devnet --internet eth0      # docker pull needs egress
+mh network create devnet --internet eth0      # docker pull needs egress (the internet, not the LAN;
+                                              # add --private for a registry on the LAN)
 mh vm create dev-ubuntu --name dev1 --net devnet
 ssh -i images/keys/microhosted_ed25519 root@<vm-ip>
 ```

@@ -40,8 +40,8 @@ var alpine = distro{
 		return nil
 	},
 	bootstrap: func(b *builder) error {
-		tarball := filepath.Join(b.o.CacheDir, b.base.File(b.o.Arch))
-		if err := cached(b.ctx, b.o.Fetch, b.base.URL(b.o.Arch), tarball, b.base.SHA256[b.o.Arch]); err != nil {
+		tarball, err := b.pinned(b.base.URL(b.o.Arch), b.base.File(b.o.Arch), b.base.SHA256[b.o.Arch])
+		if err != nil {
 			return err
 		}
 		if err := b.r.Run(b.ctx, nil, "tar", "-xzf", tarball, "-C", b.tree); err != nil {
@@ -128,10 +128,13 @@ WantedBy=multi-user.target
 `, AgentPort)
 		// As build-rootfs.sh: a passwordless root on the serial console
 		// (reachable only from the host), the root disk by its device, no
-		// timers that would wake apt in a VM.
+		// timers that would wake apt in a VM. The hostname resolves locally:
+		// otherwise every getfqdn() (Python's HTTPServer, rsyslog) asks the
+		// DNS servers, and on a network without egress waits 20 s for them.
 		return b.chroot(strings.NewReader(unit), `cat > /etc/systemd/system/microhosted-exec.service &&
 systemctl enable microhosted-exec.service &&
 passwd -d root && echo microvm > /etc/hostname &&
+{ grep -qw microvm /etc/hosts || printf '127.0.1.1\tmicrovm\n' >> /etc/hosts; } &&
 echo "/dev/vda / ext4 defaults,noatime 0 1" > /etc/fstab &&
 systemctl mask apt-daily.timer apt-daily-upgrade.timer >/dev/null`)
 	},

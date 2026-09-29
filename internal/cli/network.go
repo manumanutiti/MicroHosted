@@ -187,6 +187,9 @@ func describeEgress(n types.NetworkResponse) string {
 		if n.EgressIface == "" {
 			return "CLOSED (internet without an interface: set one with --internet IFACE)"
 		}
+		if n.EgressPrivate {
+			return "internet+private@" + n.EgressIface
+		}
 		return "internet@" + n.EgressIface
 	}
 	if len(n.AllowedEgress) == 0 {
@@ -212,7 +215,8 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	fs := newCmdFlags(e, p, cmd)
 	fs.listVar(&labels, "label", "l", "label `KEY=VALUE` (repeatable)")
 	fs.listVar(&allow, "out", "", "allow an OUT flow: `RULE` = "+ruleSyntax+" (repeatable)")
-	fs.stringVar(&req.EgressIface, "internet", "", "", "allow ALL outbound through host interface `IFACE` (NAT), e.g. eth0, instead of --out rules")
+	fs.stringVar(&req.EgressIface, "internet", "", "", "allow outbound to the internet through host interface `IFACE` (NAT), e.g. eth0, instead of --out rules; private and special addresses (the LAN, 10/8, 172.16/12, 192.168/16, link-local…) stay closed")
+	fs.boolVar(&req.EgressPrivate, "private", "", "with --internet: reach private and special addresses too (the LAN behind IFACE)")
 	fs.listVar(&ingress, "in", "", "allow an IN flow: `RULE` = "+ingressSyntax+" (repeatable; needs --subnet)")
 	fs.stringVar(&req.Subnet, "subnet", "", "", "`CIDR`, e.g. 10.10.0.0/24 (default: a free /24)")
 	fs.boolVar(&req.Intra, "intra", "", "let the network's VMs reach each other; off by default")
@@ -236,6 +240,9 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	}
 	if req.Egress && len(req.AllowedEgress) > 0 {
 		return usagef(p, "--internet already allows every outbound flow; use either it or --out")
+	}
+	if req.EgressPrivate && !req.Egress {
+		return usagef(p, "--private widens --internet: give --internet IFACE too")
 	}
 	if req.AllowedIngress, err = parseIngressRules(ingress); err != nil {
 		return usagef(p, "%v", err)
@@ -368,13 +375,15 @@ func netInspect(e *env, cmd *command, p string, args []string) error {
 func netUpdate(e *env, cmd *command, p string, args []string) error {
 	var noEgress, intra, noIntra, noIngress bool
 	var egressIface string
+	var egressPrivate bool
 	var allow, addAllow, rmAllow, ingress, addIngress, rmIngress []string
 	fs := newCmdFlags(e, p, cmd)
 	fs.listVar(&addAllow, "out", "", "add an OUT `RULE` = "+ruleSyntax+" (repeatable)")
 	fs.listVar(&rmAllow, "rm-out", "", "remove an OUT `RULE` (repeatable)")
 	fs.listVar(&allow, "set-out", "", "REPLACE all OUT rules with these `RULE`s (repeatable)")
 	fs.boolVar(&noEgress, "no-out", "", "close all outbound")
-	fs.stringVar(&egressIface, "internet", "", "", "allow ALL outbound through host interface `IFACE`, e.g. eth0 (replaces the OUT rules)")
+	fs.stringVar(&egressIface, "internet", "", "", "allow outbound to the internet through host interface `IFACE`, e.g. eth0 (replaces the OUT rules; private and special addresses stay closed)")
+	fs.boolVar(&egressPrivate, "private", "", "with --internet: reach private and special addresses too (the LAN behind IFACE)")
 	fs.listVar(&addIngress, "in", "", "add an IN `RULE` = "+ingressSyntax+" (repeatable)")
 	fs.listVar(&rmIngress, "rm-in", "", "remove an IN `RULE` (repeatable)")
 	fs.listVar(&ingress, "set-in", "", "REPLACE all IN rules with these `RULE`s (repeatable)")
@@ -400,6 +409,9 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	name := pos[0]
 
 	egress := egressIface != ""
+	if egressPrivate && !egress {
+		return usagef(p, "--private widens --internet: give --internet IFACE too")
+	}
 	modes := 0
 	for _, set := range []bool{egress, noEgress, len(allow) > 0, len(addAllow)+len(rmAllow) > 0} {
 		if set {
@@ -458,7 +470,7 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	if modes == 1 {
 		// The API replaces the whole policy; --out/--rm-out are the CLI
 		// merging onto what is there now.
-		req := types.UpdateNetworkEgressRequest{Egress: egress, EgressIface: egressIface, AllowedEgress: allowRules}
+		req := types.UpdateNetworkEgressRequest{Egress: egress, EgressIface: egressIface, EgressPrivate: egressPrivate, AllowedEgress: allowRules}
 		if len(addRules)+len(rmRules) > 0 {
 			cur, err := getNetwork(c, name)
 			if err != nil {

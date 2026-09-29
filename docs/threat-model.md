@@ -206,7 +206,8 @@ rendered in full from the declared state and applied atomically (`nft -f`):
 | **unknown bridge**: drop both ways, for any `mhbr*` the ruleset does not list | a bridge left by a crash, a network mid-create, a network whose apply failed |
 | no egress (default): **drop** towards anything that is not our bridges | calling home, scanning, pivoting to the LAN |
 | `allowed_egress`: accept only the listed `(destination, protocol, port)`, then drop | everything else outbound |
-| `egress: true` requires `egress_iface`: out through **that interface only** | "internet" silently meaning "the plant LAN / the VPN / Docker networks" |
+| `egress: true` requires `egress_iface`: out through **that interface only** | "internet" silently meaning "the plant LAN / the VPN / Docker networks" behind another interface |
+| `egress: true` drops private and special destinations (`@mhprivate`: RFC 1918, CGNAT, link-local, loopback, multicast, reserved) unless `egress_private` | "internet" meaning the LAN on the **same** interface: on a one-NIC host, the router and every device next to it, and a cloud's metadata service (found 2026-09-29: a CI runner VM reached the home router's admin page) |
 | return legs of managed-interface rules match `ct direction reply` | the device (or the VM) using the rule's port as a *source* port to open connections to any port on the other side |
 | the `forward` chain is **stateless** except for those direction matches | a flow opened under an old policy surviving a tightening: it dies on its next packet |
 
@@ -548,12 +549,19 @@ Stated plainly, most important first.
    image spec is code the operator runs, like a Dockerfile — build only specs
    you trust. Its copies are resolved inside the chroot, so a symlink in the
    image cannot aim a write at the host, and file sources cannot leave the
-   build context.
+   build context. `plan`, `apply`, `run` and `up` build what a `build:`
+   lacks, so they run those steps too. Downloads are hashed in the user's
+   cache and again, by root, in a copy under the build's root-only directory;
+   root reads only that copy.
 9. **A removed tag can be bound again.** Tags never move while they exist, but
    once `mh image rm` removes a tag (or its image), the same `name:version` can
    be imported with other bytes. A pinned reference is refused if its tag
-   disagrees, so the orchestrator is not affected; a bare `mh run name:version`
-   boots the new bytes. Pin the digest wherever it matters.
+   disagrees, so a spec with `image: …@sha256:…` is not affected; a bare
+   `mh run name:version` boots the new bytes. Pin the digest wherever it
+   matters. `build:` gets its pin from `mh build`, which would otherwise take a
+   fingerprint tag at its word: it checks the tag against the digest this
+   user's build recorded for it (`$XDG_STATE_HOME/microhosted/builds`) and
+   refuses a mismatch or an unrecorded tag until `mh build --adopt`.
 10. **Abstract Unix sockets on the host are reachable from an escaped VMM.**
    They belong to the network namespace, not to the filesystem, so the chroot
    does not hide them, and the VMM shares the host's namespace; its seccomp
@@ -565,9 +573,14 @@ Stated plainly, most important first.
 11. **Public DNS resolvers** are configured in guests; on networks without egress
    they are unreachable (DNS fails closed), with egress they are reached through
    the same NAT.
-12. **Events are in memory.** They are a notification channel, not an audit log; a
+12. **Projects are not a security boundary.** They keep plant specs from
+    removing each other's objects by mistake; anyone with the engine's API
+    can change any of them. A project's lock and failure records live in its
+    state directory (0700, the user's), never in a shared directory: the lock
+    names the pid `down` signals, which must be that user's `mh-orchestrator`.
+13. **Events are in memory.** They are a notification channel, not an audit log; a
    daemon restart starts a new epoch. Durable state is the VM records.
-13. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
+14. **Availability, not isolation:** restarting Docker removes the `DOCKER-USER`
    rules that let VM egress through Docker's forward drop; egress fails (closed)
    until the next network change or daemon restart.
 

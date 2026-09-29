@@ -39,7 +39,7 @@ func startDetached(file, host, stateDir, projectDir, project string) error {
 	go func() { exited <- cmd.Wait() }()
 	deadline := time.After(2 * time.Minute)
 	for {
-		if h := lockHolder(project); h != nil && h.pid == cmd.Process.Pid {
+		if h := lockHolder(projectDir); h != nil && h.pid == cmd.Process.Pid {
 			fmt.Printf("Project %s is up: pid %d keeps it running.\n  logs:   tail -f %s\n  status: mh status   stop: mh down\n", project, h.pid, logPath)
 			return nil
 		}
@@ -56,8 +56,8 @@ func startDetached(file, host, stateDir, projectDir, project string) error {
 // stopRunner stops the run keeping project up, if there is one, and waits
 // for it to let go of the project (it cleans up cycles in flight; persistent
 // VMs stay for down to remove).
-func stopRunner(project string) error {
-	h := lockHolder(project)
+func stopRunner(project, projectDir string) error {
+	h := lockHolder(projectDir)
 	if h == nil {
 		return nil
 	}
@@ -66,7 +66,7 @@ func stopRunner(project string) error {
 		return fmt.Errorf("stopping pid %d: %w", h.pid, err)
 	}
 	for i := 0; i < 600; i++ {
-		if lockHolder(project) == nil {
+		if lockHolder(projectDir) == nil {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)

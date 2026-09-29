@@ -211,7 +211,13 @@ func SpecHash(f *spec.Function) string {
 	// a VM born with it, and the hash never carries the content itself.
 	files := map[string]string{}
 	for _, fs := range fileSpecs(f) {
-		sum := sha256.Sum256(fs.Content)
+		content := fs.Content
+		if src := f.Secrets[fs.Path]; fs.Secret && src != nil && src.Command != "" {
+			// A secret minted per VM differs every time: what the VM is
+			// born with is the command, not one of its outputs.
+			content = []byte("command\x00" + src.Command)
+		}
+		sum := sha256.Sum256(content)
 		files[fs.Path] = fmt.Sprintf("%s %d %d %v %x", fs.Mode, fs.UID, fs.GID, fs.Secret, sum)
 	}
 	b, _ := json.Marshal(struct {
@@ -338,6 +344,9 @@ func withImageDefaults(f *spec.Function, img *types.ImageResponse) error {
 	}
 	if f.Command == "" && f.Lifecycle.Mode != spec.ModePersistent {
 		return fmt.Errorf("command: required for %s, and image %s declares none", f.Lifecycle.Mode, f.Image)
+	}
+	if f.Command == "" && f.Lifecycle.OnExit == spec.OnExitReplace {
+		return fmt.Errorf("lifecycle.on_exit: replace watches the command, and neither the function nor image %s declares one", f.Image)
 	}
 	return nil
 }

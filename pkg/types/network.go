@@ -38,6 +38,13 @@ type Network struct {
 	// rendered as no egress at all until it gets one.
 	EgressIface string
 
+	// EgressPrivate lets an Egress network reach private and special
+	// destinations too (RFC 1918, CGNAT, link-local, loopback, multicast…:
+	// network.PrivateRanges). Off by default: through a host whose interface
+	// carries both the internet and a LAN, "internet" would otherwise mean the
+	// LAN too — its router, its devices, a cloud's metadata service.
+	EgressPrivate bool
+
 	// AllowedEgress punches specific holes in a non-egress network's WAN drop:
 	// only the listed destination/protocol/port flows are forwarded (and
 	// masqueraded); everything else to the WAN is still dropped. Empty → no
@@ -132,6 +139,9 @@ type CreateNetworkRequest struct {
 	// EgressIface is required with Egress: the host interface it leaves
 	// through (see Network.EgressIface).
 	EgressIface string `json:"egress_iface,omitempty"`
+	// EgressPrivate: with Egress, private and special destinations too (see
+	// Network.EgressPrivate).
+	EgressPrivate bool `json:"egress_private,omitempty"`
 	// AllowedEgress lists the only WAN flows this network may open. Requires
 	// Egress to be false/omitted.
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
@@ -150,6 +160,7 @@ type CreateNetworkRequest struct {
 type UpdateNetworkEgressRequest struct {
 	Egress        bool         `json:"egress,omitempty"`
 	EgressIface   string       `json:"egress_iface,omitempty"`
+	EgressPrivate bool         `json:"egress_private,omitempty"`
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
 }
 
@@ -182,6 +193,7 @@ type NetworkResponse struct {
 	Gateway        string            `json:"gateway"`
 	Egress         bool              `json:"egress"`
 	EgressIface    string            `json:"egress_iface,omitempty"`
+	EgressPrivate  bool              `json:"egress_private,omitempty"`
 	AllowedEgress  []EgressRule      `json:"allowed_egress,omitempty"`
 	AllowedIngress []IngressRule     `json:"allowed_ingress,omitempty"`
 	Intra          bool              `json:"intra"`
@@ -198,6 +210,7 @@ func NewNetworkResponse(n *Network) NetworkResponse {
 		Gateway:        n.Gateway,
 		Egress:         n.Egress,
 		EgressIface:    n.EgressIface,
+		EgressPrivate:  n.EgressPrivate,
 		AllowedEgress:  n.AllowedEgress,
 		AllowedIngress: n.AllowedIngress,
 		Intra:          n.Intra,

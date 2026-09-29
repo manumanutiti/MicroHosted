@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -24,7 +25,11 @@ on stdout: the only thing it prints there.
 Without -t, the image is named after the spec's name: (else the context
 directory) and versioned with the fingerprint of everything the build takes
 in — the spec and every file it copies. When the store already holds that
-tag, nothing is built: the existing reference is printed, without sudo.
+tag and this user's last build under it imported that same image (mh build
+keeps a record per tag in $XDG_STATE_HOME/microhosted/builds), nothing is
+built: the existing reference is printed, without sudo. A tag this user did
+not build, or one that now names other bytes than it built, is refused
+rather than trusted: anyone who can import can bind a removed tag again.
 That is what lets a plant spec say build: instead of image: (mh-orchestrator
 builds on plan and apply, and only what changed). Packages are whatever the
 repositories serve at build time; --no-cache rebuilds to pick up newer ones.
@@ -41,7 +46,8 @@ const imageBuildExamples = `  mh build                                     # ./b
   mh build web/                                # web/build.yml, context web/
   mh build -q -f web/build.yml                 # just the reference
   mh build -t site:1.0 web/                    # an explicit tag
-  mh build --no-build web/ || echo "not built" # look only, exit 3 if absent`
+  mh build --no-build web/ || echo "not built" # look only, exit 3 if absent
+  mh build --adopt web/                        # trust the image the store has for these inputs`
 
 // runBuild and newBuildRunner are variables so tests can run mh build
 // without root.
@@ -75,13 +81,14 @@ func findSpecFile(dir string) string {
 func imageBuild(e *env, cmd *command, p string, args []string) error {
 	var file, tag string
 	var quiet bool
-	var noCache, noBuild bool
+	var noCache, noBuild, adopt bool
 	fs := newCmdFlags(e, p, cmd)
 	fs.stringVar(&file, "file", "f", "", "image spec `FILE` (default CONTEXT/"+BuildFile+")")
 	fs.stringVar(&tag, "tag", "t", "", "`NAME[:VERSION]` to tag the image with (default: the spec's name:, else the context directory's name; VERSION: the inputs' fingerprint)")
 	fs.boolVar(&quiet, "quiet", "q", "print only the pinned reference; build output only if a step fails")
 	fs.boolVar(&noCache, "no-cache", "", "build even if an image of the same inputs exists (tagged with the build time)")
 	fs.boolVar(&noBuild, "no-build", "", "only look: print the reference of an image of the same inputs, or exit 3 if there is none")
+	fs.boolVar(&adopt, "adopt", "", "take the image the store holds for these inputs as this spec's build although this user has no record of building it (check it first: mh image inspect)")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -91,6 +98,9 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	}
 	if noCache && noBuild {
 		return usagef(p, "--no-cache and --no-build are mutually exclusive")
+	}
+	if adopt && (noCache || tag != "" && strings.Contains(tag, ":")) {
+		return usagef(p, "--adopt takes the image of the inputs' fingerprint: not with --no-cache or -t NAME:VERSION")
 	}
 	contextDir := ""
 	if len(pos) == 1 {
@@ -144,7 +154,12 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	var have types.ImageResponse
 	switch err := c.Do("GET", "/v1/images/"+url.PathEscape(tag), nil, &have); {
 	case err == nil && cached:
-		// Same inputs, already built: the image is the answer.
+		// Same inputs, already built: the image is the answer — if it is
+		// the one this user built. The tag alone proves nothing: a removed
+		// tag can be imported again with other bytes by anyone with the API.
+		if err := checkBuildRecord(tag, have.Digest, adopt); err != nil {
+			return err
+		}
 		if !quiet {
 			fmt.Fprintf(e.stderr, "%s: already built from the same spec and files (--no-cache rebuilds)\n", tag)
 		}
@@ -168,9 +183,11 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	if paths.Store == "" || paths.Kernels == "" {
 		return fmt.Errorf("the daemon does not report its store directories; mh build needs a newer daemon")
 	}
+	// Never a shared directory such as /tmp: downloads are checked there
+	// before root copies them.
 	cache, err := os.UserCacheDir()
 	if err != nil {
-		cache = os.TempDir()
+		return fmt.Errorf("no cache directory for the build's downloads: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -209,7 +226,67 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	if err := c.Do("POST", "/v1/images", req, &img); err != nil {
 		return err
 	}
+	if cached {
+		if err := writeBuildRecord(tag, img.Digest); err != nil {
+			fmt.Fprintf(e.stderr, "mh: %v: the next build of the same inputs will ask for --adopt\n", err)
+		}
+	}
 	fmt.Fprintf(log, "Successfully built %s\n", tag)
 	fmt.Fprintln(e.stdout, tag+"@"+img.Digest)
 	return nil
+}
+
+// buildRecordPath is where mh build records the digest it imported under a
+// fingerprint tag: the user's own state directory, which nobody else writes.
+func buildRecordPath(tag string) (string, error) {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("no state directory for mh build's records: %w", err)
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	name, version, _ := strings.Cut(tag, ":")
+	return filepath.Join(dir, "microhosted", "builds", name, version), nil
+}
+
+// checkBuildRecord accepts digest as tag's cached build only if this user's
+// record says it imported exactly that; adopt records it instead.
+func checkBuildRecord(tag, digest string, adopt bool) error {
+	p, err := buildRecordPath(tag)
+	if err != nil {
+		return err
+	}
+	if adopt {
+		return writeBuildRecord(tag, digest)
+	}
+	data, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s is in the store as %s, but this user has no record of building it (%s): it is not taken on trust as this spec's image. "+
+			"Check it (mh image inspect %s) and take it with mh build --adopt, or remove the tag (mh image rm %s) and build again", tag, digest, p, tag, tag)
+	}
+	if err != nil {
+		return err
+	}
+	if want := strings.TrimSpace(string(data)); want != digest {
+		return fmt.Errorf("%s now names %s, but this user's build imported %s under it: the tag was removed and imported again with other bytes. "+
+			"Not using it: find out who imported it (mh image inspect %s), remove the tag, and build again", tag, digest, want, tag)
+	}
+	return nil
+}
+
+func writeBuildRecord(tag, digest string) error {
+	p, err := buildRecordPath(tag)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return fmt.Errorf("recording the build of %s: %w", tag, err)
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(digest+"\n"), 0o600); err != nil {
+		return fmt.Errorf("recording the build of %s: %w", tag, err)
+	}
+	return os.Rename(tmp, p)
 }

@@ -121,6 +121,10 @@ type fakeRunner struct {
 	calls []call
 	fail  string // a command line containing this fails
 	work  string
+	// installed maps what install wrote to its source, so sha256sum of the
+	// copy hashes the real file; tamper makes every copy differ from it.
+	installed map[string]string
+	tamper    bool
 }
 
 func (f *fakeRunner) Run(_ context.Context, stdin io.Reader, name string, args ...string) error {
@@ -132,6 +136,12 @@ func (f *fakeRunner) Run(_ context.Context, stdin io.Reader, name string, args .
 	f.calls = append(f.calls, c)
 	if f.fail != "" && strings.Contains(c.String(), f.fail) {
 		return fmt.Errorf("%s failed", name)
+	}
+	if name == "install" && len(args) >= 2 {
+		if f.installed == nil {
+			f.installed = map[string]string{}
+		}
+		f.installed[args[len(args)-1]] = args[len(args)-2]
 	}
 	return nil
 }
@@ -145,6 +155,15 @@ func (f *fakeRunner) Output(_ context.Context, name string, args ...string) ([]b
 		return []byte("40\t" + args[len(args)-1] + "\n"), nil
 	case "find":
 		return []byte(strings.Repeat(".", 1000)), nil
+	case "sha256sum":
+		sum, err := hashFile(f.installed[args[0]])
+		if err != nil {
+			return nil, err
+		}
+		if f.tamper {
+			sum = strings.Repeat("0", 64)
+		}
+		return []byte(sum + "  " + args[0] + "\n"), nil
 	}
 	return nil, nil // sh: the kernel is not installed yet
 }
@@ -291,6 +310,25 @@ func TestBuildRefusesWrongDownload(t *testing.T) {
 	}
 }
 
+// A download that changes after its check in the user's cache is caught by
+// root's hash of its own copy, and nothing reads the cache's file as root.
+func TestBuildChecksRootCopy(t *testing.T) {
+	o, r := testOptions(t, "base: alpine:3.22\n")
+	r.tamper = true
+	if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), "changed after it was checked") {
+		t.Fatalf("Build = %v, want the copy refused", err)
+	}
+	o, r = testOptions(t, "base: alpine:3.22\n")
+	if _, err := Build(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range r.calls {
+		if (c.name == "tar" || c.name == "install" && strings.Contains(c.String(), "-o root")) && strings.Contains(c.String(), o.CacheDir) {
+			t.Errorf("root reads the user's cache directly: %s", c)
+		}
+	}
+}
+
 // The image specs the orchestrator's examples build stay valid.
 func TestExampleImageSpecs(t *testing.T) {
 	files, _ := filepath.Glob("../../orchestrator/examples/*/build.yml")
@@ -341,6 +379,9 @@ func TestBuildUbuntu(t *testing.T) {
 	apt := r.find("apt-get install")
 	if len(apt) != 1 || !strings.Contains(apt[0].String(), "policy-rc.d") || !strings.HasSuffix(apt[0].String(), "socat nginx-light") {
 		t.Errorf("apt = %v", apt)
+	}
+	if len(r.find("127.0.1.1")) != 1 {
+		t.Error("the hostname does not resolve locally: every getfqdn() waits for DNS")
 	}
 	if len(r.find("systemctl enable microhosted-exec.service")) != 1 || len(r.find("/etc/inittab")) != 0 {
 		t.Error("the agent must be a systemd unit on Ubuntu")
@@ -396,6 +437,16 @@ func TestFingerprint(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(dir, "site/css/a.css"), []byte("x"), 0o644))
 	if fp("base: alpine:3.22\nfiles: {/srv/www/: site/}\n") == base {
 		t.Error("a new file in a copied directory did not change the fingerprint")
+	}
+	// A new pin behind the same base name is a new image.
+	old := Bases["alpine:3.22.0"]
+	b := old
+	b.SHA256 = map[string]string{"x86_64": strings.Repeat("ab", 32)}
+	Bases["alpine:3.22.0"] = b
+	repinned := fp("base: alpine:3.22\nfiles: {/srv/www/: site/}\n")
+	Bases["alpine:3.22.0"] = old
+	if repinned == fp("base: alpine:3.22\nfiles: {/srv/www/: site/}\n") {
+		t.Error("a new base pin did not change the fingerprint")
 	}
 	if v := CacheVersion(base); !strings.HasPrefix(v, "sha-") || len(v) != 16 {
 		t.Errorf("CacheVersion = %q", v)

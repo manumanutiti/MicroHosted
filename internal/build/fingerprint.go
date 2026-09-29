@@ -14,8 +14,9 @@ import (
 )
 
 // Fingerprint identifies what a build of s would take in: the spec as parsed
-// (comments and formatting do not count; its name does not either) and every
-// file its sources name — paths, modes, link targets and contents — for arch.
+// (comments and formatting do not count; its name does not either), the pins
+// its base and kernel resolve to, the guest agent, and every file its sources
+// name — paths, modes, link targets and contents — for arch.
 // Two builds with the same fingerprint start from the same inputs; mh build
 // tags an image with it (sha-<first 12 hex>) and skips a build whose tag the
 // store already holds, as Docker's build cache skips an unchanged step.
@@ -28,13 +29,25 @@ func Fingerprint(s *Spec, contextDir, arch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	base, err := resolveBase(s.Base)
+	if err != nil {
+		return "", err
+	}
 	h := sha256.New()
 	spec := *s
 	spec.Name = ""
+	// What the names in the spec resolve to counts too: a new pin behind
+	// alpine:3.22 or the kernel, or a new agent, is a new image, never the
+	// cached one built from the old bytes.
+	agentSum := sha256.Sum256(agent)
 	b, err := json.Marshal(struct {
-		Arch string
-		Spec Spec
-	}{arch, spec})
+		Recipe int
+		Arch   string
+		Spec   Spec
+		Base   Base
+		Kernel string
+		Agent  string
+	}{Recipe, arch, spec, base, Kernels[s.Kernel][arch], hex.EncodeToString(agentSum[:])})
 	if err != nil {
 		return "", err
 	}
@@ -84,6 +97,13 @@ func hashTree(h io.Writer, root string) error {
 		return nil
 	})
 }
+
+// Recipe is the version of how a build lays down an image (distro.go, the
+// steps in Build). A change to them that changes what an image holds bumps it,
+// so the next build of an unchanged spec is a new image, not the cached one.
+//
+//	2: Ubuntu resolves its hostname locally (/etc/hosts).
+const Recipe = 2
 
 // CacheVersion is the tag version a fingerprint gives.
 func CacheVersion(fingerprint string) string { return "sha-" + fingerprint[:12] }

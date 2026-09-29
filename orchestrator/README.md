@@ -67,8 +67,12 @@ background log are per project.
 (cause, output, console tail — captured before the failed VM is destroyed; the
 last 5 per function) and *degraded* flags live in `-state DIR/<project>`
 (default `~/.local/state/mh-orchestrator`, private). One `up`, `apply` or
-`down` at a time per project and host user (a lock file in
-`$XDG_RUNTIME_DIR`); `down` stops the project's `up` first.
+`down` at a time per project and host user (`run.lock` in the project's
+state directory, which nobody else can write: its pid is what `down`
+signals, and only once it is checked to be this user's `mh-orchestrator`);
+`down` stops the project's `up` first. Projects keep specs from stepping on
+each other by mistake; they are not a security boundary — anyone with the
+engine's API can change any project's VMs.
 
 ## Images
 
@@ -129,7 +133,8 @@ in place, pruning); the three modes; image digests checked against the engine's
 store; the static budget; health checks with failure thresholds; back-off and
 *degraded* for persistent functions; failure records with the console tail;
 `files:` and `secrets:` (read at load, relative to the spec; a secret's source
-must be private; a changed file recreates the VM); `${VAR}` from the
+must be private; a changed file recreates the VM; a secret may instead come
+from a `command:` run on the host for each new VM); `${VAR}` from the
 environment or `.env`; `build:` (images built by fingerprint, only when
 their inputs change); the image's default command and health check;
 cleanup of cycle VMs on stop and of

@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -525,6 +527,93 @@ func TestRunReplacesDeadVM(t *testing.T) {
 	}
 }
 
+// The launched command's exit code is recorded when it ends — also when it
+// execs, as a runner started through setpriv does — and only then.
+func TestLaunchRecordsExitCode(t *testing.T) {
+	dir := t.TempDir()
+	for cmd, want := range map[string]string{"exit 3": "3", "exec sh -c 'exit 0'": "0", "exec false": "1"} {
+		script := launchCmd(cmd)
+		for _, p := range []string{guestLog, guestPID, guestExit} {
+			script = strings.ReplaceAll(script, p, filepath.Join(dir, filepath.Base(p)))
+		}
+		if err := exec.Command("sh", "-c", script).Run(); err != nil {
+			t.Fatal(err)
+		}
+		var got []byte
+		waitFor(t, func() bool {
+			got, _ = os.ReadFile(filepath.Join(dir, filepath.Base(guestExit)))
+			return len(got) > 0
+		})
+		if strings.TrimSpace(string(got)) != want {
+			t.Errorf("%q: exit file %q, want %s", cmd, got, want)
+		}
+	}
+}
+
+// on_exit: replace — a command that ends with 0 is work done: the VM is
+// replaced at once and nothing is recorded; any other code is a failure.
+func TestOnExitReplace(t *testing.T) {
+	fastTimers(t)
+	y := strings.Replace(plant, "    health: { command: check }\n    lifecycle: { mode: persistent }", "    lifecycle: { mode: persistent, on_exit: replace }", 1)
+	f := newFake()
+	o, _ := newOrch(t, f, y)
+	var mu sync.Mutex
+	exited := map[string]string{} // vm id → exit code, once its command ended
+	checks := map[string]int{}    // vm id → liveness checks answered
+	f.exec = func(v *types.VMResponse, cmd string) (*types.ExecResponse, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		code, ended := exited[v.ID]
+		switch cmd {
+		case aliveCmd:
+			checks[v.ID]++
+			if ended {
+				return &types.ExecResponse{ExitCode: 1}, nil
+			}
+		case exitCmd:
+			if ended {
+				return &types.ExecResponse{Output: code + "\n"}, nil
+			}
+			return &types.ExecResponse{ExitCode: 1}, nil
+		}
+		return &types.ExecResponse{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- o.Run(ctx, nil) }()
+	defer func() { cancel(); <-done }()
+
+	server := map[string]string{LabelFunction: "server"}
+	serving := func(name string) func() bool {
+		return func() bool {
+			vms, _ := f.ListVMs(ctx, server)
+			return len(vms) == 1 && vms[0].Name == name && vms[0].State == types.VMStateRunning
+		}
+	}
+	// The command ends once its VM is supervised — past the start's own
+	// liveness check, where an exit is a failed start, not work done.
+	end := func(code string) {
+		vms, _ := f.ListVMs(ctx, server)
+		id := vms[0].ID
+		waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return checks[id] >= 2 })
+		mu.Lock()
+		exited[id] = code
+		mu.Unlock()
+	}
+	waitFor(t, serving("default-server-1"))
+	end("0")
+	waitFor(t, serving("default-server-2"))
+	if n := len(o.state.Get("server").Failures); n != 0 {
+		t.Errorf("a finished VM was recorded as %d failures", n)
+	}
+	end("2")
+	waitFor(t, serving("default-server-3"))
+	fails := o.state.Get("server").Failures
+	if len(fails) != 1 || !strings.Contains(fails[0].Cause, "command exited 2") {
+		t.Errorf("failures after exit 2: %+v", fails)
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); !cond(); {
@@ -750,6 +839,43 @@ func TestFilesReachEngine(t *testing.T) {
 	p, err := o.Plan(context.Background())
 	if err != nil || len(p.Actions) != 2 || p.Actions[0].Why != "spec changed" {
 		t.Errorf("plan after a secret rotation: %v %v, want destroy + create", p.Actions, err)
+	}
+}
+
+// A secret from a command is minted on this host for each VM, with the VM's
+// name in its environment; the spec hash follows the command, not its
+// output, so a fresh credential is not a spec change.
+func TestSecretFromCommand(t *testing.T) {
+	fastTimers(t)
+	f := newFake()
+	o, _ := newOrch(t, f, plant)
+	fn := o.spec.Functions["server"]
+	dir := t.TempDir()
+	fn.Secrets = map[string]*spec.File{"/etc/jit": {Command: `printf '%s' "jit-for-$MH_VM_NAME"; echo noise >&2`, Dir: dir}}
+	h1 := SpecHash(fn)
+	applyOnce(t, o)
+	got := f.lastCreate.Files
+	if len(got) != 1 || !got[0].Secret || string(got[0].Content) != "jit-for-"+f.lastCreate.Name {
+		t.Fatalf("files sent: %+v (vm %s)", got, f.lastCreate.Name)
+	}
+	if SpecHash(fn) != h1 {
+		t.Error("the spec hash changed with nothing changed")
+	}
+	if p, err := o.Plan(context.Background()); err != nil || len(p.Actions) != 0 {
+		t.Errorf("plan after a minted secret: %v %v, want nothing to do", p.Actions, err)
+	}
+	fn.Secrets["/etc/jit"].Command = "echo other"
+	if SpecHash(fn) == h1 {
+		t.Error("a changed command does not change the spec hash")
+	}
+
+	// A failing command fails the create, with its last line of stderr; a
+	// command that prints nothing too.
+	for cmd, want := range map[string]string{"echo 'token expired' >&2; exit 3": "token expired", "true": "printed nothing"} {
+		src := &spec.File{Command: cmd, Dir: dir}
+		if _, err := runSecretCommand(context.Background(), src, nil); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v, want %q", cmd, err, want)
+		}
 	}
 }
 

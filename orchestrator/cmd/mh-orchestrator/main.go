@@ -31,7 +31,9 @@ Commands:
   up         apply, then keep it: run cycles, replace what dies or fails
              (run in the foreground; up -d leaves it in the background)
   validate   check the spec on its own (no engine needed)
-  plan       show what apply would change; changes nothing
+  plan       show what apply would change; changes nothing on the engine —
+             but builds what a build: lacks, and a build runs its run:
+             steps as root: plan only specs you trust
   apply      converge once: networks, persistent functions, pruning. With a
              run going on this file, hand the new spec to it instead: it
              rolls the changes out one function at a time
@@ -72,7 +74,8 @@ apply and run run mh build on it and use the image it makes; mh build tags
 by the fingerprint of the spec and its files, so an unchanged build: builds
 nothing. A change to the build context is a new image, rolled out like any
 other change. A running orchestrator never builds on reload: apply does it
-before handing the spec over.
+before handing the spec over. An image spec is code run as root, like a
+Dockerfile: plan, apply, run and up execute it.
 `
 
 func main() {
@@ -155,7 +158,7 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		if err != nil {
 			return err
 		}
-		if h := lockHolder(s.Project); h != nil && h.path == absPath(file) {
+		if h := lockHolder(projectDir); h != nil && h.path == absPath(file) {
 			printRollout(os.Stdout, p, h)
 			return nil
 		}
@@ -167,7 +170,7 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		if cmd == "up" {
 			yes = true
 		}
-		unlock, h, err := lock(s.Project, file)
+		unlock, h, err := lock(s.Project, projectDir, file)
 		if h != nil {
 			return handOver(ctx, o, s, file, h, yes)
 		}
@@ -198,7 +201,7 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		return nil
 
 	case "run":
-		unlock, _, err := lock(s.Project, file)
+		unlock, _, err := lock(s.Project, projectDir, file)
 		if err != nil {
 			return err
 		}
@@ -231,10 +234,10 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 		}
 		// A run keeping this project up stops first, or it would bring back
 		// what down removes.
-		if err := stopRunner(s.Project); err != nil {
+		if err := stopRunner(s.Project, projectDir); err != nil {
 			return err
 		}
-		unlock, _, err := lock(s.Project, file)
+		unlock, _, err := lock(s.Project, projectDir, file)
 		if err != nil {
 			return err
 		}
@@ -249,13 +252,12 @@ func run(cmd, file, host, stateDir, function string, yes bool) error {
 }
 
 // lockPath is the project's lock: one run, apply or down at a time per
-// project; different projects run side by side.
-func lockPath(project string) string {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	return filepath.Join(dir, "mh-orchestrator-"+project+".lock")
+// project; different projects run side by side. It lives in the project's
+// state directory, which OpenState keeps 0700 and this user's: never in a
+// shared directory such as /tmp, where another user could plant a lock that
+// names any pid for down to SIGTERM or apply to SIGHUP.
+func lockPath(projectDir string) string {
+	return filepath.Join(projectDir, "run.lock")
 }
 
 // holder is the process that holds the lock, as it recorded itself.
@@ -271,21 +273,40 @@ func absPath(p string) string {
 	return p
 }
 
+// openLock opens the lock file without following a link, and only if this
+// user owns it and nobody else can write it.
+func openLock(path string, flag int) (*os.File, error) {
+	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(f.Fd()), &st); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if int(st.Uid) != os.Geteuid() || st.Mode&0o022 != 0 || st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		f.Close()
+		return nil, fmt.Errorf("%s: not a regular file of this user's, writable only by it: remove it", path)
+	}
+	return f, nil
+}
+
 // lock makes this the only orchestrator changing the engine: a run and an
 // apply on the same host would both think they own the functions. The holder
 // writes its pid and spec into the lock file, so an apply can hand a new spec
 // to a running orchestrator instead of fighting it. When the lock is taken,
 // the holder is returned along with the error.
-func lock(project, spec string) (func(), *holder, error) {
-	path := lockPath(project)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+func lock(project, projectDir, spec string) (func(), *holder, error) {
+	path := lockPath(projectDir)
+	f, err := openLock(path, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, nil, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, lockHolder(project), fmt.Errorf("another mh-orchestrator (run, apply or down) of project %s holds %s", project, path)
+			return nil, lockHolder(projectDir), fmt.Errorf("another mh-orchestrator (run, apply or down) of project %s holds %s", project, path)
 		}
 		return nil, nil, err
 	}
@@ -294,9 +315,11 @@ func lock(project, spec string) (func(), *holder, error) {
 	return func() { _ = f.Truncate(0); f.Close() }, nil, nil
 }
 
-// lockHolder reads who holds the lock; nil when nobody does.
-func lockHolder(project string) *holder {
-	f, err := os.Open(lockPath(project))
+// lockHolder reads who holds the lock; nil when nobody does, or when the pid
+// it names is not an mh-orchestrator of this user's: a pid is only ever
+// signalled once it is known to be one.
+func lockHolder(projectDir string) *holder {
+	f, err := openLock(lockPath(projectDir), os.O_RDONLY)
 	if err != nil {
 		return nil
 	}
@@ -313,10 +336,25 @@ func lockHolder(project string) *holder {
 		return nil
 	}
 	pid, err := strconv.Atoi(lines[0])
-	if err != nil || pid <= 0 {
+	if err != nil || pid <= 1 || !isOrchestrator(pid) {
 		return nil
 	}
 	return &holder{pid: pid, path: lines[1]}
+}
+
+// isOrchestrator reports whether pid is a process of this user's running an
+// mh-orchestrator binary.
+func isOrchestrator(pid int) bool {
+	var st syscall.Stat_t
+	if err := syscall.Stat(fmt.Sprintf("/proc/%d", pid), &st); err != nil || int(st.Uid) != os.Geteuid() {
+		return false
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return false
+	}
+	// A binary replaced by make install-cli while it runs reads "… (deleted)".
+	return strings.TrimSuffix(filepath.Base(exe), " (deleted)") == "mh-orchestrator"
 }
 
 // handOver gives a new spec to the orchestrator running on this file: it is

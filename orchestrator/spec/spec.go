@@ -70,9 +70,17 @@ type File struct {
 	Mode string `yaml:"mode"`
 	UID  int    `yaml:"uid"`
 	GID  int    `yaml:"gid"`
+	// Command (secrets only), instead of From: a shell command run on the
+	// orchestrator's host, in the spec's directory, each time one of the
+	// function's VMs is created; its standard output is the secret. It mints
+	// a credential for that VM alone — a GitHub runner's just-in-time config —
+	// so the VM never holds one that outlives it.
+	Command string `yaml:"command"`
 
-	// Content, read by Load.
+	// Content, read by Load (From only: a command's output exists per VM).
 	Content []byte `yaml:"-"`
+	// Dir is where Command runs: the spec's directory, set by Load.
+	Dir string `yaml:"-"`
 }
 
 // Budget is the hard ceiling the spec's worst case must fit (§11).
@@ -85,10 +93,13 @@ type Budget struct {
 
 // Network mirrors the engine's CreateNetworkRequest field for field (§5).
 type Network struct {
-	Subnet         string        `yaml:"subnet"`
-	Intra          bool          `yaml:"intra"`
-	Egress         bool          `yaml:"egress"`
-	EgressIface    string        `yaml:"egress_iface"`
+	Subnet      string `yaml:"subnet"`
+	Intra       bool   `yaml:"intra"`
+	Egress      bool   `yaml:"egress"`
+	EgressIface string `yaml:"egress_iface"`
+	// EgressPrivate: with egress, private and special addresses too (the
+	// LAN behind egress_iface); closed by default.
+	EgressPrivate  bool          `yaml:"egress_private"`
 	AllowedEgress  []EgressRule  `yaml:"allowed_egress"`
 	AllowedIngress []IngressRule `yaml:"allowed_ingress"`
 }
@@ -181,7 +192,20 @@ type Lifecycle struct {
 	// Recycle (persistent only): "never" (the default) or an interval after
 	// which a fresh VM takes the running one's place.
 	Recycle Recycle `yaml:"recycle"`
+	// OnExit (persistent only) is what the command's exit means: "fail" (the
+	// default) — a persistent command should never end, so its exit is a
+	// failure — or "replace": a VM that does one piece of work and ends (a CI
+	// runner's job) exits 0 when done, and a fresh VM takes its place at once,
+	// with no failure recorded and no back-off. Any other exit code is still a
+	// failure.
+	OnExit string `yaml:"on_exit"`
 }
+
+// What a persistent command's exit means (Lifecycle.OnExit).
+const (
+	OnExitFail    = "fail"
+	OnExitReplace = "replace"
+)
 
 // Resources override the image's defaults; zero keeps them.
 type Resources struct {
@@ -335,6 +359,10 @@ func (s *Spec) ReadFiles(dir string) error {
 		}{{"files", f.Files, false}, {"secrets", f.Secrets, true}} {
 			for guest, src := range set.files {
 				where := fmt.Sprintf("functions.%s.%s[%s]", name, set.what, guest)
+				if src.Command != "" {
+					src.Dir = dir
+					continue
+				}
 				p := src.From
 				if !filepath.IsAbs(p) {
 					p = filepath.Join(dir, p)
@@ -514,6 +542,9 @@ func (s *Spec) validate() error {
 		if !n.Egress && n.EgressIface != "" {
 			add("%s: egress_iface without egress: true", where)
 		}
+		if !n.Egress && n.EgressPrivate {
+			add("%s: egress_private without egress: true", where)
+		}
 		if n.Egress && len(n.AllowedEgress) > 0 {
 			add("%s: egress: true and allowed_egress are exclusive", where)
 		}
@@ -615,8 +646,8 @@ func (s *Spec) validate() error {
 			} else if lc.Timeout >= lc.Every {
 				add("%s.lifecycle: timeout must be shorter than every", where)
 			}
-			if lc.Duration != 0 || lc.Recycle != 0 {
-				add("%s.lifecycle: duration and recycle do not apply to transaction", where)
+			if lc.Duration != 0 || lc.Recycle != 0 || lc.OnExit != "" {
+				add("%s.lifecycle: duration, recycle and on_exit do not apply to transaction", where)
 			}
 		case ModeWindow:
 			if lc.Every == 0 || lc.Duration == 0 {
@@ -624,8 +655,8 @@ func (s *Spec) validate() error {
 			} else if lc.Duration >= lc.Every {
 				add("%s.lifecycle: duration must be shorter than every", where)
 			}
-			if lc.Timeout != 0 || lc.Recycle != 0 {
-				add("%s.lifecycle: timeout and recycle do not apply to window", where)
+			if lc.Timeout != 0 || lc.Recycle != 0 || lc.OnExit != "" {
+				add("%s.lifecycle: timeout, recycle and on_exit do not apply to window", where)
 			}
 		case ModePersistent:
 			if lc.Every != 0 || lc.Timeout != 0 || lc.Duration != 0 {
@@ -633,6 +664,9 @@ func (s *Spec) validate() error {
 			}
 			if lc.Recycle != 0 && lc.Recycle.D() < time.Minute {
 				add("%s.lifecycle.recycle: at least 1m, or never", where)
+			}
+			if lc.OnExit != "" && lc.OnExit != OnExitFail && lc.OnExit != OnExitReplace {
+				add("%s.lifecycle.on_exit: %q: want %s or %s", where, lc.OnExit, OnExitFail, OnExitReplace)
 			}
 		case "":
 			add("%s.lifecycle.mode: required: %s, %s or %s", where, ModeTransaction, ModeWindow, ModePersistent)
@@ -672,9 +706,20 @@ func (s *Spec) validate() error {
 				if !strings.HasPrefix(guest, "/") || strings.Contains(guest, "/../") || strings.HasSuffix(guest, "/..") || strings.HasSuffix(guest, "/") || strings.ContainsAny(guest, "\n\x00") {
 					add("%s: the guest path must be absolute and name a file", w)
 				}
-				if src == nil || src.From == "" {
-					add("%s.from: required", w)
+				switch {
+				case src == nil || src.From == "" && src.Command == "":
+					add("%s.from: required (a secret may give command: instead)", w)
 					continue
+				case src.Command != "" && set.what != "secrets":
+					add("%s.command: only a secret can come from a command", w)
+					continue
+				case src.Command != "" && src.From != "":
+					add("%s: from and command are exclusive", w)
+					continue
+				case src.Command != "":
+					if err := checkCommand(src.Command); err != nil {
+						add("%s.command: %v", w, err)
+					}
 				}
 				if src.Mode != "" && !modeRE.MatchString(src.Mode) {
 					add("%s.mode: octal permission bits such as 0644, no setuid, setgid or sticky", w)

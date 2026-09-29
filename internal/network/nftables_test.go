@@ -77,6 +77,42 @@ func TestRenderNftablesIsolationAndEgress(t *testing.T) {
 // whose apply failed, a leftover of a crash — is dark in both directions, and
 // that drop comes before anything else in forward: the chain is `policy
 // accept`, so a bridge no rule names would otherwise have no policy at all.
+// Full egress is the internet, not the LAN behind the same interface: private
+// and special destinations are dropped unless the network opts in. A
+// restricted network's explicit rules are what they name, private or not.
+func TestRenderNftablesEgressClosesPrivateRanges(t *testing.T) {
+	nets := []types.Network{
+		{Name: "ci", Bridge: "mhbraaaa", Subnet: "172.30.60.0/24", Egress: true, EgressIface: "enp8s0"},
+		{Name: "lan", Bridge: "mhbrbbbb", Subnet: "172.30.61.0/24", Egress: true, EgressIface: "enp8s0", EgressPrivate: true},
+		{Name: "plc", Bridge: "mhbrcccc", Subnet: "172.30.62.0/24",
+			AllowedEgress: []types.EgressRule{{IP: "192.168.0.50", Protocol: "tcp", Port: 502}}},
+	}
+	got := renderNftables(nets, nil)
+	for _, r := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4"} {
+		if !strings.Contains(got, r) {
+			t.Errorf("@mhprivate lacks %s:\n%s", r, got)
+		}
+	}
+	drop := `iifname "mhbraaaa" oifname != @mhbridges ip daddr @mhprivate drop`
+	i := strings.Index(got, drop)
+	if i < 0 {
+		t.Fatalf("full egress reaches private ranges:\n%s", got)
+	}
+	if j := strings.Index(got, "chain postrouting"); j < i {
+		t.Error("the private drop is not in the forward chain")
+	}
+	if strings.Contains(got, `iifname "mhbrbbbb" oifname != @mhbridges ip daddr @mhprivate drop`) {
+		t.Error("egress_private did not open private ranges")
+	}
+	if strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges ip daddr @mhprivate drop`) ||
+		!strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges ip daddr 192.168.0.50 tcp dport 502 accept`) {
+		t.Error("an explicit allowed_egress rule to a private address must stay as declared")
+	}
+	if ValidateEgressPrivate(false, true) == nil || ValidateEgressPrivate(true, true) != nil || ValidateEgressPrivate(false, false) != nil {
+		t.Error("egress_private without egress must be refused, and only then")
+	}
+}
+
 func TestRenderNftablesUnknownBridgeIsDark(t *testing.T) {
 	nets := []types.Network{
 		{Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24", AllowedEgress: []types.EgressRule{

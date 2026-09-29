@@ -220,6 +220,7 @@ Named L2 segments (bridge + subnet + nftables policy). Model detail in
 | `subnet`         | string | no       | CIDR (e.g. `10.10.0.0/24`); if omitted, a free `/24` is assigned   |
 | `egress`         | bool   | no       | if `true`, the subnet goes out via NAT through `egress_iface`, and only through it; `false` by default |
 | `egress_iface`   | string | with `egress` | the host interface full egress leaves through (e.g. `eth0`). Required with `egress: true`, forbidden without it. Never a managed interface, a VPN you did not mean, or one of the daemon's own bridges/taps: "everything that is not a bridge" would include the LAN behind a second NIC, VPNs and Docker networks |
+| `egress_private` | bool   | no       | with `egress`: also reach private and special addresses (RFC 1918, CGNAT, link-local, loopback, multicast, reserved) — the LAN behind `egress_iface`. `false` by default: full egress is the internet only. Refused without `egress` |
 | `allowed_egress` | array  | no       | fine-grained egress: only these flows reach the WAN; requires `egress` = `false`. See `docs/networking.md` |
 | `allowed_ingress` | array | no       | devices on a managed interface allowed to connect into one guest address (DNAT); requires `subnet`. See `docs/networking.md` § Ingress |
 | `intra`          | bool   | no       | if `true`, the network's VMs see each other (L2); `false` by default: each TAP is an isolated bridge port |
@@ -297,6 +298,7 @@ mhcurl 'http://localhost/v1/networks?label=managed-by=mh-orchestrator'
 | `gateway`    | the host's IP on the bridge (the `.1`, the guests' route) |
 | `egress`     | whether it has full egress                              |
 | `egress_iface` | the interface full egress leaves through. A network created before this field existed was pinned at startup to the default route's interface; if there was none usable, it has `egress: true` with no `egress_iface` and its egress is **closed** (the `egress_policy` health check lists it) |
+| `egress_private` | whether full egress reaches private and special addresses too (omitted if false) |
 | `allowed_egress` | fine-grained egress rules, if any (omitted if empty) |
 | `allowed_ingress` | ingress rules, if any (omitted if empty) |
 | `intra`      | whether the network's VMs can see each other           |
@@ -306,7 +308,8 @@ mhcurl 'http://localhost/v1/networks?label=managed-by=mh-orchestrator'
 
 Replaces the **whole** egress policy (no merge) without touching the connected
 VMs. Same fields and validation as on creation: `egress` (bool) with its
-`egress_iface`, or `allowed_egress` (array) — mutually exclusive.
+`egress_iface` and optional `egress_private`, or `allowed_egress` (array) —
+mutually exclusive.
 
 The new policy is applied **before** it is saved: if `nft` rejects it, the call
 fails and both the daemon and its database keep the previous policy, so what

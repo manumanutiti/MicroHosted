@@ -1,0 +1,93 @@
+# A GitHub Actions self-hosted runner on Ubuntu 24.04, with Docker, for one
+# job per VM. microse.yml, next to it, keeps one ready; jit-config.py gives
+# each VM a single-use registration.
+#
+# Build (on the engine's host; needs debootstrap, ubuntu-keyring and sudo;
+# the first build takes several minutes: debootstrap, apt, Docker, the runner):
+#
+#   mh build orchestrator/examples/github-runner
+#
+# What runs in the VM is the job's code: untrusted, with Docker, so root in
+# the guest. The boundary is the microVM, and what the VM holds is worth
+# nothing after it: its registration is single-use (see microse.yml).
+
+name: github-runner
+
+base: ubuntu:24.04
+
+# Docker as validated inside a microVM (docs/development-environments.md);
+# the runner's own dependencies (.NET: ICU, libssl…) come from its
+# installdependencies.sh below. git, curl and jq are what most workflows
+# expect on a runner.
+packages:
+  - docker.io
+  - containerd
+  - runc
+  - iptables
+  - ethtool
+  - git
+  - curl
+  - jq
+  - ca-certificates
+
+run:
+  # The guest kernel (Firecracker CI 6.1.102) has the xtables modules but not
+  # nf_tables: with iptables-nft, dockerd cannot set up its bridge NAT.
+  - update-alternatives --set iptables /usr/sbin/iptables-legacy && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+  # The same kernel has no iptables raw table either (CONFIG_IP_NF_RAW),
+  # where Docker 28+ puts the rules that drop packets sent straight to a
+  # container's address from outside the VM. Without them dockerd cannot
+  # start a container at all; with this, a container is reachable directly
+  # only from what can route to the VM's docker0 — nothing else on this
+  # VM's network routes there.
+  - |
+    mkdir -p /etc/systemd/system/docker.service.d
+    printf '[Service]\nEnvironment=DOCKER_INSECURE_NO_IPTABLES_RAW=1\n' > /etc/systemd/system/docker.service.d/10-no-iptables-raw.conf
+  # Firecracker's virtio-net leaves UDP checksums to offload: once Docker has
+  # NATed a container's packet, it leaves the VM with a bad checksum and is
+  # dropped — DNS in containers times out while TCP works. Checksums are
+  # computed in the guest instead, before Docker starts.
+  - |
+    printf '%s\n' '[Unit]' 'Description=Checksum in the guest: UDP from containers survives NAT' 'Before=docker.service' 'After=sys-subsystem-net-devices-eth0.device' 'Wants=sys-subsystem-net-devices-eth0.device' '' '[Service]' 'Type=oneshot' 'ExecStart=/usr/sbin/ethtool -K eth0 tx off' 'RemainAfterExit=yes' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/mh-tx-checksum.service
+  # Started at boot; the build itself starts no service (policy-rc.d).
+  - systemctl enable containerd.service docker.service mh-tx-checksum.service
+  # The runner refuses to run as root; the docker group lets its jobs use
+  # Docker (root in the guest: the VM is the boundary, not this user).
+  - useradd --create-home --shell /bin/bash --groups docker runner
+  # The runner, pinned: the SHA-256 GitHub publishes in the release notes
+  # (the same as the release assets' digests). A new version is a change to
+  # this file: GitHub stops sending jobs to runners too far behind the latest.
+  - |
+    set -e
+    v=2.337.0
+    case "$(uname -m)" in
+      x86_64)  a=x64;   sum=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613 ;;
+      aarch64) a=arm64; sum=9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393 ;;
+      *) echo "no runner for $(uname -m)" >&2; exit 1 ;;
+    esac
+    curl -fsSL -o /tmp/runner.tar.gz "https://github.com/actions/runner/releases/download/v$v/actions-runner-linux-$a-$v.tar.gz"
+    echo "$sum  /tmp/runner.tar.gz" | sha256sum -c -
+    mkdir -p /opt/actions-runner
+    tar -xzf /tmp/runner.tar.gz -C /opt/actions-runner
+    rm -f /tmp/runner.tar.gz
+  - DEBIAN_FRONTEND=noninteractive /opt/actions-runner/bin/installdependencies.sh
+  - chown -R runner:runner /opt/actions-runner
+  - mkdir -p -m 0700 /var/lib/mh-runner
+
+# The registration arrives as a secret file (microse.yml) written into the
+# disk before boot. The command reads it as root, deletes it, and starts the
+# runner as its user with it: a just-in-time runner takes one job and exits,
+# and the orchestrator replaces the VM with a clean one.
+command: JIT=$(cat /var/lib/mh-runner/jit) && rm -f /var/lib/mh-runner/jit && cd /opt/actions-runner && exec setpriv --reuid=runner --regid=runner --init-groups env HOME=/home/runner USER=runner ./run.sh --jitconfig "$JIT"
+
+# No health check: the command is the check. While the runner waits for or
+# runs a job it is alive; when it exits 0, the job is over (microse.yml's
+# on_exit: replace takes it from there).
+
+# Sized for builds with Docker; a plant spec's resources: overrides them.
+# The disk is each VM's own copy, grown to disk_mb and sparse: what a VM does
+# not write costs nothing.
+vcpus: 2
+mem_mb: 2048
+disk_mb: 20480
+size_mb: 0
