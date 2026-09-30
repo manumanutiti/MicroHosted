@@ -31,8 +31,16 @@ built: the existing reference is printed, without sudo. A tag this user did
 not build, or one that now names other bytes than it built, is refused
 rather than trusted: anyone who can import can bind a removed tag again.
 That is what lets a plant spec say build: instead of image: (mh-orchestrator
-builds on plan and apply, and only what changed). Packages are whatever the
-repositories serve at build time; --no-cache rebuilds to pick up newer ones.
+builds on plan and apply, and only what changed).
+
+Each step (FROM, PACKAGES, every file, every run command) is a layer kept
+for the next build, as Docker's build cache: a change reruns its step and
+the ones after it, never those before — a new line in a file copies that
+file again, it does not lay the base down again. A step takes the network's
+state as it was when it ran (the base's upgrade, unpinned packages), so a
+layer is reused for 7 days at most; --no-cache reruns every step now. The
+layers are root's, under the daemon's store; mh builder prune removes the
+unused ones.
 
 The build runs on the engine's host, as root through sudo: it lays down the
 base, installs packages and runs the run steps in a chroot — which does not
@@ -53,6 +61,7 @@ const imageBuildExamples = `  mh build                                     # ./b
 // without root.
 var (
 	runBuild       = build.Build
+	runPrune       = build.Prune
 	newBuildRunner = func(out io.Writer, quiet bool) buildRunner { return build.Sudo{Out: out, Quiet: quiet} }
 )
 
@@ -86,7 +95,7 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	fs.stringVar(&file, "file", "f", "", "image spec `FILE` (default CONTEXT/"+BuildFile+")")
 	fs.stringVar(&tag, "tag", "t", "", "`NAME[:VERSION]` to tag the image with (default: the spec's name:, else the context directory's name; VERSION: the inputs' fingerprint)")
 	fs.boolVar(&quiet, "quiet", "q", "print only the pinned reference; build output only if a step fails")
-	fs.boolVar(&noCache, "no-cache", "", "build even if an image of the same inputs exists (tagged with the build time)")
+	fs.boolVar(&noCache, "no-cache", "", "run every step, reusing no layer, even if an image of the same inputs exists (tagged with the build time)")
 	fs.boolVar(&noBuild, "no-build", "", "only look: print the reference of an image of the same inputs, or exit 3 if there is none")
 	fs.boolVar(&adopt, "adopt", "", "take the image the store holds for these inputs as this spec's build although this user has no record of building it (check it first: mh image inspect)")
 	pos, err := fs.parse(args)
@@ -203,7 +212,7 @@ func imageBuild(e *env, cmd *command, p string, args []string) error {
 	res, err := runBuild(ctx, build.Options{
 		Spec: spec, Context: contextDir, Arch: buildArch,
 		Store: paths.Store, Kernels: paths.Kernels,
-		CacheDir: filepath.Join(cache, "microhosted"), Log: log, Runner: runner,
+		CacheDir: filepath.Join(cache, "microhosted"), Log: log, Runner: runner, NoCache: noCache,
 	})
 	if err != nil {
 		return err
@@ -289,4 +298,70 @@ func writeBuildRecord(tag, digest string) error {
 		return fmt.Errorf("recording the build of %s: %w", tag, err)
 	}
 	return os.Rename(tmp, p)
+}
+
+var builderGroup = &group{
+	name:    "builder",
+	summary: "Manage mh build's layer cache",
+	cmds: []*command{
+		{name: "prune", summary: "Remove build layers no build has used lately (--all: every layer and the package caches)", help: builderPruneHelp, run: builderPrune},
+	},
+}
+
+const builderPruneHelp = `Removes the layers mh build keeps under the daemon's store (as root, through
+sudo): those no build has taken for --older-than (default 7 days, after
+which a build would not take them anyway), and those a newer layer replaced
+for the same step, after an hour. --all removes every layer and the package
+caches: the next build starts from scratch, and a build running now may
+fail. Images already built are not touched.`
+
+func builderPrune(e *env, cmd *command, p string, args []string) error {
+	var all bool
+	var older string
+	fs := newCmdFlags(e, p, cmd)
+	fs.boolVar(&all, "all", "a", "remove every layer and the package caches")
+	fs.stringVar(&older, "older-than", "", "", "remove the layers unused for this `DURATION` (default 168h)")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return usagef(p, "unexpected argument %q", pos[0])
+	}
+	var o build.PruneOptions
+	o.All = all
+	if older != "" {
+		d, err := time.ParseDuration(older)
+		if err != nil || d <= 0 {
+			return usagef(p, "--older-than %q: a positive duration such as 72h", older)
+		}
+		o.OlderThan = d
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	var sys types.SystemResponse
+	if err := c.Do("GET", "/v1/system", nil, &sys); err != nil {
+		return err
+	}
+	if sys.Daemon.Paths.Store == "" {
+		return fmt.Errorf("the daemon does not report its store directory; mh builder prune needs a newer daemon")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	runner := newBuildRunner(e.stderr, true)
+	if err := runner.Authenticate(ctx); err != nil {
+		return err
+	}
+	res, err := runPrune(ctx, runner, sys.Daemon.Paths.Store, o)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(e.stdout, "removed %d layers", res.Layers)
+	if res.Caches {
+		fmt.Fprint(e.stdout, " and the package caches")
+	}
+	fmt.Fprintln(e.stdout)
+	return nil
 }

@@ -77,7 +77,7 @@ type shortcut struct {
 	name, group, cmd string
 }
 
-var groups = []*group{vmGroup, networkGroup, volumeGroup, snapshotGroup, imageGroup, templateGroup, systemGroup}
+var groups = []*group{vmGroup, networkGroup, volumeGroup, snapshotGroup, imageGroup, builderGroup, templateGroup, systemGroup}
 
 var shortcuts = []shortcut{
 	{"ps", "vm", "ls"},

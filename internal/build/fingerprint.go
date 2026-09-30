@@ -19,7 +19,8 @@ import (
 // name — paths, modes, link targets and contents — for arch.
 // Two builds with the same fingerprint start from the same inputs; mh build
 // tags an image with it (sha-<first 12 hex>) and skips a build whose tag the
-// store already holds, as Docker's build cache skips an unchanged step.
+// store already holds; a build that does run still takes every unchanged
+// step's layer (layers.go).
 //
 // What it cannot see is what the network serves: a package without a pinned
 // version is whatever the repository has at build time. Rebuild with
@@ -103,7 +104,9 @@ func hashTree(h io.Writer, root string) error {
 // so the next build of an unchanged spec is a new image, not the cached one.
 //
 //	2: Ubuntu resolves its hostname locally (/etc/hosts).
-const Recipe = 2
+//	3: layered builds: Alpine's base upgraded (apk upgrade), Ubuntu from
+//	   debootstrap's minbase; no build-time /dev nodes left in the image.
+const Recipe = 3
 
 // CacheVersion is the tag version a fingerprint gives.
 func CacheVersion(fingerprint string) string { return "sha-" + fingerprint[:12] }

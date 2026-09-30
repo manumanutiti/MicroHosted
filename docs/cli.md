@@ -281,7 +281,7 @@ mh build                                     # ./build.yml, context .
 mh build web/                                # web/build.yml, context web/
 mh build -q -f web/build.yml                 # just the reference: web:sha-3f2a9c1e7b04@sha256:…
 mh build -t web:1.0 web/                     # an explicit tag
-mh build --no-cache web/                     # build again even if nothing changed (newer packages)
+mh build --no-cache web/                     # every step again, even if nothing changed (newer packages)
 mh build --no-build web/                     # only look: the reference, or exit 3 if not built
 mh build --adopt web/                        # trust a store image of these inputs you have no record of building
 ```
@@ -301,6 +301,40 @@ record (built by another user, or the record lost) is refused until
 pin in the code, and the next build is a new version. The fingerprint cannot see what the package repositories serve:
 unpinned packages stay as they were built until `--no-cache`.
 
+**Layers.** A build that does run is a chain of layers, as Docker's:
+`FROM` (the base laid down), `PREPARE` (the base upgraded), `PACKAGES`,
+`AGENT`, then one `COPY` per file and one `RUN` per command, in that order.
+Each is kept for the next build under a key made of its parent layer and all
+it takes in (its scripts, their arguments, a copied source's contents); a
+build takes every layer whose key it finds (`---> Using cache`) and runs the
+rest. So a change reruns its step and those after it, nothing before: a new
+line in a copied file copies that file and reruns the `run:` steps, it does
+not lay down or upgrade the base again, and a change to `command`, `health`
+or `mem_mb` — which are not in the tree — only writes the ext4 again.
+
+- Each step runs on an overlayfs of the layers below it, chrooted, in mount,
+  PID, UTS and IPC namespaces of its own: what it mounts and every process it
+  starts end with it, and it does not see the host's processes. The network
+  is the host's. `/proc`, `/dev`, `/etc/resolv.conf` and the package cache are
+  the build's own, mounted over directories that hide whatever the image has
+  at those paths, and are not in any layer.
+- The layers, and the package caches (apk's and apt's downloads, and
+  debootstrap's), are root's: `STORE/build/layers` and `STORE/build/cache`,
+  `0700`. apk and apt check every cached index and package against the
+  archive's signature before using it. A layer is written once, by its step,
+  and only mounted read-only after that.
+- A step takes the network's state as it was when it ran — the base's
+  upgrade, unpinned packages, a `run:` step's downloads — so a layer is
+  reused for **7 days** at most; after that its step runs again, and every
+  step above it (layers chain on their parent's identity, not its key).
+  `--no-cache` runs every step now and replaces the kept layers.
+- `mh builder prune` removes the layers no build took for a week (or
+  `--older-than`) and those a newer layer replaced; `--all` removes every
+  layer and the package caches.
+- The store's filesystem must support overlayfs as an upper layer (ext4,
+  xfs, btrfs do; an overlay itself, as in a container, does not), and its
+  path must be letters, digits and `. _ - /`.
+
 **From a plant spec.** A function says `build: DIR` (the directory holding a
 `build.yml`) or `build: path/to/build.yml` instead of `image:`, and
 `mh-orchestrator plan`/`apply`/`run` run `mh build` on it — building only what
@@ -315,7 +349,9 @@ echo "WEB=$(mh build -q web/)" >> .env       # microse.yml: image: ${WEB}
 
 The image spec, one YAML document parsed strictly (an unknown field is an
 error). Commented, buildable examples, each next to a `microse.yml` that runs
-it: `orchestrator/examples/alpine-nginx` and `orchestrator/examples/app-ubuntu`.
+it: `orchestrator/examples/alpine-nginx` and `orchestrator/examples/app-ubuntu`;
+`orchestrator/examples/stack` builds three (two Ubuntu, one Alpine) and runs
+them together.
 
 ```yaml
 name: web                    # optional; default: the build context directory's name
@@ -344,15 +380,17 @@ size_mb: 0                   # rootfs size; 0: its content plus a quarter and 32
   once, up front): unpacking the base, `apk add`, the copies and the `run`
   steps happen in a chroot of the image. A chroot does not confine root —
   build only specs you trust, as with any Dockerfile.
-- **Bases.** `alpine:3.22`: the minirootfs, `apk`, busybox init — a ~10 MB
-  image idling at ~10 MB of RAM. `ubuntu:24.04`: `debootstrap` (needs
-  `debootstrap` and `ubuntu-keyring` on the build host), `apt` with the
-  `-updates` and `-security` pockets, systemd starting the agent — hundreds
-  of MB and ~100 MB of RAM idle, for software that only exists as `.deb` or
-  expects glibc. No SSH in either: access is `mh exec` (add `openssh-server`
-  to `packages` if you want it). Ubuntu's packages are verified by the
-  archive's signature, not pinned by hash; its `.deb`s are cached between
-  builds.
+- **Bases.** `alpine:3.22`: the minirootfs, upgraded to the branch's current
+  packages (`apk upgrade`), busybox init — a ~10 MB image idling at ~10 MB of
+  RAM. `ubuntu:24.04`: `debootstrap --variant=minbase` (needs `debootstrap`
+  and `ubuntu-keyring` on the build host) with systemd and udev, `apt` with the
+  `-updates` and `-security` pockets, systemd starting the agent — for
+  software that only exists as `.deb` or expects glibc. Minbase is Ubuntu's
+  essential packages and apt, not the default variant's netplan, rsyslog,
+  cron and the like: `packages:` adds what the image needs. No SSH in either:
+  access is `mh exec` (add `openssh-server` to `packages` if you want it).
+  Ubuntu's packages are verified by the archive's signature, not pinned by
+  hash.
 - **What goes in.** The Alpine base and the kernel are downloaded once to
   `~/.cache/microhosted` and refused unless their SHA-256 matches the pins in
   `scripts/checksums.sha256` (kept equal to `internal/build/pins.go` by a test).

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -50,13 +52,19 @@ type Options struct {
 	// Kernels is the engine's kernel directory; a missing kernel is
 	// installed there.
 	Kernels string
-	// CacheDir keeps downloads between builds.
+	// CacheDir keeps downloads between builds (the user's: the pinned
+	// ones are hashed again in root's copy).
 	CacheDir string
 	// Log receives one line per step.
 	Log    io.Writer
 	Runner Runner
 	// Fetch downloads url to dst; nil uses HTTP.
 	Fetch func(ctx context.Context, url, dst string) error
+	// NoCache runs every step, taking no layer from the store (the new
+	// layers replace the old ones for the next build).
+	NoCache bool
+	// MaxAge is how long a layer is reused; 0 takes DefaultLayerMaxAge.
+	MaxAge time.Duration
 }
 
 // Result is a finished build: files under the engine's store, ready to
@@ -77,20 +85,27 @@ func (r *Result) Cleanup(ctx context.Context) error {
 	return r.cleanup(ctx)
 }
 
-// staging is where file sources are copied inside the tree before a copy
-// run in the chroot puts them in place: a path in the image is resolved by
-// the chroot, never by the host, so a symlink in the image (Alpine's
+// staging is where a COPY's source is put, in the build's scaffold, before a
+// copy run in the chroot puts it in place: a path in the image is resolved
+// by the chroot, never by the host, so a symlink in the image (Alpine's
 // /var/run → /run) cannot send a write to the host's own directories.
 const staging = "/.mh-build"
 
-// Build builds o.Spec. Every write into the image after the base is laid
-// down happens inside the chroot; run steps execute as root on the build
-// host, which a chroot does not confine — build only specs you trust, as with
-// any Dockerfile.
+// Build builds o.Spec, one layer per step (layers.go), taking every step
+// the layer store already has for the same inputs. Every write into the
+// image after the base is laid down happens inside the chroot; run steps
+// execute as root on the build host, which a chroot does not confine — build
+// only specs you trust, as with any Dockerfile.
 func Build(ctx context.Context, o Options) (res *Result, err error) {
 	s := o.Spec
 	if o.Fetch == nil {
 		o.Fetch = httpFetch
+	}
+	if o.MaxAge <= 0 {
+		o.MaxAge = DefaultLayerMaxAge
+	}
+	if !safePathRE.MatchString(o.Store) || strings.Contains(o.Store, "..") {
+		return nil, fmt.Errorf("store directory %q: the build's overlays need a path of letters, digits and . _ - /", o.Store)
 	}
 	sources, err := resolveSources(o.Context, s)
 	if err != nil {
@@ -108,20 +123,22 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 	if !ok {
 		return nil, fmt.Errorf("kernel %s has no pinned build for %s", s.Kernel, o.Arch)
 	}
-
-	steps := 6 + len(s.FileOrder) + len(s.Run)
-	n := 0
-	step := func(format string, a ...any) {
-		n++
-		fmt.Fprintf(o.Log, "Step %d/%d : %s\n", n, steps, fmt.Sprintf(format, a...))
-	}
 	r := o.Runner
 	if err := os.MkdirAll(o.CacheDir, 0o755); err != nil {
 		return nil, err
 	}
 
 	buildDir := filepath.Join(o.Store, "build")
-	if err := r.Run(ctx, nil, "mkdir", "-p", "-m", "0700", buildDir); err != nil {
+	b := &builder{ctx: ctx, r: r, o: o, base: base,
+		layers: layersDir(o.Store), pkgCache: pkgCacheDir(o.Store, base, o.Arch), maxAge: o.MaxAge}
+	for _, dir := range []string{buildDir, b.layers, filepath.Join(buildDir, "cache")} {
+		if err := r.Run(ctx, nil, "mkdir", "-p", "-m", "0700", dir); err != nil {
+			return nil, err
+		}
+	}
+	// The package cache is reached through build/ (0700); inside the
+	// chroot, the distro's download user (apt's _apt) needs to enter it.
+	if err := r.Run(ctx, nil, "mkdir", "-p", "-m", "0755", b.pkgCache); err != nil {
 		return nil, err
 	}
 	out, err := r.Output(ctx, "mktemp", "-d", filepath.Join(buildDir, "mh-build-XXXXXX"))
@@ -129,14 +146,15 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 		return nil, err
 	}
 	work := strings.TrimSpace(string(out))
-	if !strings.HasPrefix(work, buildDir+"/mh-build-") {
+	if !strings.HasPrefix(work, buildDir+"/mh-build-") || !safePathRE.MatchString(work) {
 		return nil, fmt.Errorf("mktemp returned %q", work)
 	}
-	tree := filepath.Join(work, "tree")
+	b.work = work
 	defer func() {
-		// Whatever the build mounted in the tree goes first, on every path:
-		// a mount left behind would make the tree impossible to remove.
-		if uerr := unmountUnder(context.WithoutCancel(ctx), r, tree); uerr != nil && err == nil {
+		// The steps' mounts live in namespaces that end with them; anything
+		// still mounted under the work directory would make it impossible
+		// to remove, so it goes first, on every path.
+		if uerr := unmountUnder(context.WithoutCancel(ctx), r, work); uerr != nil && err == nil {
 			err = uerr
 		}
 		if err != nil {
@@ -145,55 +163,153 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 			}
 		}
 	}()
-	if err := r.Run(ctx, nil, "mkdir", tree); err != nil {
+	// The layers are moved in from the work directory and stacked with
+	// it: one filesystem, or overlayfs's inode numbers — which mkfs uses to
+	// find hard links — could collide between layers.
+	if out, err := r.Output(ctx, "stat", "-L", "-c", "%d", b.layers, work); err != nil {
+		return nil, err
+	} else if f := strings.Fields(string(out)); len(f) != 2 || f[0] != f[1] {
+		return nil, fmt.Errorf("%s and %s are on different filesystems: the build's layers need one", b.layers, work)
+	}
+	if err := b.makeScaffold(len(s.FileOrder) > 0); err != nil {
 		return nil, err
 	}
-	b := &builder{ctx: ctx, r: r, tree: tree, work: work, o: o, base: base}
 
-	step("KERNEL %s", s.Kernel)
+	steps, err := b.steps(d, sources)
+	if err != nil {
+		return nil, err
+	}
+	if len(steps) > maxLayers {
+		return nil, fmt.Errorf("%d files and run steps: a build takes at most %d", len(steps)-4, maxLayers-4)
+	}
+	total := len(steps) + 3
+	n := 0
+	stepLog := func(format string, a ...any) {
+		n++
+		fmt.Fprintf(o.Log, "Step %d/%d : %s\n", n, total, fmt.Sprintf(format, a...))
+	}
+
+	stepLog("KERNEL %s", s.Kernel)
 	kernel := filepath.Join(o.Kernels, "vmlinux-"+s.Kernel)
 	if err := b.installKernel(kernel, KernelURL(s.Kernel, o.Arch), kernelSum); err != nil {
 		return nil, err
 	}
 
-	step("FROM %s (%s)", s.Base, o.Arch)
-	if err := d.bootstrap(b); err != nil {
+	var chain []layer
+	parent := ""
+	for i, st := range steps {
+		stepLog("%s", st.desc)
+		key := st.key(o.Arch, parent)
+		if !o.NoCache {
+			l, ok, err := b.lookup(key)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				fmt.Fprintf(o.Log, " ---> Using cache (%s, built %s)\n", l.id[:12], l.built.Format("2006-01-02 15:04"))
+				chain, parent = append(chain, l), l.id
+				continue
+			}
+		}
+		dir := filepath.Join(work, "steps", strconv.Itoa(i))
+		if st.from != nil {
+			upper := filepath.Join(dir, "upper")
+			if err := r.Run(ctx, nil, "mkdir", "-p", "-m", "0755", upper); err != nil {
+				return nil, err
+			}
+			if err := st.from(upper); err != nil {
+				return nil, err
+			}
+		} else {
+			if st.stage != nil {
+				if err := st.stage(); err != nil {
+					return nil, fmt.Errorf("%s: %w", st.desc, err)
+				}
+			}
+			if err := b.runStep(chain, dir, st.actions); err != nil {
+				return nil, fmt.Errorf("%s: %w", st.desc, err)
+			}
+		}
+		l, err := b.commit(key, filepath.Join(dir, "upper"))
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(o.Log, " ---> %s\n", l.id[:12])
+		chain, parent = append(chain, l), l.id
+	}
+
+	// FINISH is never kept: it undoes what the steps needed (the package
+	// cache's configuration, the indexes) and gives the image the DNS the
+	// engine hands out — the kernel's ip= writes the nameservers to
+	// /proc/net/pnp.
+	stepLog("FINISH")
+	finish := filepath.Join(work, "finish")
+	if err := b.runStep(chain, finish, []action{{
+		Script: d.cleanup + ` && rm -f /etc/resolv.conf && ln -s /proc/net/pnp /etc/resolv.conf`,
+	}}); err != nil {
+		return nil, fmt.Errorf("finishing the tree: %w", err)
+	}
+	top, merged := filepath.Join(finish, "upper"), filepath.Join(finish, "merged")
+
+	sizeMB, inodes, err := b.measure(top, merged, chain, s.SizeMB)
+	if err != nil {
 		return nil, err
 	}
-	// Packages and run steps need DNS, a /dev/null and a /proc; all three go
-	// at the end. --remove-destination: never write through a link the base
-	// might have.
-	if err := r.Run(ctx, nil, "cp", "--remove-destination", "/etc/resolv.conf", filepath.Join(tree, "etc/resolv.conf")); err != nil {
+	stepLog("ROOTFS ext4, %d MB", sizeMB)
+	rootfs := filepath.Join(work, "rootfs.ext4")
+	// mkfs says it creates a missing file even with -q: the file exists.
+	if err := r.Run(ctx, nil, "truncate", "-s", strconv.FormatInt(sizeMB, 10)+"M", rootfs); err != nil {
 		return nil, err
 	}
-	if err := b.chroot(nil, `mkdir -p /dev /proc && for n in "null 1 3" "zero 1 5" "random 1 8" "urandom 1 9"; do set -- $n; [ -e /dev/$1 ] || mknod -m 666 /dev/$1 c $2 $3; done && mount -t proc proc /proc`); err != nil {
-		return nil, fmt.Errorf("preparing /dev and /proc: %w", err)
+	if _, err := b.onFinal(ctx, top, merged, chain, false, "mkfs.ext4", "-q", "-F", "-L", "microhosted", "-N", strconv.FormatInt(inodes, 10),
+		"-E", "root_owner=0:0", "-d", "$MERGED", rootfs, strconv.FormatInt(sizeMB, 10)+"M"); err != nil {
+		return nil, fmt.Errorf("writing the ext4 (size_mb %d too small?): %w", sizeMB, err)
 	}
-
-	pkgs := append(append([]string{}, d.basePackages...), s.Packages...)
-	step("PACKAGES %s", strings.Join(pkgs, " "))
-	if err := d.install(b, pkgs); err != nil {
-		return nil, fmt.Errorf("installing packages: %w", err)
+	if err := r.Run(ctx, nil, "chmod", "0644", rootfs); err != nil {
+		return nil, err
 	}
-
-	step("AGENT vsock:%d, %s", AgentPort, d.init)
-	if err := b.chroot(bytes.NewReader(agent), `mkdir -p /usr/local/bin && cat > /usr/local/bin/microhosted-exec && chmod 0755 /usr/local/bin/microhosted-exec`); err != nil {
-		return nil, fmt.Errorf("installing the agent: %w", err)
-	}
-	if err := d.configure(b); err != nil {
-		return nil, fmt.Errorf("configuring %s: %w", d.init, err)
-	}
-
-	if len(s.FileOrder) > 0 {
-		if err := r.Run(ctx, nil, "mkdir", "-m", "0700", filepath.Join(tree, staging)); err != nil {
+	for _, dir := range []string{filepath.Join(work, "steps"), finish, filepath.Join(work, "scaffold")} {
+		if err := removeTree(ctx, r, dir); err != nil {
 			return nil, err
 		}
 	}
-	for i, guest := range s.FileOrder {
+	return NewResult(kernel, rootfs, func(ctx context.Context) error { return removeWork(ctx, r, work) }), nil
+}
+
+// steps are the spec's layers: FROM, PREPARE (the base brought up to date),
+// PACKAGES, AGENT, then one per file and one per run command.
+func (b *builder) steps(d distro, sources map[string]source) ([]step, error) {
+	s := b.o.Spec
+	from, err := d.fromInputs(b)
+	if err != nil {
+		return nil, fmt.Errorf("base %s: %w", s.Base, err)
+	}
+	pins, err := json.Marshal(b.base)
+	if err != nil {
+		return nil, err
+	}
+	prep := action{Script: d.prepare, Env: d.env}
+	if d.prepareStdin != nil {
+		prep.Stdin = d.prepareStdin(b)
+	}
+	pkgs := append(append([]string{}, d.basePackages...), s.Packages...)
+	steps := []step{
+		{desc: fmt.Sprintf("FROM %s (%s)", s.Base, b.o.Arch), inputs: string(pins) + "\x00" + from,
+			from: func(dir string) error { return d.bootstrap(b, dir) }},
+		{desc: "PREPARE " + d.update, actions: []action{prep}},
+		{desc: "PACKAGES " + strings.Join(pkgs, " "), actions: []action{{Script: d.install, Args: pkgs, Env: d.env}}},
+		{desc: fmt.Sprintf("AGENT vsock:%d, %s", AgentPort, d.init), actions: []action{
+			{Script: `mkdir -p /usr/local/bin && cat > /usr/local/bin/microhosted-exec && chmod 0755 /usr/local/bin/microhosted-exec`, Stdin: string(agent)},
+			{Script: d.configure, Stdin: d.configureStdin},
+		}},
+	}
+	for _, guest := range s.FileOrder {
 		src := sources[guest]
-		step("COPY %s %s", s.Files[guest], guest)
-		staged := path.Join(staging, strconv.Itoa(i))
-		if err := r.Run(ctx, nil, "cp", "-a", "--no-preserve=ownership", src.path, filepath.Join(tree, staged)); err != nil {
+		// The staged name is the guest path's: the same file keeps its key
+		// when others are added before it.
+		staged := path.Join(staging, sha256Hex([]byte(guest))[:16])
+		h := sha256.New()
+		if err := hashTree(h, src.path); err != nil {
 			return nil, fmt.Errorf("files[%s]: %w", guest, err)
 		}
 		var script string
@@ -205,72 +321,50 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 		default:
 			script = `mkdir -p "$(dirname "$2")" && cp -a "$1" "$2"`
 		}
-		if err := b.chroot(nil, script, staged, guest, filepath.Base(src.path)); err != nil {
-			return nil, fmt.Errorf("files[%s]: %w", guest, err)
-		}
+		steps = append(steps, step{
+			desc:    fmt.Sprintf("COPY %s %s", s.Files[guest], guest),
+			inputs:  hex.EncodeToString(h.Sum(nil)),
+			actions: []action{{Script: script, Args: []string{staged, guest, filepath.Base(src.path)}}},
+			stage: func() error {
+				return b.r.Run(b.ctx, nil, "cp", "-a", "--no-preserve=ownership", src.path, filepath.Join(b.scaffold, staged))
+			},
+		})
 	}
-
 	for _, c := range s.Run {
-		step("RUN %s", c)
-		if err := b.chroot(nil, c); err != nil {
-			return nil, fmt.Errorf("run %q: %w", c, err)
-		}
+		steps = append(steps, step{desc: "RUN " + c, actions: []action{{Script: c}}})
 	}
-
-	// DNS as the engine hands it out: the kernel's ip= writes the
-	// nameservers to /proc/net/pnp.
-	step("FINISH")
-	if err := unmountUnder(ctx, r, tree); err != nil {
-		return nil, err
-	}
-	if err := b.chroot(nil, d.cleanup+` && rm -rf `+staging+` && rm -f /etc/resolv.conf && ln -s /proc/net/pnp /etc/resolv.conf`); err != nil {
-		return nil, fmt.Errorf("finishing the tree: %w", err)
-	}
-	if !d.keepDev {
-		if err := b.chroot(nil, `rm -f /dev/null /dev/zero /dev/random /dev/urandom`); err != nil {
-			return nil, fmt.Errorf("finishing the tree: %w", err)
-		}
-	}
-
-	sizeMB, inodes, err := measure(ctx, r, tree, s.SizeMB)
-	if err != nil {
-		return nil, err
-	}
-	step("ROOTFS ext4, %d MB", sizeMB)
-	rootfs := filepath.Join(work, "rootfs.ext4")
-	if err := r.Run(ctx, nil, "mkfs.ext4", "-q", "-F", "-L", "microhosted", "-N", strconv.FormatInt(inodes, 10),
-		"-E", "root_owner=0:0", "-d", tree, rootfs, strconv.FormatInt(sizeMB, 10)+"M"); err != nil {
-		return nil, fmt.Errorf("writing the ext4 (size_mb %d too small?): %w", sizeMB, err)
-	}
-	if err := r.Run(ctx, nil, "chmod", "0644", rootfs); err != nil {
-		return nil, err
-	}
-	if err := removeTree(ctx, r, tree); err != nil {
-		return nil, err
-	}
-	return NewResult(kernel, rootfs, func(ctx context.Context) error { return removeWork(ctx, r, work) }), nil
+	return steps, nil
 }
 
-// builder is what a distro's steps work with.
+// makeScaffold writes the build's own top layer (see stepScript).
+func (b *builder) makeScaffold(files bool) error {
+	b.scaffold = filepath.Join(b.work, "scaffold")
+	dirs := []string{b.scaffold, filepath.Join(b.scaffold, "etc"), filepath.Join(b.scaffold, "dev"), filepath.Join(b.scaffold, ".mh-cache")}
+	if err := b.r.Run(b.ctx, nil, "mkdir", append([]string{"-m", "0755"}, dirs...)...); err != nil {
+		return err
+	}
+	if err := b.r.Run(b.ctx, nil, "mkdir", "-m", "0555", filepath.Join(b.scaffold, "proc")); err != nil {
+		return err
+	}
+	if files {
+		if err := b.r.Run(b.ctx, nil, "mkdir", "-m", "0700", filepath.Join(b.scaffold, staging)); err != nil {
+			return err
+		}
+	}
+	return b.r.Run(b.ctx, nil, "install", "-m", "0644", "/etc/resolv.conf", filepath.Join(b.scaffold, "etc/resolv.conf"))
+}
+
+// builder is what a build's steps work with.
 type builder struct {
-	ctx  context.Context
-	r    Runner
-	tree string
-	work string // root's working directory; tree is inside it
-	o    Options
-	base Base
-}
-
-// chroot runs script with /bin/sh inside the image, with a clean
-// environment; args are its $1, $2…
-func (b *builder) chroot(stdin io.Reader, script string, args ...string) error {
-	return b.chrootEnv(stdin, nil, script, args...)
-}
-
-func (b *builder) chrootEnv(stdin io.Reader, env []string, script string, args ...string) error {
-	argv := append([]string{b.tree, "/usr/bin/env", "-i", "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root"}, env...)
-	argv = append(append(argv, "/bin/sh", "-c", script, "sh"), args...)
-	return b.r.Run(b.ctx, stdin, "chroot", argv...)
+	ctx      context.Context
+	r        Runner
+	work     string // root's working directory
+	scaffold string // the steps' top layer, in work
+	layers   string // the layer store
+	pkgCache string // mounted at /.mh-cache
+	maxAge   time.Duration
+	o        Options
+	base     Base
 }
 
 // unmountUnder unmounts everything mounted at or below dir, deepest first.
@@ -337,18 +431,19 @@ func resolveSources(dir string, s *Spec) (map[string]source, error) {
 	return out, errors.Join(errs...)
 }
 
-// measure sizes the ext4 for tree: its content plus a quarter and 32 MB of
-// headroom (at least 64 MB), and inodes for every file with room to spare.
-func measure(ctx context.Context, r Runner, tree string, want int64) (sizeMB, inodes int64, err error) {
-	out, err := r.Output(ctx, "du", "-s", "-x", "--block-size=1M", tree)
+// measure sizes the ext4 for the finished image: its content plus a
+// quarter and 32 MB of headroom (at least 64 MB), and inodes for every file
+// with room to spare.
+func (b *builder) measure(top, merged string, chain []layer, want int64) (sizeMB, inodes int64, err error) {
+	out, err := b.onFinal(b.ctx, top, merged, chain, true, "du", "-s", "-x", "--block-size=1M", "$MERGED")
 	if err != nil {
 		return 0, 0, err
 	}
 	usedMB, err := strconv.ParseInt(strings.Fields(string(out) + " x")[0], 10, 64)
 	if err != nil {
-		return 0, 0, fmt.Errorf("du %s: %q", tree, out)
+		return 0, 0, fmt.Errorf("du of the image: %q", out)
 	}
-	out, err = r.Output(ctx, "find", tree, "-xdev", "-printf", ".")
+	out, err = b.onFinal(b.ctx, top, merged, chain, true, "find", "$MERGED", "-xdev", "-printf", ".")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -511,10 +606,19 @@ type Sudo struct {
 }
 
 func (s Sudo) command(ctx context.Context, name string, args []string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
-		return exec.CommandContext(ctx, name, args...)
+		cmd = exec.CommandContext(ctx, name, args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "sudo", append([]string{"--", name}, args...)...)
 	}
-	return exec.CommandContext(ctx, "sudo", append([]string{"--", name}, args...)...)
+	// Cancelled (Ctrl-C), the command is asked to stop — sudo passes
+	// SIGTERM on, and a step's supervisor (layers.go) ends everything in its
+	// namespaces — and killed if it has not within 10 s. A SIGKILL to sudo
+	// alone would leave its command running.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 10 * time.Second
+	return cmd
 }
 
 // Run implements Runner.

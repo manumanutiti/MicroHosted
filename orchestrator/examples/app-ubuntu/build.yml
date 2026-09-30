@@ -4,22 +4,25 @@
 # next to it, runs it.
 #
 # Build (on the engine's host; needs debootstrap and ubuntu-keyring there, and
-# sudo; the first build downloads the release, later ones reuse the cached
-# .debs). The build context is this directory:
+# sudo; the first build downloads the release). The build context is this
+# directory:
 #
 #   mh build orchestrator/examples/app-ubuntu     # prints app-ubuntu:sha-…@sha256:…
 #
 # Unchanged, a second run builds nothing: the version is the fingerprint of
-# this file and of app/. --no-cache rebuilds (newer packages).
+# this file and of app/. Changed, it reruns only the steps from the change on
+# (a new line in app/server.py: its COPY and the run steps, not debootstrap
+# or apt). --no-cache reruns every step (newer packages).
 
 # The image's name (default: the directory's name).
 name: app-ubuntu
 
-# ubuntu:24.04 (= ubuntu:noble): laid down by debootstrap, verified against
-# the Ubuntu archive's signing keyring; apt then uses the release, -updates
-# and -security pockets (the build upgrades to their current state). systemd
-# is the init and starts the engine's agent. No SSH: access is mh exec (add
-# openssh-server below if you want it).
+# ubuntu:24.04 (= ubuntu:noble): laid down by debootstrap (minbase: the
+# essential packages and apt, plus systemd and udev; packages: adds the
+# rest), verified against the Ubuntu archive's signing keyring; apt then uses
+# the release, -updates and -security pockets (the build upgrades to their
+# current state). systemd is the init and starts the engine's agent. No SSH:
+# access is mh exec (add openssh-server below if you want it).
 base: ubuntu:24.04
 
 # The guest kernel (Firecracker CI build, pinned by SHA-256); optional.
