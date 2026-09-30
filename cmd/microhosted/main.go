@@ -366,6 +366,12 @@ func parseManagedIfaces(ifaces, hostAllow string) ([]network.ManagedIface, error
 		if err := network.ValidateIfaceName(name); err != nil {
 			return nil, err
 		}
+		// The ruleset drops these names by prefix, ahead of any managed
+		// interface's rules: such an interface would be silently dark.
+		if network.IsOwnDeviceName(name) {
+			return nil, fmt.Errorf("interface %q is named like this daemon's own devices (%s*, %s*) and cannot be managed",
+				name, network.BridgePrefix, network.TapPrefix)
+		}
 		if slices.ContainsFunc(out, func(m network.ManagedIface) bool { return m.Name == name }) {
 			return nil, fmt.Errorf("interface %q listed twice", name)
 		}

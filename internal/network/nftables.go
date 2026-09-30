@@ -21,6 +21,23 @@ const nftTable = "inet microhosted"
 // it does not know about dark — see renderNftables.
 const BridgePrefix = "mhbr"
 
+// TapPrefix starts the name of every TAP this daemon creates ("tap" + 8 hex
+// chars of the VM id, see tapNameRe). A TAP is the VM's wire, never a way in
+// to the host or through it: on a bridge, the IP hooks see the bridge as the
+// interface, never the port, so the only packets that ever name a TAP there
+// are those of a TAP enslaved to nothing — a quarantined VM. The ruleset drops
+// them by prefix, first thing (see renderNftables). The prefix is reserved:
+// a host interface of the operator's named tap* cannot be managed or used for
+// egress (see IsOwnDeviceName).
+const TapPrefix = "tap"
+
+// IsOwnDeviceName reports whether name is in this daemon's device namespace
+// (BridgePrefix or TapPrefix), which the ruleset matches by prefix and so
+// cannot also treat as an operator's interface.
+func IsOwnDeviceName(name string) bool {
+	return strings.HasPrefix(name, BridgePrefix) || strings.HasPrefix(name, TapPrefix)
+}
+
 // ManagedIface is a host interface whose ENTIRE nftables policy this daemon
 // owns: denied in both directions, with each network's interface-scoped egress
 // rules and its ingress rules as the only holes.
@@ -124,6 +141,11 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// is exactly as untrusted as one it does.
 	b.WriteString("\tchain input {\n")
 	b.WriteString("\t\ttype filter hook input priority 0; policy accept;\n")
+	// A TAP seen at the IP layer is one enslaved to nothing (quarantine; see
+	// TapPrefix): nothing from it reaches the host — ahead of the established
+	// accept, so a flow the VM had open while on its bridge (or a host-opened
+	// one it answers) does not survive the cut either.
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", TapPrefix)
 	b.WriteString("\t\tct state established,related accept\n")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", BridgePrefix)
 	// A managed interface reaches only the host services the operator listed
@@ -174,6 +196,11 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// need the conntrack(8) binary to flush anything.
 	b.WriteString("\tchain forward {\n")
 	b.WriteString("\t\ttype filter hook forward priority 0; policy accept;\n")
+	// Nor is a detached TAP a way through the host, in either direction (see
+	// TapPrefix): the host must never route a quarantined VM's packets
+	// anywhere, nor route anything to it.
+	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", TapPrefix)
+	fmt.Fprintf(&b, "\t\toifname \"%s*\" drop\n", TapPrefix)
 	// A bridge of ours that this ruleset does not list is dark, first thing,
 	// in both directions. It exists whenever the bridge and the ruleset
 	// disagree: a network whose rules failed to apply, one whose bridge came
@@ -394,8 +421,8 @@ func ValidateEgressPolicy(egress bool, iface string, rules []types.EgressRule, m
 	if slices.Contains(managed, iface) {
 		return fmt.Errorf("egress_iface %q is a managed interface: its only holes are allowed_egress rules naming it (@%s)", iface, iface)
 	}
-	if strings.HasPrefix(iface, BridgePrefix) || tapNameRe.MatchString(iface) {
-		return fmt.Errorf("egress_iface %q is one of this daemon's own devices, not a way out of the host", iface)
+	if IsOwnDeviceName(iface) {
+		return fmt.Errorf("egress_iface %q is named like this daemon's own devices (%s*, %s*), not a way out of the host", iface, BridgePrefix, TapPrefix)
 	}
 	return nil
 }

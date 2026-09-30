@@ -87,22 +87,43 @@ func tuntapAdd(tap string, owner int) ([]string, error) {
 	return []string{"ip", "tuntap", "add", tap, "mode", "tap", "user", id, "group", id}, nil
 }
 
+// noHostAddrs returns the commands that keep the host from ever addressing a
+// TAP: no IPv6 link-local autoconfigured on it (addrgenmode none, which must
+// be set before the link first comes up) and none left from before (flush).
+// A TAP is the VM's wire, never a host interface — but a TAP enslaved to
+// nothing (quarantine) is an L3 interface of the host, and with an fe80::
+// address on it the guest reaches every host service listening on [::]. The
+// input/forward drops in renderNftables are the barrier; this removes the
+// address those drops would otherwise be the only thing guarding.
+//
+// Empty on a host booted without IPv6 (ipv6.disable=1), where there is nothing
+// to strip and both commands fail.
+func noHostAddrs(tap string) [][]string {
+	if _, err := os.Stat("/proc/sys/net/ipv6"); err != nil {
+		return nil
+	}
+	return [][]string{
+		{"ip", "link", "set", "dev", tap, "addrgenmode", "none"},
+		{"ip", "-6", "addr", "flush", "dev", tap},
+	}
+}
+
 // CreateTapQuarantined creates a TAP device enslaved to nothing, up but going
 // nowhere. Firecracker refuses to restore a snapshot that had a network device
 // unless a host TAP backs it, and a quarantined fork wants exactly that: the
 // guest wakes up believing it still has its network (IP/MAC frozen in the
 // restored memory) while every frame it emits dies at a TAP with no bridge —
 // no path to the host, other VMs, or the internet. vsock exec still works.
+// The TAP gets no host address (see noHostAddrs), and the ruleset drops
+// whatever still arrives on it (TapPrefix in renderNftables).
 // owner is the VM's identity; see tuntapAdd.
 func CreateTapQuarantined(tap string, owner int) error {
 	add, err := tuntapAdd(tap, owner)
 	if err != nil {
 		return err
 	}
-	steps := [][]string{
-		add,
-		{"ip", "link", "set", tap, "up"},
-	}
+	steps := append([][]string{add}, noHostAddrs(tap)...)
+	steps = append(steps, []string{"ip", "link", "set", tap, "up"})
 	for _, args := range steps {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
 			_ = DeleteTap(tap) // best-effort rollback
@@ -131,11 +152,13 @@ func CreateTapEnslaved(tap, bridge string, isolated bool, owner int) error {
 	if err != nil {
 		return err
 	}
-	steps := [][]string{
-		add,
-		{"ip", "link", "set", tap, "master", bridge},
-		{"ip", "link", "set", tap, "up"},
-	}
+	// No host address on it either, so the TAP is already bare if it is
+	// later detached (DetachTap) — see noHostAddrs.
+	steps := append([][]string{add}, noHostAddrs(tap)...)
+	steps = append(steps,
+		[]string{"ip", "link", "set", tap, "master", bridge},
+		[]string{"ip", "link", "set", tap, "up"},
+	)
 	if isolated {
 		// After master: the flag lives on the bridge port, which only exists
 		// once the TAP is enslaved.
@@ -153,7 +176,18 @@ func CreateTapEnslaved(tap, bridge string, isolated bool, owner int) error {
 // DetachTap takes a live TAP off its bridge, leaving it up and enslaved to
 // nothing — the state CreateTapQuarantined builds, reached without touching
 // the VM behind it. Idempotent: detaching a TAP with no master succeeds.
+//
+// Host addresses are stripped first (see noHostAddrs): a TAP created before
+// CreateTapEnslaved did that carries an fe80:: address, which off the bridge
+// would make it a host interface the guest can talk to. Stripping before
+// `nomaster` means a failure leaves the VM exactly as it was, still on its
+// bridge, instead of half-quarantined.
 func DetachTap(tap string) error {
+	for _, args := range noHostAddrs(tap) {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("running %v: %w (%s)", args, err, strings.TrimSpace(string(out)))
+		}
+	}
 	if out, err := exec.Command("ip", "link", "set", "dev", tap, "nomaster").CombinedOutput(); err != nil {
 		return fmt.Errorf("detaching %s from its bridge: %w (%s)", tap, err, strings.TrimSpace(string(out)))
 	}

@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-var tapNameRe = regexp.MustCompile(`^tap[0-9a-f]{8}$`)
+var tapNameRe = regexp.MustCompile(`^` + TapPrefix + `[0-9a-f]{8}$`)
 
 // SweepOrphans removes leftover TAP devices from a previous run of the daemon
 // that crashed or was killed before it could call DeleteTap itself, without

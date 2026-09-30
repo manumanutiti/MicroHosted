@@ -128,6 +128,43 @@ func TestRenderNftablesUnknownBridgeIsDark(t *testing.T) {
 	}
 }
 
+// A TAP off its bridge (a quarantined VM) is an L3 interface of the host, and
+// the only one the IP hooks ever see named like a TAP. Nothing from it reaches
+// the host — not even a flow the VM had open while bridged, so the drop comes
+// before the established accept — and nothing crosses the host to or from it.
+// With no networks too: quarantine does not depend on any network existing.
+func TestRenderNftablesQuarantinedTapIsDark(t *testing.T) {
+	for _, nets := range [][]types.Network{nil, mqttNet()} {
+		got := renderNftables(nets, managedWlan())
+
+		inStart := mustIndex(t, got, "chain input {")
+		input := got[inStart : inStart+strings.Index(got[inStart:], "}")]
+		drop := mustIndex(t, input, `iifname "tap*" drop`)
+		if est := mustIndex(t, input, "ct state established,related accept"); drop > est {
+			t.Errorf("tap drop must precede the established accept in input:\n%s", input)
+		}
+
+		fwdStart := mustIndex(t, got, "chain forward {")
+		forward := got[fwdStart : fwdStart+strings.Index(got[fwdStart:], "}")]
+		in := mustIndex(t, forward, `iifname "tap*" drop`)
+		out := mustIndex(t, forward, `oifname "tap*" drop`)
+		if first := strings.Index(forward, "accept\n"); first >= 0 && (in > first || out > first) {
+			t.Errorf("tap drops must precede every accept in forward:\n%s", forward)
+		}
+	}
+}
+
+func TestIsOwnDeviceName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"mhbr1234": true, "tapdeadbeef": true, "tap0": true,
+		"eth0": false, "wlan0": false, "vnet0": false,
+	} {
+		if got := IsOwnDeviceName(name); got != want {
+			t.Errorf("IsOwnDeviceName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 // Egress persisted before EgressIface existed, with no interface resolved for
 // it, is rendered closed: "everything that is not a bridge" is the policy this
 // daemon no longer enforces.
@@ -161,6 +198,7 @@ func TestValidateEgressPolicy(t *testing.T) {
 		{"managed iface", true, "wlan0", nil, "managed interface"},
 		{"our own bridge", true, "mhbr1234", nil, "daemon's own"},
 		{"our own tap", true, "tap0123abcd", nil, "daemon's own"},
+		{"a tap-named host iface", true, "tap0", nil, "daemon's own"},
 		{"injection", true, "eth0\" accept", nil, "may only contain"},
 	} {
 		err := ValidateEgressPolicy(c.egress, c.iface, c.rules, managed)
@@ -224,8 +262,10 @@ func TestRenderNftablesScalesLinearly(t *testing.T) {
 	if n := strings.Count(got, "oifname @mhbridges iifname . oifname != @mhsame drop"); n != 1 {
 		t.Fatalf("want exactly 1 aggregate cross-segment drop, got %d", n)
 	}
-	// Nothing else should scale per-pair: total drop rules stay O(N).
-	if n := strings.Count(got, "drop"); n > len(nets)+5 {
+	// Nothing else should scale per-pair: total drop rules stay O(N) on top of
+	// the fixed ones every ruleset carries.
+	fixed := strings.Count(renderNftables(nil, nil), "drop")
+	if n := strings.Count(got, "drop"); n > len(nets)+fixed+2 {
 		t.Fatalf("drop rule count %d suggests per-pair rendering came back", n)
 	}
 }
