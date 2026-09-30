@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // These tests exercise the limit maths and file layout against a fake cgroup
@@ -117,6 +118,116 @@ func TestRemoveCgroup(t *testing.T) {
 	// never built its child) are success, not an error.
 	if err := RemoveCgroup(d, "vm1"); err != nil {
 		t.Fatalf("RemoveCgroup on missing dirs: %v", err)
+	}
+}
+
+func TestInCgroup(t *testing.T) {
+	root, d := withFakeCgroupRoot(t)
+	dir := filepath.Join(root, "microhosted", "82970554")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("41\n4242\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for pid, want := range map[int]bool{4242: true, 41: true, 424: false, 0: false} {
+		if got := InCgroup(d, "82970554", pid); got != want {
+			t.Errorf("InCgroup(%d) = %v, want %v", pid, got, want)
+		}
+	}
+	if InCgroup(d, "06364720", 4242) {
+		t.Error("pid counted as member of another VM's cgroup")
+	}
+	d.CgroupVersion = "1"
+	if InCgroup(d, "82970554", 4242) {
+		t.Error("cgroup v1 host: InCgroup = true")
+	}
+}
+
+// A fake group: cgroup.events says what the test wants, cgroup.kill exists
+// empty (a 5.14+ kernel), and nothing acts on it unless the test does.
+func fakeGroup(t *testing.T, dir, events string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for file, data := range map[string]string{"cgroup.events": events, "cgroup.kill": ""} {
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestKillCgroup(t *testing.T) {
+	root, d := withFakeCgroupRoot(t)
+	old := cgroupKillTimeout
+	cgroupKillTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { cgroupKillTimeout = old })
+
+	// Nothing there (never launched, already removed), or a v1 host: success.
+	if err := KillCgroup(d, "82970554"); err != nil {
+		t.Fatalf("KillCgroup on missing groups: %v", err)
+	}
+
+	// Already empty: no kill needed.
+	limits := filepath.Join(root, "microhosted", "82970554")
+	fakeGroup(t, limits, "populated 0\nfrozen 0\n")
+	if err := KillCgroup(d, "82970554"); err != nil {
+		t.Fatalf("KillCgroup on an empty group: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(limits, "cgroup.kill")); len(b) != 0 {
+		t.Error("cgroup.kill written for an empty group")
+	}
+
+	// Populated, and the kernel empties it once told to.
+	fakeGroup(t, limits, "populated 1\nfrozen 0\n")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			if b, _ := os.ReadFile(filepath.Join(limits, "cgroup.kill")); string(b) == "1" {
+				_ = os.WriteFile(filepath.Join(limits, "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o644)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	if err := KillCgroup(d, "82970554"); err != nil {
+		t.Fatalf("KillCgroup: %v", err)
+	}
+	<-done
+
+	// Populated and staying so — or unreadable — counts as still running.
+	fakeGroup(t, limits, "populated 1\nfrozen 0\n")
+	if err := KillCgroup(d, "82970554"); !errors.Is(err, ErrCgroupNotDrained) {
+		t.Fatalf("KillCgroup on a group that won't drain = %v, want ErrCgroupNotDrained", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(limits, "cgroup.kill")); string(b) != "1" {
+		t.Errorf("cgroup.kill = %q, want \"1\"", b)
+	}
+	fakeGroup(t, limits, "frozen 0\n")
+	if err := KillCgroup(d, "82970554"); !errors.Is(err, ErrCgroupNotDrained) {
+		t.Fatalf("KillCgroup with no populated key = %v, want ErrCgroupNotDrained", err)
+	}
+
+	// Jailer's per-VM child is killed too; its shared parent never is.
+	_ = os.RemoveAll(limits)
+	jailerDir := filepath.Join(root, "firecracker", "82970554")
+	fakeGroup(t, jailerDir, "populated 1\n")
+	fakeGroup(t, filepath.Join(root, "firecracker"), "populated 1\n")
+	if err := KillCgroup(d, "82970554"); !errors.Is(err, ErrCgroupNotDrained) {
+		t.Fatalf("KillCgroup with a populated jailer child = %v, want ErrCgroupNotDrained", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "firecracker", "cgroup.kill")); len(b) != 0 {
+		t.Error("cgroup.kill written in Jailer's shared parent")
+	}
+	if b, _ := os.ReadFile(filepath.Join(jailerDir, "cgroup.kill")); string(b) != "1" {
+		t.Errorf("Jailer's per-VM child: cgroup.kill = %q, want \"1\"", b)
+	}
+
+	d.CgroupVersion = "1"
+	if err := KillCgroup(d, "82970554"); err != nil {
+		t.Fatalf("KillCgroup on a v1 host: %v", err)
 	}
 }
 

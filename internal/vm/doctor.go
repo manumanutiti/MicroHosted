@@ -100,7 +100,7 @@ func (m *Manager) Doctor() types.DoctorReport {
 		}
 	}
 	for id, v := range running {
-		if _, ok := procs[id]; !ok && !processAlive(v.PID, id) {
+		if _, ok := procs[id]; !ok && !m.processAlive(v.PID, id) {
 			add("process_missing", id, "recorded as running (pid %d) but no process exists", v.PID)
 		}
 	}

@@ -240,6 +240,13 @@ func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, auto
 				m.adoptVMIdentity(rec)
 				continue
 			}
+			// Its recorded process is gone, but whatever is left in its
+			// cgroup (a VMM whose PID the record lost track of) must be too
+			// before anything it holds is released.
+			if err := jailer.KillCgroup(m.jailerCfg, id); err != nil {
+				m.keepUndrained(rec, keepTaps, err)
+				continue
+			}
 			if !m.keepDead(rec) {
 				continue
 			}
@@ -276,7 +283,7 @@ func (m *Manager) Reconcile(records []*types.VM) (keepTaps map[string]bool, auto
 // restart, adding its TAP to keepTaps. Reports false if the process is gone.
 func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
 	id := rec.Config.ID
-	if !processAlive(rec.PID, id) {
+	if !m.processAlive(rec.PID, id) {
 		return false
 	}
 	// No SDK handle for adopted VMs (Destroy signals by PID); the console
@@ -327,6 +334,28 @@ func (m *Manager) adoptIfAlive(rec *types.VM, keepTaps map[string]bool) bool {
 	// from a previous daemon run.
 	m.watchAgent(id)
 	return true
+}
+
+// keepUndrained tracks a VM whose recorded process is gone but whose cgroup
+// could not be emptied: something of it may still run and hold its volumes'
+// open file descriptors, so nothing is released. It stays "running" — TAP, IP,
+// name, identity and volume claims all kept — and the monitor, finding its
+// recorded process dead, retries the kill every tick (see reap).
+func (m *Manager) keepUndrained(rec *types.VM, keepTaps map[string]bool, err error) {
+	id := rec.Config.ID
+	log.Printf("reconcile: vm %s: pid %d is gone but its cgroup won't drain (%v); kept as running, the monitor retries", id, rec.PID, err)
+	m.mu.Lock()
+	m.vms[id] = rec
+	m.run[id] = &running{}
+	m.mu.Unlock()
+	m.adoptName(rec)
+	m.adoptVMIdentity(rec)
+	if tap := rec.Config.TapDevice; tap != "" {
+		keepTaps[tap] = true
+	}
+	if rec.Config.GuestIP != "" && rec.Config.NetworkName != "" {
+		m.netmgr.ReserveVM(rec.Config.NetworkName, id, rec.Config.GuestIP, rec.Config.TapDevice)
+	}
 }
 
 // keepDead turns the record of a VM that died while the daemon was down into a
@@ -1013,6 +1042,10 @@ func (m *Manager) applyLimits(id string, pid int, cfg types.VMConfig) error {
 func (m *Manager) powerOff(ctx context.Context, record *types.VM, r *running) error {
 	id := record.Config.ID
 	stopErr := m.halt(ctx, record, r, true)
+	if errors.Is(stopErr, jailer.ErrCgroupNotDrained) {
+		// Still running as far as the kernel is concerned: release nothing.
+		return fmt.Errorf("stopping vm %s: %w", id, stopErr)
+	}
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
@@ -1048,11 +1081,19 @@ func (m *Manager) destroy(ctx context.Context, id string) error {
 	// Not graceful: the disk is deleted below, so there's nothing for an
 	// orderly guest power-off to protect, and skipping it keeps Destroy fast.
 	stopErr := m.halt(ctx, record, r, false)
+	// The one failure that stops the teardown: the kernel still has processes
+	// in the VM's cgroup. Such a VMM may still hold its volumes open read-write
+	// and its identity, so handing either to another VM — or forgetting the
+	// record that says so — is exactly what must not happen. The VM stays as
+	// it is, and a later destroy tries again.
+	if errors.Is(stopErr, jailer.ErrCgroupNotDrained) {
+		return fmt.Errorf("stopping vm %s: %w", id, stopErr)
+	}
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
 
-	// Every resource is cleaned up regardless of earlier failures — a VM that
+	// Every other resource is cleaned up regardless of earlier failures — a VM that
 	// fails to stop cleanly must still have its tap/IP/clone/jail dir released,
 	// or the leak compounds on every crash. Errors are collected, not returned
 	// early, so one failed step never skips the rest.
@@ -1119,6 +1160,11 @@ func (m *Manager) stop(ctx context.Context, id string, graceful bool) (*types.VM
 	}
 
 	stopErr := m.halt(ctx, record, r, graceful)
+	// Something of the VM still runs (see halt): recording it stopped would
+	// let Start boot a second VMM on the same disk. It stays running.
+	if errors.Is(stopErr, jailer.ErrCgroupNotDrained) {
+		return nil, fmt.Errorf("stopping vm %s: %w", id, stopErr)
+	}
 	if r != nil && r.logFile != nil {
 		_ = r.logFile.Close()
 	}
@@ -1207,7 +1253,10 @@ func (m *Manager) Start(ctx context.Context, id string) (*types.VM, error) {
 		m.mu.Lock()
 		r := m.run[id]
 		m.mu.Unlock()
-		_ = m.powerOff(ctx, record, r)
+		if perr := m.powerOff(ctx, record, r); errors.Is(perr, jailer.ErrCgroupNotDrained) {
+			// Left running: the monitor keeps trying to empty its cgroup.
+			return nil, fmt.Errorf("mounting volumes for vm %s: %w (powering it back off: %w)", id, err, perr)
+		}
 		m.mu.Lock()
 		record.State = types.VMStateStopped
 		record.PID = 0
@@ -2401,14 +2450,32 @@ func (m *Manager) cleanupNetwork(networkName, tapName, vmID string) {
 	}
 }
 
-// processAlive reports whether pid is a live Firecracker process for vmID. The
-// vmID check guards against PID reuse — by the time we reconcile, the original
-// pid may have been recycled by an unrelated process; Firecracker's own
-// command line always carries `--id <vmID>`, so requiring it there means we
-// only ever adopt the real VM, never a stranger that inherited its pid.
-func processAlive(pid int, vmID string) bool {
+// processAlive reports whether pid is a live Firecracker process for vmID.
+//
+// On cgroup v2 the answer is the kernel's: pid is alive for vmID exactly when
+// it sits in the VM's limits cgroup (jailer.InCgroup). Only root moves a
+// process into or out of that group, so a compromised VMM can't talk its way
+// out of being tracked — its command line, which it can overwrite from its own
+// memory without a syscall, is not consulted — and a stranger that inherited a
+// recycled PID was never in the group, so it is never adopted or signalled.
+//
+// On a cgroup v1 host there is no such group, and the old heuristic remains:
+// Firecracker's own command line carries `--id <vmID>`. That guards against PID
+// reuse but not against a VMM rewriting its argv; v1 hosts run without per-VM
+// limits already and are warned about at every boot. The same heuristic covers
+// a v2 VM whose limits group does not exist at all — one launched by a daemon
+// that predates per-VM limits and adopted across the upgrade — so it is still
+// tracked instead of reaped while it runs. Every launch today fails unless
+// ApplyLimits put the VMM in that group, and only root removes it, so a VMM
+// cannot land itself on this path.
+func (m *Manager) processAlive(pid int, vmID string) bool {
 	if pid <= 0 {
 		return false
+	}
+	if m.jailerCfg.CgroupVersion == "2" {
+		if _, err := os.Stat(jailer.CgroupDir(m.jailerCfg, vmID)); !os.IsNotExist(err) {
+			return jailer.InCgroup(m.jailerCfg, vmID, pid)
+		}
 	}
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
