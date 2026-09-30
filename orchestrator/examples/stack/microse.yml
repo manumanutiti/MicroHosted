@@ -1,0 +1,61 @@
+# Three tiers, three images built from this directory — two on Ubuntu, one on
+# Alpine — on one network where they reach each other:
+#
+#   stack 172.30.60.0/24 (intra: VMs see each other; no egress)
+#     db   .10  PostgreSQL 16 on Ubuntu          (db/build.yml)
+#     api  .11  Node.js + pg on Ubuntu, :8080    (api/build.yml)   → db
+#     web  .12  nginx on Alpine, :8080           (web/build.yml)   → api
+#
+#   cd orchestrator/examples/stack
+#   mh plan          # builds the three images the first time (sudo; Ubuntu's take minutes)
+#   mh up -d
+#   curl http://172.30.60.12:8080/api/visits     # {"visits":1,"db":"PostgreSQL 16…","node":…}
+#   open http://172.30.60.12:8080/ in a browser on this host
+#   mh status
+#   mh down
+#
+# What to try with the build cache (mh build -f DIR/build.yml shows the steps;
+# mh apply rebuilds what changed and replaces only those VMs):
+#   edit web/site/index.html   web: one COPY and its run steps; apk does not run
+#   edit api/app/server.js     api: COPY, useradd, npm install; apt does not run
+#   add a package to db        db: PACKAGES and after; debootstrap and the
+#                              upgrade come from the cache
+#   change mem_mb in a build.yml  every layer from the cache: only the ext4
+#
+# The visit count lives in the db VM's disk: a replaced db starts from zero
+# (lasting data goes in a volume, docs/volumes.md).
+
+version: 1
+
+budget:
+  max_vms: 6            # the three, plus a replacement of each during an update
+  max_mem_mb: 1280      # 2 × (256 + 256 + 128)
+
+networks:
+  stack:
+    subnet: 172.30.60.0/24
+    intra: true
+
+functions:
+  db:
+    build: db
+    network: stack
+    ip: 172.30.60.10
+    # No command: systemd starts PostgreSQL; the health check is the image's.
+    lifecycle: { mode: persistent, recycle: never }
+    labels: { tier: data }
+
+  api:
+    build: api
+    network: stack
+    ip: 172.30.60.11      # db/build.yml lets this address, and only it, connect
+    command: setpriv --reuid=api --regid=api --init-groups node /opt/api/server.js 8080 172.30.60.10
+    lifecycle: { mode: persistent }
+    labels: { tier: app }
+
+  web:
+    build: web
+    network: stack
+    ip: 172.30.60.12      # web/nginx.conf passes /api/ to 172.30.60.11
+    lifecycle: { mode: persistent }
+    labels: { tier: front }

@@ -20,6 +20,9 @@ orchestrator/
     alpine-nginx/          build.yml (nginx serving site/, every field
                            commented) + microse.yml that runs it with build: .
     app-ubuntu/            the same on Ubuntu 24.04: a Python service
+    stack/                 three tiers, three images, one microse.yml: db
+                           (PostgreSQL, Ubuntu), api (Node.js, Ubuntu), web
+                           (nginx, Alpine) — for trying the build cache
     images/                build.yml of the images the flat examples use:
                            alpine, alpine-py
     first.yaml             the three modes with shell one-liners

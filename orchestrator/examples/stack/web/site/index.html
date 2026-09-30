@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MicroHosted stack</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #1d2330; background: #f7f8fa; }
+  h1 { font-size: 1.4rem; }
+  .tier { background: #fff; border: 1px solid #dde1e8; border-radius: 8px; padding: .75rem 1rem; margin: .5rem 0; }
+  .tier b { display: inline-block; width: 4.5rem; }
+  #err { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Three microVMs, three images</h1>
+<div class="tier"><b>web</b> nginx on Alpine (this page)</div>
+<div class="tier"><b>api</b> <span id="api">…</span></div>
+<div class="tier"><b>db</b> <span id="db">…</span></div>
+<p>Visits: <strong id="visits">…</strong> <span id="err"></span></p>
+<script>
+fetch("/api/visits").then(r => r.json()).then(v => {
+  if (v.error) throw new Error(v.error);
+  document.getElementById("visits").textContent = v.visits;
+  document.getElementById("api").textContent = "Node.js " + v.node + " on " + v.os;
+  document.getElementById("db").textContent = v.db;
+}).catch(e => { document.getElementById("err").textContent = "(" + e.message + ")"; });
+</script>
+</body>
+</html>

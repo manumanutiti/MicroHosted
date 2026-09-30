@@ -1,0 +1,42 @@
+# The stack's database: PostgreSQL 16 from Ubuntu's archive, started by
+# systemd. What it tests of mh build: a package whose install scripts do real
+# work (postgresql-16 creates its cluster and enables its unit — neither
+# starts a service on the build host: policy-rc.d), and a run step that
+# starts the server inside the build, uses it and stops it (its own PID
+# namespace and /dev/shm; nothing it started outlives the step).
+#
+#   mh build orchestrator/examples/stack/db
+#
+# ../microse.yml runs it; alone: mh run <reference> --wait, then
+#   mh exec VM 'runuser -u postgres -- psql -c "select version()"'
+
+name: stack-db
+base: ubuntu:24.04
+
+packages:
+  - postgresql-16
+
+run:
+  # Listen on the stack's network. Only the api's address may connect, as
+  # the counter role, without a password: the engine lets each VM send from
+  # its own address alone, so the address is the api (the network is intra
+  # and nothing else is on it). A spec that reaches beyond one closed segment
+  # uses a password from secrets: instead.
+  - pg_conftool 16 main set listen_addresses '*'
+  - echo 'host counter counter 172.30.60.11/32 trust' >> /etc/postgresql/16/main/pg_hba.conf
+  # The role and the database, created with the server up for the step only.
+  - >-
+    pg_ctlcluster 16 main start &&
+    runuser -u postgres -- createuser counter &&
+    runuser -u postgres -- createdb -O counter counter &&
+    pg_ctlcluster 16 main stop
+
+# No command: systemd starts postgresql@16-main at boot.
+health:
+  command: pg_isready -q -h 127.0.0.1
+  every: 10s
+  timeout: 3s
+  failures: 3
+
+vcpus: 1
+mem_mb: 256
