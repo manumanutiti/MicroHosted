@@ -41,6 +41,17 @@ var defaultNameservers = []string{"1.1.1.1", "8.8.8.8"}
 // for the API socket.
 const VsockDevicePath = "v.sock"
 
+// APISocketPath is where Firecracker creates its API socket, in its chrooted
+// view: the chroot's top level, next to v.sock — not the SDK's default
+// /run/firecracker.socket. When the VMM exits, the SDK unlinks the host-side
+// path as root (a cleanup it registers on its own), and unlink follows every
+// symlink but the last component's. Under /run that is a directory the jailed
+// uid owns: a compromised VMM could swap run for a link to any host directory
+// and have root delete that directory's firecracker.socket. At the top level
+// the only directories above the socket are the root-owned InstanceDir and
+// the chroot itself, which the VMM cannot replace (its parent is root's).
+const APISocketPath = "/firecracker.socket"
+
 // rootDriveID is the root drive's ID, in the boot config and so in every
 // vmstate taken from it — which is how a restore addresses it.
 const rootDriveID = "rootfs"
@@ -70,6 +81,7 @@ func BuildConfig(vm types.VMConfig, io types.IOLimits, jcfg fc.JailerConfig) (fc
 		// lifetime is the manager's, ended only by an explicit Destroy.
 		ForwardSignals: []os.Signal{},
 		Seccomp:        seccomp,
+		SocketPath:     APISocketPath,
 		Drives:         buildDrives(vm, DiskRateLimiter(io)),
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  fc.Int64(vm.VCPUs),
@@ -197,6 +209,7 @@ func BuildRestoreConfig(vmID, diskPath string, jcfg fc.JailerConfig) fc.Config {
 		// the daemon's signals to the Firecracker child.
 		ForwardSignals: []os.Signal{},
 		Seccomp:        seccomp,
+		SocketPath:     APISocketPath,
 		Drives: []models.Drive{{
 			DriveID:      fc.String(rootDriveID),
 			PathOnHost:   fc.String(diskPath),

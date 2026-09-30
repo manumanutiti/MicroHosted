@@ -145,6 +145,13 @@ control. The daemon (root) therefore never connects to a path there as given:
 A VMM that plants a link to a host socket (the daemon's API, systemd, a
 container runtime) gets a refused connection, not root talking to that socket.
 
+Both sockets sit at the chroot's top level (`/firecracker.socket`, `/v.sock`),
+never in a subdirectory: when the VMM exits, the Firecracker SDK unlinks the API
+socket as root, by path, and a path walk follows symlinks in every directory but
+the last. In a subdirectory the VMM owns (the SDK's default `/run`), swapping
+it for a link would have root delete a file outside the jail; at the top level
+the directories above the socket are root's.
+
 - **Where:** `internal/jailer/config.go`, `internal/jailer/cgroup.go`,
   `internal/jailer/sockdial.go`, `internal/firecracker/ratelimit.go`,
   `internal/vm/manager.go` (`applyLimits`), `internal/vm/iolimits.go`.
