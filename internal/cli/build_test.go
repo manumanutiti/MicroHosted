@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"microhosted/internal/build"
 	"microhosted/pkg/types"
@@ -146,6 +147,38 @@ func TestImageBuild(t *testing.T) {
 	// An explicit tag that exists is refused before building.
 	if code, _, errOut := f.run("", "build", "-t", "site:0.9", dir); code == 0 || !strings.Contains(errOut, "tags never move") || builds != 2 {
 		t.Errorf("taken tag: exit %d, stderr %q, %d builds", code, errOut, builds)
+	}
+	// --no-cache reuses no layer either.
+	if got.NoCache {
+		t.Error("a build without --no-cache skipped the layer cache")
+	}
+	if code, _, errOut := f.run("", "build", "-q", "--no-cache", dir); code != 0 || !got.NoCache || builds != 3 {
+		t.Errorf("--no-cache: exit %d, %s, NoCache %v", code, errOut, got.NoCache)
+	}
+}
+
+// mh builder prune prunes the layer store under the daemon's store.
+func TestBuilderPrune(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/system", reply(types.SystemResponse{Daemon: types.DaemonInfo{Paths: types.DaemonPaths{Store: "/store", Kernels: "/store/kernels"}}}))
+	f := newFakeAPI(t, mux)
+	oldPrune, oldRunner := runPrune, newBuildRunner
+	t.Cleanup(func() { runPrune, newBuildRunner = oldPrune, oldRunner })
+	newBuildRunner = func(io.Writer, bool) buildRunner { return noAuthRunner{nopRunner{}} }
+	var store string
+	var opts build.PruneOptions
+	runPrune = func(_ context.Context, _ build.Runner, s string, o build.PruneOptions) (build.PruneResult, error) {
+		store, opts = s, o
+		return build.PruneResult{Layers: 3, Caches: o.All}, nil
+	}
+	if code, out, errOut := f.run("", "builder", "prune", "--older-than", "48h"); code != 0 || out != "removed 3 layers\n" || store != "/store" || opts.OlderThan != 48*time.Hour || opts.All {
+		t.Errorf("prune: exit %d, %q %q, %s %+v", code, out, errOut, store, opts)
+	}
+	if code, out, _ := f.run("", "builder", "prune", "--all"); code != 0 || !strings.Contains(out, "package caches") || !opts.All {
+		t.Errorf("prune --all: exit %d, %q", code, out)
+	}
+	if code, _, _ := f.run("", "builder", "prune", "--older-than", "soon"); code == 0 {
+		t.Error("a malformed --older-than was accepted")
 	}
 }
 

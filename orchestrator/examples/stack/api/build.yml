@@ -1,0 +1,38 @@
+# The stack's API: a Node.js service on Ubuntu that counts visits in the
+# database. What it tests of mh build: a large dependency tree from apt (npm
+# brings a few hundred packages: the PACKAGES layer is the expensive one),
+# and a run step with the network (npm install fetches pg from the npm
+# registry).
+#
+#   mh build orchestrator/examples/stack/api
+#
+# Edit app/server.js and build again: FROM, PREPARE, PACKAGES and AGENT come
+# from the cache; the COPY and the run steps run — npm install too, as it
+# comes after the files (files: are copied before run: steps).
+
+name: stack-api
+base: ubuntu:24.04
+
+packages:
+  - nodejs
+  - npm
+
+files:
+  /opt/api/: app/
+
+run:
+  - useradd --system --home /opt/api --shell /usr/sbin/nologin api
+  - cd /opt/api && npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+  - node --check /opt/api/server.js && node --check /opt/api/health.js   # a syntax error fails the build
+
+# The database's address is the plant spec's to give: ../microse.yml sets
+# the command (this one is for mh run alone, against a local database).
+command: setpriv --reuid=api --regid=api --init-groups node /opt/api/server.js 8080 127.0.0.1
+health:
+  command: node /opt/api/health.js
+  every: 10s
+  timeout: 3s
+  failures: 3
+
+vcpus: 1
+mem_mb: 256

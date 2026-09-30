@@ -1,0 +1,30 @@
+# The stack's front: nginx on Alpine serving a page and passing /api/ to the
+# API. What it tests of mh build: the Alpine path (the minirootfs, apk
+# upgrade, apk add), and a COPY per file — change one and only that file's
+# COPY and the steps after it run again.
+#
+#   mh build orchestrator/examples/stack/web
+
+name: stack-web
+base: alpine:3.22
+
+packages:
+  - nginx
+
+files:
+  /srv/www/: site/
+  /etc/nginx/http.d/default.conf: nginx.conf
+
+run:
+  - mkdir -p /run/nginx
+  - nginx -t
+
+command: nginx -g 'daemon off;'
+health:
+  command: wget -qO- -T 2 http://127.0.0.1:8080/healthz >/dev/null
+  every: 10s
+  timeout: 3s
+  failures: 3
+
+vcpus: 1
+mem_mb: 128

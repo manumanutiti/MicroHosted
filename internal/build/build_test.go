@@ -7,10 +7,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -117,6 +120,34 @@ type call struct {
 
 func (c call) String() string { return c.name + " " + strings.Join(c.args, " ") }
 
+// script is the shell script a sh -c call runs ("" if none).
+func (c call) script() string {
+	for i, a := range c.args {
+		if a == "-c" && i+1 < len(c.args) {
+			return c.args[i+1]
+		}
+	}
+	return ""
+}
+
+// inImage is what a step call runs chrooted in the image: the script after
+// env, and its arguments.
+func (c call) inImage() (script string, args []string, ok bool) {
+	if c.name != "unshare" || !slices.Contains(c.args, stepScript) {
+		return "", nil, false
+	}
+	i := slices.Index(c.args, "/usr/bin/env")
+	for j := i; j < len(c.args)-1; j++ {
+		if c.args[j] == "-c" {
+			return c.args[j+1], c.args[j+3:], true
+		}
+	}
+	return "", nil, false
+}
+
+// fakeRunner stands in for root. Its layer store (keys) outlives a build, as
+// the real one does: a second build with the same runner finds the layers
+// the first one kept.
 type fakeRunner struct {
 	calls []call
 	fail  string // a command line containing this fails
@@ -125,6 +156,8 @@ type fakeRunner struct {
 	// copy hashes the real file; tamper makes every copy differ from it.
 	installed map[string]string
 	tamper    bool
+	keys      map[string]string // layer key → "<id> <built>"
+	devices   string            // stat -c %d's answer
 }
 
 func (f *fakeRunner) Run(_ context.Context, stdin io.Reader, name string, args ...string) error {
@@ -143,18 +176,44 @@ func (f *fakeRunner) Run(_ context.Context, stdin io.Reader, name string, args .
 		}
 		f.installed[args[len(args)-1]] = args[len(args)-2]
 	}
+	if c.script() == commitScript {
+		if f.keys == nil {
+			f.keys = map[string]string{}
+		}
+		// layers id key dir built
+		f.keys[args[5]] = args[4] + " " + args[7]
+	}
 	return nil
 }
 
 func (f *fakeRunner) Output(_ context.Context, name string, args ...string) ([]byte, error) {
-	f.calls = append(f.calls, call{name: name, args: args})
+	c := call{name: name, args: args}
+	f.calls = append(f.calls, c)
+	if f.fail != "" && strings.Contains(c.String(), f.fail) {
+		return nil, fmt.Errorf("%s failed", name)
+	}
+	if c.script() == lookupScript {
+		if v, ok := f.keys[args[len(args)-1]]; ok {
+			return []byte(v + "\n"), nil
+		}
+		return nil, nil
+	}
+	if name == "unshare" && slices.Contains(args, finalScript) {
+		switch {
+		case slices.Contains(args, "du"):
+			return []byte("40\t/merged\n"), nil
+		case slices.Contains(args, "find"):
+			return []byte(strings.Repeat(".", 1000)), nil
+		}
+	}
 	switch name {
 	case "mktemp":
 		return []byte(f.work + "\n"), nil
-	case "du":
-		return []byte("40\t" + args[len(args)-1] + "\n"), nil
-	case "find":
-		return []byte(strings.Repeat(".", 1000)), nil
+	case "stat":
+		if f.devices != "" {
+			return []byte(f.devices), nil
+		}
+		return []byte("2049\n2049\n"), nil
 	case "sha256sum":
 		sum, err := hashFile(f.installed[args[0]])
 		if err != nil {
@@ -178,6 +237,19 @@ func (f *fakeRunner) find(sub string) []call {
 	return out
 }
 
+// ran lists the scripts the steps ran in the image, in order.
+func (f *fakeRunner) ran() []string {
+	var out []string
+	for _, c := range f.calls {
+		if s, _, ok := c.inImage(); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (f *fakeRunner) reset() { f.calls = nil }
+
 // pinnedFetch serves content whose hash it pins for the test's duration.
 func pinnedFetch(t *testing.T) func(context.Context, string, string) error {
 	t.Helper()
@@ -199,13 +271,18 @@ func testOptions(t *testing.T, spec string) (Options, *fakeRunner) {
 	must(t, os.MkdirAll(filepath.Join(ctxDir, "out/css"), 0o755))
 	must(t, os.WriteFile(filepath.Join(ctxDir, "out/index.html"), []byte("<h1>hi</h1>"), 0o644))
 	must(t, os.WriteFile(filepath.Join(ctxDir, "nginx.conf"), []byte("server {}"), 0o644))
+	r := &fakeRunner{work: "/store/build/mh-build-abc123"}
+	return Options{Spec: parse(t, spec), Context: ctxDir, Arch: "x86_64", Store: "/store", Kernels: "/store/kernels",
+		CacheDir: t.TempDir(), Log: io.Discard, Runner: r, Fetch: pinnedFetch(t)}, r
+}
+
+func parse(t *testing.T, spec string) *Spec {
+	t.Helper()
 	s, err := Parse([]byte(spec))
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &fakeRunner{work: "/store/build/mh-build-abc123"}
-	return Options{Spec: s, Context: ctxDir, Arch: "x86_64", Store: "/store", Kernels: "/store/kernels",
-		CacheDir: t.TempDir(), Log: io.Discard, Runner: r, Fetch: pinnedFetch(t)}, r
+	return s
 }
 
 func must(t *testing.T, err error) {
@@ -215,78 +292,254 @@ func must(t *testing.T, err error) {
 	}
 }
 
-func TestBuildSteps(t *testing.T) {
-	o, r := testOptions(t, `
+const nginxSpec = `
 base: alpine:3.22
 packages: [nginx]
 files:
   /srv/www/: out/
   /etc/nginx/http.d/default.conf: nginx.conf
 run: ["mkdir -p /run/nginx"]
-`)
+`
+
+func TestBuildSteps(t *testing.T) {
+	o, r := testOptions(t, nginxSpec)
 	res, err := Build(context.Background(), o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Rootfs != "/store/build/mh-build-abc123/rootfs.ext4" || res.Kernel != "/store/kernels/vmlinux-6.1.102" {
+	work := "/store/build/mh-build-abc123"
+	if res.Rootfs != work+"/rootfs.ext4" || res.Kernel != "/store/kernels/vmlinux-6.1.102" {
 		t.Errorf("result = %+v", res)
 	}
 	if len(r.find("install -D -o root -g root -m 0644")) != 1 {
 		t.Error("the missing kernel was not installed")
 	}
-	// Every write into the image after unpacking goes through the chroot;
-	// the host side only writes into paths the build created itself.
-	tree := "/store/build/mh-build-abc123/tree"
+	scaffold := work + "/scaffold"
 	for _, c := range r.calls {
 		switch c.name {
-		case "chroot":
-			if c.args[0] != tree {
-				t.Errorf("chroot into %s", c.args[0])
-			}
 		case "cp":
-			dst := c.args[len(c.args)-1]
-			if dst != tree+"/etc/resolv.conf" && !strings.HasPrefix(dst, tree+staging+"/") {
+			// The host side writes only into the build's own scaffold;
+			// everything else goes into the image through the chroot.
+			if dst := c.args[len(c.args)-1]; !strings.HasPrefix(dst, scaffold+staging+"/") {
 				t.Errorf("host-side copy into the image: %s", c)
+			}
+		case "tar":
+			if c.args[len(c.args)-1] != work+"/steps/0/upper" {
+				t.Errorf("the base was unpacked into %s", c.args[len(c.args)-1])
+			}
+		case "unshare":
+			// Every step in its own namespaces, the scaffold on top.
+			if slices.Contains(c.args, stepScript) {
+				if !slices.Equal(c.args[:4], []string{"--mount", "--uts", "--ipc", "--pid"}) || !slices.Contains(c.args, superviseScript) {
+					t.Errorf("a step not isolated: %s", c)
+				}
+				if lower := c.args[slices.Index(c.args, stepScript)+3]; !strings.HasPrefix(lower, scaffold+":") {
+					t.Errorf("lowerdir = %s, want the scaffold on top", lower)
+				}
 			}
 		}
 	}
-	if apk := r.find("apk add"); len(apk) != 1 || strings.Join(apk[0].args[len(apk[0].args)-2:], " ") != "socat nginx" {
-		t.Errorf("apk = %v", apk)
+	want := []string{
+		alpine.prepare, alpine.install,
+		`mkdir -p /usr/local/bin && cat > /usr/local/bin/microhosted-exec && chmod 0755 /usr/local/bin/microhosted-exec`, alpine.configure,
+		`mkdir -p "$(dirname "$2")" && cp -a "$1" "$2"`, `mkdir -p "$2" && cp -a "$1"/. "$2"/`, // files in path order
+		"mkdir -p /run/nginx",
+		alpine.cleanup + ` && rm -f /etc/resolv.conf && ln -s /proc/net/pnp /etc/resolv.conf`,
+	}
+	if got := r.ran(); !slices.Equal(got, want) {
+		t.Errorf("steps ran\n%q\nwant\n%q", got, want)
+	}
+	for _, c := range r.calls {
+		if s, args, ok := c.inImage(); ok && s == alpine.install && strings.Join(args, " ") != "socat nginx" {
+			t.Errorf("apk add %v", args)
+		}
 	}
 	if a := r.find("/usr/local/bin/microhosted-exec"); len(a) != 1 || a[0].stdin != string(agent) {
 		t.Error("the agent was not installed")
 	}
-	// Files in path order: the config (a file) first, then the directory's
-	// contents.
-	copies := r.find(`cp -a "$1"`)
-	if len(copies) != 2 || !strings.Contains(copies[0].String(), "/etc/nginx/http.d/default.conf") ||
-		!strings.Contains(copies[1].String(), `"$1"/. "$2"/`) {
-		t.Errorf("copies = %v", copies)
-	}
-	if len(r.find("mkdir -p /run/nginx")) != 1 {
-		t.Error("the run step did not run")
+	if len(r.keys) != 7 {
+		t.Errorf("%d layers kept, want 7 (FROM, PREPARE, PACKAGES, AGENT, 2 COPY, RUN)", len(r.keys))
 	}
 	mkfs := r.find("mkfs.ext4")
-	if len(mkfs) != 1 || !strings.Contains(mkfs[0].String(), "-d "+tree) || !strings.HasSuffix(mkfs[0].String(), " 82M") {
-		t.Errorf("mkfs = %v (want 40 MB used → 82M)", mkfs)
+	if len(mkfs) != 1 || mkfs[0].name != "unshare" || !slices.Contains(mkfs[0].args, finalScript) ||
+		!strings.Contains(mkfs[0].String(), "-d "+work+"/finish/merged") || !strings.HasSuffix(mkfs[0].String(), " 82M") {
+		t.Errorf("mkfs = %v (want 40 MB used → 82M, on the finished overlay)", mkfs)
 	}
-	if len(r.find("rm -rf --one-file-system "+tree)) != 1 {
-		t.Error("the tree was not removed")
+	// The image is the layers and FINISH's changes, without the scaffold.
+	if lower := mkfs[0].args[slices.Index(mkfs[0].args, finalScript)+3]; !strings.HasPrefix(lower, work+"/finish/upper:") || strings.Contains(lower, "scaffold") {
+		t.Errorf("the image's lowerdir = %s", lower)
+	}
+	for _, dir := range []string{"steps", "finish", "scaffold"} {
+		if len(r.find("rm -rf --one-file-system "+work+"/"+dir)) != 1 {
+			t.Errorf("%s was not removed", dir)
+		}
 	}
 	must(t, res.Cleanup(context.Background()))
-	if len(r.find("rm -rf --one-file-system /store/build/mh-build-abc123")) != 2 {
+	if len(r.find("rm -rf --one-file-system "+work)) != 4 {
 		t.Error("Cleanup did not remove the working directory")
 	}
 }
 
+// A second build takes every layer it can: a change reruns its step and the
+// ones after it, nothing before.
+func TestBuildCache(t *testing.T) {
+	o, r := testOptions(t, nginxSpec)
+	_, err := Build(context.Background(), o)
+	must(t, err)
+
+	r.reset()
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 1 || !strings.Contains(got[0], "/proc/net/pnp") {
+		t.Errorf("unchanged, the build ran %q: want only FINISH", got)
+	}
+	if len(r.find("tar -xzf")) != 0 {
+		t.Error("the base was unpacked again")
+	}
+
+	// A new run step: only it.
+	r.reset()
+	o.Spec = parse(t, strings.Replace(nginxSpec, `run: ["mkdir -p /run/nginx"]`, `run: ["mkdir -p /run/nginx", "nginx -t"]`, 1))
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 2 || got[0] != "nginx -t" {
+		t.Errorf("with a new run step, the build ran %q", got)
+	}
+
+	// A changed file: its COPY and what follows. The config, copied
+	// before it, is not copied again.
+	r.reset()
+	must(t, os.WriteFile(filepath.Join(o.Context, "out/index.html"), []byte("<h1>v2</h1>"), 0o644))
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	want := []string{`mkdir -p "$2" && cp -a "$1"/. "$2"/`, "mkdir -p /run/nginx", "nginx -t"}
+	if got := r.ran(); len(got) != 4 || !slices.Equal(got[:3], want) {
+		t.Errorf("with a changed file, the build ran %q", got)
+	}
+	if cp := r.find("cp -a --no-preserve=ownership"); len(cp) != 1 || !strings.Contains(cp[0].String(), "/out ") {
+		t.Errorf("staged %v: want only the changed source", cp)
+	}
+
+	// VM defaults are not in the tree: every layer is taken.
+	r.reset()
+	o.Spec.MemMB, o.Spec.Command = 256, "nginx"
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 1 {
+		t.Errorf("with new VM defaults, the build ran %q", got)
+	}
+}
+
+// A layer is reused for DefaultLayerMaxAge at most; after that, and with
+// NoCache, the build starts from the base again — and the layers on the new
+// base are new too (keys chain on the parent's id).
+func TestBuildLayerAge(t *testing.T) {
+	o, r := testOptions(t, nginxSpec)
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	first := maps.Clone(r.keys)
+
+	defer func(old func() time.Time) { now = old }(now)
+	now = func() time.Time { return time.Now().Add(DefaultLayerMaxAge + time.Hour) }
+	r.reset()
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if len(r.find("tar -xzf")) != 1 || len(r.ran()) != 8 {
+		t.Errorf("expired layers were reused: ran %q", r.ran())
+	}
+	if n := newKeys(first, r.keys); n != 6 {
+		t.Errorf("%d new keys on the rebuilt base, want 6: the steps above it", n)
+	}
+
+	now = time.Now
+	second := maps.Clone(r.keys)
+	r.reset()
+	o.NoCache = true
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if len(r.find(lookupScript)) != 0 || len(r.ran()) != 8 {
+		t.Errorf("NoCache looked up layers or skipped steps: ran %q", r.ran())
+	}
+	if n := newKeys(second, r.keys); n != 6 {
+		t.Errorf("%d new keys after NoCache, want 6", n)
+	}
+}
+
+func newKeys(before, after map[string]string) int {
+	n := 0
+	for k := range after {
+		if _, ok := before[k]; !ok {
+			n++
+		}
+	}
+	return n
+}
+
+// The store's answer is checked: a malformed id is a miss, never a path.
+func TestBuildRefusesMalformedLayer(t *testing.T) {
+	o, r := testOptions(t, "base: alpine:3.22\n")
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	for k := range r.keys {
+		r.keys[k] = "../../etc 1700000000"
+	}
+	r.reset()
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if len(r.find("tar -xzf")) != 1 {
+		t.Error("a malformed layer entry was taken")
+	}
+	for _, c := range r.calls {
+		if strings.Contains(c.String(), "../../etc") {
+			t.Errorf("the malformed id reached a command: %s", c)
+		}
+	}
+}
+
+// A failed step keeps the layers before it: the next build starts there.
 func TestBuildFailureCleansUp(t *testing.T) {
 	o, r := testOptions(t, "base: alpine:3.22\nrun: [\"false\"]\n")
-	r.fail = "false"
-	if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), `run "false"`) {
+	r.fail = `-c false`
+	if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), `RUN false`) {
 		t.Fatalf("Build = %v, want the run step's failure", err)
 	}
 	if len(r.find("rm -rf --one-file-system /store/build/mh-build-abc123")) != 1 {
 		t.Error("a failed build left its working directory")
+	}
+	if len(r.keys) != 4 {
+		t.Errorf("%d layers kept, want the 4 before the failed step", len(r.keys))
+	}
+	r.reset()
+	r.fail = ""
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 2 || got[0] != "false" {
+		t.Errorf("after a failure, the build ran %q: want the failed step and FINISH", got)
+	}
+}
+
+// What the overlays need of the store: a path overlayfs's options can
+// carry, and the layers on the working directory's filesystem.
+func TestBuildChecksStore(t *testing.T) {
+	for _, store := range []string{"/srv/a:b", "/srv/a,upperdir=/", "srv", "/srv/../etc"} {
+		o, _ := testOptions(t, "base: alpine:3.22\n")
+		o.Store = store
+		if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), "store directory") {
+			t.Errorf("store %q: %v", store, err)
+		}
+	}
+	o, r := testOptions(t, "base: alpine:3.22\n")
+	r.devices = "2049\n2050\n"
+	if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), "different filesystems") {
+		t.Errorf("layers on another filesystem: %v", err)
+	}
+}
+
+func TestBuildTooManySteps(t *testing.T) {
+	run := strings.Repeat(`"true", `, maxLayers)
+	o, _ := testOptions(t, "base: alpine:3.22\nrun: ["+run+"\"true\"]\n")
+	if _, err := Build(context.Background(), o); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Errorf("Build = %v", err)
 	}
 }
 
@@ -329,12 +582,78 @@ func TestBuildChecksRootCopy(t *testing.T) {
 	}
 }
 
+// Keys: the same step on another parent, or with other input, is another
+// key; the log's description is not the only thing that counts.
+func TestStepKey(t *testing.T) {
+	s := step{desc: "RUN x", actions: []action{{Script: "x"}}}
+	k := s.key("x86_64", "a")
+	if s.key("x86_64", "b") == k || s.key("aarch64", "a") == k {
+		t.Error("the parent or the arch does not change the key")
+	}
+	s2 := s
+	s2.actions = []action{{Script: "x", Stdin: "other"}}
+	if s2.key("x86_64", "a") == k {
+		t.Error("stdin does not change the key")
+	}
+	s3 := s
+	s3.inputs = "tree"
+	if s3.key("x86_64", "a") == k || !layerKeyRE.MatchString(k) {
+		t.Error("inputs do not change the key")
+	}
+}
+
+func TestPrune(t *testing.T) {
+	old, stale, gone, super := strings.Repeat("a", 32), strings.Repeat("b", 32), strings.Repeat("c", 32), strings.Repeat("d", 32)
+	fresh := strings.Repeat("e", 32)
+	k := func(c string) string { return strings.Repeat(c, 64) }
+	t0 := time.Now()
+	list := fmt.Sprintf("layer %s %d\nlayer %s %d\nlayer %s %d\nlayer %s %d\nlayer ../x 0\nkey %s %s\nkey %s %s\nkey %s %s\nkey %s %s\n",
+		old, t0.Add(-8*24*time.Hour).Unix(), stale, t0.Add(-2*time.Hour).Unix(), fresh, t0.Unix(), super, t0.Add(-2*time.Hour).Unix(),
+		k("1"), old, k("2"), fresh, k("3"), gone, k("4"), stale)
+	r := &listRunner{out: list}
+	res, err := Prune(context.Background(), r, "/store", PruneOptions{})
+	must(t, err)
+	// old: unused for 8 days; super: no key points at it and unused for 2 h;
+	// stale: 2 h but current; fresh: kept.
+	var rm []string
+	for _, c := range r.calls {
+		rm = append(rm, c.String())
+	}
+	want := []string{
+		"rm -rf --one-file-system /store/build/layers/" + old,
+		"rm -rf --one-file-system /store/build/layers/" + super,
+	}
+	if res.Layers != 2 || !slices.Equal(rm[:2], want) {
+		t.Errorf("removed %v", rm)
+	}
+	slices.Sort(rm)
+	if !slices.Contains(rm, "rm -f /store/build/layers/keys/"+k("1")) || !slices.Contains(rm, "rm -f /store/build/layers/keys/"+k("3")) || len(rm) != 4 {
+		t.Errorf("keys removed: %v: want the old layer's and the missing one's", rm)
+	}
+
+	r = &listRunner{out: list}
+	res, err = Prune(context.Background(), r, "/store", PruneOptions{All: true})
+	must(t, err)
+	if res.Layers != 4 || !res.Caches || len(r.find("rm -rf --one-file-system /store/build/cache")) != 1 {
+		t.Errorf("All: %+v, %v", res, r.calls)
+	}
+}
+
+type listRunner struct {
+	fakeRunner
+	out string
+}
+
+func (l *listRunner) Output(context.Context, string, ...string) ([]byte, error) {
+	return []byte(l.out), nil
+}
+
 // The image specs the orchestrator's examples build stay valid.
 func TestExampleImageSpecs(t *testing.T) {
 	files, _ := filepath.Glob("../../orchestrator/examples/*/build.yml")
-	more, _ := filepath.Glob("../../orchestrator/examples/images/*/build.yml")
+	more, _ := filepath.Glob("../../orchestrator/examples/*/*/build.yml") // images/…, stack/…
 	files = append(files, more...)
-	if len(files) < 4 {
+	if len(files) < 7 {
 		t.Fatalf("example image specs found: %v", files)
 	}
 	for _, f := range files {
@@ -351,34 +670,56 @@ func TestExampleImageSpecs(t *testing.T) {
 	}
 }
 
-// An Ubuntu base: debootstrap verified by the keyring, apt with services kept
-// from starting, systemd starting the agent, /proc unmounted before the
-// tree is written out.
+// An Ubuntu base: debootstrap (minbase) verified by the keyring in its own
+// namespaces with root's cache, apt with services kept from starting and
+// its downloads in the package cache, systemd starting the agent.
 func TestBuildUbuntu(t *testing.T) {
 	keyring := filepath.Join(t.TempDir(), "ubuntu-archive-keyring.gpg")
 	must(t, os.WriteFile(keyring, []byte("keys"), 0o644))
-	oldKeyring, oldHave, oldMounts := ubuntuKeyring, haveDebootstrap, mountsUnder
-	t.Cleanup(func() { ubuntuKeyring, haveDebootstrap, mountsUnder = oldKeyring, oldHave, oldMounts })
+	oldKeyring, oldHave := ubuntuKeyring, haveDebootstrap
+	t.Cleanup(func() { ubuntuKeyring, haveDebootstrap = oldKeyring, oldHave })
 	ubuntuKeyring, haveDebootstrap = keyring, func() bool { return true }
 
 	o, r := testOptions(t, "base: ubuntu:noble\npackages: [nginx-light]\nrun: [\"true\"]\n")
-	tree := r.work + "/tree"
-	// /proc stays mounted in the tree until the build unmounts it.
-	mountsUnder = func(dir string) []string {
-		if len(r.find("mount -t proc")) > 0 && len(r.find("umount -l "+tree+"/proc")) == 0 && strings.HasPrefix(tree, dir) {
-			return []string{tree + "/proc"}
-		}
-		return nil
-	}
 	if _, err := Build(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.find("debootstrap --keyring=" + keyring); len(d) != 1 || !strings.Contains(d[0].String(), "noble "+tree+" http://archive.ubuntu.com/ubuntu") {
+	d := r.find("debootstrap --keyring=" + keyring)
+	if len(d) != 1 || d[0].name != "unshare" || !slices.Contains(d[0].args, superviseScript) ||
+		!strings.Contains(d[0].String(), "--variant=minbase --include=systemd-sysv,udev") ||
+		!strings.Contains(d[0].String(), "--cache-dir=/store/build/cache/debootstrap-noble-amd64 noble "+r.work+"/steps/0/upper http://archive.ubuntu.com/ubuntu") {
 		t.Errorf("debootstrap = %v", d)
 	}
-	apt := r.find("apt-get install")
-	if len(apt) != 1 || !strings.Contains(apt[0].String(), "policy-rc.d") || !strings.HasSuffix(apt[0].String(), "socat nginx-light") {
-		t.Errorf("apt = %v", apt)
+	ran := r.ran()
+	if len(ran) < 3 || ran[0] != ubuntu.prepare || ran[1] != ubuntu.install {
+		t.Fatalf("ran %q", ran)
+	}
+	for _, c := range r.calls {
+		s, args, ok := c.inImage()
+		switch {
+		case !ok:
+		case s == ubuntu.prepare:
+			if !strings.Contains(c.stdin, "noble-security main universe") || !slices.Contains(c.args, "DEBIAN_FRONTEND=noninteractive") {
+				t.Errorf("prepare: %s", c)
+			}
+		case s == ubuntu.install:
+			if strings.Join(args, " ") != "socat nginx-light" {
+				t.Errorf("apt-get install %v", args)
+			}
+		}
+		if c.name == "unshare" && slices.Contains(c.args, stepScript) && c.args[slices.Index(c.args, stepScript)+7] != "/store/build/cache/ubuntu-24.04-x86_64" {
+			t.Errorf("package cache: %s", c)
+		}
+	}
+	for _, want := range []string{"policy-rc.d", "force-unsafe-io", `Dir::Cache::archives "/.mh-cache/apt/"`} {
+		if !strings.Contains(ubuntu.prepare, want) {
+			t.Errorf("prepare does not set %s", want)
+		}
+	}
+	for _, f := range []string{"policy-rc.d", "00mh-build"} {
+		if !strings.Contains(ubuntu.cleanup, f) {
+			t.Errorf("FINISH leaves %s in the image", f)
+		}
 	}
 	if len(r.find("127.0.1.1")) != 1 {
 		t.Error("the hostname does not resolve locally: every getfqdn() waits for DNS")
@@ -386,20 +727,15 @@ func TestBuildUbuntu(t *testing.T) {
 	if len(r.find("systemctl enable microhosted-exec.service")) != 1 || len(r.find("/etc/inittab")) != 0 {
 		t.Error("the agent must be a systemd unit on Ubuntu")
 	}
-	umount, mkfs := -1, -1
-	for i, c := range r.calls {
-		switch {
-		case c.name == "umount":
-			umount = i
-		case c.name == "mkfs.ext4":
-			mkfs = i
-		}
-	}
-	if umount < 0 || umount > mkfs {
-		t.Errorf("/proc unmounted at call %d, mkfs at %d", umount, mkfs)
-	}
-	if len(r.find("rm -f /dev/null")) != 0 {
-		t.Error("Ubuntu's own /dev nodes were removed")
+
+	// A new keyring is a new base.
+	first := maps.Clone(r.keys)
+	must(t, os.WriteFile(keyring, []byte("new keys"), 0o644))
+	r.reset()
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	if n := newKeys(first, r.keys); len(r.find("debootstrap --keyring")) != 1 || n != 5 {
+		t.Errorf("a new keyring reused the base built with the old one (%d new keys)", n)
 	}
 
 	haveDebootstrap = func() bool { return false }

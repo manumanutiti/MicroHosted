@@ -573,7 +573,14 @@ Stated plainly, most important first.
    build context. `plan`, `apply`, `run` and `up` build what a `build:`
    lacks, so they run those steps too. Downloads are hashed in the user's
    cache and again, by root, in a copy under the build's root-only directory;
-   root reads only that copy.
+   root reads only that copy. The build's layers and package caches are
+   root's (`STORE/build`, `0700`) — nothing root stacks or installs from is in
+   a directory the user can write — and each step runs in its own mount and PID
+   namespaces, so no process of a step outlives it to change a kept layer.
+   Those namespaces isolate the build's mounts and processes; they do not
+   confine a `run:` step, which is root. A kept layer carries the packages
+   of the day it was built for up to 7 days (`mh build --no-cache` for a fix
+   that cannot wait).
 9. **A removed tag can be bound again.** Tags never move while they exist, but
    once `mh image rm` removes a tag (or its image), the same `name:version` can
    be imported with other bytes. A pinned reference is refused if its tag
