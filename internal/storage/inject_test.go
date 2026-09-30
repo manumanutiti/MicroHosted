@@ -40,7 +40,7 @@ func TestInjectFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, size, err := o.ExtractFileStream(img, "/etc/app/parser.conf")
+	r, size, err := o.ExtractFileStream(img, "/etc/app/parser.conf", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

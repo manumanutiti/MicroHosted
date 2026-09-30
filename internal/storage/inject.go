@@ -137,21 +137,36 @@ type inodeStat struct {
 
 var (
 	statHeaderRE = regexp.MustCompile(`^debugfs: stat "(.*)"$`)
-	statTypeRE   = regexp.MustCompile(`Type: (\S+)\s+Mode:\s+([0-7]+)`)
-	statOwnerRE  = regexp.MustCompile(`User:\s+(\d+)\s+Group:\s+(\d+).*Size: (\d+)`)
+	statTypeRE   = regexp.MustCompile(`^Inode: \d+\s+Type: (\S+)\s+Mode:\s+([0-7]+)`)
+	statOwnerRE  = regexp.MustCompile(`^User:\s+(\d+)\s+Group:\s+(\d+).*\sSize: (\d+)`)
 )
 
 // parseStats reads the stdout of a debugfs script of `stat "path"` commands.
 // debugfs -f echoes each command as "debugfs: <command>" before its output,
 // which is what attributes each block to its path; a path that does not exist
 // gets a header and no fields (its error goes to stderr).
+//
+// A stat block ends with what the guest wrote — xattr values, a symlink's
+// target (printed raw, newlines and all) — so a line there can read like a
+// header field, or even a command echo. The fields are the block's first lines,
+// in the first block for a path: the type is taken only
+// from the line right after the header, the owner and size only from the
+// first "User:" line after it, and neither is ever overwritten.
 func parseStats(out string) map[string]inodeStat {
 	res := make(map[string]inodeStat)
 	cur := ""
+	n, owned := 0, false // lines into the current block; owner line seen
 	for _, line := range strings.Split(out, "\n") {
 		if m := statHeaderRE.FindStringSubmatch(line); m != nil {
+			// The first block for a path is the real one; a later "header"
+			// for it can only be guest text in a block's tail.
+			if _, seen := res[m[1]]; seen {
+				cur = ""
+				continue
+			}
 			cur = m[1]
 			res[cur] = inodeStat{}
+			n, owned = 0, false
 			continue
 		}
 		if strings.HasPrefix(line, "debugfs: ") {
@@ -161,11 +176,15 @@ func parseStats(out string) map[string]inodeStat {
 		if cur == "" {
 			continue
 		}
+		n++
 		st := res[cur]
-		if m := statTypeRE.FindStringSubmatch(line); m != nil && st.typ == "" {
-			mode, _ := strconv.ParseUint(m[2], 8, 32)
-			st.typ, st.mode = m[1], uint32(mode)
-		} else if m := statOwnerRE.FindStringSubmatch(line); m != nil {
+		if n == 1 {
+			if m := statTypeRE.FindStringSubmatch(line); m != nil {
+				mode, _ := strconv.ParseUint(m[2], 8, 32)
+				st.typ, st.mode = m[1], uint32(mode)
+			}
+		} else if m := statOwnerRE.FindStringSubmatch(line); m != nil && st.typ != "" && !owned {
+			owned = true
 			st.uid, _ = strconv.Atoi(m[1])
 			st.gid, _ = strconv.Atoi(m[2])
 			st.size, _ = strconv.ParseInt(m[3], 10, 64)

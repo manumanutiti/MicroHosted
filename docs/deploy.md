@@ -106,6 +106,7 @@ host into its OOM killer. Defaults, overridable on the daemon's command line:
 | `--quota` | none | `CONSUMER=vms:N,mem:MB` (repeatable): cap on what the VMs labelled `managed-by=CONSUMER` may hold at once (running + launching, their `mem_mb`); over it a launch is 429 |
 | `--quota-default` | none | `vms:N,mem:MB`: the quota of every labelled consumer without its own `--quota` |
 | `--disk-reserve-mb` | 1024 | store space kept free: a launch, snapshot, volume, image import or upload that would leave less is refused (503), and `host.disk_low` is raised while the store is under it |
+| `--max-extract-mb` | 4096 | largest file read off a stopped VM's disk or a detached volume, by its size in the guest (a sparse file counts in full: it is staged on the store with its holes as zeros); larger ones, or ones the store cannot stage above `--disk-reserve-mb`, are refused (503) |
 
 Every VM's disk and network throughput has a ceiling too. A VM may ask for
 less (`io_limits` on create or fork), never more; `0` lifts a limit, and the

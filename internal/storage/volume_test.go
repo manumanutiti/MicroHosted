@@ -73,7 +73,7 @@ func TestInjectAndExtractFileRoundTrip(t *testing.T) {
 // helper mirror of ExtractFileStream for assertions.
 func extractBytes(t *testing.T, imagePath, guestPath, stagingDir string) []byte {
 	t.Helper()
-	f, _, err := OfflineIO{StagingDir: stagingDir}.ExtractFileStream(imagePath, guestPath)
+	f, _, err := OfflineIO{StagingDir: stagingDir}.ExtractFileStream(imagePath, guestPath, nil)
 	if err != nil {
 		t.Fatalf("ExtractFileStream(%s): %v", guestPath, err)
 	}
@@ -116,7 +116,7 @@ func TestExtractMissingFileErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if _, _, err := (OfflineIO{StagingDir: dir}).ExtractFileStream(path, "/nope"); err == nil {
+	if _, _, err := (OfflineIO{StagingDir: dir}).ExtractFileStream(path, "/nope", nil); err == nil {
 		t.Fatal("expected error extracting a missing file, got nil")
 	}
 }
@@ -160,7 +160,7 @@ func TestInjectExtractLargeFileStreams(t *testing.T) {
 		t.Fatalf("InjectFile: %v", err)
 	}
 
-	rc, gotSize, err := oio.ExtractFileStream(path, "/big.bin")
+	rc, gotSize, err := oio.ExtractFileStream(path, "/big.bin", nil)
 	if err != nil {
 		t.Fatalf("ExtractFileStream: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestInjectionAttemptReachesNoHostFile(t *testing.T) {
 	if err := oio.InjectFile(img, evil, bytes.NewReader([]byte("p"))); err == nil {
 		t.Error("InjectFile accepted a path carrying a newline")
 	}
-	if _, _, err := oio.ExtractFileStream(img, evil); err == nil {
+	if _, _, err := oio.ExtractFileStream(img, evil, nil); err == nil {
 		t.Error("ExtractFileStream accepted a path carrying a newline")
 	}
 	if _, err := os.Stat(leak); !os.IsNotExist(err) {
