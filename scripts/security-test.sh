@@ -19,6 +19,9 @@
 #          internet without egress are unreachable; IPv6 is dead; a spoofed
 #          IP or MAC is dropped. Each has a positive control, so a broken
 #          tool cannot pass for a blocked path.
+#   quarantine  a quarantined VM's TAP is on no bridge and has no host
+#          address (IPv4 or IPv6 link-local), and — as root — the ruleset
+#          drops traffic to the host arriving on it even when it has one.
 #
 # Not disruptive: creates its own networks and VMs (label sectest=1), removed
 # at the end. Checks that need root are SKIPPED without it — run with sudo for
@@ -306,6 +309,59 @@ reach "spoofed source IP dropped" "$I1" "ip addr add $spoof/24 dev eth0 && ping 
 "$MH" exec "$I1" "ip addr del $spoof/24 dev eth0" >/dev/null 2>&1
 gx "$I1" "ping -c 2 -W 2 $i2" && pass "control: real address still works after the spoof attempt" || fail "control: real address stopped working"
 reach "spoofed MAC dropped" "$I1" "ip link set eth0 address 02:00:00:de:ad:01 && ping -c 2 -W 2 $i2"
+
+# ---------------------------------------------------------------- quarantine
+# A quarantined VM's TAP is off every bridge, which makes it an L3 interface of
+# the host: nothing may reach the host through it. Two layers, each checked on
+# its own: the TAP carries no host address (no fe80:: autoconfigured, the
+# guest's way to [::]-bound services), and the ruleset drops whatever arrives
+# on it anyway — proven by giving the TAP an address by hand, which is exactly
+# what the ruleset must not rely on anyone not doing.
+log "quarantine"
+Q1=$(mk --net sect-a)
+if [[ -z "$Q1" ]] || ! agent_up "$Q1"; then
+  fail "quarantine: test VM did not start"
+elif ! "$MH" quarantine "$Q1" >/dev/null 2>&1; then
+  fail "quarantine: mh quarantine $Q1 failed"
+else
+  qtap=$("$MH" inspect "$Q1" | jq -r '.tap_device // empty')
+  qinfo=$(ip -d link show "$qtap" 2>/dev/null)
+  if [[ -z "$qtap" || -z "$qinfo" ]]; then
+    fail "quarantine: TAP ${qtap:-?} of $Q1 not found"
+  else
+    grep -q " master " <<<"$qinfo" && fail "quarantine: TAP $qtap still has a master" || pass "quarantine: TAP $qtap on no bridge"
+    q6=$(ip -6 -o addr show dev "$qtap" 2>/dev/null)
+    [[ -z "$q6" ]] && pass "quarantine: TAP $qtap has no IPv6 address" || fail "quarantine: TAP $qtap carries $(awk '{print $4}' <<<"$q6" | paste -sd, -)"
+    q4=$(ip -4 -o addr show dev "$qtap" 2>/dev/null)
+    [[ -z "$q4" ]] && pass "quarantine: TAP $qtap has no IPv4 address" || fail "quarantine: TAP $qtap carries $(awk '{print $4}' <<<"$q4" | paste -sd, -)"
+    if [[ -d /proc/sys/net/ipv6 ]]; then
+      grep -q "addrgenmode none" <<<"$qinfo" && pass "quarantine: TAP $qtap addrgenmode none" || fail "quarantine: TAP $qtap would autoconfigure IPv6"
+    fi
+  fi
+  gx "$Q1" "true" && pass "control: quarantined VM still answers over vsock" || fail "control: quarantined VM unreachable over vsock"
+  reach "quarantine: host LAN/gateway addresses unreachable (gateway ping)" "$Q1" "ping -c 2 -W 2 $gw_a"
+  reach "quarantine: no IPv6 neighbour on the TAP answers (ff02::1)" "$Q1" "ping -6 -c 2 -W 2 ff02::1%eth0"
+
+  if root && [[ -n "$qinfo" ]]; then
+    # The ruleset alone: with host addresses on the TAP, the host would answer
+    # a ping to them — unless the input chain drops what comes in on it.
+    ip addr add 169.254.77.1/30 dev "$qtap" 2>/dev/null
+    ip -6 addr add fe80::77:1/64 dev "$qtap" nodad 2>/dev/null
+    reach "quarantine: ruleset drops IPv4 to the host on the TAP" "$Q1" "ip addr add 169.254.77.2/30 dev eth0 && ping -c 2 -W 2 -I 169.254.77.2 169.254.77.1"
+    reach "quarantine: ruleset drops IPv6 link-local to the host on the TAP" "$Q1" "ping -6 -c 2 -W 2 fe80::77:1%eth0"
+    ip addr del 169.254.77.1/30 dev "$qtap" 2>/dev/null
+    ip -6 addr del fe80::77:1/64 dev "$qtap" 2>/dev/null
+    input=$(nft list chain inet microhosted input 2>/dev/null)
+    tapdrop=$(grep -n 'iifname "tap\*" drop' <<<"$input" | cut -d: -f1 | head -1)
+    est=$(grep -n 'ct state established,related accept' <<<"$input" | cut -d: -f1 | head -1)
+    [[ -n "$tapdrop" && -n "$est" && "$tapdrop" -lt "$est" ]] && pass "input drops tap* before the established accept" || fail "input: tap* drop missing or after the established accept"
+    forward=$(nft list chain inet microhosted forward 2>/dev/null)
+    grep -q 'iifname "tap\*" drop' <<<"$forward" && grep -q 'oifname "tap\*" drop' <<<"$forward" &&
+      pass "forward drops tap* both ways" || fail "forward: tap* drops missing"
+  else
+    skip "quarantine: ruleset checks with host addresses on the TAP (need root)"
+  fi
+fi
 
 echo
 echo "$passes passed, $failures failed, $skips skipped"

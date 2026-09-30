@@ -178,6 +178,12 @@ the host:
   before any firewall is involved. (Same-bridge traffic never reaches nftables;
   this is the only layer that can separate it.)
 - or attached to **nothing**, for a quarantined VM: every frame dies at the TAP.
+  Off a bridge a TAP is an L3 interface of the host, so that takes two things:
+  the TAP never carries a host address (`addrgenmode none` from creation, IPv6
+  flushed on detach — no `fe80::` for the guest to reach `[::]`-bound services
+  through), and the ruleset drops everything arriving on or leaving through a
+  `tap*` interface (4b). `tap*` is reserved: the daemon refuses it as a managed
+  interface or an `egress_iface`.
 - or absent: a VM created with `no_network` has no NIC at all.
 
 Each bridge port is **pinned to its VM's addresses** (a `bridge microhosted`
@@ -202,6 +208,7 @@ rendered in full from the declared state and applied atomically (`nft -f`):
 | Rule | Stops |
 |---|---|
 | guest → host (`input`): **drop** from every `mhbr*` bridge | the VM reaching the API, SSH, any host service, even its own gateway address |
+| quarantine (`input`, `forward`): **drop** anything on a `tap*` interface, in `input` ahead of the established accept | a quarantined VM, whose TAP is off every bridge, reaching host services or being routed anywhere — including a flow it had open before the cut. On a bridge the IP hooks see the bridge, never the TAP, so this touches no bridged VM |
 | cross-segment (`forward`): **drop** between our bridges (one aggregated rule over sets, O(N)) | VM ↔ VM across networks |
 | **unknown bridge**: drop both ways, for any `mhbr*` the ruleset does not list | a bridge left by a crash, a network mid-create, a network whose apply failed |
 | no egress (default): **drop** towards anything that is not our bridges | calling home, scanning, pivoting to the LAN |
