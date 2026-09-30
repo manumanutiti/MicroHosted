@@ -129,14 +129,16 @@ fi
 echo "==> Installing the binary to $BIN_DST..."
 install -o root -g root -m 0755 "$BIN_SRC" "$BIN_DST"
 
-# The mh client talks to this daemon's socket; installing both together keeps
-# the CLI in step with the API it speaks. Optional so an older build dir that
-# predates cmd/mh still installs the daemon.
-CLI_SRC="$REPO_ROOT/build/mh"
-if [[ -x "$CLI_SRC" ]]; then
-  echo "==> Installing the mh client to /usr/local/bin/mh..."
-  install -o root -g root -m 0755 "$CLI_SRC" /usr/local/bin/mh
-fi
+# The clients talk to this daemon's socket; installing them together keeps
+# them in step with the API they speak: mh, and mh-orchestrator, which mh
+# up/down/plan run (and which runs mh build). Optional so an older build dir
+# that predates them still installs the daemon.
+for client in mh mh-orchestrator; do
+  if [[ -x "$REPO_ROOT/build/$client" ]]; then
+    echo "==> Installing $client to /usr/local/bin/$client..."
+    install -o root -g root -m 0755 "$REPO_ROOT/build/$client" "/usr/local/bin/$client"
+  fi
+done
 
 # State lives under /var/lib/microhosted, owned by root: the database and the
 # catalog name the paths this root daemon truncates, deletes and boots, so

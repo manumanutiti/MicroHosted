@@ -6,8 +6,8 @@ body. It is a thin client over the [HTTP API](api.md) — every command maps to
 one or two API calls and shows the daemon's own error message when one fails.
 
 It is built with the daemon (`make build` → `build/mh`) and installed with it
-(`make install-service` → `/usr/local/bin/mh`); `make install-cli` installs just
-the client.
+(`make install-service`, and so `make full-install` → `/usr/local/bin/mh`, with
+`mh-orchestrator`); `make install-cli` installs just the clients.
 
 ## Shape of a command
 
@@ -426,7 +426,8 @@ size_mb: 0                   # rootfs size; 0: its content plus a quarter and 32
 
 A plant spec (`microse.yml`, see `orchestrator/README.md`) is run with docker
 compose's verbs, on `./microse.yml` unless `-f FILE` says otherwise. `mh` hands
-them to `mh-orchestrator` (installed with it by `make install-cli`), a separate
+them to `mh-orchestrator` (installed with it by `make install-service` and
+`make install-cli`), a separate
 program with the same API access.
 
 ```bash

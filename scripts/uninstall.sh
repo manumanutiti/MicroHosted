@@ -12,10 +12,11 @@
 #   5. deletes the daemon's cgroups (/sys/fs/cgroup/microhosted and the
 #      Jailer's /sys/fs/cgroup/firecracker)
 #   6. unmounts the CoW store, removes its /etc/fstab line, and deletes the
-#      btrfs image file and all of /var/lib/microhosted (state DB and catalog
-#      included)
-#   7. deletes the installed binaries (microhosted, mh; firecracker and jailer
-#      unless KEEP_FC=1) and any state DB an older install left in the repo
+#      btrfs image file and all of /var/lib/microhosted (state DB, catalog,
+#      and mh build's layers and package caches included)
+#   7. deletes the installed binaries (microhosted, mh, mh-orchestrator;
+#      firecracker and jailer unless KEEP_FC=1) and any state DB an older
+#      install left in the repo
 #
 # Idempotent: it can be re-run over a partial installation without failing.
 #
@@ -204,8 +205,8 @@ fi
 # --- [7/7] Repo binaries and state ------------------------------------------------
 echo ""
 echo "==> [7/7] Removing binaries and the state DB..."
-run rm -f "$BIN_DIR/microhosted" "$BIN_DIR/mh"
-echo "  $BIN_DIR/{microhosted,mh}: removed"
+run rm -f "$BIN_DIR/microhosted" "$BIN_DIR/mh" "$BIN_DIR/mh-orchestrator"
+echo "  $BIN_DIR/{microhosted,mh,mh-orchestrator}: removed"
 if [[ -n "${KEEP_FC:-}" ]]; then
   echo "  firecracker/jailer: kept (KEEP_FC=1)"
 else
