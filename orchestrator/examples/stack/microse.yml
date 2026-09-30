@@ -17,7 +17,9 @@
 # What to try with the build cache (mh build -f DIR/build.yml shows the steps;
 # mh apply rebuilds what changed and replaces only those VMs):
 #   edit web/site/index.html   web: one COPY and its run steps; apk does not run
-#   edit api/app/server.js     api: COPY, useradd, npm install; apt does not run
+#   edit api/app/server.js     api: the last COPY and its check; npm install
+#                              and apt come from the cache (api/build.yml
+#                              uses steps: to install before the code)
 #   add a package to db        db: PACKAGES and after; debootstrap and the
 #                              upgrade come from the cache
 #   change mem_mb in a build.yml  every layer from the cache: only the ext4

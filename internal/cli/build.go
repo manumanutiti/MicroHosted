@@ -17,8 +17,8 @@ import (
 	"microhosted/pkg/types"
 )
 
-const imageBuildHelp = `Builds an image from an image spec (build.yml: base, packages, files, run,
-and the defaults of its VMs — command, health, vcpus, mem_mb), imports it
+const imageBuildHelp = `Builds an image from an image spec (build.yml: base, packages, files and run
+or steps, and the defaults of its VMs — command, health, vcpus, mem_mb), imports it
 into the engine's store and prints its pinned reference, NAME:VERSION@sha256:…,
 on stdout: the only thing it prints there.
 
@@ -33,7 +33,7 @@ rather than trusted: anyone who can import can bind a removed tag again.
 That is what lets a plant spec say build: instead of image: (mh-orchestrator
 builds on plan and apply, and only what changed).
 
-Each step (FROM, PACKAGES, every file, every run command) is a layer kept
+Each step (FROM, PACKAGES, every copy, every command) is a layer kept
 for the next build, as Docker's build cache: a change reruns its step and
 the ones after it, never those before — a new line in a file copies that
 file again, it does not lay the base down again. A step takes the network's

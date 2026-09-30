@@ -34,8 +34,33 @@ mem_mb: 64
 	if s.Kernel != DefaultKernel || s.VCPUs != 1 || s.MemMB != 64 {
 		t.Errorf("defaults: kernel %q vcpus %d mem %d", s.Kernel, s.VCPUs, s.MemMB)
 	}
-	if want := []string{"/etc/nginx/http.d/default.conf", "/srv/www/"}; strings.Join(s.FileOrder, ",") != strings.Join(want, ",") {
-		t.Errorf("FileOrder = %v, want %v", s.FileOrder, want)
+	// files: in guest path order, then run:.
+	want := []Op{
+		{Guest: "/etc/nginx/http.d/default.conf", Source: "nginx.conf", Where: "files[/etc/nginx/http.d/default.conf]"},
+		{Guest: "/srv/www/", Source: "out/", Where: "files[/srv/www/]"},
+		{Run: "mkdir -p /run/nginx", Where: "run[0]"},
+	}
+	if !slices.Equal(s.Ops, want) {
+		t.Errorf("Ops = %+v, want %+v", s.Ops, want)
+	}
+
+	// steps: as written.
+	s, err = Parse([]byte(`
+base: alpine:3.22
+steps:
+  - copy: {/opt/app/requirements.txt: app/requirements.txt}
+  - run: pip install -r /opt/app/requirements.txt
+  - copy: {/opt/app/: app/, /etc/app.conf: app.conf}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, op := range s.Ops {
+		got = append(got, op.Where)
+	}
+	if want := []string{"steps[0].copy[/opt/app/requirements.txt]", "steps[1].run", "steps[2].copy[/etc/app.conf]", "steps[2].copy[/opt/app/]"}; !slices.Equal(got, want) {
+		t.Errorf("steps: Ops = %v, want %v", got, want)
 	}
 
 	for name, spec := range map[string]string{
@@ -55,6 +80,14 @@ mem_mb: 64
 		"small mem":       "base: alpine:3.22\nmem_mb: 16\n",
 		"two documents":   "base: alpine:3.22\n---\nbase: alpine:3.22\n",
 		"empty run":       "base: alpine:3.22\nrun: [\"  \"]\n",
+		"steps and files": "base: alpine:3.22\nfiles: {/x: x}\nsteps: [{run: true}]\n",
+		"steps and run":   "base: alpine:3.22\nrun: [true]\nsteps: [{run: true}]\n",
+		"copy and run":    "base: alpine:3.22\nsteps: [{run: true, copy: {/x: x}}]\n",
+		"empty step":      "base: alpine:3.22\nsteps: [{}]\n",
+		"empty copy":      "base: alpine:3.22\nsteps: [{copy: {}}]\n",
+		"step unknown":    "base: alpine:3.22\nsteps: [{cmd: true}]\n",
+		"step bad guest":  "base: alpine:3.22\nsteps: [{copy: {x: x}}]\n",
+		"step source ..":  "base: alpine:3.22\nsteps: [{copy: {/x: ../x}}]\n",
 	} {
 		if _, err := Parse([]byte(spec)); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -237,6 +270,17 @@ func (f *fakeRunner) find(sub string) []call {
 	return out
 }
 
+// exact lists the calls whose command line is line.
+func (f *fakeRunner) exact(line string) []call {
+	var out []call
+	for _, c := range f.calls {
+		if c.String() == line {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // ran lists the scripts the steps ran in the image, in order.
 func (f *fakeRunner) ran() []string {
 	var out []string
@@ -370,12 +414,12 @@ func TestBuildSteps(t *testing.T) {
 		t.Errorf("the image's lowerdir = %s", lower)
 	}
 	for _, dir := range []string{"steps", "finish", "scaffold"} {
-		if len(r.find("rm -rf --one-file-system "+work+"/"+dir)) != 1 {
+		if len(r.exact("rm -rf --one-file-system "+work+"/"+dir)) != 1 {
 			t.Errorf("%s was not removed", dir)
 		}
 	}
 	must(t, res.Cleanup(context.Background()))
-	if len(r.find("rm -rf --one-file-system "+work)) != 4 {
+	if n := len(r.exact("rm -rf --one-file-system " + work)); n != 1 {
 		t.Error("Cleanup did not remove the working directory")
 	}
 }
@@ -427,6 +471,62 @@ func TestBuildCache(t *testing.T) {
 	must(t, err)
 	if got := r.ran(); len(got) != 1 {
 		t.Errorf("with new VM defaults, the build ran %q", got)
+	}
+}
+
+// steps: run in the order written, so a dependency list and its install,
+// before the code, survive a change to the code.
+func TestBuildOrderedSteps(t *testing.T) {
+	o, r := testOptions(t, `
+base: alpine:3.22
+steps:
+  - copy: {/opt/app/deps.txt: app/deps.txt}
+  - run: install-deps /opt/app/deps.txt
+  - copy: {/opt/app/: app/}
+  - run: check /opt/app
+`)
+	must(t, os.MkdirAll(filepath.Join(o.Context, "app"), 0o755))
+	must(t, os.WriteFile(filepath.Join(o.Context, "app/deps.txt"), []byte("pg\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(o.Context, "app/main.js"), []byte("v1"), 0o644))
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	fileCopy, dirCopy := `mkdir -p "$(dirname "$2")" && cp -a "$1" "$2"`, `mkdir -p "$2" && cp -a "$1"/. "$2"/`
+	if got := r.ran(); len(got) != 9 || !slices.Equal(got[4:8], []string{fileCopy, "install-deps /opt/app/deps.txt", dirCopy, "check /opt/app"}) {
+		t.Errorf("ran %q", got)
+	}
+
+	// The code changes: the install is taken from the cache.
+	r.reset()
+	must(t, os.WriteFile(filepath.Join(o.Context, "app/main.js"), []byte("v2"), 0o644))
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 3 || got[0] != dirCopy || got[1] != "check /opt/app" {
+		t.Errorf("after a code change, ran %q: want the last COPY, its check and FINISH", got)
+	}
+
+	// The dependencies change: the install runs again, and what follows.
+	r.reset()
+	must(t, os.WriteFile(filepath.Join(o.Context, "app/deps.txt"), []byte("pg\nexpress\n"), 0o644))
+	_, err = Build(context.Background(), o)
+	must(t, err)
+	if got := r.ran(); len(got) != 5 || got[1] != "install-deps /opt/app/deps.txt" {
+		t.Errorf("after a dependency change, ran %q", got)
+	}
+}
+
+// The same source copied twice is staged afresh each time, never into the
+// copy staged before.
+func TestBuildSameCopyTwice(t *testing.T) {
+	o, r := testOptions(t, "base: alpine:3.22\nsteps:\n  - copy: {/srv/www/: out/}\n  - run: rm -rf /srv/www\n  - copy: {/srv/www/: out/}\n")
+	_, err := Build(context.Background(), o)
+	must(t, err)
+	cps := r.find("cp -a --no-preserve=ownership")
+	if len(cps) != 2 || cps[0].String() != cps[1].String() {
+		t.Fatalf("staged %v", cps)
+	}
+	dst := cps[0].args[len(cps[0].args)-1]
+	if len(r.exact("rm -rf --one-file-system "+dst)) != 2 {
+		t.Error("the second copy was staged over the first")
 	}
 }
 
@@ -783,6 +883,11 @@ func TestFingerprint(t *testing.T) {
 	Bases["alpine:3.22.0"] = old
 	if repinned == fp("base: alpine:3.22\nfiles: {/srv/www/: site/}\n") {
 		t.Error("a new base pin did not change the fingerprint")
+	}
+	// steps: the order counts; files: and the steps it means are one spec.
+	ordered := fp("base: alpine:3.22\nsteps:\n  - copy: {/srv/www/: site/}\n  - run: a\n")
+	if fp("base: alpine:3.22\nsteps:\n  - run: a\n  - copy: {/srv/www/: site/}\n") == ordered {
+		t.Error("the order of steps does not change the fingerprint")
 	}
 	if v := CacheVersion(base); !strings.HasPrefix(v, "sha-") || len(v) != 16 {
 		t.Errorf("CacheVersion = %q", v)

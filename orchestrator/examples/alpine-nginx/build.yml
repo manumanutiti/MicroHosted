@@ -46,6 +46,17 @@ run:
   - mkdir -p /run/nginx
   - nginx -t                    # a broken configuration fails the build, not the deploy
 
+# Or, instead of files: and run: (which copy every file first), steps: in the
+# order they run, as a Dockerfile's COPY and RUN lines — each one a layer, so
+# a change reruns that step and those after it. Put what changes least first:
+#
+#   steps:
+#     - copy: {/etc/nginx/http.d/default.conf: nginx.conf}
+#     - run: mkdir -p /run/nginx && nginx -t
+#     - copy: {/srv/www/: site/}           # a new page: only this step runs
+#
+# (../stack/api/build.yml installs its dependencies before copying its code.)
+
 # What the image's VMs run and how they are checked. mh run starts the
 # command (as docker run starts CMD; --no-command skips it); the orchestrator
 # uses both when a plant spec's function sets no command / health; the engine

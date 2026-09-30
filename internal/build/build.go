@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -171,7 +172,7 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 	} else if f := strings.Fields(string(out)); len(f) != 2 || f[0] != f[1] {
 		return nil, fmt.Errorf("%s and %s are on different filesystems: the build's layers need one", b.layers, work)
 	}
-	if err := b.makeScaffold(len(s.FileOrder) > 0); err != nil {
+	if err := b.makeScaffold(len(sources) > 0); err != nil {
 		return nil, err
 	}
 
@@ -180,7 +181,7 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 		return nil, err
 	}
 	if len(steps) > maxLayers {
-		return nil, fmt.Errorf("%d files and run steps: a build takes at most %d", len(steps)-4, maxLayers-4)
+		return nil, fmt.Errorf("%d copies and commands: a build takes at most %d", len(steps)-4, maxLayers-4)
 	}
 	total := len(steps) + 3
 	n := 0
@@ -278,7 +279,7 @@ func Build(ctx context.Context, o Options) (res *Result, err error) {
 
 // steps are the spec's layers: FROM, PREPARE (the base brought up to date),
 // PACKAGES, AGENT, then one per file and one per run command.
-func (b *builder) steps(d distro, sources map[string]source) ([]step, error) {
+func (b *builder) steps(d distro, sources map[int]source) ([]step, error) {
 	s := b.o.Spec
 	from, err := d.fromInputs(b)
 	if err != nil {
@@ -303,35 +304,41 @@ func (b *builder) steps(d distro, sources map[string]source) ([]step, error) {
 			{Script: d.configure, Stdin: d.configureStdin},
 		}},
 	}
-	for _, guest := range s.FileOrder {
-		src := sources[guest]
-		// The staged name is the guest path's: the same file keeps its key
+	for i, op := range s.Ops {
+		if !op.IsCopy() {
+			steps = append(steps, step{desc: "RUN " + op.Run, actions: []action{{Script: op.Run}}})
+			continue
+		}
+		src := sources[i]
+		// The staged name is the copy's own: the same copy keeps its key
 		// when others are added before it.
-		staged := path.Join(staging, sha256Hex([]byte(guest))[:16])
+		staged := path.Join(staging, sha256Hex([]byte(op.Guest + "\x00" + op.Source))[:16])
 		h := sha256.New()
 		if err := hashTree(h, src.path); err != nil {
-			return nil, fmt.Errorf("files[%s]: %w", guest, err)
+			return nil, fmt.Errorf("%s: %w", op.Where, err)
 		}
 		var script string
 		switch {
 		case src.dir:
 			script = `mkdir -p "$2" && cp -a "$1"/. "$2"/`
-		case strings.HasSuffix(guest, "/"):
+		case strings.HasSuffix(op.Guest, "/"):
 			script = `mkdir -p "$2" && cp -a "$1" "$2/$3"`
 		default:
 			script = `mkdir -p "$(dirname "$2")" && cp -a "$1" "$2"`
 		}
+		dst := filepath.Join(b.scaffold, staged)
 		steps = append(steps, step{
-			desc:    fmt.Sprintf("COPY %s %s", s.Files[guest], guest),
+			desc:    fmt.Sprintf("COPY %s %s", op.Source, op.Guest),
 			inputs:  hex.EncodeToString(h.Sum(nil)),
-			actions: []action{{Script: script, Args: []string{staged, guest, filepath.Base(src.path)}}},
+			actions: []action{{Script: script, Args: []string{staged, op.Guest, filepath.Base(src.path)}}},
 			stage: func() error {
-				return b.r.Run(b.ctx, nil, "cp", "-a", "--no-preserve=ownership", src.path, filepath.Join(b.scaffold, staged))
+				// The same copy twice in steps: stage it afresh.
+				if err := b.r.Run(b.ctx, nil, "rm", "-rf", "--one-file-system", dst); err != nil {
+					return err
+				}
+				return b.r.Run(b.ctx, nil, "cp", "-a", "--no-preserve=ownership", src.path, dst)
 			},
 		})
-	}
-	for _, c := range s.Run {
-		steps = append(steps, step{desc: "RUN " + c, actions: []action{{Script: c}}})
 	}
 	return steps, nil
 }
@@ -383,12 +390,12 @@ type source struct {
 	dir  bool
 }
 
-// resolveSources finds every file source in the build context. A source
-// that resolves outside it — through a symlink too — is refused, as COPY
-// refuses it.
-func resolveSources(dir string, s *Spec) (map[string]source, error) {
-	out := map[string]source{}
-	if len(s.Files) == 0 {
+// resolveSources finds every copy's source in the build context, by the
+// copy's index in s.Ops. A source that resolves outside it — through a
+// symlink too — is refused, as COPY refuses it.
+func resolveSources(dir string, s *Spec) (map[int]source, error) {
+	out := map[int]source{}
+	if !slices.ContainsFunc(s.Ops, Op.IsCopy) {
 		return out, nil
 	}
 	root, err := filepath.EvalSymlinks(dir)
@@ -400,33 +407,36 @@ func resolveSources(dir string, s *Spec) (map[string]source, error) {
 		return nil, err
 	}
 	var errs []error
-	for _, guest := range s.FileOrder {
-		src := s.Files[guest]
+	for i, op := range s.Ops {
+		if !op.IsCopy() {
+			continue
+		}
+		guest, src, w := op.Guest, op.Source, op.Where
 		p, err := filepath.EvalSymlinks(filepath.Join(root, src))
 		if err != nil {
-			errs = append(errs, fmt.Errorf("files[%s]: %w", guest, err))
+			errs = append(errs, fmt.Errorf("%s: %w", w, err))
 			continue
 		}
 		if rel, err := filepath.Rel(root, p); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
-			errs = append(errs, fmt.Errorf("files[%s]: %s is outside the build context %s", guest, src, root))
+			errs = append(errs, fmt.Errorf("%s: %s is outside the build context %s", w, src, root))
 			continue
 		}
 		fi, err := os.Stat(p)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("files[%s]: %w", guest, err))
+			errs = append(errs, fmt.Errorf("%s: %w", w, err))
 			continue
 		}
 		if !fi.IsDir() && !fi.Mode().IsRegular() {
-			errs = append(errs, fmt.Errorf("files[%s]: %s is neither a file nor a directory", guest, src))
+			errs = append(errs, fmt.Errorf("%s: %s is neither a file nor a directory", w, src))
 			continue
 		}
 		if fi.IsDir() && !strings.HasSuffix(guest, "/") {
 			// COPY dir /path: the contents land in /path either way; say it
 			// with the slash so the spec reads as what it does.
-			errs = append(errs, fmt.Errorf("files[%s]: %s is a directory: write the guest path as %s/ (its contents are copied into it)", guest, src, guest))
+			errs = append(errs, fmt.Errorf("%s: %s is a directory: write the guest path as %s/ (its contents are copied into it)", w, src, guest))
 			continue
 		}
-		out[guest] = source{path: p, dir: fi.IsDir()}
+		out[i] = source{path: p, dir: fi.IsDir()}
 	}
 	return out, errors.Join(errs...)
 }
