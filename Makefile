@@ -92,7 +92,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 # Installs the clients: mh, and mh-orchestrator, which mh up/down/plan… run
-# (install-service installs mh too).
+# (install-service, and so full-install, installs both too).
 install-cli: build
 	sudo install -o root -g root -m 0755 $(BUILD_DIR)/$(CLI) /usr/local/bin/$(CLI)
 	sudo install -o root -g root -m 0755 $(BUILD_DIR)/$(ORCH) /usr/local/bin/$(ORCH)

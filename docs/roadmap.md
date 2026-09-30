@@ -340,8 +340,7 @@ Still open, in the order they matter:
    addresses; an ingress rule to several `to_ip` is an engine change, later.
    Today: two functions with the same `build:` do the same by hand.
 3. **`mh up -d` across reboots:** a systemd unit per project (or one that
-   starts every project's `up`), so a background `up` survives a host restart;
-   `full-install` installing `mh-orchestrator` too.
+   starts every project's `up`), so a background `up` survives a host restart.
 4. **Reproducible builds** (see "a plant spec that works on another host", 5):
    the fingerprint already gives the same *tag* on every host; the same
    *digest* needs fixed ext4 inode times, readdir order and pinned packages.
@@ -423,9 +422,10 @@ secure path is the easy one; no security property is traded for convenience.
 
 **Installation**
 
-- `mh-orchestrator` is installed with `mh` by `make install-cli` (2026-09-28;
-  `mh up`/`down`/`plan`… run it) and `mh up -d` keeps a project running in the
-  background — but not across a reboot: there is no systemd unit yet.
+- `mh-orchestrator` (which `mh up`/`down`/`plan`… run) is installed with `mh`
+  by `make install-cli` (2026-09-28) and by `make install-service`/`full-install`
+  (2026-09-30), and `mh up -d` keeps a project running in the background — but
+  not across a reboot: there is no systemd unit yet.
   `full-install` still installs `mh` only.
 - The API socket has no group by default (`SOCKET_GROUP` empty), so every `mh`
   call needs `sudo` until the user reconfigures. `full-install` should offer
