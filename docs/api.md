@@ -1141,7 +1141,13 @@ mhcurl "http://localhost/v1/volumes/VOLID/files?path=/output/result.txt" -o resu
 
 **204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing
 or invalid (see [path rules](#path-rules)) · **404** if the volume or the file
-doesn't exist · **409** if the volume is attached to a VM.
+doesn't exist · **409** if the volume is attached to a VM · **503** (GET) if the
+file is over `--max-extract-mb` or the store has no room to stage it (see below).
+
+A GET is staged on the store before it is sent, at the file's full size in the
+guest — a sparse file's holes included — so it is refused over
+`--max-extract-mb` (4096 MB), or when staging it would leave the store under
+`--disk-reserve-mb`. The same holds for a GET from a stopped VM.
 
 > **Large data**: Firecracker has no disk hot-plug, so you don't attach a volume to
 > an already-booted VM. The model is **prepare and attach**: create the volume of the
@@ -1168,7 +1174,9 @@ mhcurl "http://localhost/v1/vms/VMID/files?path=/root/output.bin" -o output.bin
 
 **204 response** (PUT) / **200** with the file (GET) · **400** if `path` is missing
 or invalid (see below) · **404** if the VM doesn't exist · **409** if the VM is
-neither `running` nor `stopped`.
+neither `running` nor `stopped` · **503** (GET, stopped VM) if the file is over
+`--max-extract-mb` or the store has no room to stage it (as for
+volumes, above).
 
 Watch the root disk's size (`disk_mb`) if you upload a large file there; for large
 data use a sized **volume**, not the rootfs.

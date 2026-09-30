@@ -51,6 +51,10 @@ type Limits struct {
 	// DiskReserveMB is the store space kept free (see diskguard.go): an
 	// operation that writes to the store is refused while it would leave less.
 	DiskReserveMB int64
+	// MaxExtractMB caps a file read off a stopped VM's disk or a detached
+	// volume (debugfs stages the whole of it on the store, and a guest makes
+	// a sparse file of any size for free); over it the read is refused.
+	MaxExtractMB int64
 	// Quotas caps each consumer (managed-by value) named in it; DefaultQuota,
 	// when set, every other labelled consumer. See quota.go.
 	Quotas       map[string]Quota
@@ -64,6 +68,7 @@ type Limits struct {
 const (
 	DefaultMemReserveMB     = 512
 	DefaultMaxParallelBoots = 4
+	DefaultMaxExtractMB     = 4096
 )
 
 // SetLimits installs the admission limits. Call once, before serving.
@@ -76,6 +81,9 @@ func (m *Manager) SetLimits(l Limits) {
 	}
 	if l.DiskReserveMB <= 0 {
 		l.DiskReserveMB = DefaultDiskReserveMB
+	}
+	if l.MaxExtractMB <= 0 {
+		l.MaxExtractMB = DefaultMaxExtractMB
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

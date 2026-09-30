@@ -71,6 +71,7 @@ func main() {
 	})
 	defaultQuota := flag.String("quota-default", "", "quota for every labelled consumer without its own --quota: `vms:N,mem:MB` (default: none)")
 	diskReserve := flag.Int64("disk-reserve-mb", vm.DefaultDiskReserveMB, "store space kept free (MB): VM launches, snapshots, volumes and image imports that would leave less are refused, and host.disk_low is raised while the store is under it")
+	maxExtract := flag.Int64("max-extract-mb", vm.DefaultMaxExtractMB, "largest file (MB, by its size in the guest, holes included) read off a stopped VM's disk or a detached volume; larger ones are refused")
 	maxVMs := flag.Int("max-vms", 0, "cap on running VMs plus launches in progress (0 = no cap)")
 	maxBoots := flag.Int("max-parallel-boots", vm.DefaultMaxParallelBoots, "launches (create/fork/start) allowed to run at once; the rest wait")
 	diskMiBs := flag.Int64("vm-disk-mib-s", vm.DefaultDiskMiBs, "ceiling on each VM drive's throughput (MiB/s); a VM may ask for less, never more; 0 lifts it")
@@ -218,7 +219,7 @@ func main() {
 		defQuota = &q
 	}
 	mgr.SetLimits(vm.Limits{MemReserveMB: *memReserve, MaxVMs: *maxVMs, MaxParallelBoots: *maxBoots, DiskReserveMB: *diskReserve,
-		Quotas: quotas, DefaultQuota: defQuota, IO: io})
+		MaxExtractMB: *maxExtract, Quotas: quotas, DefaultQuota: defQuota, IO: io})
 
 	// The content-addressed image store lives in the instances dir: clones
 	// reflink from it and the kernel is hard-linked from it into each jail.

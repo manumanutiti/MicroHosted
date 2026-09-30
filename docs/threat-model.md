@@ -373,7 +373,10 @@ The API can do everything, so who can reach it is the question.
 - **Store space:** disks are thin, so the store keeps `--disk-reserve-mb`
   (1024 MB) free: a launch, snapshot, volume, image import or upload that would
   leave less is refused (503), and `host.disk_low` is raised while the store is
-  under it. This bounds what the operator's actions can take, not what running
+  under it. An offline file read (a stopped VM's disk, a detached volume) is
+  admitted the same way at the file's guest-chosen size, holes included, and
+  capped at `--max-extract-mb`; debugfs runs under an `RLIMIT_FSIZE` of that
+  size, so a `truncate -s 16T` file cannot fill the store. This bounds what the operator's actions can take, not what running
   guests write (see §7).
 - **Per-VM caps** (Layer 3) bound what each running VM can take.
 - **The daemon survives memory pressure** (`OOMScoreAdjust=-900`), and systemd

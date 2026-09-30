@@ -145,7 +145,7 @@ func NewManager(catalog *storage.Catalog, jailerCfg jailer.Defaults, instancesDi
 		vmIO:           make(map[string]bool),
 		busy:           make(map[string]string),
 		inflight:       make(map[string]launch),
-		limits:         Limits{MemReserveMB: DefaultMemReserveMB, MaxParallelBoots: DefaultMaxParallelBoots, DiskReserveMB: DefaultDiskReserveMB},
+		limits:         Limits{MemReserveMB: DefaultMemReserveMB, MaxParallelBoots: DefaultMaxParallelBoots, DiskReserveMB: DefaultDiskReserveMB, MaxExtractMB: DefaultMaxExtractMB},
 		bootSlots:      make(chan struct{}, DefaultMaxParallelBoots),
 		memAvailable:   hostMemAvailable,
 		disk:           diskState{usage: hostinfo.ReadDiskUsage},
@@ -2204,14 +2204,10 @@ func (m *Manager) GetFileStream(id, guestPath string) (io.ReadCloser, int64, err
 		return vsock.GetFileStream(vsockPath, uid, guestPath)
 	case types.VMStateStopped:
 		// The debugfs read finishes inside ExtractFileStream (into an unlinked
-		// temp the reader wraps), so releasing the reservation here is safe even
+		// temp the reader wraps), so releasing the busy mark here is safe even
 		// though the caller reads the stream afterwards.
 		defer m.endVMDiskIO(id)
-		f, size, err := m.offlineIO(uid).ExtractFileStream(rootfs, guestPath)
-		if err != nil {
-			return nil, 0, err
-		}
-		return f, size, nil
+		return m.extractOffline("reading from the disk of vm "+id, rootfs, uid, guestPath)
 	default:
 		return nil, 0, fmt.Errorf("%w: vm %s is %s (files need it running or stopped)", ErrVMState, id, state)
 	}
@@ -2279,11 +2275,46 @@ func (m *Manager) ExtractFromVolumeStream(volID, guestPath string) (io.ReadClose
 		return nil, 0, err
 	}
 	defer m.endVolumeIO(volID)
-	f, size, err := m.offlineIO(uid).ExtractFileStream(path, guestPath)
+	return m.extractOffline("reading from volume "+volID, path, uid, guestPath)
+}
+
+// extractOffline reads guestPath out of image with debugfs, admitting its size
+// before anything is staged: a file over MaxExtractMB, or one the store cannot
+// stage above its reserve, is refused with ErrCapacity. The size is the guest's
+// i_size, not what the file occupies — a sparse 16 TB file is free to make and
+// dumps as 16 TB of zeros — so it is judged, and reserved, in full. The
+// reservation lasts as long as the staged copy: until the reader is closed.
+func (m *Manager) extractOffline(what, image string, uid int, guestPath string) (io.ReadCloser, int64, error) {
+	var release func()
+	f, size, err := m.offlineIO(uid).ExtractFileStream(image, guestPath, func(size int64) error {
+		if limit := m.Limits().MaxExtractMB; size > limit<<20 {
+			return fmt.Errorf("%w: %s: %s is %d bytes, over the %d MB limit on offline reads (--max-extract-mb)", ErrCapacity, what, guestPath, size, limit)
+		}
+		var err error
+		release, err = m.reserveDisk(what, (size+1<<20-1)>>20)
+		return err
+	})
 	if err != nil {
+		if release != nil {
+			release()
+		}
 		return nil, 0, err
 	}
-	return f, size, nil
+	return &releaseOnClose{File: f, release: release}, size, nil
+}
+
+// releaseOnClose is a staged extract that gives its disk reservation back when
+// closed, once however many times Close is called.
+type releaseOnClose struct {
+	*os.File
+	once    sync.Once
+	release func()
+}
+
+func (r *releaseOnClose) Close() error {
+	err := r.File.Close()
+	r.once.Do(r.release)
+	return err
 }
 
 // Get returns a single VM by ID.
