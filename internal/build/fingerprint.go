@@ -53,10 +53,13 @@ func Fingerprint(s *Spec, contextDir, arch string) (string, error) {
 		return "", err
 	}
 	h.Write(b)
-	for _, guest := range s.FileOrder {
-		fmt.Fprintf(h, "\x00file %s\x00", guest)
-		if err := hashTree(h, sources[guest].path); err != nil {
-			return "", fmt.Errorf("files[%s]: %w", guest, err)
+	for i, op := range s.Ops {
+		if !op.IsCopy() {
+			continue
+		}
+		fmt.Fprintf(h, "\x00file %d %s\x00", i, op.Guest)
+		if err := hashTree(h, sources[i].path); err != nil {
+			return "", fmt.Errorf("%s: %w", op.Where, err)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

@@ -312,6 +312,14 @@ line in a copied file copies that file and reruns the `run:` steps, it does
 not lay down or upgrade the base again, and a change to `command`, `health`
 or `mem_mb` — which are not in the tree — only writes the ext4 again.
 
+`files:` and `run:` copy every file before the first command, so a change to
+any file reruns every command. `steps:` lists copies and commands in the
+order they run, as a Dockerfile's lines do: copy the dependency list, install
+it, then copy the code, and a change to the code leaves the install in the
+cache (`orchestrator/examples/stack/api/build.yml`). A spec has either
+`steps:` or `files:`/`run:`; a step is `copy:` (one or more guest path ←
+source entries, with the same rules as `files:`) or `run:`, never both.
+
 - Each step runs on an overlayfs of the layers below it, chrooted, in mount,
   PID, UTS and IPC namespaces of its own: what it mounts and every process it
   starts end with it, and it does not see the host's processes. The network
@@ -363,6 +371,11 @@ files:                       # COPY: guest path ← source in the build context
   /etc/nginx/http.d/default.conf: nginx.conf   # a file (into the path when it ends in /)
 run:                         # RUN: shell commands in the image, after packages and files
   - mkdir -p /run/nginx
+# …or steps:, instead of files: and run:, in the order they run (Dockerfile order):
+# steps:
+#   - copy: {/opt/app/requirements.txt: app/requirements.txt}
+#   - run: pip install -r /opt/app/requirements.txt   # kept while requirements.txt is unchanged
+#   - copy: {/opt/app/: app/}                         # a code change reruns only this and after
 # Defaults of its VMs. command and health are for whoever runs them — mh run
 # starts the command (docker run's CMD), the orchestrator uses both when a plant
 # spec leaves them out; the engine itself runs neither.

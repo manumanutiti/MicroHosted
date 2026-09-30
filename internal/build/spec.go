@@ -29,6 +29,10 @@ import (
 //	  /etc/nginx/http.d/default.conf: nginx.conf
 //	run:
 //	  - mkdir -p /run/nginx
+//	# or, in the order they run (each a layer, as a Dockerfile's COPY and RUN):
+//	# steps:
+//	#   - copy: {/srv/www/: out/}
+//	#   - run: mkdir -p /run/nginx
 //	command: nginx -g 'daemon off;'
 //	health: { command: "wget -qO- -T 2 http://127.0.0.1/", every: 10s, timeout: 3s }
 //	mem_mb: 64
@@ -53,6 +57,11 @@ type Spec struct {
 	// Run are shell commands run in the image, in order, after packages and
 	// files, with the build host's network — Docker's RUN.
 	Run []string `yaml:"run"`
+	// Steps are copies and commands in the order they run, instead of Files
+	// and Run (which copy every file first): so that what changes least —
+	// a dependency list and its install — comes before what changes most,
+	// and a change to the code does not rerun the install.
+	Steps []Step `yaml:"steps"`
 
 	// Defaults of the VMs created from the image. Command and Health are for
 	// whoever runs them (mh run starts the command, the orchestrator uses
@@ -66,10 +75,30 @@ type Spec struct {
 	// headroom.
 	SizeMB int64 `yaml:"size_mb"`
 
-	// FileOrder lists Files' guest paths sorted, so a build copies them in
-	// the same order every time (a directory before what goes inside it).
-	FileOrder []string `yaml:"-"`
+	// Ops are the build's copies and commands in order: Steps as written,
+	// or Files sorted by guest path (a directory before what goes inside
+	// it) and then Run.
+	Ops []Op `yaml:"-" json:"-"`
 }
+
+// Step is one entry of steps: exactly one of copy (guest path ← source, as
+// Files; several are copied in guest path order) and run.
+type Step struct {
+	Copy map[string]string `yaml:"copy"`
+	Run  string            `yaml:"run"`
+}
+
+// Op is one copy (Guest ← Source) or one command (Run) of a build.
+type Op struct {
+	Guest, Source string
+	Run           string
+	// Where is where the spec says it, for errors: "files[/etc/x]",
+	// "steps[2].copy[/opt/app/]", "run[0]".
+	Where string
+}
+
+// IsCopy tells a copy from a command.
+func (o Op) IsCopy() bool { return o.Run == "" }
 
 // Health is the image's default health check.
 type Health struct {
@@ -152,8 +181,7 @@ func (s *Spec) validate() error {
 			add("packages[%d]: %q is not an apk package name (optionally with a version: nginx=1.28.0-r3)", i, p)
 		}
 	}
-	for guest, src := range s.Files {
-		w := fmt.Sprintf("files[%s]", guest)
+	checkCopy := func(w, guest, src string) {
 		if !path.IsAbs(guest) || strings.ContainsAny(guest, "\n\x00") || hasDotDot(guest) {
 			add("%s: the guest path must be absolute, without '..'", w)
 		}
@@ -165,12 +193,42 @@ func (s *Spec) validate() error {
 		} else if path.IsAbs(src) || hasDotDot(src) {
 			add("%s: %q: the source must be relative to the build context, without '..' (as COPY takes it)", w, src)
 		}
-		s.FileOrder = append(s.FileOrder, guest)
 	}
-	sort.Strings(s.FileOrder)
-	for i, c := range s.Run {
-		if strings.TrimSpace(c) == "" {
-			add("run[%d]: empty", i)
+	// copies are a map's entries in guest path order.
+	copies := func(where string, m map[string]string) {
+		for _, guest := range sortedKeys(m) {
+			w := fmt.Sprintf("%s[%s]", where, guest)
+			checkCopy(w, guest, m[guest])
+			s.Ops = append(s.Ops, Op{Guest: guest, Source: m[guest], Where: w})
+		}
+	}
+	if s.Steps != nil && (s.Files != nil || s.Run != nil) {
+		add("steps: replaces files: and run: — put the copies and commands in steps:, in the order they run")
+	}
+	s.Ops = nil
+	if s.Steps == nil {
+		copies("files", s.Files)
+		for i, c := range s.Run {
+			w := fmt.Sprintf("run[%d]", i)
+			if strings.TrimSpace(c) == "" {
+				add("%s: empty", w)
+			}
+			s.Ops = append(s.Ops, Op{Run: c, Where: w})
+		}
+	}
+	for i, st := range s.Steps {
+		w := fmt.Sprintf("steps[%d]", i)
+		switch {
+		case st.Copy != nil && st.Run != "":
+			add("%s: either copy: or run:, not both (make them two steps)", w)
+		case st.Copy != nil && len(st.Copy) == 0:
+			add("%s.copy: empty", w)
+		case st.Copy != nil:
+			copies(w+".copy", st.Copy)
+		case strings.TrimSpace(st.Run) == "":
+			add("%s: needs copy: {GUEST_PATH: SOURCE} or run: COMMAND", w)
+		default:
+			s.Ops = append(s.Ops, Op{Run: st.Run, Where: w + ".run"})
 		}
 	}
 	if err := checkCommand(s.Command); err != nil {

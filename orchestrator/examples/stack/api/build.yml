@@ -6,9 +6,10 @@
 #
 #   mh build orchestrator/examples/stack/api
 #
-# Edit app/server.js and build again: FROM, PREPARE, PACKAGES and AGENT come
-# from the cache; the COPY and the run steps run — npm install too, as it
-# comes after the files (files: are copied before run: steps).
+# steps: rather than files: and run:, so the install comes before the code:
+# edit app/server.js and build again, and only the last COPY and the check
+# run — npm install is taken from the cache with everything before it. Edit
+# app/package.json, and npm install runs again.
 
 name: stack-api
 base: ubuntu:24.04
@@ -17,13 +18,12 @@ packages:
   - nodejs
   - npm
 
-files:
-  /opt/api/: app/
-
-run:
-  - useradd --system --home /opt/api --shell /usr/sbin/nologin api
-  - cd /opt/api && npm install --omit=dev --no-audit --no-fund && npm cache clean --force
-  - node --check /opt/api/server.js && node --check /opt/api/health.js   # a syntax error fails the build
+steps:
+  - run: useradd --system --home /opt/api --shell /usr/sbin/nologin api
+  - copy: {/opt/api/package.json: app/package.json}
+  - run: cd /opt/api && npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+  - copy: {/opt/api/: app/}
+  - run: node --check /opt/api/server.js && node --check /opt/api/health.js   # a syntax error fails the build
 
 # The database's address is the plant spec's to give: ../microse.yml sets
 # the command (this one is for mh run alone, against a local database).
