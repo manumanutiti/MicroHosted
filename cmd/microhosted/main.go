@@ -50,6 +50,7 @@ func main() {
 	// everything, including DHCP.
 	hostAllowList := flag.String("managed-host-allow", "udp/67", "host services reachable from a managed interface, e.g. \"udp/67,udp/123\"; empty denies every host service")
 	addr := flag.String("addr", "", "serve on this TCP address INSTEAD of the socket — unauthenticated, exposes root-equivalent control of the host")
+	addrHosts := flag.String("addr-hosts", "", "comma-separated DNS names clients may use to reach --addr; IP addresses and localhost always work, any other Host is refused (DNS rebinding)")
 	catalogPath := flag.String("catalog", storage.DefaultCatalogPath, "path to the template catalog (JSON); must be root-owned and writable by root alone")
 	instancesDir := flag.String("instances-dir", "/var/lib/microhosted/store", "disk store (btrfs CoW): clones, goldens, kernels, and the Jailer chroot. Outside the repo on purpose: it's root-owned runtime data, not sources")
 	dbPath := flag.String("db", storage.DefaultDBPath, "path to the SQLite state database; must be root-owned and writable by root alone")
@@ -307,6 +308,9 @@ func main() {
 	ln, listeningOn, err := apiListener(*addr, *socketPath, *socketGroup)
 	if err != nil {
 		log.Fatalf("opening the API listener: %v", err)
+	}
+	if *addr != "" {
+		srv.Handler = api.GuardTCP(srv.Handler, strings.Split(*addrHosts, ","))
 	}
 
 	go func() {

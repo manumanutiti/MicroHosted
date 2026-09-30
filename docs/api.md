@@ -62,6 +62,17 @@ authentication in front of that port, so anyone who can reach it has
 root-equivalent control of the host: it is for a loopback-only dashboard or a
 tunnel, never for a segment where the workloads themselves live.
 
+A browser on the same machine can reach a loopback port, so the TCP listener
+refuses what a web page could send it:
+
+- a write whose `Origin` / `Sec-Fetch-Site` says another site sent it — `403`
+  (on the socket too; `mh`, curl and scripts send neither header);
+- a `Host` that is not an IP address, `localhost`, or a name given with
+  `--addr-hosts mh.lab.internal,...` — `403` (DNS rebinding);
+- a JSON body without `Content-Type: application/json` — `415`. Over TCP, curl
+  needs `-H 'Content-Type: application/json'`; `mh` sends it already. The Unix
+  socket accepts plain `curl -d`, as in the examples below.
+
 Status: covers create/read/delete + stop/start + exec + snapshots/fork +
 volumes/files + observability (`/v1/system`, `/v1/health`). The full CRUD
 (including "update" and create/delete nuances) is in progress.

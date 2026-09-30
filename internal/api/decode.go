@@ -48,6 +48,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any, optional bool) bo
 		writeError(w, http.StatusBadRequest, errors.New("a JSON request body is required"))
 		return false
 	}
+	if err := checkJSONType(r); err != nil {
+		writeError(w, http.StatusUnsupportedMediaType, err)
+		return false
+	}
 	if err := strictDecode(data, v); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("request body: %w", err))
 		return false

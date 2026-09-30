@@ -644,7 +644,17 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 	// No Addr: the caller owns the listener (see cmd/microhosted's apiListener),
 	// because whether this is a Unix socket or a port is an access-control
 	// decision, not an HTTP one.
-	srv := &http.Server{Handler: logRequests(mux)}
+	//
+	// CrossOriginProtection refuses a write a browser sends on behalf of a page
+	// of another origin (Sec-Fetch-Site, else Origin vs Host); mh, curl and the
+	// orchestrator send neither header and pass. No ReadTimeout/WriteTimeout:
+	// exec, file transfers and the event stream legitimately run long; only
+	// the headers and an idle keep-alive are bounded.
+	srv := &http.Server{
+		Handler:           logRequests(http.NewCrossOriginProtection().Handler(mux)),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	// Shutdown waits for open connections, and an event stream never ends on
 	// its own: close them so it doesn't wait out its whole timeout.
 	srv.RegisterOnShutdown(bus.Shutdown)
