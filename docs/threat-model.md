@@ -346,6 +346,10 @@ The API can do everything, so who can reach it is the question.
 - It never listens on a network by default. `--addr` opts into TCP, with a
   warning on every start: there is **no authentication** on it — use it only on
   loopback or behind a tunnel, never on a segment a workload or device can reach.
+  Against a browser on the host (CSRF, DNS rebinding) it refuses cross-origin
+  writes, any `Host` that is not an IP, `localhost` or an `--addr-hosts` name,
+  and JSON bodies not labelled `application/json`. Headers must arrive within
+  10 s.
 - VMs cannot reach it: the guest → host drop (Layer 4) covers every host address,
   and vsock is host-initiated only (Layer 5).
 - **Input to the firewall is validated as a security boundary**: rule fields are

@@ -26,6 +26,14 @@ import (
 // the manager before serving (e.g. to connect an image store).
 func newTestServer(t *testing.T, setup ...func(mgr *vm.Manager, st *store.Store, storeDir string)) *httptest.Server {
 	t.Helper()
+	ts := httptest.NewServer(newTestAPI(t, setup...).Handler)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// newTestAPI is newTestServer's *http.Server, unstarted.
+func newTestAPI(t *testing.T, setup ...func(mgr *vm.Manager, st *store.Store, storeDir string)) *http.Server {
+	t.Helper()
 	dir := t.TempDir()
 
 	catalogPath := filepath.Join(dir, "catalog.json")
@@ -61,9 +69,7 @@ func newTestServer(t *testing.T, setup ...func(mgr *vm.Manager, st *store.Store,
 		CatalogPath: catalogPath,
 		StartedAt:   time.Now().Add(-3 * time.Second),
 	})
-	ts := httptest.NewServer(srv.Handler)
-	t.Cleanup(ts.Close)
-	return ts
+	return srv
 }
 
 func TestSystemEndpoint(t *testing.T) {
