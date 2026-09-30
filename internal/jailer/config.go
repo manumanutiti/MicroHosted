@@ -37,6 +37,12 @@ type Defaults struct {
 	// mounted. DetectCgroupVersion below figures this out automatically;
 	// it's only a field here so it can still be forced via a flag.
 	CgroupVersion string
+
+	// CgroupMount is where the unified cgroup2 hierarchy is mounted. Empty
+	// means /sys/fs/cgroup, which is every host this targets; it is a field
+	// so other packages' tests can point the per-VM cgroup logic at a fake
+	// tree in a temp dir, without root or a real cgroupfs.
+	CgroupMount string
 }
 
 // DetectCgroupVersion inspects the host and returns "2" if the unified

@@ -30,7 +30,7 @@ func adoptedVM(t *testing.T, id string, ignoreTerm bool) (*types.VM, *exec.Cmd) 
 	go func() { _ = cmd.Wait(); close(done) }() // reap, so the pid does not linger as a zombie
 	t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
 	// Until the child has exec'd, its cmdline is the test binary's.
-	for deadline := time.Now().Add(2 * time.Second); !processAlive(cmd.Process.Pid, id); {
+	for deadline := time.Now().Add(2 * time.Second); !(&Manager{}).processAlive(cmd.Process.Pid, id); {
 		if time.Now().After(deadline) {
 			t.Fatal("stand-in process never came up")
 		}
@@ -54,7 +54,7 @@ func withAgent(t *testing.T, fn func(cmd string) (int, error)) *[]string {
 	return &calls
 }
 
-func exited(pid int, id string) bool { return !processAlive(pid, id) }
+func exited(pid int, id string) bool { return !(&Manager{}).processAlive(pid, id) }
 
 // The agent takes the request and the guest goes down: halt returns once the
 // process is gone, without signalling it.

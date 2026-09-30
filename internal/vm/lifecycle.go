@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"microhosted/internal/firecracker"
@@ -224,6 +225,13 @@ func (m *Manager) undoCreate(rec *types.VM) {
 	if pid, ok := m.findVMProcesses()[id]; ok {
 		errs = append(errs, wrapErr("stopping vm %s", id, stopByPID(pid)))
 	}
+	// And whatever is in its cgroup, found or not. If that won't empty, the
+	// VMM may still hold the volumes: nothing is released, and the record
+	// stays "creating" for the next start to retry.
+	if err := jailer.KillCgroup(m.jailerCfg, id); err != nil {
+		log.Printf("vm %s: undoing a failed create: %v; its record stays \"creating\" so the next daemon start retries", id, errors.Join(append(errs, err)...))
+		return
+	}
 	if rec.Config.TapDevice != "" {
 		errs = append(errs, network.DeleteTap(rec.Config.TapDevice))
 	}
@@ -271,7 +279,7 @@ func (m *Manager) reapDead() {
 	m.mu.Lock()
 	var dead []string
 	for id, v := range m.vms {
-		if v.State == types.VMStateRunning && m.busy[id] == "" && !processAlive(v.PID, id) {
+		if v.State == types.VMStateRunning && m.busy[id] == "" && !m.processAlive(v.PID, id) {
 			dead = append(dead, id)
 		}
 	}
@@ -294,7 +302,7 @@ func (m *Manager) reap(id string) {
 	rec, ok := m.vms[id]
 	r := m.run[id]
 	m.mu.Unlock()
-	if !ok || rec.State != types.VMStateRunning || processAlive(rec.PID, id) {
+	if !ok || rec.State != types.VMStateRunning || m.processAlive(rec.PID, id) {
 		return
 	}
 
@@ -305,6 +313,15 @@ func (m *Manager) reap(id string) {
 		if oom > 0 {
 			reason = "killed by the OOM killer (reached its cgroup memory.max)"
 		}
+	}
+
+	// The recorded PID has left the VM's cgroup, which on its own only means
+	// that PID exited. Anything still in the group — whatever the record lost
+	// track of — is killed before a single resource is released; if the group
+	// won't empty, the VM stays running and the next tick tries again.
+	if err := jailer.KillCgroup(m.jailerCfg, id); err != nil {
+		log.Printf("monitor: vm %s: pid %d is gone but its cgroup won't drain, keeping it running: %v", id, rec.PID, err)
+		return
 	}
 
 	if r != nil && r.logFile != nil {
@@ -362,8 +379,18 @@ func (m *Manager) SweepResidue() {
 		}
 		log.Printf("sweep: killed orphan firecracker pid %d (vm %s is not running)", pid, id)
 	}
+	// The process scan above goes by command line, which a VMM can rewrite;
+	// the cgroups below are the kernel's record of what still runs, so each
+	// is emptied before its residue goes. One that won't empty is left whole,
+	// and so are the volumes its VM claims.
+	undrained := make(map[string]bool)
 	for _, id := range jailer.InstanceIDs(m.jailerCfg) {
 		if _, ok := running[id]; ok {
+			continue
+		}
+		if err := jailer.KillCgroup(m.jailerCfg, id); err != nil {
+			log.Printf("sweep: vm %s: %v; leaving its jail dir", id, err)
+			undrained[id] = true
 			continue
 		}
 		if err := jailer.RemoveInstanceDir(m.jailerCfg, id); err != nil {
@@ -374,6 +401,11 @@ func (m *Manager) SweepResidue() {
 	}
 	for _, id := range jailer.CgroupIDs(m.jailerCfg) {
 		if _, ok := running[id]; ok {
+			continue
+		}
+		if err := jailer.KillCgroup(m.jailerCfg, id); err != nil {
+			log.Printf("sweep: vm %s: %v; leaving its cgroup", id, err)
+			undrained[id] = true
 			continue
 		}
 		if err := jailer.RemoveCgroup(m.jailerCfg, id); err != nil {
@@ -388,7 +420,7 @@ func (m *Manager) SweepResidue() {
 	m.mu.Lock()
 	var orphaned []*types.Volume
 	for _, vol := range m.vols {
-		if vol.AttachedTo != "" && m.vms[vol.AttachedTo] == nil {
+		if vol.AttachedTo != "" && m.vms[vol.AttachedTo] == nil && !undrained[vol.AttachedTo] {
 			log.Printf("sweep: releasing volume %s (%s), claimed by vm %s which no longer exists", vol.ID, vol.Name, vol.AttachedTo)
 			vol.AttachedTo = ""
 			orphaned = append(orphaned, vol)
@@ -497,6 +529,17 @@ func (m *Manager) ownsProcess(pid int, id string, cmdline []byte) bool {
 				return true
 			}
 		}
+	}
+	// The marks below are only ever Jailer's own, before it drops to the VM's
+	// identity and execs: a process still running as root. Anything else that
+	// shows them is a local user's process dressed up as one (its argv is
+	// whatever it says), and must not shadow — or be mistaken for — the VM's.
+	fi, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
+	if err != nil {
+		return false
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 {
+		return false
 	}
 	if root, err := os.Readlink(fmt.Sprintf("/proc/%d/root", pid)); err == nil {
 		if root == jailer.WorkspaceRoot(m.jailerCfg, id) {

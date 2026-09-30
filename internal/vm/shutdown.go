@@ -2,11 +2,13 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"log"
 	"syscall"
 	"time"
 
 	"microhosted/internal/firecracker"
+	"microhosted/internal/jailer"
 	"microhosted/internal/vsock"
 	"microhosted/pkg/types"
 )
@@ -51,9 +53,22 @@ var (
 //
 // graceful false kills outright, for a caller that discards the guest's state
 // anyway (a destroy, a restore, a replace --old destroy).
+//
+// Whatever that did — or skipped, for a record with no live PID — the VM's
+// cgroup is emptied last (jailer.KillCgroup): the record's PID and the SDK
+// handle are the daemon's view, the cgroup is the kernel's. An error wrapping
+// jailer.ErrCgroupNotDrained means something of the VM may still run: the
+// caller must keep it counted as alive and release nothing it holds.
 func (m *Manager) halt(ctx context.Context, record *types.VM, r *running, graceful bool) error {
+	err := m.endProcess(ctx, record, r, graceful)
+	return errors.Join(err, jailer.KillCgroup(m.jailerCfg, record.Config.ID))
+}
+
+func (m *Manager) endProcess(ctx context.Context, record *types.VM, r *running, graceful bool) error {
 	owned := r != nil && r.machine != nil
-	if !owned && record.PID <= 0 {
+	// An adopted VM is signalled by PID, so the PID must still be the VM's: a
+	// recycled one belongs to a stranger (root would SIGKILL it).
+	if !owned && !m.processAlive(record.PID, record.Config.ID) {
 		return nil // no process to end
 	}
 	if graceful && record.VsockPath != "" {
@@ -113,7 +128,7 @@ func (m *Manager) waitExit(ctx context.Context, record *types.VM, r *running, wi
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
 	for {
-		if syscall.Kill(record.PID, 0) == syscall.ESRCH || !processAlive(record.PID, record.Config.ID) {
+		if syscall.Kill(record.PID, 0) == syscall.ESRCH || !m.processAlive(record.PID, record.Config.ID) {
 			return true
 		}
 		select {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -40,6 +41,15 @@ import (
 // not a const, so tests can point it at a temp directory and exercise the
 // writes without root or a real cgroupfs.
 var cgroupMountPoint = "/sys/fs/cgroup"
+
+// mountPoint is the cgroup2 mount for d: Defaults.CgroupMount when set (tests
+// of other packages point it at a fake tree), cgroupMountPoint otherwise.
+func mountPoint(d Defaults) string {
+	if d.CgroupMount != "" {
+		return d.CgroupMount
+	}
+	return cgroupMountPoint
+}
 
 // ErrCgroupV1 is returned by ApplyLimits on hosts still on cgroup v1, where
 // this per-VM limit scheme doesn't apply (jailer v1 layout is per-controller
@@ -79,7 +89,7 @@ const limitsParent = "microhosted"
 // <mount>/microhosted/<vmID>. This is the daemon's tree, not the one Jailer
 // touches (see jailerCgroupDir).
 func CgroupDir(d Defaults, vmID string) string {
-	return filepath.Join(cgroupMountPoint, limitsParent, vmID)
+	return filepath.Join(mountPoint(d), limitsParent, vmID)
 }
 
 // jailerCgroupDir returns the cgroup Jailer itself creates when it got at
@@ -88,7 +98,7 @@ func CgroupDir(d Defaults, vmID string) string {
 // layout). The daemon never writes into it — ApplyLimits migrates the PID out
 // — but it's per-VM residue Jailer never removes, so RemoveCgroup must.
 func jailerCgroupDir(d Defaults, vmID string) string {
-	return filepath.Join(cgroupMountPoint, filepath.Base(d.ExecFile), vmID)
+	return filepath.Join(mountPoint(d), filepath.Base(d.ExecFile), vmID)
 }
 
 // ApplyLimits caps a freshly launched VM's host resources by writing cpu,
@@ -121,7 +131,7 @@ func ApplyLimits(d Defaults, vmID string, pid int, vcpus, memMB int64) error {
 	// an already-enabled controller is a no-op. Safe here (and only here)
 	// because no process is ever attached to <mount>/microhosted itself; see
 	// the package comment.
-	for _, anc := range []string{cgroupMountPoint, filepath.Dir(dir)} {
+	for _, anc := range []string{mountPoint(d), filepath.Dir(dir)} {
 		if err := enableControllers(anc); err != nil {
 			return err
 		}
@@ -177,6 +187,138 @@ func RemoveCgroup(d Defaults, vmID string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ErrCgroupNotDrained is returned by KillCgroup when a VM's cgroup still has
+// processes after the kill and its timeout. The VM must then keep counting as
+// alive: whatever it holds (volumes, identity, name) stays held.
+var ErrCgroupNotDrained = errors.New("vm cgroup still populated after kill")
+
+// cgroupKillTimeout bounds how long KillCgroup waits for the kernel to empty
+// a group after cgroup.kill. SIGKILL is not deferrable, so this only covers
+// exit latency (unmapping a large guest). A var so tests can shorten it.
+var cgroupKillTimeout = 5 * time.Second
+
+// InCgroup reports whether pid is a member of vmID's limits cgroup, per the
+// kernel's own cgroup.procs. This — not the process's command line, which the
+// process can rewrite from its own memory — is how the daemon decides that a
+// VM's Firecracker is alive: only root can move a process into or out of that
+// group, so a compromised VMM can't leave it, and a stranger that inherited a
+// recycled PID was never in it. False on a cgroup v1 host, where there is no
+// such group; the caller has to fall back to something weaker there.
+func InCgroup(d Defaults, vmID string, pid int) bool {
+	if d.CgroupVersion != "2" || pid <= 0 {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(CgroupDir(d, vmID), "cgroup.procs"))
+	if err != nil {
+		return false
+	}
+	want := strconv.Itoa(pid)
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// KillCgroup kills every process in vmID's per-VM cgroups — the daemon's
+// limits group and, where Jailer built one, its own per-VM child (never
+// Jailer's shared parent) — and waits until the kernel reports them empty.
+// It is the teardown step that doesn't depend on knowing the right PID: a VMM
+// that rewrote its argv, or a record whose PID is stale, still dies here.
+// cgroup.kill needs Linux 5.14; on older kernels each listed process is
+// SIGKILLed instead. A missing group (never launched, already removed) and a
+// cgroup v1 host are success. Every error wraps ErrCgroupNotDrained: a group
+// whose emptiness can't be confirmed — still populated after
+// cgroupKillTimeout, or unreadable — counts as still running.
+func KillCgroup(d Defaults, vmID string) error {
+	if d.CgroupVersion != "2" {
+		return nil
+	}
+	var errs []error
+	for _, dir := range []string{CgroupDir(d, vmID), jailerCgroupDir(d, vmID)} {
+		if err := killCgroupDir(dir); err != nil {
+			errs = append(errs, fmt.Errorf("%w: %s: %w", ErrCgroupNotDrained, dir, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func killCgroupDir(dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	}
+	deadline := time.Now().Add(cgroupKillTimeout)
+	for {
+		populated, err := cgroupPopulated(dir)
+		if err != nil {
+			return err
+		}
+		if !populated {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("still populated after %s", cgroupKillTimeout)
+		}
+		// Re-sent every round: cheap, idempotent, and it also catches a task
+		// that raced into the group after the first write.
+		if err := writeKill(dir); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("writing cgroup.kill: %w", err)
+			}
+			killListed(dir) // pre-5.14 kernel: no cgroup.kill
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// writeKill writes "1" to dir's cgroup.kill without O_CREAT: on a kernel
+// without the file, cgroupfs would refuse the create with EACCES, hiding the
+// ENOENT the fallback keys on.
+func writeKill(dir string) error {
+	f, err := os.OpenFile(filepath.Join(dir, "cgroup.kill"), os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString("1")
+	return errors.Join(err, f.Close())
+}
+
+// killListed SIGKILLs every process cgroup.procs lists — KillCgroup's fallback
+// on kernels without cgroup.kill. Not atomic against a process that forks
+// meanwhile, which the retry loop and the group's tight pids.max cover.
+func killListed(dir string) {
+	data, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// cgroupPopulated reads the "populated" key of dir's cgroup.events, which the
+// kernel clears once no process is left in the group or below it. A group
+// that vanished meanwhile is unpopulated; any other read failure is an error,
+// so a caller never mistakes "couldn't tell" for "empty".
+func cgroupPopulated(dir string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "cgroup.events"))
+	if err != nil {
+		if _, serr := os.Stat(dir); os.IsNotExist(serr) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading cgroup.events: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if key, val, ok := strings.Cut(line, " "); ok && key == "populated" {
+			return strings.TrimSpace(val) != "0", nil
+		}
+	}
+	return false, errors.New("cgroup.events has no populated key")
 }
 
 // enableControllers turns on the cpu, memory and pids controllers for dir's
@@ -280,7 +422,7 @@ func ProcessCgroupOwner(d Defaults, procCgroup []byte, vmID string) CgroupOwner 
 	if path == "" {
 		return CgroupNone
 	}
-	rel := func(dir string) string { return strings.TrimPrefix(dir, cgroupMountPoint) }
+	rel := func(dir string) string { return strings.TrimPrefix(dir, mountPoint(d)) }
 	switch path {
 	case rel(CgroupDir(d, vmID)):
 		return CgroupLimits
