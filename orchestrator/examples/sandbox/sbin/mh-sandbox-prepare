@@ -67,7 +67,7 @@ printf '//registry.npmjs.org/:_authToken=npm_%s%s\n' "$tok" "$tok" |
 printf '[pypi]\nusername = __token__\npassword = pypi-%s%s\n' "$tok" "$tok" |
 	decoy .pypirc "twine reads it to upload"
 printf 'machine api.heroku.com\n  login %s@example.com\n  password %s\n' "$U" "$tok" |
-	decoy .netrc "curl -n, ftp and some git setups read it"
+	decoy .netrc "curl -n, ftp, git setups and Python requests (looking for credentials) read it"
 printf '{\n  "auths": {\n    "ghcr.io": { "auth": "%s" }\n  }\n}\n' "$(b64 "$U:ghp_$tok")" |
 	decoy .docker/config.json "docker reads it"
 printf 'apiVersion: v1\nkind: Config\nclusters:\n- name: prod\n  cluster:\n    server: https://10.20.0.2:6443\ncontexts:\n- name: prod\n  context: {cluster: prod, user: admin}\ncurrent-context: prod\nusers:\n- name: admin\n  user:\n    token: %s%s\n' "$tok" "$tok" |

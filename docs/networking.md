@@ -329,7 +329,7 @@ to NFLOG group 77 (`network.FlowLogGroup`), with the reason in the prefix:
 | Prefix | The guest tried to reach |
 |---|---|
 | `mh drop host` | the host itself (`input`) |
-| `mh drop quarantine` | anything, from a quarantined TAP |
+| `mh drop quarantine` | anything, from a quarantined TAP — in practice, almost never (below) |
 | `mh drop egress` | outside, from a network with no egress or not to one of its `allowed_egress` |
 | `mh drop iface` | outside through an interface that is not its `egress_iface` (a VPN, Docker, a second NIC) |
 | `mh drop private` | a private or special range from a full-egress network: the LAN, the router, cloud metadata |
@@ -341,6 +341,17 @@ Nothing else is needed to read a record: the input device gives the network,
 and the source address — pinned to its TAP by the port filter — the VM. What
 arrives from outside (a managed segment's own traffic, anything towards a
 quarantined TAP) is dropped without a record.
+
+**A quarantined VM is cut off, not watched.** Its frames still carry the
+bridge's MAC as their destination, and its TAP is on no bridge: the host
+discards them as addressed to another host before netfilter sees them, so the
+`quarantine` rules rarely match anything and what the VM tries is not
+recorded (seen 2026-10-01: a quarantined guest's packets left it, none
+reached the log). To keep recording what a VM tries after cutting it off, cut
+its **network** instead (`mh network update NET --no-out`, a network of its
+own): it stays on its bridge and every attempt is dropped and recorded as
+`egress`. Recording a quarantined TAP itself would take a `netdev` ingress
+hook on it — not done.
 
 - **The policy does not change.** A log rule carries the drop's match and no
   verdict; the drop after it is the same rule as without the flow log

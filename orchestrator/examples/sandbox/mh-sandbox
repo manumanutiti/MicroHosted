@@ -8,20 +8,23 @@
 #   -f 'FETCH'    first download the dependencies, with a network: FETCH must
 #                 run nothing of the code (npm ci --ignore-scripts,
 #                 pip download --only-binary=:all: -d wheels, go mod download)
-#   -n NETWORK    the network FETCH runs on (default sbx-fetch): internet
-#                 through one interface, no private ranges, some ports only —
-#                 anything else is refused
+#   -n NETWORK    the network FETCH's is copied from (default sbx-fetch):
+#                 internet through one interface, no private ranges, some
+#                 ports only — anything else is refused
 #   -t TIMEOUT    for FETCH and COMMAND each (default 5m, at most 10m)
 #   -k            keep the VM afterwards, to look inside (mh exec, mh cp)
 #
 #   mh-sandbox ./repo 'bash install.sh'
 #   mh-sandbox -f 'npm ci --ignore-scripts' ./app 'npm rebuild && npm test'
 #
-# With -f the VM starts on NETWORK, downloads, and is quarantined — cut off
-# its network, still running — before it is prepared and COMMAND runs: the
-# code never runs with a network, and every connection it tries is refused
-# and recorded. If the network cannot be cut, nothing runs and the VM is
-# removed. Without -f the VM is on "default", which has no way out.
+# With -f the VM starts on a network of its own, a copy of NETWORK's policy,
+# downloads, and that network's way out is closed (mh network update --no-out)
+# before the VM is prepared and COMMAND runs: the code never runs with a
+# network, and — the VM still on its bridge — every connection it tries is
+# refused and recorded (mh flows). If the cut cannot be confirmed, nothing
+# runs and the VM is removed. Without -f the VM is on "default", which has no
+# way out. (Not mh quarantine: a quarantined VM is cut off but not recorded —
+# docs/networking.md, "Flow log".)
 #
 # The fetch network, once (IFACE: the host's way to the internet):
 #
@@ -60,7 +63,7 @@ if [ -n "$fetch" ]; then
 		echo "  mh network create $net --internet IFACE --ports tcp:80,tcp:443,udp:53" >&2
 		exit 1
 	}
-	NET="$net" NINFO="$ninfo" python3 -c '
+	policy=$(NET="$net" NINFO="$ninfo" python3 -c '
 import json, os, sys
 n, name = json.loads(os.environ["NINFO"]), os.environ["NET"]
 why = []
@@ -78,28 +81,38 @@ if n.get("intra"):
     why.append("its VMs reach each other (--intra)")
 if why:
     sys.exit("mh-sandbox: network %s is not fit to fetch on: %s" % (name, "; ".join(why)))
-' || exit 1
+print(n["egress_iface"], ",".join("%s:%d" % (p["protocol"], p["port"]) for p in n["egress_ports"]))
+') || exit 1
+	read -r iface ports <<<"$policy"
 fi
 
 tgz=$(mktemp --suffix=.tgz)
-trap 'rm -f "$tgz"' EXIT
-tar -czf "$tgz" -C "$dir" .
-
-say "VM ($image${fetch:+, on $net to fetch})"
-vmnet=default
-[ -z "$fetch" ] || vmnet=$net
-vm=$(mh run "$image" --net "$vmnet" --name "sbx-$(date +%H%M%S)-$$" -l managed-by=mh-sandbox --wait)
-echo "$vm" >&2
+vm= runnet=
 cleanup() {
 	rm -f "$tgz"
-	if [ -n "$keep" ]; then
-		echo "kept: $vm (mh rm $vm when done)" >&2
-	else
-		mh rm "$vm" >/dev/null && echo "removed $vm (its flows stay: mh flows $vm)" >&2
+	if [ -n "$keep" ] && [ -n "$vm" ]; then
+		echo "kept: $vm${runnet:+ on $runnet} (mh rm $vm${runnet:+; mh network rm $runnet} when done)" >&2
+		return
 	fi
+	[ -z "$vm" ] || { mh rm "$vm" >/dev/null && echo "removed $vm (its flows stay: mh flows $vm)" >&2; }
+	[ -z "$runnet" ] || mh network rm "$runnet" >/dev/null || echo "mh-sandbox: could not remove network $runnet" >&2
 }
 trap cleanup EXIT
+tar -czf "$tgz" -C "$dir" .
 
+id="$(date +%H%M%S)-$$"
+vmnet=default
+if [ -n "$fetch" ]; then
+	# A network of its own: its way out can be closed without touching
+	# anyone else's, and the VM stays on its bridge, recorded.
+	runnet=sbx-$id
+	mh network create "$runnet" --internet "$iface" --ports "$ports" -l managed-by=mh-sandbox >/dev/null
+	vmnet=$runnet
+fi
+
+say "VM ($image on $vmnet${fetch:+: internet@$iface ports $ports, to fetch})"
+vm=$(mh run "$image" --net "$vmnet" --name "sbx-$id" -l managed-by=mh-sandbox --wait)
+echo "$vm" >&2
 mh cp "$tgz" "$vm:/root/code.tgz"
 
 if [ -n "$fetch" ]; then
@@ -108,15 +121,17 @@ if [ -n "$fetch" ]; then
 	fetch_rc=0
 	mh exec -t "$timeout" "$vm" -- mh-sandbox-run --fetch "$fetch" || fetch_rc=$?
 
-	# Cut, whatever the fetch did — and check it is cut. If it is not,
-	# nothing runs: the VM goes, keep or not.
+	# Close the way out, whatever the fetch did — and confirm it on the
+	# daemon's account of the network. If not, nothing runs: the VM goes,
+	# -k or not.
 	say "cutting the network"
-	if ! mh quarantine "$vm" >/dev/null || ! mh inspect "$vm" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("quarantine") else 1)'; then
-		echo "mh-sandbox: could not cut $vm off its network: nothing runs" >&2
+	if ! mh network update "$runnet" --no-out >/dev/null ||
+		! mh network inspect "$runnet" | python3 -c 'import json,sys; n=json.load(sys.stdin); sys.exit(1 if n.get("egress") or n.get("allowed_egress") else 0)'; then
+		echo "mh-sandbox: could not close $runnet's way out: nothing runs" >&2
 		keep=
 		exit 1
 	fi
-	echo "quarantined: no network" >&2
+	echo "$runnet: no way out" >&2
 	if [ "$fetch_rc" -ne 0 ]; then
 		echo "mh-sandbox: the fetch failed (exit $fetch_rc): not running the code" >&2
 		exit "$fetch_rc"
