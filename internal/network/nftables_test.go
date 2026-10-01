@@ -11,7 +11,7 @@ import (
 func TestRenderNftablesEmpty(t *testing.T) {
 	// No networks still installs the table: the rules that keep a bridge the
 	// ruleset does not know dark must be in force at all times.
-	got := renderNftables(nil, nil)
+	got := renderNftables(nil, nil, true)
 	for _, want := range []string{
 		"delete table inet microhosted",
 		`iifname "mhbr*" drop`,
@@ -33,7 +33,7 @@ func TestRenderNftablesIsolationAndEgress(t *testing.T) {
 		{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24", Egress: false},
 		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
 	}
-	got := renderNftables(nets, nil)
+	got := renderNftables(nets, nil, true)
 
 	// guest → host is always dropped, for any bridge of ours.
 	if !strings.Contains(got, `iifname "mhbr*" drop`) {
@@ -87,7 +87,7 @@ func TestRenderNftablesEgressClosesPrivateRanges(t *testing.T) {
 		{Name: "plc", Bridge: "mhbrcccc", Subnet: "172.30.62.0/24",
 			AllowedEgress: []types.EgressRule{{IP: "192.168.0.50", Protocol: "tcp", Port: 502}}},
 	}
-	got := renderNftables(nets, nil)
+	got := renderNftables(nets, nil, true)
 	for _, r := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4"} {
 		if !strings.Contains(got, r) {
 			t.Errorf("@mhprivate lacks %s:\n%s", r, got)
@@ -119,7 +119,7 @@ func TestRenderNftablesUnknownBridgeIsDark(t *testing.T) {
 			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
 		}},
 	}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 	in := mustIndex(t, got, `iifname "mhbr*" iifname != @mhbridges drop`)
 	out := mustIndex(t, got, `oifname "mhbr*" oifname != @mhbridges drop`)
 	firstAccept := mustIndex(t, got[strings.Index(got, "chain forward"):], "accept\n") + strings.Index(got, "chain forward")
@@ -135,17 +135,15 @@ func TestRenderNftablesUnknownBridgeIsDark(t *testing.T) {
 // With no networks too: quarantine does not depend on any network existing.
 func TestRenderNftablesQuarantinedTapIsDark(t *testing.T) {
 	for _, nets := range [][]types.Network{nil, mqttNet()} {
-		got := renderNftables(nets, managedWlan())
+		got := renderNftables(nets, managedWlan(), true)
 
-		inStart := mustIndex(t, got, "chain input {")
-		input := got[inStart : inStart+strings.Index(got[inStart:], "}")]
+		input := chainBody(t, got, "input")
 		drop := mustIndex(t, input, `iifname "tap*" drop`)
 		if est := mustIndex(t, input, "ct state established,related accept"); drop > est {
 			t.Errorf("tap drop must precede the established accept in input:\n%s", input)
 		}
 
-		fwdStart := mustIndex(t, got, "chain forward {")
-		forward := got[fwdStart : fwdStart+strings.Index(got[fwdStart:], "}")]
+		forward := chainBody(t, got, "forward")
 		in := mustIndex(t, forward, `iifname "tap*" drop`)
 		out := mustIndex(t, forward, `oifname "tap*" drop`)
 		if first := strings.Index(forward, "accept\n"); first >= 0 && (in > first || out > first) {
@@ -170,7 +168,7 @@ func TestIsOwnDeviceName(t *testing.T) {
 // daemon no longer enforces.
 func TestRenderNftablesEgressWithoutIfaceIsClosed(t *testing.T) {
 	nets := []types.Network{{Name: "old", Bridge: "mhbrdddd", Subnet: "172.18.0.0/24", Egress: true}}
-	got := renderNftables(nets, nil)
+	got := renderNftables(nets, nil, true)
 	if !strings.Contains(got, `iifname "mhbrdddd" oifname != @mhbridges drop`) {
 		t.Fatalf("egress without an interface must be dropped:\n%s", got)
 	}
@@ -219,7 +217,7 @@ func TestRenderNftablesAllowedEgress(t *testing.T) {
 			{IP: "203.0.113.7", Protocol: "icmp"},
 		}},
 	}
-	got := renderNftables(nets, nil)
+	got := renderNftables(nets, nil, true)
 
 	// Each allowed flow gets an accept scoped to the bridge and the WAN.
 	for _, want := range []string{
@@ -257,15 +255,15 @@ func TestRenderNftablesScalesLinearly(t *testing.T) {
 			Subnet: fmt.Sprintf("172.16.%d.0/24", i%256),
 		}
 	}
-	got := renderNftables(nets, nil)
+	got := renderNftables(nets, nil, true)
 
 	if n := strings.Count(got, "oifname @mhbridges iifname . oifname != @mhsame drop"); n != 1 {
 		t.Fatalf("want exactly 1 aggregate cross-segment drop, got %d", n)
 	}
 	// Nothing else should scale per-pair: total drop rules stay O(N) on top of
 	// the fixed ones every ruleset carries.
-	fixed := strings.Count(renderNftables(nil, nil), "drop")
-	if n := strings.Count(got, "drop"); n > len(nets)+fixed+2 {
+	fixed := strings.Count(renderNftables(nil, nil, true), " drop\n")
+	if n := strings.Count(got, " drop\n"); n > len(nets)+fixed+2 {
 		t.Fatalf("drop rule count %d suggests per-pair rendering came back", n)
 	}
 }
@@ -281,18 +279,14 @@ func TestForwardChainMatchesStatelessly(t *testing.T) {
 		Name: "iot", Bridge: "mhbrcccc", Subnet: "172.18.0.0/24", AllowedEgress: []types.EgressRule{
 			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
 		}})
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 
-	fwdStart := strings.Index(got, "chain forward {")
-	fwdEnd := strings.Index(got[fwdStart:], "}")
-	forward := got[fwdStart : fwdStart+fwdEnd]
+	forward := chainBody(t, got, "forward")
 	if strings.Contains(forward, "ct state") {
 		t.Fatalf("forward chain must not have ct-state accepts:\n%s", forward)
 	}
 
-	inStart := strings.Index(got, "chain input {")
-	inEnd := strings.Index(got[inStart:], "}")
-	input := got[inStart : inStart+inEnd]
+	input := chainBody(t, got, "input")
 	if !strings.Contains(input, "ct state established,related accept") {
 		t.Fatalf("input chain must keep its established accept:\n%s", input)
 	}
@@ -344,13 +338,21 @@ func mustIndex(t *testing.T, script, needle string) int {
 	return i
 }
 
+// chainBody returns the rules of one chain: up to its own closing brace, not
+// the first brace in it (the flow-log rules carry a `{ … }` of their own).
+func chainBody(t *testing.T, script, name string) string {
+	t.Helper()
+	start := mustIndex(t, script, "chain "+name+" {")
+	return script[start : start+mustIndex(t, script[start:], "\n\t}\n")]
+}
+
 // TestRenderNftablesManagedIfaceDeniedByDefault: declaring an interface hands
 // the daemon its whole policy. With no network claiming anything on it, nothing
 // crosses it in either direction and nothing reaches the host through it beyond
 // the services the operator listed.
 func TestRenderNftablesManagedIfaceDeniedByDefault(t *testing.T) {
 	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 
 	for _, want := range []string{
 		`iifname "wlan0" udp dport 67 accept`,
@@ -374,7 +376,7 @@ func TestRenderNftablesManagedIfaceDeniedByDefault(t *testing.T) {
 // TestRenderNftablesManagedHostAllowIsNotAssumed: an operator whose segment is
 // addressed by something else denies every host service, DHCP included.
 func TestRenderNftablesManagedHostAllowIsNotAssumed(t *testing.T) {
-	got := renderNftables(nil, []ManagedIface{{Name: "eth1"}})
+	got := renderNftables(nil, []ManagedIface{{Name: "eth1"}}, true)
 	if strings.Contains(got, "dport 67") {
 		t.Fatalf("DHCP was opened on an interface that asked for no host service:\n%s", got)
 	}
@@ -391,7 +393,7 @@ func TestRenderNftablesIfaceRuleOrdering(t *testing.T) {
 			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
 		},
 	}}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 
 	out := mustIndex(t, got, `iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.52 tcp dport 502 accept`)
 	back := mustIndex(t, got, `iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.52 ip daddr 172.16.9.0/24 tcp sport 502 ct direction reply accept`)
@@ -425,7 +427,7 @@ func TestRenderNftablesIfaceReturnLegIsReplyOnly(t *testing.T) {
 			{Iface: "wlan0", IP: "192.168.50.0/24", Protocol: "icmp"},
 		},
 	}}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 	n := 0
 	for _, line := range strings.Split(got, "\n") {
 		if !strings.Contains(line, `iifname "wlan0" oifname "mhbrcccc"`) {
@@ -454,9 +456,9 @@ func TestRenderNftablesWANRuleCannotReachManagedSegment(t *testing.T) {
 		}},
 		{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
 	}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 	blanketOut := mustIndex(t, got, `oifname "wlan0" drop`)
-	blanketIn := mustIndex(t, got, `iifname "wlan0" drop`+"\n\t\toifname")
+	blanketIn := mustIndex(t, got, `iifname "wlan0" drop`+"\n\t\t") // forward's; input's closes the chain
 	for _, wan := range []string{
 		`iifname "mhbrcccc" oifname != @mhbridges ip daddr 192.168.50.52 meta l4proto icmp accept`,
 		`iifname "mhbrcccc" oifname != @mhbridges ip daddr 192.168.50.0/24 tcp dport 502 accept`,
@@ -477,7 +479,7 @@ func TestRenderNftablesWholeRangeOnManagedIface(t *testing.T) {
 			{Iface: "wlan0", IP: "192.168.50.0/24", Protocol: "icmp"},
 		},
 	}}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 	for _, want := range []string{
 		`iifname "mhbrcccc" oifname "wlan0" ip daddr 192.168.50.0/24 meta l4proto icmp accept`,
 		`iifname "wlan0" oifname "mhbrcccc" ip saddr 192.168.50.0/24 ip daddr 172.16.9.0/24 meta l4proto icmp ct direction reply accept`,
@@ -498,7 +500,7 @@ func TestRenderNftablesMixedDestinations(t *testing.T) {
 			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
 		},
 	}}
-	got := renderNftables(nets, managedWlan())
+	got := renderNftables(nets, managedWlan(), true)
 
 	if !strings.Contains(got, `iifname "mhbrcccc" oifname != @mhbridges ip daddr 203.0.113.7 tcp dport 8883 accept`) {
 		t.Fatalf("the WAN rule lost its old shape:\n%s", got)
@@ -530,7 +532,7 @@ func TestRenderNftablesSkipsRulesForUnmanagedIface(t *testing.T) {
 		"no managed interface":    nil,
 		"a different one managed": {{Name: "eth1"}},
 	} {
-		got := renderNftables(nets, managed)
+		got := renderNftables(nets, managed, true)
 		if strings.Contains(got, `"wlan0"`) {
 			t.Errorf("%s: a rule for unmanaged wlan0 was rendered:\n%s", name, got)
 		}
@@ -547,7 +549,7 @@ func TestRenderNftablesSkipsRulesForUnmanagedIface(t *testing.T) {
 // gets exactly the ruleset they had before this feature existed.
 func TestRenderNftablesNoManagedIfaceNoPolicy(t *testing.T) {
 	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
-	if strings.Contains(renderNftables(nets, nil), "wlan0") {
+	if strings.Contains(renderNftables(nets, nil, true), "wlan0") {
 		t.Fatal("rules rendered for an interface nobody declared")
 	}
 }
@@ -602,7 +604,7 @@ func mqttNet() []types.Network {
 // host itself never opens the port — the flow is routed to the guest, it never
 // reaches `input`.
 func TestRenderNftablesIngress(t *testing.T) {
-	got := renderNftables(mqttNet(), managedWlan())
+	got := renderNftables(mqttNet(), managedWlan(), true)
 
 	pre := mustIndex(t, got, "chain prerouting {")
 	mustIndex(t, got, "type nat hook prerouting priority -100; policy accept;")
@@ -642,7 +644,7 @@ func TestRenderNftablesIngress(t *testing.T) {
 // direction on the return leg, a compromised VM could bind the ingress port as
 // its SOURCE port and open connections to any port on the device.
 func TestRenderNftablesIngressReturnLegIsReplyOnly(t *testing.T) {
-	got := renderNftables(mqttNet(), managedWlan())
+	got := renderNftables(mqttNet(), managedWlan(), true)
 	for _, line := range strings.Split(got, "\n") {
 		if strings.Contains(line, `iifname "mhbrdddd" oifname "wlan0"`) && !strings.Contains(line, "ct direction reply") {
 			t.Fatalf("a bridge→device accept is not restricted to replies: %q", line)
@@ -654,7 +656,7 @@ func TestRenderNftablesIngressReturnLegIsReplyOnly(t *testing.T) {
 // exactly the ruleset they had before the feature existed.
 func TestRenderNftablesNoIngressNoPrerouting(t *testing.T) {
 	nets := []types.Network{{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"}}
-	if got := renderNftables(nets, managedWlan()); strings.Contains(got, "prerouting") || strings.Contains(got, "dnat") {
+	if got := renderNftables(nets, managedWlan(), true); strings.Contains(got, "prerouting") || strings.Contains(got, "dnat") {
 		t.Fatalf("a prerouting chain appeared with no ingress rules:\n%s", got)
 	}
 }
@@ -667,7 +669,7 @@ func TestRenderNftablesSkipsIngressForUnmanagedIface(t *testing.T) {
 		"no managed interface":    nil,
 		"a different one managed": {{Name: "eth1"}},
 	} {
-		got := renderNftables(mqttNet(), managed)
+		got := renderNftables(mqttNet(), managed, true)
 		if strings.Contains(got, "1883") || strings.Contains(got, "prerouting") {
 			t.Errorf("%s: an ingress rule for unmanaged wlan0 was rendered:\n%s", name, got)
 		}
@@ -755,5 +757,109 @@ func TestTuntapAddRequiresOwner(t *testing.T) {
 	want := "ip tuntap add tapdeadbeef mode tap user 1900000007 group 1900000007"
 	if got := strings.Join(args, " "); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// flowLogNets covers every logged drop: a restricted network, a full-egress
+// one (wrong interface, private ranges), a managed interface and ingress.
+func flowLogNets() []types.Network {
+	return append(mqttNet(),
+		types.Network{Name: "iot", Bridge: "mhbrcccc", Subnet: "172.18.0.0/24", AllowedEgress: []types.EgressRule{
+			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
+			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
+		}},
+		types.Network{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
+	)
+}
+
+// Recording drops must not change the policy by a single rule: the ruleset
+// with flow log, minus its log rules and their meter, is the ruleset without.
+func TestFlowLogLeavesPolicyUnchanged(t *testing.T) {
+	without := renderNftables(flowLogNets(), managedWlan(), false)
+	if strings.Contains(without, "log group") || strings.Contains(without, "mhlograte") {
+		t.Fatalf("flow log rendered although off:\n%s", without)
+	}
+	with := renderNftables(flowLogNets(), managedWlan(), true)
+	var kept []string
+	skipSet := false
+	for _, line := range strings.SplitAfter(with, "\n") {
+		switch {
+		case strings.Contains(line, "set mhlograte {"):
+			skipSet = true
+		case skipSet:
+			skipSet = !strings.HasPrefix(line, "\t}")
+		case !strings.Contains(line, "log group"):
+			kept = append(kept, line)
+		}
+	}
+	if got := strings.Join(kept, ""); got != without {
+		t.Errorf("flow log changed the policy.\nwith, minus logs:\n%s\nwithout:\n%s", got, without)
+	}
+}
+
+// A log rule never carries a verdict and a verdict never carries the limit: a
+// drop with a limit stops matching past the rate, and the packet goes on to
+// the chain's `policy accept`. Each log rule is followed by the drop it
+// records, never by an accept.
+func TestFlowLogNeverConditionsAVerdict(t *testing.T) {
+	lines := strings.Split(renderNftables(flowLogNets(), managedWlan(), true), "\n")
+	logs := 0
+	for i, line := range lines {
+		verdict := strings.HasSuffix(line, " drop") || strings.HasSuffix(line, " accept")
+		if verdict && (strings.Contains(line, "limit") || strings.Contains(line, "mhlograte") || strings.Contains(line, "log")) {
+			t.Errorf("a verdict is conditioned by the flow log: %q", line)
+		}
+		if !strings.Contains(line, "log group") {
+			continue
+		}
+		logs++
+		if verdict {
+			t.Errorf("a log rule carries a verdict: %q", line)
+		}
+		if !strings.Contains(line, "update @mhlograte { ip saddr "+flowLogLimit+" }") {
+			t.Errorf("a log rule is not rate-limited per guest: %q", line)
+		}
+		if next := lines[i+1]; !strings.HasSuffix(next, " drop") {
+			t.Errorf("log rule %q is followed by %q, not a drop", line, next)
+		}
+	}
+	if logs == 0 {
+		t.Fatal("no log rules rendered")
+	}
+}
+
+// Every drop of what a guest sent is recorded, with its reason; what arrives
+// from outside (a managed segment's chatter, traffic towards a quarantined
+// TAP) is not.
+func TestFlowLogReasons(t *testing.T) {
+	got := renderNftables(flowLogNets(), managedWlan(), true)
+	input, forward := chainBody(t, got, "input"), chainBody(t, got, "forward")
+	for chain, want := range map[string][]string{
+		input: {
+			`iifname "tap*" update @mhlograte`, `prefix "mh drop quarantine"`,
+			`iifname "mhbr*" update @mhlograte`, `prefix "mh drop host"`,
+		},
+		forward: {
+			`iifname "tap*" update @mhlograte`, `prefix "mh drop quarantine"`,
+			`iifname "mhbr*" iifname != @mhbridges update @mhlograte`, `prefix "mh drop unlisted"`,
+			`iifname . oifname != @mhsame update @mhlograte`, `prefix "mh drop cross"`,
+			`iifname @mhbridges oifname "wlan0" update @mhlograte`, `prefix "mh drop managed"`,
+			`iifname "mhbrcccc" oifname != @mhbridges update @mhlograte`, `prefix "mh drop egress"`,
+			`iifname "mhbrbbbb" oifname != @mhbridges oifname != "eth0" update @mhlograte`, `prefix "mh drop iface"`,
+			`iifname "mhbrbbbb" oifname != @mhbridges ip daddr @mhprivate update @mhlograte`, `prefix "mh drop private"`,
+		},
+	} {
+		for _, w := range want {
+			mustIndex(t, chain, w)
+		}
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.Contains(line, "log group") && (strings.Contains(line, `iifname "wlan0"`) || strings.Contains(line, "oifname \"tap*\"")) {
+			t.Errorf("traffic that no guest sent is recorded: %q", line)
+		}
+	}
+	// The meter is declared once, bounded, and forgets.
+	if strings.Count(got, "set mhlograte {") != 1 || !strings.Contains(got, "size 65536") || !strings.Contains(got, "timeout 1m") {
+		t.Errorf("meter @mhlograte missing or unbounded:\n%s", got)
 	}
 }

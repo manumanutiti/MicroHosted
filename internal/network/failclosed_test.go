@@ -273,7 +273,7 @@ func TestRenderedRulesetParses(t *testing.T) {
 	}
 	for name, nets := range cases {
 		cmd := exec.Command("nft", "-c", "-f", "-")
-		cmd.Stdin = strings.NewReader(renderNftables(nets, managedWlan()))
+		cmd.Stdin = strings.NewReader(renderNftables(nets, managedWlan(), true))
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: nft -c rejected the ruleset: %v\n%s", name, err, out)
 		}

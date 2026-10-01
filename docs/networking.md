@@ -296,6 +296,45 @@ binary isn't needed to flush anything. Replies (return traffic from the WAN)
 aren't touched by any drop (they're all scoped by bridge `iifname`), they pass via
 policy accept.
 
+### Flow log: what a guest tried and was refused
+
+Every drop of traffic a **guest sent** is preceded by a rule that records it
+to NFLOG group 77 (`network.FlowLogGroup`), with the reason in the prefix:
+
+| Prefix | The guest tried to reach |
+|---|---|
+| `mh drop host` | the host itself (`input`) |
+| `mh drop quarantine` | anything, from a quarantined TAP |
+| `mh drop egress` | outside, from a network with no egress or not to one of its `allowed_egress` |
+| `mh drop iface` | outside through an interface that is not its `egress_iface` (a VPN, Docker, a second NIC) |
+| `mh drop private` | a private or special range from a full-egress network: the LAN, the router, cloud metadata |
+| `mh drop managed` | a device on a managed segment that no rule names |
+| `mh drop cross` | another network |
+| `mh drop unlisted` | anything, from a bridge of ours the ruleset does not list |
+
+Nothing else is needed to read a record: the input device gives the network,
+and the source address — pinned to its TAP by the port filter — the VM. What
+arrives from outside (a managed segment's own traffic, anything towards a
+quarantined TAP) is dropped without a record.
+
+- **The policy does not change.** A log rule carries the drop's match and no
+  verdict; the drop after it is the same rule as without the flow log
+  (`TestFlowLogLeavesPolicyUnchanged`).
+- **Bounded.** Records are limited per guest address (10/s, burst 20) through
+  the meter `@mhlograte` (65 536 addresses, forgotten after a minute). The limit
+  is on the log rule and never on the drop: past the rate the rule does not
+  match, and a drop that does not match lets the packet on to `policy accept`
+  (`TestFlowLogNeverConditionsAVerdict`). Past the limit a guest's packets are
+  still dropped, only not recorded.
+- **Never at the policy's expense.** At the first apply the daemon checks the
+  ruleset with the log rules with `nft -c` (needs `nft_log`, `nfnetlink_log`,
+  `nft_limit` and dynamic sets). If the kernel refuses them they are not
+  rendered, and the daemon says so in its log: a rule the kernel rejects would
+  fail the whole atomic apply, and with it every network.
+
+Nothing reads group 77 yet; until the daemon does, the kernel discards the
+records.
+
 ## Egress and coexistence with the host firewall (READ — a source of subtle bugs)
 
 Internet egress for an `egress: true` network depends on **two host-level
