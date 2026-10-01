@@ -6,6 +6,7 @@ is. Each entry says what would make it worth doing. The roadmap's
 for the smaller ones, so the next person does not start from zero.
 
 - [Egress by domain name (DNS allowlist)](#egress-by-domain-name-dns-allowlist) — 2026-10-01
+- [Quarantine: cut off, but not filtered or recorded](#quarantine-cut-off-but-not-filtered-or-recorded) — 2026-10-02, **next session**
 
 ---
 
@@ -91,3 +92,60 @@ the code — with the internet but not the LAN, before the network is cut.
 It would be worth doing when long-running VMs need to reach services by name
 (an API behind a CDN, a cloud broker), or when DNS exfiltration from a
 network with a resolver allowed becomes a case to close.
+
+---
+
+## Quarantine: cut off, but not filtered or recorded
+
+**Status: to work on next (noted 2026-10-02).** Found while building the
+sandbox's fetch step (orchestrator/examples/sandbox), which now avoids
+quarantine and closes a network of its own instead.
+
+### What was measured
+
+`mh quarantine` takes a running VM's TAP off its bridge and leaves it up:
+Firecracker cannot lose a running VM's NIC, and the VM stays alive for
+forensics over vsock. On the host, the quarantined TAP is UP, has no master
+and no address, and is outside the port filter (that table only lists ports
+of bridges). Its kernel defaults are untouched (`arp_ignore=0`, IPv6 not
+disabled).
+
+1. **Not recorded.** The guest keeps sending — its ARP cache still holds the
+   gateway — but its frames carry the bridge's MAC; on a TAP with no bridge,
+   the host discards them as addressed to another host before netfilter. The
+   `quarantine` flow-log rules almost never match: what a compromised VM
+   tries after being cut off is lost, and that is evidence.
+2. **Less filtered than a VM in service.** A bridged VM's frames go through
+   the port filter (its own MAC and address only, ARP checked, anything not
+   IPv4 dropped) before the host does anything. A quarantined VM's
+   broadcasts and frames to the TAP's own MAC reach the host's stack — ARP,
+   IPv6, IPv4 defragmentation, conntrack, routing — until the `input`/
+   `forward` drop of `tap*`. No host service is reachable, but the VM trusted
+   least is the one that touches the most host kernel with the fewest checks.
+
+### Options
+
+1. **Bring the TAP down on quarantine.** The host processes nothing from it.
+   Smallest surface, simplest; nothing recorded. To check first: Firecracker
+   tolerates writes failing on a down TAP (VM alive, vsock working, no log
+   flood).
+2. **Drop on `netdev` ingress of quarantined TAPs** — the earliest hook,
+   before ARP or IP — logging to the flow-log group first. Smallest surface
+   *and* a record of what the VM tries. More engine work: a netdev chain over
+   the set of quarantined TAPs, re-rendered when it changes; parse frames,
+   not only IPv4 packets, in the reader.
+3. Remove the TAP: not possible under a running Firecracker; at best option 1,
+   more fragile.
+
+Leaning: 2, with 1 as a stopgap if it must be closed sooner.
+
+### And the sandbox's fetch
+
+`mh-sandbox` cuts a network of its own (`mh network update --no-out`) rather
+than quarantining: the VM stays on its bridge, behind the port filter, and
+every attempt is recorded as `egress`. Once quarantine filters and records
+(option 2), it becomes a second line for it: close the network, then
+quarantine, so even a VM whose network were reopened by mistake would stay
+cut off. Questions for that session: does the run need the network cut and
+quarantine both, or quarantine alone once it records; and what `mh flows`
+should show for a VM that moved from a network to quarantine mid-run.
