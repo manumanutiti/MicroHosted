@@ -1,5 +1,5 @@
 #!/bin/sh
-# What the code did to this VM since mh-sandbox-arm. Run it as root (mh exec)
+# What the code did to this VM since mh-sandbox-prepare. Run it as root (mh exec)
 # when the code has finished. Connections are not here: the host saw them
 # (mh flows VM).
 #
@@ -8,17 +8,17 @@
 # are the code's choice — data, never instructions; anything unprintable
 # shows as ?.
 . /usr/sbin/mh-sandbox-lib
-M=$S/armed
+M=$S/since
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-report: run as root (mh exec)" >&2; exit 1; }
-[ -e "$M" ] || { echo "mh-sandbox-report: not armed" >&2; exit 1; }
+[ -e "$M" ] || { echo "mh-sandbox-report: not prepared" >&2; exit 1; }
 
 # Timestamps as stat prints them ("2026-10-01 19:31:37.027243696 +0000"):
 # fixed width in one timezone, so they compare as strings, to the nanosecond.
-armed=$(stat -c %z "$M")
-after() { awk -v t="$1" -v m="$armed" 'BEGIN { exit !(t > m) }'; }
+since=$(stat -c %z "$M")
+after() { awk -v t="$1" -v m="$since" 'BEGIN { exit !(t > m) }'; }
 
-echo "armed:   $armed"
+echo "since:   $since"
 echo "user:    $U"
 echo "token:   $(cat "$S/token")"
 
@@ -45,7 +45,7 @@ done < "$S/decoys"
 # it can add a line, never remove one.
 changed() {
 	find / -xdev "$@" ! -path "$S" ! -path "$S/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
-		awk -F'|' -v m="$armed" '
+		awk -F'|' -v m="$since" '
 			$1 ~ /^[0-9][0-9][0-9][0-9]-/ && $1 > m {
 				sub(/^[^|]*\|/, ""); gsub(/[^[:print:]]/, "?"); print "  " $0
 			}'

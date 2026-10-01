@@ -1,9 +1,9 @@
 #!/bin/sh
-# Arms the sandbox: puts the decoys in the user's home and starts the clock.
+# Prepares the sandbox: puts the decoys in the user's home and starts the clock.
 # Run it as root (mh exec), once, AFTER copying the code in and BEFORE
 # running it: everything changed after this moment is reported.
 #
-#   mh-sandbox-arm [ARCHIVE]
+#   mh-sandbox-prepare [ARCHIVE]
 #
 # ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
 # unpacked into ~/work as the user and removed, before the clock starts.
@@ -15,9 +15,9 @@
 set -eu
 . /usr/sbin/mh-sandbox-lib
 
-[ "$(id -u)" = 0 ] || { echo "mh-sandbox-arm: run as root (mh exec)" >&2; exit 1; }
-[ ! -e "$S/armed" ] || { echo "mh-sandbox-arm: already armed" >&2; exit 1; }
-[ $# -eq 0 ] || [ -f "$1" ] || { echo "mh-sandbox-arm: no archive at $1" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-prepare: run as root (mh exec)" >&2; exit 1; }
+[ ! -e "$S/since" ] || { echo "mh-sandbox-prepare: already prepared" >&2; exit 1; }
+[ $# -eq 0 ] || [ -f "$1" ] || { echo "mh-sandbox-prepare: no archive at $1" >&2; exit 1; }
 
 # Every read updates atime (not just the first in a day, relatime; nor never,
 # noatime), whatever the image was mounted with.
@@ -35,10 +35,10 @@ asuser 'mkdir -p "$HOME/work"'
 # their place.
 if [ $# -gt 0 ]; then
 	# An archive tar does not unpack cleanly (GNU tar refuses members with
-	# "..") is not armed around: part of it is already unpacked, so this VM
+	# "..") is not prepared around: part of it is already unpacked, so this VM
 	# is no longer a clean start.
 	if ! asuser 'tar -xzf - -C "$HOME/work"' < "$1"; then
-		echo "mh-sandbox-arm: the archive did not unpack cleanly (tar's errors above): not armed; remove this VM and start another" >&2
+		echo "mh-sandbox-prepare: the archive did not unpack cleanly (tar's errors above): not prepared; remove this VM and start another" >&2
 		exit 1
 	fi
 	rm -f "$1"
@@ -52,7 +52,7 @@ b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
 # decoy PATH [NOTE]: installs stdin as PATH (relative to the user's home),
 # mode 600, dated in the past — the code sees credentials that have been
-# there a long time, and a read moves atime past the moment of arming. NOTE
+# there a long time, and a read moves atime past the moment of preparing. NOTE
 # says who reads that file legitimately, for whoever reads the report.
 : > "$S/decoys"
 decoy() {
@@ -98,5 +98,5 @@ printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xp
 echo "$tok" > "$S/token"
 
 # The clock: last, so that everything above is before it.
-touch "$S/armed"
-echo "armed: $(wc -l < "$S/decoys") decoys in $H, token $tok"
+touch "$S/since"
+echo "prepared: $(wc -l < "$S/decoys") decoys in $H, token $tok"

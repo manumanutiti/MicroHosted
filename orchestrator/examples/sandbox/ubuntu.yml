@@ -9,7 +9,7 @@
 #   tar -czf /tmp/code.tgz -C ./code .
 #   VM=$(mh run sandbox-ubuntu:1 --wait)
 #   mh cp /tmp/code.tgz $VM:/root/code.tgz
-#   mh exec $VM mh-sandbox-arm /root/code.tgz
+#   mh exec $VM mh-sandbox-prepare /root/code.tgz
 #   mh exec -t 5m $VM mh-sandbox-run 'npm ci && npm test'
 #   mh exec $VM mh-sandbox-report
 #   mh flows $VM
@@ -20,7 +20,7 @@
 #     serial console, and su with an empty password is root for anyone;
 #   - the code becomes dev with setpriv, not su: no PAM, no session, no log;
 #   - systemd writes nothing on its own once booted: the journal is kept in
-#     memory and every timer is masked. An armed VM where nothing runs
+#     memory and every timer is masked. A prepared VM where nothing runs
 #     reports nothing — anything in the report is the code's.
 name: sandbox-ubuntu
 base: ubuntu:24.04
@@ -39,7 +39,7 @@ packages:
 
 files:
   /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
-  /usr/sbin/mh-sandbox-arm: sbin/mh-sandbox-arm
+  /usr/sbin/mh-sandbox-prepare: sbin/mh-sandbox-prepare
   /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
 
@@ -56,8 +56,8 @@ run:
   # tmpfiles, fstrim…). What is left writing is the code.
   - mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/mh-sandbox.conf
   - systemctl list-unit-files --type=timer --no-legend | awk '{print $1}' | xargs -r systemctl mask
-  - chmod 0700 /usr/sbin/mh-sandbox-arm /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
   - chmod 0600 /usr/sbin/mh-sandbox-lib
-  - sh -n /usr/sbin/mh-sandbox-arm && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
 
 mem_mb: 512

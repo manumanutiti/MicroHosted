@@ -10,7 +10,7 @@
 #   tar -czf /tmp/code.tgz -C ./code .              # what to run (mh cp copies single files)
 #   VM=$(mh run sandbox:1 --no-net --wait)          # or a network with only what the code needs
 #   mh cp /tmp/code.tgz $VM:/root/code.tgz
-#   mh exec $VM mh-sandbox-arm /root/code.tgz       # unpacked as runner, decoys in place, the clock starts
+#   mh exec $VM mh-sandbox-prepare /root/code.tgz       # unpacked as runner, decoys in place, the clock starts
 #   mh exec -t 5m $VM mh-sandbox-run 'sh install.sh'  # as runner, no way to gain privileges
 #   mh exec $VM mh-sandbox-report                   # decoys read, files changed, processes left
 #   mh flows $VM                                    # connections it tried that the network refused
@@ -28,7 +28,7 @@ base: alpine:3.22
 
 files:
   /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
-  /usr/sbin/mh-sandbox-arm: sbin/mh-sandbox-arm
+  /usr/sbin/mh-sandbox-prepare: sbin/mh-sandbox-prepare
   /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
 
@@ -39,8 +39,8 @@ run:
   - find / -xdev -type f -perm +6000 -exec chmod ug-s {} +
   # The tools are root's: runner can neither run them nor read which files
   # are decoys.
-  - chmod 0700 /usr/sbin/mh-sandbox-arm /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
   - chmod 0600 /usr/sbin/mh-sandbox-lib
-  - sh -n /usr/sbin/mh-sandbox-arm && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
 
 mem_mb: 256
