@@ -1,11 +1,14 @@
 #!/bin/sh
-# Runs one shell line as runner, in /home/runner/work, unable to gain
-# privileges (no_new_privs: setuid and file capabilities do nothing). Its
-# exit code is the command's. Run it as root (mh exec), after mh-sandbox-arm:
+# Runs one command line as the sandbox's user, in its ~/work, unable to gain
+# privileges (no_new_privs: setuid and file capabilities do nothing), in bash
+# where there is one. Its exit code is the command's. Run it as root (mh
+# exec), after mh-sandbox-arm:
 #
 #   mh exec -t 5m VM mh-sandbox-run 'npm install && npm test'
+. /usr/sbin/mh-sandbox-lib
+
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-run: run as root (mh exec)" >&2; exit 1; }
-[ -e /var/lib/mh-sandbox/armed ] || { echo "mh-sandbox-run: not armed: run mh-sandbox-arm first" >&2; exit 1; }
+[ -e "$S/armed" ] || { echo "mh-sandbox-run: not armed: run mh-sandbox-arm first" >&2; exit 1; }
 [ $# -gt 0 ] || { echo "usage: mh-sandbox-run COMMAND..." >&2; exit 2; }
 
-MH_CMD="$*" exec su runner -s /bin/sh -c 'cd "$HOME/work" && exec setpriv --nnp sh -c "$MH_CMD"'
+asuser 'cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"

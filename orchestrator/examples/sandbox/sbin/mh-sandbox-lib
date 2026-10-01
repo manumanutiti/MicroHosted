@@ -1,0 +1,33 @@
+# Sourced by the mh-sandbox tools (root only): who the code runs as, and how
+# to become them. /etc/mh-sandbox.conf, written by the image's build, may set
+# U, the user; the default is runner.
+S=/var/lib/mh-sandbox
+U=runner
+[ ! -r /etc/mh-sandbox.conf ] || . /etc/mh-sandbox.conf
+H=/home/$U
+# The shell the code's command line runs in: bash where there is one.
+SH=/bin/sh
+[ ! -x /bin/bash ] || SH=/bin/bash
+
+# asuser SCRIPT [ARG...]: runs the sh SCRIPT as U, its arguments as $0, $1…,
+# stdin passed through, with no way to gain privileges (no_new_privs: setuid
+# bits and file capabilities do nothing).
+if setpriv --help 2>&1 | grep -q -- --reuid; then
+	# util-linux: no PAM, no session, nothing logged — the system writes
+	# nothing that the report would show — and a clean environment.
+	asuser() {
+		_s=$1
+		shift
+		setpriv --reuid="$U" --regid="$U" --init-groups --no-new-privs \
+			env -i HOME="$H" USER="$U" LOGNAME="$U" SHELL="$SH" LANG=C.UTF-8 \
+			PATH=/usr/local/bin:/usr/bin:/bin \
+			/bin/sh -c "$_s" "$@"
+	}
+else
+	# busybox: su (from root, no password), then no_new_privs.
+	asuser() {
+		_s=$1
+		shift
+		su "$U" -s /bin/sh -c 'exec setpriv --nnp /bin/sh -c "$0" "$@"' "$_s" "$@"
+	}
+fi

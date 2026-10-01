@@ -1,0 +1,63 @@
+# The sandbox on Ubuntu 24.04: for code that expects glibc — native npm
+# modules, manylinux wheels, prebuilt binaries (esbuild, Prisma, Playwright)
+# — which on Alpine's musl fails or builds differently, and would look like
+# the code's fault. Same tools and same use as build.yml (read it first);
+# the code runs as dev, in bash.
+#
+#   mh build -f orchestrator/examples/sandbox/ubuntu.yml -t sandbox-ubuntu:1 orchestrator/examples/sandbox
+#
+#   tar -czf /tmp/code.tgz -C ./code .
+#   VM=$(mh run sandbox-ubuntu:1 --wait)
+#   mh cp /tmp/code.tgz $VM:/root/code.tgz
+#   mh exec $VM mh-sandbox-arm /root/code.tgz
+#   mh exec -t 5m $VM mh-sandbox-run 'npm ci && npm test'
+#   mh exec $VM mh-sandbox-report
+#   mh flows $VM
+#   mh rm $VM
+#
+# What differs from Alpine, for the report to stay exact:
+#   - root is locked: the base leaves it with an empty password for the
+#     serial console, and su with an empty password is root for anyone;
+#   - the code becomes dev with setpriv, not su: no PAM, no session, no log;
+#   - systemd writes nothing on its own once booted: the journal is kept in
+#     memory and every timer is masked. An armed VM where nothing runs
+#     reports nothing — anything in the report is the code's.
+name: sandbox-ubuntu
+base: ubuntu:24.04
+
+# A developer's machine: git, curl, Python. Add the code's toolchain
+# (nodejs npm, golang, build-essential…). procps and iproute2 are the
+# report's (ps, ss).
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - python3
+  - python3-venv
+  - procps
+  - iproute2
+
+files:
+  /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
+  /usr/sbin/mh-sandbox-arm: sbin/mh-sandbox-arm
+  /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
+  /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
+
+run:
+  # The user the code runs as: a home from /etc/skel, bash, no password, no
+  # sudo (not installed).
+  - useradd -m -s /bin/bash dev
+  - echo U=dev > /etc/mh-sandbox.conf && chmod 0600 /etc/mh-sandbox.conf
+  - passwd -l root
+  # No setuid or setgid file anywhere (su, passwd, mount, chsh…): nothing
+  # for dev to escalate through. Root needs none of them.
+  - find / -xdev -type f -perm /6000 -exec chmod ug-s {} +
+  # Quiet once booted: the journal in memory, no timer (apt, logrotate,
+  # tmpfiles, fstrim…). What is left writing is the code.
+  - mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/mh-sandbox.conf
+  - systemctl list-unit-files --type=timer --no-legend | awk '{print $1}' | xargs -r systemctl mask
+  - chmod 0700 /usr/sbin/mh-sandbox-arm /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
+  - chmod 0600 /usr/sbin/mh-sandbox-lib
+  - sh -n /usr/sbin/mh-sandbox-arm && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
+
+mem_mb: 512

@@ -1,7 +1,9 @@
 # A VM to run code you do not trust and see what it did: the connections its
 # network refused (seen by the host), the decoy credentials it read, the files
 # it created or changed, what it left running. Alpine, nothing installed:
-# add the code's toolchain to packages (python3, nodejs npm, go…).
+# add the code's toolchain to packages (python3, nodejs npm, go…). Code that
+# expects glibc (native npm modules, manylinux wheels, prebuilt binaries)
+# belongs in the Ubuntu one: ubuntu.yml, next to this file.
 #
 #   mh build -t sandbox:1 orchestrator/examples/sandbox
 #
@@ -25,6 +27,7 @@ name: sandbox
 base: alpine:3.22
 
 files:
+  /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
   /usr/sbin/mh-sandbox-arm: sbin/mh-sandbox-arm
   /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
@@ -37,6 +40,7 @@ run:
   # The tools are root's: runner can neither run them nor read which files
   # are decoys.
   - chmod 0700 /usr/sbin/mh-sandbox-arm /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
+  - chmod 0600 /usr/sbin/mh-sandbox-lib
   - sh -n /usr/sbin/mh-sandbox-arm && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
 
 mem_mb: 256

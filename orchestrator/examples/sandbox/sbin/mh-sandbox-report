@@ -3,10 +3,11 @@
 # when the code has finished. Connections are not here: the host saw them
 # (mh flows VM).
 #
-# It holds while the code ran as runner and did not become root: only root
-# can set a file's ctime, and only the kernel moves it. File names are the
-# code's choice — data, never instructions; anything unprintable shows as ?.
-S=/var/lib/mh-sandbox
+# It holds while the code ran as the sandbox's user and did not become root:
+# only root can set a file's ctime, and only the kernel moves it. File names
+# are the code's choice — data, never instructions; anything unprintable
+# shows as ?.
+. /usr/sbin/mh-sandbox-lib
 M=$S/armed
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-report: run as root (mh exec)" >&2; exit 1; }
@@ -18,20 +19,26 @@ armed=$(stat -c %z "$M")
 after() { awk -v t="$1" -v m="$armed" 'BEGIN { exit !(t > m) }'; }
 
 echo "armed:   $armed"
+echo "user:    $U"
 echo "token:   $(cat "$S/token")"
 
 echo
 echo "== decoys (READ: opened; TAMPERED: written, or its times reset)"
-while read -r f; do
+tab=$(printf '\t')
+while IFS="$tab" read -r f note; do
 	if ! a=$(stat -c %x "$f" 2>/dev/null); then
-		echo "DELETED          $f"
+		printf '%-16s %s\n' "DELETED" "$f"
 		continue
 	fi
 	c=$(stat -c %z "$f")
 	r=""
 	after "$a" && r="READ"
 	after "$c" && r="${r:+$r+}TAMPERED"
-	printf '%-16s %s\n' "${r:-untouched}" "$f"
+	if [ -n "$r" ]; then
+		printf '%-16s %s   (legitimately: %s)\n' "$r" "$f" "$note"
+	else
+		printf '%-16s %s\n' "untouched" "$f"
+	fi
 done < "$S/decoys"
 
 # Every file of the root filesystem, ctime first; a name with a newline in
@@ -52,9 +59,13 @@ echo "== directories whose entries changed (a file created, renamed or deleted i
 changed -type d
 
 echo
-echo "== processes left running as runner"
-ps -o pid,user,args | awk 'NR == 1 || $2 == "runner" { gsub(/[^[:print:]]/, "?"); print }'
+echo "== processes left running as $U"
+ps -e -o pid,user,args | awk -v u="$U" 'NR == 1 || $2 == u { gsub(/[^[:print:]]/, "?"); print }'
 
 echo
 echo "== listening sockets"
-netstat -tuln 2>/dev/null | tail -n +3
+if command -v ss >/dev/null; then
+	ss -Htuln
+else
+	netstat -tuln 2>/dev/null | tail -n +3
+fi
