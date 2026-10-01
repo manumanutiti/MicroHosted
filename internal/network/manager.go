@@ -927,6 +927,22 @@ func (m *Manager) Rules() RulesStatus {
 	return m.rules
 }
 
+// ResolveFlow names the network whose bridge is iface and the VM holding src
+// on it — the attribution of a flow-log record (see FlowResolver). Empty when
+// iface is not one of the bridges: a quarantined TAP is the VM manager's to
+// name.
+func (m *Manager) ResolveFlow(iface, src string) (network, vm string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, mn := range m.nets {
+		if mn.net.Bridge == iface {
+			vm, _ = mn.subnet.Holder(src)
+			return name, vm
+		}
+	}
+	return "", ""
+}
+
 // Leases returns, per network, the VM IDs holding an address on it — what the
 // doctor compares against the VMs the manager tracks.
 func (m *Manager) Leases() map[string][]string {

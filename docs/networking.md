@@ -332,8 +332,29 @@ quarantined TAP) is dropped without a record.
   rendered, and the daemon says so in its log: a rule the kernel rejects would
   fail the whole atomic apply, and with it every network.
 
-Nothing reads group 77 yet; until the daemon does, the kernel discards the
-records.
+The daemon reads group 77 (`network.FlowLog`, `internal/network/flowlog.go`)
+and keeps, in memory, what each guest tried, aggregated by destination:
+verdict, reason, protocol, destination and port, with a count and the first
+and last time. The source port is not kept — each retry has a new one.
+
+- **Attributed on arrival.** The input device and the source address name the
+  network and the VM holding that address *then*; a quarantined TAP names its
+  VM directly. A VM destroyed afterwards keeps its records, and whoever gets
+  its address next does not inherit them.
+- **Bounded, earliest first.** 256 destinations per guest: past that, new
+  destinations are counted (`omitted`), not kept, so a guest cannot push its
+  first attempts out by trying many more. 4 096 guests: past that, the one
+  heard from longest ago is forgotten. When the daemon's socket fills, the
+  kernel discards records and the daemon counts the times (`overruns`).
+- **Only what is needed.** The kernel copies 64 bytes of each packet — the IP
+  header and the port — and nothing more of what the guest sent.
+- **Optional.** If the daemon cannot bind the group (no `nfnetlink_log`,
+  another reader on it) it says so and runs without: the drops are in the
+  ruleset either way.
+
+It is lost on restart. `MH_NET_E2E=1 go test ./internal/network -run EndToEnd`,
+as root in a throwaway namespace, checks it against the kernel: a guest in a
+netns on a bridge of ours, the ruleset, and the reader.
 
 ## Egress and coexistence with the host firewall (READ — a source of subtle bugs)
 

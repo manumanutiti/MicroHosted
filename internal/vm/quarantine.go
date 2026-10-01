@@ -113,3 +113,17 @@ func (m *Manager) quarantine(id string) (*types.VM, error) {
 	m.emit(types.EventVMQuarantined, &cp, "", nil)
 	return &cp, nil
 }
+
+// ByTap names the VM whose TAP is tap, and the network a quarantined one was
+// cut off from — the attribution of a flow-log record from a TAP enslaved to
+// no bridge (see network.FlowResolver). Empty when no VM has it.
+func (m *Manager) ByTap(tap string) (id, network string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, v := range m.vms {
+		if v.Config.TapDevice == tap {
+			return id, v.Config.QuarantinedFrom
+		}
+	}
+	return "", ""
+}
