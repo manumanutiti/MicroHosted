@@ -76,6 +76,9 @@ subnet** (per-network IPAM). The guest's gateway is the bridge's.
 
 ## Fine-grained egress (`allowed_egress`)
 
+Rules name addresses, not domain names; egress by name was studied and
+deferred — why, and the approach chosen for it: [not-yet.md](not-yet.md#egress-by-domain-name-dns-allowlist).
+
 Each rule is `{ip, protocol, port}`: `ip` is an IPv4 or IPv4 CIDR **in canonical
 form**, `protocol` ∈ {`tcp`, `udp`, `icmp`} (lowercase), and `port` (1–65535) is
 required for tcp/udp and forbidden for icmp. It is **mutually exclusive** with
