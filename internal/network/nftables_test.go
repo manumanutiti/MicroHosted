@@ -768,7 +768,8 @@ func flowLogNets() []types.Network {
 			{IP: "203.0.113.7", Protocol: "tcp", Port: 8883},
 			{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
 		}},
-		types.Network{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
+		types.Network{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0",
+			EgressPorts: []types.PortRule{{Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}}},
 	)
 }
 
@@ -861,5 +862,66 @@ func TestFlowLogReasons(t *testing.T) {
 	// The meter is declared once, bounded, and forgets.
 	if strings.Count(got, "set mhlograte {") != 1 || !strings.Contains(got, "size 65536") || !strings.Contains(got, "timeout 1m") {
 		t.Errorf("meter @mhlograte missing or unbounded:\n%s", got)
+	}
+}
+
+// EgressPorts narrows full egress to its ports: two drops (not tcp/udp, then
+// tcp/udp to another port) after the interface and private-range drops, and
+// never an accept — it can only take away.
+func TestRenderNftablesEgressPorts(t *testing.T) {
+	nets := []types.Network{{Name: "fetch", Bridge: "mhbrffff", Subnet: "172.19.0.0/24", Egress: true, EgressIface: "eth0",
+		EgressPorts: []types.PortRule{{Protocol: "tcp", Port: 443}, {Protocol: "tcp", Port: 80}, {Protocol: "udp", Port: 53}}}}
+	got := renderNftables(nets, nil, true)
+	forward := chainBody(t, got, "forward")
+
+	private := mustIndex(t, forward, `iifname "mhbrffff" oifname != @mhbridges ip daddr @mhprivate drop`)
+	notL4 := mustIndex(t, forward, `iifname "mhbrffff" oifname != @mhbridges meta l4proto != { tcp, udp } drop`)
+	notPort := mustIndex(t, forward, `iifname "mhbrffff" oifname != @mhbridges meta l4proto . th dport != { tcp . 443, tcp . 80, udp . 53 } drop`)
+	if !(private < notL4 && notL4 < notPort) {
+		t.Errorf("port drops must follow the private-range drop:\n%s", forward)
+	}
+	if strings.Count(forward, `prefix "mh drop port"`) != 2 {
+		t.Errorf("both port drops must be recorded:\n%s", forward)
+	}
+	for _, line := range strings.Split(forward, "\n") {
+		if strings.Contains(line, "mhbrffff") && strings.HasSuffix(line, " accept") {
+			t.Errorf("egress ports added an accept: %q", line)
+		}
+	}
+
+	// Without ports, nothing of it.
+	nets[0].EgressPorts = nil
+	if got := renderNftables(nets, nil, true); strings.Contains(got, "th dport") || strings.Contains(got, "l4proto != { tcp, udp }") {
+		t.Errorf("port drops rendered for a network without egress ports:\n%s", got)
+	}
+}
+
+func TestValidateEgressPorts(t *testing.T) {
+	ok := []types.PortRule{{Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}}
+	if err := ValidateEgressPorts(true, ok); err != nil {
+		t.Errorf("valid ports refused: %v", err)
+	}
+	if err := ValidateEgressPorts(false, nil); err != nil {
+		t.Errorf("no ports refused: %v", err)
+	}
+	many := make([]types.PortRule, maxEgressPorts+1)
+	for i := range many {
+		many[i] = types.PortRule{Protocol: "tcp", Port: i + 1}
+	}
+	for name, c := range map[string]struct {
+		egress bool
+		ports  []types.PortRule
+	}{
+		"without egress": {false, ok},
+		"icmp":           {true, []types.PortRule{{Protocol: "icmp", Port: 0}}},
+		"port 0":         {true, []types.PortRule{{Protocol: "tcp", Port: 0}}},
+		"port too high":  {true, []types.PortRule{{Protocol: "udp", Port: 65536}}},
+		"twice":          {true, []types.PortRule{{Protocol: "tcp", Port: 443}, {Protocol: "tcp", Port: 443}}},
+		"too many":       {true, many},
+		"injection":      {true, []types.PortRule{{Protocol: "tcp } accept #", Port: 1}}},
+	} {
+		if err := ValidateEgressPorts(c.egress, c.ports); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

@@ -153,6 +153,7 @@ Everything not listed is dropped, both ways. (The API calls these
 mh network create lab                       # isolated: nothing in or out, VMs can't see each other
 mh network create build --internet eth0     # the internet, through eth0 only (NAT); not the LAN
 mh network create dev --internet eth0 --private   # the LAN behind eth0 too
+mh network create fetch --internet eth0 --ports tcp:80,tcp:443,udp:53   # the internet on these ports only
 mh network create lab2 --intra --subnet 10.10.0.0/24
 mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
 mh network create ot-52 --out tcp:192.168.50.52:502@wlan0

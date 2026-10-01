@@ -871,3 +871,33 @@ func TestFlowsOfDestroyedVM(t *testing.T) {
 		t.Errorf("unknown VM: exit %d stderr %q", code, errOut)
 	}
 }
+
+func TestNetworkCreatePorts(t *testing.T) {
+	var got types.CreateNetworkRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/networks", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		reply(types.NetworkResponse{Name: got.Name, Egress: true, EgressIface: got.EgressIface, EgressPorts: got.EgressPorts})(w, r)
+	})
+	f := newFakeAPI(t, mux)
+	code, out, errOut := f.run("", "network", "create", "fetch", "--internet", "eth0", "--ports", "tcp:80,tcp:443", "--ports", "udp:53")
+	if code != 0 {
+		t.Fatalf("exit %d stderr %q", code, errOut)
+	}
+	want := []types.PortRule{{Protocol: "tcp", Port: 80}, {Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}}
+	if !reflect.DeepEqual(got.EgressPorts, want) || !got.Egress {
+		t.Errorf("sent %+v", got)
+	}
+	if !strings.Contains(out, "internet@eth0 ports tcp:80,tcp:443,udp:53") {
+		t.Errorf("listing does not show the ports:\n%s", out)
+	}
+	for _, args := range [][]string{
+		{"network", "create", "x", "--ports", "tcp:443"},                      // without --internet
+		{"network", "create", "x", "--internet", "eth0", "--ports", "tcp-443"}, // malformed
+		{"network", "update", "x", "--ports", "tcp:443"},
+	} {
+		if code, _, _ := f.run("", args...); code == 0 {
+			t.Errorf("%v accepted", args)
+		}
+	}
+}

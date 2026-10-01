@@ -1,6 +1,7 @@
 package network
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -224,7 +225,12 @@ func (f *FlowLog) list(match func(*types.Flow) bool) types.FlowList {
 			out.Omitted += s.omitted
 		}
 	}
-	slices.SortStableFunc(out.Flows, func(a, b types.Flow) int { return a.First.Compare(b.First) })
+	// Oldest first; ties (one clock tick, several guests) in a fixed order,
+	// not the map's.
+	slices.SortFunc(out.Flows, func(a, b types.Flow) int {
+		return cmp.Or(a.First.Compare(b.First), strings.Compare(a.VM, b.VM), strings.Compare(a.Src, b.Src),
+			strings.Compare(a.Reason, b.Reason), strings.Compare(a.Dst, b.Dst), cmp.Compare(a.DstPort, b.DstPort))
+	})
 	return out
 }
 

@@ -74,6 +74,28 @@ subnet** (per-network IPAM). The guest's gateway is the bridge's.
     parser that can only talk to its MQTT broker (`203.0.113.7:8883/tcp`) and
     nothing else.
 
+## Internet on some ports only (`egress_ports`)
+
+Full egress (`--internet IFACE`) opens every port. `--ports` narrows it:
+
+```bash
+mh network create fetch --internet eth0 --ports tcp:80,tcp:443,udp:53
+```
+
+Two drops, after the interface and private-range ones: anything that is not
+tcp or udp (ICMP included), then tcp and udp to any other port. Only drops, so
+it can take away from `--internet` and never add to it: the LAN stays closed
+even on an allowed port. Both are recorded in the flow log as `port`.
+
+Not the same as `--out tcp:0.0.0.0/0:443`, which **must not be used for
+"the internet"**: an `--out` rule names destinations and leaves through any
+interface that is not a bridge, so `0.0.0.0/0` there reaches the LAN, a VPN
+and Docker's networks on that port. `--internet` is one interface, without the
+private ranges.
+
+`PUT /v1/networks/{name}/egress` replaces the whole policy, ports included:
+an update with `--internet` and no `--ports` opens every port again.
+
 ## Fine-grained egress (`allowed_egress`)
 
 Rules name addresses, not domain names; egress by name was studied and

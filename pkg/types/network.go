@@ -45,6 +45,13 @@ type Network struct {
 	// LAN too — its router, its devices, a cloud's metadata service.
 	EgressPrivate bool
 
+	// EgressPorts narrows an Egress network to these protocols and
+	// destination ports (tcp:443, udp:53…): anything else leaving it is
+	// dropped, ICMP included. Empty: every port. It only ever removes from
+	// what Egress allows — the interface and the private ranges are closed
+	// before it.
+	EgressPorts []PortRule `json:",omitempty"`
+
 	// AllowedEgress punches specific holes in a non-egress network's WAN drop:
 	// only the listed destination/protocol/port flows are forwarded (and
 	// masqueraded); everything else to the WAN is still dropped. Empty → no
@@ -65,6 +72,12 @@ type Network struct {
 	Intra bool
 
 	CreatedAt time.Time
+}
+
+// PortRule is a protocol and a destination port: tcp or udp, 1-65535.
+type PortRule struct {
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
 }
 
 // EgressRule permits one outbound flow from a network whose egress is otherwise
@@ -142,6 +155,8 @@ type CreateNetworkRequest struct {
 	// EgressPrivate: with Egress, private and special destinations too (see
 	// Network.EgressPrivate).
 	EgressPrivate bool `json:"egress_private,omitempty"`
+	// EgressPorts: with Egress, only these (see Network.EgressPorts).
+	EgressPorts []PortRule `json:"egress_ports,omitempty"`
 	// AllowedEgress lists the only WAN flows this network may open. Requires
 	// Egress to be false/omitted.
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
@@ -161,6 +176,7 @@ type UpdateNetworkEgressRequest struct {
 	Egress        bool         `json:"egress,omitempty"`
 	EgressIface   string       `json:"egress_iface,omitempty"`
 	EgressPrivate bool         `json:"egress_private,omitempty"`
+	EgressPorts   []PortRule   `json:"egress_ports,omitempty"`
 	AllowedEgress []EgressRule `json:"allowed_egress,omitempty"`
 }
 
@@ -194,6 +210,7 @@ type NetworkResponse struct {
 	Egress         bool              `json:"egress"`
 	EgressIface    string            `json:"egress_iface,omitempty"`
 	EgressPrivate  bool              `json:"egress_private,omitempty"`
+	EgressPorts    []PortRule        `json:"egress_ports,omitempty"`
 	AllowedEgress  []EgressRule      `json:"allowed_egress,omitempty"`
 	AllowedIngress []IngressRule     `json:"allowed_ingress,omitempty"`
 	Intra          bool              `json:"intra"`
@@ -211,6 +228,7 @@ func NewNetworkResponse(n *Network) NetworkResponse {
 		Egress:         n.Egress,
 		EgressIface:    n.EgressIface,
 		EgressPrivate:  n.EgressPrivate,
+		EgressPorts:    n.EgressPorts,
 		AllowedEgress:  n.AllowedEgress,
 		AllowedIngress: n.AllowedIngress,
 		Intra:          n.Intra,

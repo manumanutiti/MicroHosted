@@ -372,6 +372,21 @@ func renderNftables(networks []types.Network, managed []ManagedIface, flowLog bo
 				writeFlowLog(&b, flowLog, fmt.Sprintf("iifname %q oifname != @mhbridges ip daddr @mhprivate", n.Bridge), "private")
 				fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges ip daddr @mhprivate drop\n", n.Bridge)
 			}
+			// And, when it names ports, through those only: anything that is
+			// not tcp or udp (ICMP too), then tcp and udp to any other port.
+			// Drops after the ones above, so it can only take away.
+			if len(n.EgressPorts) > 0 {
+				notL4 := fmt.Sprintf("iifname %q oifname != @mhbridges meta l4proto != { tcp, udp }", n.Bridge)
+				writeFlowLog(&b, flowLog, notL4, "port")
+				fmt.Fprintf(&b, "\t\t%s drop\n", notL4)
+				ports := make([]string, len(n.EgressPorts))
+				for i, p := range n.EgressPorts {
+					ports[i] = fmt.Sprintf("%s . %d", p.Protocol, p.Port)
+				}
+				notPort := fmt.Sprintf("iifname %q oifname != @mhbridges meta l4proto . th dport != { %s }", n.Bridge, strings.Join(ports, ", "))
+				writeFlowLog(&b, flowLog, notPort, "port")
+				fmt.Fprintf(&b, "\t\t%s drop\n", notPort)
+			}
 			continue
 		}
 		for _, r := range n.AllowedEgress {
@@ -432,6 +447,38 @@ var PrivateRanges = []string{
 	"198.18.0.0/15",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
+}
+
+// maxEgressPorts bounds a network's EgressPorts: a handful is the use (web,
+// DNS, a registry's port), and every one lands in the ruleset.
+const maxEgressPorts = 32
+
+// ValidateEgressPorts vets EgressPorts: only with full egress, which it
+// narrows; tcp or udp, a port in 1-65535, no repeats, at most maxEgressPorts.
+func ValidateEgressPorts(egress bool, ports []types.PortRule) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	if !egress {
+		return fmt.Errorf("egress_ports narrows egress: it needs egress (and egress_iface); without it, allowed_egress names ports already")
+	}
+	if len(ports) > maxEgressPorts {
+		return fmt.Errorf("egress_ports: %d ports, at most %d", len(ports), maxEgressPorts)
+	}
+	seen := make(map[types.PortRule]bool, len(ports))
+	for i, p := range ports {
+		if p.Protocol != "tcp" && p.Protocol != "udp" {
+			return fmt.Errorf("egress_ports %d: protocol %q must be tcp or udp", i, p.Protocol)
+		}
+		if p.Port < 1 || p.Port > 65535 {
+			return fmt.Errorf("egress_ports %d: port %d must be in 1-65535", i, p.Port)
+		}
+		if seen[p] {
+			return fmt.Errorf("egress_ports %d: %s:%d given twice", i, p.Protocol, p.Port)
+		}
+		seen[p] = true
+	}
+	return nil
 }
 
 // ValidateEgressPrivate refuses EgressPrivate on a network without full
