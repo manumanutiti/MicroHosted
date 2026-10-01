@@ -1,0 +1,68 @@
+#!/bin/sh
+# Arms the sandbox: puts the decoys in runner's home and starts the clock.
+# Run it as root (mh exec), once, AFTER copying the code in and BEFORE
+# running it: everything changed after this moment is reported.
+#
+#   mh-sandbox-arm [ARCHIVE]
+#
+# ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
+# unpacked into /home/runner/work as runner and removed, before the clock
+# starts.
+#
+# Root never writes inside runner's home: what is there may be the code's (a
+# symlink to a system file), and root writing through it would be the
+# escalation the sandbox exists to prevent. Root hands files over on stdin;
+# runner writes them.
+set -eu
+
+S=/var/lib/mh-sandbox
+H=/home/runner
+asrunner() { su runner -s /bin/sh -c "$@"; }
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-arm: run as root (mh exec)" >&2; exit 1; }
+[ ! -e "$S/armed" ] || { echo "mh-sandbox-arm: already armed" >&2; exit 1; }
+[ $# -eq 0 ] || [ -f "$1" ] || { echo "mh-sandbox-arm: no archive at $1" >&2; exit 1; }
+
+# Every read updates atime, not just the first in a day (relatime), whatever
+# the image was mounted with.
+mount -o remount,strictatime /
+# Kernel addresses and the kernel log help a privilege escalation; runner
+# has no use for them.
+sysctl -w kernel.kptr_restrict=2 kernel.dmesg_restrict=1 >/dev/null
+
+install -d -m 700 "$S"
+asrunner 'mkdir -p "$HOME/work"'
+
+# The code first: the decoys, written after it, replace anything it put in
+# their place.
+if [ $# -gt 0 ]; then
+	asrunner 'tar -xzf - -C "$HOME/work"' < "$1"
+	rm -f "$1"
+fi
+
+# A token unique to this VM, inside every decoy: seen anywhere else (output,
+# a request), it came from here.
+tok=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
+TOK=$(echo "$tok" | tr a-f A-F)
+
+# decoy PATH: installs stdin as runner's PATH (relative to its home), mode
+# 600 in 700 directories, with old times — the code sees long-standing
+# credentials, and a read moves atime past the moment of arming.
+decoy() {
+	asrunner 'umask 077 && cd "$HOME" && rm -rf "$0" && mkdir -p "$(dirname "$0")" && cat > "$0" && touch -d "2025-01-01 00:00:00" "$0"' "$1"
+	echo "$H/$1" >> "$S/decoys"
+}
+: > "$S/decoys"
+
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACD%s\n-----END OPENSSH PRIVATE KEY-----\n' "$tok" | decoy .ssh/id_ed25519
+printf '[default]\naws_access_key_id = AKIA%s\naws_secret_access_key = %s%s\n' "$TOK" "$tok" "$tok" | decoy .aws/credentials
+printf 'github.com:\n    oauth_token: ghp_%s%s\n    user: runner\n' "$tok" "$tok" | decoy .config/gh/hosts.yml
+printf 'https://runner:ghp_%s@github.com\n' "$tok" | decoy .git-credentials
+printf '//registry.npmjs.org/:_authToken=npm_%s%s\n' "$tok" "$tok" | decoy .npmrc
+printf 'DATABASE_URL=postgres://admin:%s@db.internal:5432/prod\nOPENAI_API_KEY=sk-%s%s\n' "$tok" "$tok" "$tok" | decoy .env
+
+echo "$tok" > "$S/token"
+
+# The clock: last, so that everything above is before it.
+touch "$S/armed"
+echo "armed: $(wc -l < "$S/decoys") decoys in $H, token $tok"
