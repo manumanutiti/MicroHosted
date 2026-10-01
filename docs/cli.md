@@ -30,6 +30,7 @@ The VM verbs you use most also exist at the top level, like `docker ps`,
 | `mh stop` / `mh start` | `mh vm stop` / `start` | | `mh inspect` | `mh vm inspect` |
 | `mh rm` | `mh vm rm` | | `mh images` | `mh template ls` |
 | `mh cp` | `mh vm cp` | | `mh health` / `mh info` | `mh system health` / `info` |
+| `mh flows` | `mh vm flows` | | | |
 
 **The verb may also come first**: `mh create vm base-alpine`,
 `mh list network` and `mh change network lab --intra` are rewritten to the
@@ -104,6 +105,8 @@ mh cp a1b2:/etc/os-release -                # to stdout
 
 mh logs a1b2 -n 50                          # console log (through the API)
 mh logs -f a1b2                             # follow (read from the host's disk)
+mh flows a1b2                               # connections it tried that its network refused
+mh flows a1b2 --json                        # with "recording": false if the host is not recording
 
 mh stop a1b2 && mh start a1b2               # power off keeping disk + IP, boot again
 mh vm update a1b2 --autostart               # boot it again on its own after a host reboot

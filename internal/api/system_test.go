@@ -64,7 +64,7 @@ func newTestAPI(t *testing.T, setup ...func(mgr *vm.Manager, st *store.Store, st
 		f(mgr, st, storeDir)
 	}
 
-	srv := NewServer(mgr, network.NewManager(st, nil), events.NewBus(0), SystemConfig{
+	srv := NewServer(mgr, network.NewManager(st, nil), events.NewBus(0), nil, SystemConfig{
 		DBPath:      filepath.Join(dir, "state.db"),
 		CatalogPath: catalogPath,
 		StartedAt:   time.Now().Add(-3 * time.Second),

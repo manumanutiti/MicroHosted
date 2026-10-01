@@ -88,6 +88,7 @@ var shortcuts = []shortcut{
 	{"rm", "vm", "rm"},
 	{"cp", "vm", "cp"},
 	{"logs", "vm", "logs"},
+	{"flows", "vm", "flows"},
 	{"fork", "vm", "fork"},
 	{"restore", "vm", "restore"},
 	{"inspect", "vm", "inspect"},

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -45,6 +46,9 @@ type FlowLog struct {
 	resolve FlowResolver
 	ifname  func(index uint32) string
 	now     func() time.Time
+
+	// running is true while Run holds the group.
+	running atomic.Bool
 
 	mu       sync.Mutex
 	sources  map[string]*flowSource
@@ -84,6 +88,8 @@ func (f *FlowLog) Run(ctx context.Context) error {
 		return err
 	}
 	defer c.close()
+	f.running.Store(true)
+	defer f.running.Store(false)
 	buf := make([]byte, 1<<16)
 	for ctx.Err() == nil {
 		pkts, err := c.read(buf)
@@ -173,6 +179,21 @@ func (f *FlowLog) forgetOldestSource() {
 	delete(f.sources, oldest)
 }
 
+// Recording reports whether drops are being recorded at all: the kernel took
+// the log rules and Run is reading them.
+func (f *FlowLog) Recording() bool {
+	return f.running.Load() && flowLogAvailable()
+}
+
+// Known reports whether the log holds anything for VM id — for a VM destroyed
+// since, its records are all that is left of it.
+func (f *FlowLog) Known(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.sources[id]
+	return ok
+}
+
 // ByVM returns what one VM tried.
 func (f *FlowLog) ByVM(id string) types.FlowList {
 	return f.list(func(fl *types.Flow) bool { return fl.VM == id })
@@ -187,9 +208,10 @@ func (f *FlowLog) ByNetwork(name string) types.FlowList {
 // list copies the flows that match, oldest first, with the omissions of the
 // guests they belong to.
 func (f *FlowLog) list(match func(*types.Flow) bool) types.FlowList {
+	recording := f.Recording()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := types.FlowList{Flows: []types.Flow{}, Overruns: f.overruns}
+	out := types.FlowList{Recording: recording, Flows: []types.Flow{}, Overruns: f.overruns}
 	for _, s := range f.sources {
 		matched := false
 		for _, k := range s.order {

@@ -35,6 +35,7 @@ var vmGroup = &group{
 		{name: "exec", args: "VM COMMAND...", summary: "Run a command inside a VM (over vsock)", run: vmExec},
 		{name: "cp", args: "VM:PATH LOCAL | LOCAL VM:PATH", summary: "Copy a file between a VM and the host", run: vmCopy},
 		{name: "logs", args: "VM", summary: "Show a VM's console log (-f: same host only)", run: vmLogs},
+		{name: "flows", args: "VM", summary: "Show the connections a VM tried that its network refused", run: vmFlows},
 		{name: "snapshot", args: "VM", summary: "Snapshot a running VM", run: vmSnapshot},
 		{name: "fork", args: "VM", summary: "Clone a running VM into a new one", run: vmFork},
 		{name: "restore", args: "VM SNAPSHOT", summary: "Rewind a VM in place to one of its snapshots", run: vmRestore},
@@ -1140,4 +1141,61 @@ func countNonEmpty(ss ...string) int {
 		}
 	}
 	return n
+}
+
+// vmFlows prints what a VM tried and the ruleset refused (docs/networking.md,
+// "Flow log"). A VM destroyed since is no longer listed, so it cannot be
+// resolved by name or prefix — its full ID still reaches its records.
+func vmFlows(e *env, cmd *command, p string, args []string) error {
+	var asJSON bool
+	fs := newCmdFlags(e, p, cmd)
+	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usagef(p, "expected exactly one VM")
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	id, resolveErr := c.resolveVM(pos[0])
+	if resolveErr != nil {
+		id = pos[0]
+	}
+	var list types.FlowList
+	if err := c.Do("GET", "/v1/vms/"+url.PathEscape(id)+"/flows", nil, &list); err != nil {
+		if resolveErr != nil && IsNotFound(err) {
+			return resolveErr
+		}
+		return err
+	}
+	if asJSON {
+		return printJSON(e.stdout, list)
+	}
+	// Said on stderr and first: these change what the table means.
+	if !list.Recording {
+		fmt.Fprintln(e.stderr, "WARNING: this host is not recording refused connections (see the daemon's log): an empty list does not mean the VM tried nothing")
+	}
+	if list.Overruns > 0 {
+		fmt.Fprintf(e.stderr, "WARNING: the daemon missed records %d time(s) since it started: counts may be low\n", list.Overruns)
+	}
+	rows := make([][]string, 0, len(list.Flows))
+	for _, f := range list.Flows {
+		dst := f.Dst
+		if f.DstPort != 0 {
+			dst += ":" + strconv.Itoa(f.DstPort)
+		}
+		rows = append(rows, []string{
+			f.Verdict, f.Reason, f.Protocol, dst, strconv.FormatUint(f.Count, 10),
+			f.First.Local().Format(time.DateTime), f.Last.Local().Format(time.TimeOnly),
+		})
+	}
+	table(e.stdout, []string{"VERDICT", "REASON", "PROTO", "DESTINATION", "COUNT", "FIRST", "LAST"}, rows)
+	if list.Omitted > 0 {
+		fmt.Fprintf(e.stdout, "(%d more attempts to other destinations, not listed: the first ones are kept)\n", list.Omitted)
+	}
+	return nil
 }

@@ -144,3 +144,17 @@ func TestNetworkIdentityStatuses(t *testing.T) {
 		}
 	}
 }
+
+// A VM the daemon does not know, and the flow log holds nothing of, is a 404:
+// not an empty list that would read as "it tried nothing".
+func TestFlowsUnknownVM(t *testing.T) {
+	ts := newTestServer(t)
+	res, err := http.Get(ts.URL + "/v1/vms/nope/flows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("status %d, want 404", res.StatusCode)
+	}
+}

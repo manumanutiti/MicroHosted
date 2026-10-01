@@ -247,3 +247,15 @@ func TestResolveFlow(t *testing.T) {
 		t.Errorf("a TAP is not a network's to name: %q, %q", nw, vm)
 	}
 }
+
+func TestFlowLogKnownAndRecording(t *testing.T) {
+	f, _ := testFlowLog(DefaultFlowLimits, map[string][2]string{"mhbr0001 10.0.0.2": {"lab", "vm-a"}})
+	f.record(drop("egress", 1, unix.IPPROTO_TCP, "10.0.0.2", "1.1.1.1", 443))
+	if !f.Known("vm-a") || f.Known("vm-b") {
+		t.Error("Known must tell the VMs the log holds records of")
+	}
+	// Not running (Run never bound the group): the list must say so.
+	if f.Recording() || f.ByVM("vm-a").Recording {
+		t.Error("a flow log whose reader is not running must not report recording")
+	}
+}

@@ -36,8 +36,13 @@ type Flow struct {
 // many more. Overruns counts, host-wide since the daemon started, the times
 // the kernel discarded records because the daemon's socket was full: each
 // hides one record or more, and the kernel does not say how many.
+//
+// Recording is false when this host is not recording at all — the kernel
+// refused the log rules, or the daemon could not read them. An empty list
+// then means nothing: it is not "the guest tried nothing".
 type FlowList struct {
-	Flows    []Flow `json:"flows"`
-	Omitted  uint64 `json:"omitted,omitempty"`
-	Overruns uint64 `json:"overruns,omitempty"`
+	Recording bool   `json:"recording"`
+	Flows     []Flow `json:"flows"`
+	Omitted   uint64 `json:"omitted,omitempty"`
+	Overruns  uint64 `json:"overruns,omitempty"`
 }

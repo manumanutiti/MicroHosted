@@ -315,7 +315,7 @@ func main() {
 		}
 		return p
 	}
-	srv := api.NewServer(mgr, netmgr, bus, api.SystemConfig{
+	srv := api.NewServer(mgr, netmgr, bus, flows, api.SystemConfig{
 		DBPath:      absOr(*dbPath),
 		CatalogPath: absOr(*catalogPath),
 		StartedAt:   time.Now(),
