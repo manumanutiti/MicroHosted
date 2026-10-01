@@ -31,3 +31,19 @@ else
 		su "$U" -s /bin/sh -c 'exec setpriv --nnp /bin/sh -c "$0" "$@"' "$_s" "$@"
 	}
 fi
+
+# unpack TOOL ARCHIVE: unpacks a .tar.gz into ~/work as U — root opens it and
+# hands it over on stdin, U writes — once per VM, then removes it. An archive
+# tar does not unpack cleanly (GNU tar refuses members with "..") leaves part
+# of itself behind: the VM is no longer a clean start, and it says so.
+unpack() {
+	[ ! -e "$S/unpacked" ] || { echo "$1: the code is already unpacked" >&2; exit 1; }
+	[ -f "$2" ] || { echo "$1: no archive at $2" >&2; exit 1; }
+	install -d -m 700 "$S"
+	asuser 'mkdir -p "$HOME/work" && tar -xzf - -C "$HOME/work"' < "$2" || {
+		echo "$1: the archive did not unpack cleanly (tar's errors above); remove this VM and start another" >&2
+		exit 1
+	}
+	rm -f "$2"
+	touch "$S/unpacked"
+}

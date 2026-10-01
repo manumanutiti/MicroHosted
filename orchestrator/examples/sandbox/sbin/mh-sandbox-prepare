@@ -7,6 +7,8 @@
 #
 # ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
 # unpacked into ~/work as the user and removed, before the clock starts.
+# Without it: the code was unpacked before (mh-sandbox-unpack), typically to
+# fetch its dependencies first (mh-sandbox-run --fetch).
 #
 # Root never writes inside the user's home: what is there may be the code's
 # (a symlink to a system file), and root writing through it would be the
@@ -17,7 +19,6 @@ set -eu
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-prepare: run as root (mh exec)" >&2; exit 1; }
 [ ! -e "$S/since" ] || { echo "mh-sandbox-prepare: already prepared" >&2; exit 1; }
-[ $# -eq 0 ] || [ -f "$1" ] || { echo "mh-sandbox-prepare: no archive at $1" >&2; exit 1; }
 
 # Every read updates atime (not just the first in a day, relatime; nor never,
 # noatime), whatever the image was mounted with.
@@ -33,16 +34,7 @@ asuser 'mkdir -p "$HOME/work"'
 
 # The code first: the decoys, written after it, replace anything it put in
 # their place.
-if [ $# -gt 0 ]; then
-	# An archive tar does not unpack cleanly (GNU tar refuses members with
-	# "..") is not prepared around: part of it is already unpacked, so this VM
-	# is no longer a clean start.
-	if ! asuser 'tar -xzf - -C "$HOME/work"' < "$1"; then
-		echo "mh-sandbox-prepare: the archive did not unpack cleanly (tar's errors above): not prepared; remove this VM and start another" >&2
-		exit 1
-	fi
-	rm -f "$1"
-fi
+[ $# -eq 0 ] || unpack mh-sandbox-prepare "$1"
 
 # A token unique to this VM, inside every decoy: seen anywhere else (output,
 # a request, a paste site), it came from here.

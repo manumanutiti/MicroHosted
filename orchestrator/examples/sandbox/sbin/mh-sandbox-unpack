@@ -1,0 +1,14 @@
+#!/bin/sh
+# Unpacks the code into ~/work without preparing: for code whose dependencies
+# are fetched (mh-sandbox-run --fetch) before mh-sandbox-prepare. Run it as
+# root (mh exec):
+#
+#   mh-sandbox-unpack ARCHIVE
+set -eu
+. /usr/sbin/mh-sandbox-lib
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-unpack: run as root (mh exec)" >&2; exit 1; }
+[ ! -e "$S/since" ] || { echo "mh-sandbox-unpack: already prepared" >&2; exit 1; }
+[ $# -eq 1 ] || { echo "usage: mh-sandbox-unpack ARCHIVE" >&2; exit 2; }
+unpack mh-sandbox-unpack "$1"
+echo "unpacked into $H/work"

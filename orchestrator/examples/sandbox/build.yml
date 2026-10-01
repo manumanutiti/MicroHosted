@@ -29,6 +29,7 @@ base: alpine:3.22
 files:
   /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
   /usr/sbin/mh-sandbox-prepare: sbin/mh-sandbox-prepare
+  /usr/sbin/mh-sandbox-unpack: sbin/mh-sandbox-unpack
   /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
 
@@ -39,8 +40,8 @@ run:
   - find / -xdev -type f -perm +6000 -exec chmod ug-s {} +
   # The tools are root's: runner can neither run them nor read which files
   # are decoys.
-  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report
   - chmod 0600 /usr/sbin/mh-sandbox-lib
-  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report
 
 mem_mb: 256

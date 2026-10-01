@@ -5,10 +5,23 @@
 # exec), after mh-sandbox-prepare:
 #
 #   mh exec -t 5m VM mh-sandbox-run 'npm install && npm test'
+#
+# --fetch runs it BEFORE mh-sandbox-prepare instead — no decoys yet, nothing
+# reported — to download the code's dependencies while the VM has a network.
+# The command must run nothing of the code: npm ci --ignore-scripts,
+# pip download --only-binary=:all:, go mod download. Then the network is cut
+# (mh quarantine), the VM prepared, and the code run without one:
+#
+#   mh exec -t 5m VM -- mh-sandbox-run --fetch 'npm ci --ignore-scripts'
 . /usr/sbin/mh-sandbox-lib
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-run: run as root (mh exec)" >&2; exit 1; }
-[ -e "$S/since" ] || { echo "mh-sandbox-run: not prepared: run mh-sandbox-prepare first" >&2; exit 1; }
-[ $# -gt 0 ] || { echo "usage: mh-sandbox-run COMMAND..." >&2; exit 2; }
+if [ "${1:-}" = --fetch ]; then
+	shift
+	[ ! -e "$S/since" ] || { echo "mh-sandbox-run: --fetch is before mh-sandbox-prepare, and this VM is prepared" >&2; exit 1; }
+else
+	[ -e "$S/since" ] || { echo "mh-sandbox-run: not prepared: run mh-sandbox-prepare first (or --fetch, to download before it)" >&2; exit 1; }
+fi
+[ $# -gt 0 ] || { echo "usage: mh-sandbox-run [--fetch] COMMAND..." >&2; exit 2; }
 
-asuser 'cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
+asuser 'mkdir -p "$HOME/work" && cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
