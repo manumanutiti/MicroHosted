@@ -232,6 +232,9 @@ func (s *sandbox) run() (err error) {
 		defer os.Remove(tgz)
 	}
 
+	// mh sandbox … | head: a closed pipe makes a write fail, not kill mh
+	// before it removes the VM.
+	signal.Ignore(syscall.SIGPIPE)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stop)

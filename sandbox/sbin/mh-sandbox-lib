@@ -407,6 +407,10 @@ classify() {
 			} else if (f ~ pet) {
 				seen["privesc\t" st "\t" base(f) "\t" c]++
 			} else if (f ~ ped) {
+				# A stat alone is what listing a directory does (ls -l /etc,
+				# find, os.walk in Python stat every entry): an escalation
+				# opens these files or asks whether it may (open, access).
+				if (s ~ /^(stat|lstat|newfstatat|fstatat64|statx)$/) next
 				sub(/^\/proc\/[0-9]+\//, "/proc/PID/", f)
 				seen["privesc\t" st "\t" f "\t" c]++
 			}
