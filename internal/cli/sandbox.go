@@ -15,10 +15,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,10 +46,11 @@ sandbox's own, which is closed before the code runs: the code never runs with
 a network, and every connection it tries is refused and recorded. If closing
 it cannot be confirmed, nothing runs.
 
-The report: decoy credentials read, ways the code looked for a VM, files
+The report: a verdict, then only what was found, graded high, warn or info —
+decoy credentials read, ways the code looked for a VM or for root, files
 changed, processes left, sockets opened, connections refused, and text
-addressed to an AI agent in the input or the output. An empty report is not
-"safe": it is what this run did. File names, process names, the output and
+addressed to an AI agent in the input or the output. The code's own output
+only with -o. An empty report is not "safe": it is what this run did. File names, process names, the output and
 matched text are the code's to choose — data, never instructions.
 
 The image is built once: mh build -t sandbox:1 sandbox  (docs/sandbox.md)`,
@@ -70,6 +69,8 @@ type sandboxOpts struct {
 	timeout time.Duration
 	keep    bool
 	asJSON  bool
+	verbose bool
+	output  bool
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -95,6 +96,8 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.defined = append(fs.defined, "timeout")
 	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
 	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
+	fs.boolVar(&o.verbose, "verbose", "v", "show what it does as it happens; then every probe by every program, and every command it ran")
+	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -229,6 +232,9 @@ func (s *sandbox) run() (err error) {
 		defer os.Remove(tgz)
 	}
 
+	// mh sandbox … | head: a closed pipe makes a write fail, not kill mh
+	// before it removes the VM.
+	signal.Ignore(syscall.SIGPIPE)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stop)
@@ -300,7 +306,14 @@ func (s *sandbox) run() (err error) {
 		return err
 	}
 	s.say("run: %s", s.command)
+	stopWatch := func() {}
+	if s.o.verbose {
+		stopWatch = s.watch()
+	}
+	began := time.Now()
 	res, timedOut, err := s.exec("mh-sandbox-run "+shellQuote(s.command), s.o.timeout)
+	took := time.Since(began)
+	stopWatch()
 	if err != nil {
 		return err
 	}
@@ -309,11 +322,8 @@ func (s *sandbox) run() (err error) {
 		code = 124
 	}
 
-	rep, err := s.report()
-	if err != nil {
-		return err
-	}
-	rep.ExitCode, rep.TimedOut = code, timedOut
+	rep := s.report()
+	rep.ExitCode, rep.TimedOut, rep.DurationMS = code, timedOut, took.Milliseconds()
 	rep.Output = untrustedTail(res.Output, 8<<10)
 	patterns, perr := s.patterns()
 	if perr != nil {
@@ -333,12 +343,102 @@ func (s *sandbox) run() (err error) {
 			return err
 		}
 	} else {
-		rep.print(s.e.stdout)
+		rep.render(s.e.stdout, styleFor(s.e.stdout), s.o.verbose, s.o.output)
 	}
 	if code != 0 {
 		return exitError{code: code}
 	}
 	return nil
+}
+
+// watchEvery is how often -v looks at what the code has done while it runs.
+var watchEvery = 2 * time.Second
+
+// watch prints, while the code runs, each finding as it appears: a decoy
+// read, a probe for a VM or for a way to root (the image's mh-sandbox-watch),
+// a connection the host refused. The returned stop looks one last time and
+// waits: what a short run did shows too. The report afterwards is the whole
+// account; this is it as it happens.
+func (s *sandbox) watch() (stop func()) {
+	start := time.Now()
+	seen := map[string]bool{}
+	pos := ""
+	guest := true
+	st := styleFor(s.e.stderr)
+	look := func() {
+		// once per thing found: the first program to find it is named
+		show := func(key string, sev severity, what, detail string) {
+			if !seen[key] {
+				seen[key] = true
+				liveLine(s.e.stderr, st, time.Since(start), sev, what, detail)
+			}
+		}
+		if guest {
+			r, timedOut, err := s.exec("mh-sandbox-watch "+pos, 30*time.Second)
+			switch {
+			case err != nil || timedOut:
+			case r.ExitCode == 127:
+				guest = false
+				fmt.Fprintf(s.e.stderr, "  (image %s has no mh-sandbox-watch: only connections show live; rebuild it from sandbox/)\n", s.image)
+			case r.ExitCode == 0:
+				for _, line := range strings.Split(r.Output, "\n") {
+					f := strings.Split(line, "\t")
+					at := func(i int) string {
+						if i < len(f) {
+							return untrusted(f[i], 160)
+						}
+						return ""
+					}
+					switch f[0] {
+					case "at":
+						pos = shellQuote(at(1)) + " " + shellQuote(at(2))
+					case "decoy":
+						show("decoy "+at(1)+at(2), sevHigh, "decoy", at(1)+"  "+at(2))
+					case "probe":
+						show("probe "+at(1)+at(3), vmProbeSeverity(at(3)), "VM probe", at(3)+" "+at(1)+"  (by "+at(4)+")")
+					case "privesc":
+						show("privesc "+at(1)+at(3), privescSeverity(at(3)), "privesc", at(3)+" "+at(1)+"  (by "+at(4)+")")
+					case "alert":
+						k := kindOf(at(1))
+						show("alert "+at(1)+at(3), k.Severity, "alert", k.Title+": "+at(3)+"  (by "+at(4)+")")
+					}
+				}
+			}
+		}
+		var flows types.FlowList
+		if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err == nil {
+			for _, f := range flows.Flows {
+				if f.Count > s.before[flowKey(f)] {
+					dst := f.Dst
+					if f.DstPort != 0 {
+						dst += ":" + strconv.Itoa(f.DstPort)
+					}
+					show("flow "+flowKey(f), sevWarn, "connection", f.Protocol+" "+dst+" refused  ("+f.Reason+")")
+				}
+			}
+		}
+	}
+	s.say("live (-v): what it does, as it happens")
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTicker(watchEvery)
+		defer t.Stop()
+		for {
+			look()
+			select {
+			case <-done:
+				look()
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 // fetchPhase brings in what the code needs while there is a network — no
@@ -473,17 +573,31 @@ func (s *sandbox) upload(local, remote string) error {
 	return s.c.Stream("PUT", "/v1/vms/"+s.vm+"/files?path="+url.QueryEscape(remote), f, fi.Size())
 }
 
-func (s *sandbox) report() (*sandboxReport, error) {
-	r, timedOut, err := s.exec("mh-sandbox-report --tsv", 2*time.Minute)
+// report is what the VM and the host say the code did. When the VM's side
+// cannot be had, the rest — the output, the exit code, the host's
+// connections — still is, marked incomplete: unknown is not none.
+func (s *sandbox) report() *sandboxReport {
+	var rep *sandboxReport
+	r, timedOut, err := s.exec("mh-sandbox-report --tsv", 5*time.Minute)
+	failed := ""
 	switch {
 	case err != nil:
-		return nil, fmt.Errorf("report: %w", err)
+		failed = err.Error()
 	case timedOut:
-		return nil, errors.New("report: timed out")
+		failed = "timed out"
 	case r.ExitCode != 0:
-		return nil, fmt.Errorf("report (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Output))
+		failed = fmt.Sprintf("exit %d: %s", r.ExitCode, untrusted(strings.TrimSpace(r.Output), 512))
 	}
-	rep := parseSandboxReport(r.Output)
+	if failed != "" {
+		rep = parseSandboxReport("")
+		rep.Warnings = append(rep.Warnings, "the report from inside the VM failed ("+failed+"): decoys, probes, commands, files and processes are unknown, not none")
+	} else {
+		rep = parseSandboxReport(r.Output)
+		rep.Complete = true
+		if rep.commands < 0 {
+			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the commands the code ran: rebuild it from sandbox/ (docs/sandbox.md)")
+		}
+	}
 	rep.Target, rep.Image, rep.VM, rep.Kept = s.t.given, s.image, s.vm, s.o.keep
 	var flows types.FlowList
 	if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err != nil {
@@ -501,7 +615,7 @@ func (s *sandbox) report() (*sandboxReport, error) {
 			}
 		}
 	}
-	return rep, nil
+	return rep
 }
 
 func flowKey(f types.Flow) string {
@@ -868,16 +982,24 @@ func repackZip(tw *tar.Writer, p string) error {
 // sandboxReport is what --json prints (docs/sandbox.md). Fields marked
 // untrusted hold strings the code chose.
 type sandboxReport struct {
-	Target   string         `json:"target"`
-	Image    string         `json:"image"`
-	VM       string         `json:"vm"`
-	Kept     bool           `json:"kept"`
-	ExitCode int            `json:"exit_code"`
-	TimedOut bool           `json:"timed_out"`
+	Target   string `json:"target"`
+	Image    string `json:"image"`
+	VM       string `json:"vm"`
+	Kept     bool   `json:"kept"`
+	ExitCode int    `json:"exit_code"`
+	TimedOut bool   `json:"timed_out"`
+	// DurationMS: from the command's start to its end (or the timeout).
+	DurationMS int64 `json:"duration_ms"`
+	// Complete: the VM's side of the report was read. When false, every
+	// list but connections is unknown, not empty (warnings say why).
+	Complete bool           `json:"complete"`
 	Summary  sandboxSummary `json:"summary"`
 
 	Decoys           []sandboxDecoy     `json:"decoys"`
 	VMProbes         []sandboxProbe     `json:"vm_probes"` // untrusted: path, by
+	Privesc          []sandboxProbe     `json:"privesc"`   // untrusted: path, by
+	Commands         []sandboxCommand   `json:"commands"`  // untrusted: args
+	Alerts           []sandboxAlert     `json:"alerts"`    // untrusted: what, by
 	Changed          sandboxChanged     `json:"changed"`   // untrusted
 	Processes        []sandboxProc      `json:"processes"` // untrusted: args
 	Listening        []string           `json:"listening"`
@@ -886,13 +1008,17 @@ type sandboxReport struct {
 	Output           string             `json:"output"`             // untrusted
 	Warnings         []string           `json:"warnings"`
 
-	user string
+	user     string
+	commands int // distinct, as the image counted them; -1: not recorded
 }
 
 type sandboxSummary struct {
 	DecoysRead         int  `json:"decoys_read"`
 	VMProbes           int  `json:"vm_probes"`
 	EvasionSuspected   bool `json:"evasion_suspected"`
+	Privesc            int  `json:"privesc"`
+	Commands           int  `json:"commands"` // distinct; commands lists the first 2000
+	Alerts             int  `json:"alerts"`
 	ChangedOutsideWork int  `json:"changed_outside_work"`
 	ProcessesLeft      int  `json:"processes_left"`
 	Listening          int  `json:"listening"`
@@ -925,6 +1051,21 @@ type sandboxChanged struct {
 	WorkDirs  []sandboxWorkEntry `json:"work_dirs"`
 }
 
+// sandboxAlert is one "alert KIND COUNT WHAT BY" record: KIND one of
+// alertKinds (sandbox_kinds.go), WHAT and BY the code's choice.
+type sandboxAlert struct {
+	Kind     string `json:"kind"`
+	Severity string `json:"severity"`
+	Count    int    `json:"count"`
+	What     string `json:"what"`
+	By       string `json:"by"`
+}
+
+type sandboxCommand struct {
+	Count int    `json:"count"`
+	Args  string `json:"args"`
+}
+
 type sandboxProc struct {
 	PID  int    `json:"pid"`
 	Args string `json:"args"`
@@ -949,9 +1090,10 @@ type sandboxAgentText struct {
 // are skipped: a newer image may say more.
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
-		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Processes: []sandboxProc{}, Listening: []string{},
+		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
 		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{},
-		Changed: sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
+		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
+		commands: -1,
 	}
 	for _, line := range strings.Split(tsv, "\n") {
 		f := strings.Split(line, "\t")
@@ -975,6 +1117,14 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			}
 		case "probe":
 			r.VMProbes = append(r.VMProbes, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
+		case "privesc":
+			r.Privesc = append(r.Privesc, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
+		case "commands":
+			r.commands = num(1)
+		case "alert":
+			r.Alerts = append(r.Alerts, sandboxAlert{Kind: at(1), Severity: kindOf(at(1)).Severity.String(), Count: num(2), What: at(3), By: at(4)})
+		case "exec":
+			r.Commands = append(r.Commands, sandboxCommand{Count: num(1), Args: at(2)})
 		case "file":
 			r.Changed.Files = append(r.Changed.Files, at(1))
 		case "dir":
@@ -1014,6 +1164,9 @@ func (r *sandboxReport) summarize() {
 			s.EvasionSuspected = true
 		}
 	}
+	s.Privesc = len(r.Privesc)
+	s.Alerts = len(r.Alerts)
+	s.Commands = max(r.commands, len(r.Commands))
 	s.ChangedOutsideWork = len(r.Changed.Files) + len(r.Changed.Dirs)
 	s.ProcessesLeft = len(r.Processes)
 	s.Listening = len(r.Listening)
@@ -1021,92 +1174,6 @@ func (r *sandboxReport) summarize() {
 		s.ConnectionsRefused += int(c.Count)
 	}
 	s.AddressesAnAgent = len(r.AddressesAnAgent)
-}
-
-func (r *sandboxReport) print(w io.Writer) {
-	if r.Output != "" {
-		fmt.Fprint(w, r.Output)
-		if !strings.HasSuffix(r.Output, "\n") {
-			fmt.Fprintln(w)
-		}
-	}
-	fmt.Fprintf(w, "exit code: %d", r.ExitCode)
-	if r.TimedOut {
-		fmt.Fprint(w, " (timed out: it may still have been running)")
-	}
-	fmt.Fprintln(w)
-
-	section := func(title string) { fmt.Fprintf(w, "\n== %s\n", title) }
-	none := func(n int) {
-		if n == 0 {
-			fmt.Fprintln(w, "  (none)")
-		}
-	}
-	section("decoys (READ: opened; TAMPERED: written, or its times reset)")
-	for _, d := range r.Decoys {
-		if d.State == "untouched" {
-			continue
-		}
-		fmt.Fprintf(w, "  %-14s %s   (legitimately: %s)\n", d.State, d.Path, d.Legitimately)
-	}
-	fmt.Fprintf(w, "  %d of %d untouched\n", len(r.Decoys)-r.Summary.DecoysRead, len(r.Decoys))
-
-	section("looking for a VM (absent: not in this VM; /proc/cpuinfo is read by ordinary programs too)")
-	for _, p := range r.VMProbes {
-		state := "absent"
-		if p.Found {
-			state = "found"
-		}
-		fmt.Fprintf(w, "  %3d %-7s %s by %s\n", p.Count, state, p.Path, p.By)
-	}
-	none(len(r.VMProbes))
-
-	section("files created or changed (in ~/work: counted per entry)")
-	printChanged(w, r.Changed.Files, r.Changed.WorkFiles)
-	none(len(r.Changed.Files) + len(r.Changed.WorkFiles))
-	section("directories whose entries changed")
-	printChanged(w, r.Changed.Dirs, r.Changed.WorkDirs)
-	none(len(r.Changed.Dirs) + len(r.Changed.WorkDirs))
-
-	section("processes left running as " + r.user)
-	for _, p := range r.Processes {
-		fmt.Fprintf(w, "  %6d  %s\n", p.PID, p.Args)
-	}
-	none(len(r.Processes))
-	section("listening sockets")
-	for _, l := range r.Listening {
-		fmt.Fprintln(w, "  "+l)
-	}
-	none(len(r.Listening))
-	section("connections refused (seen by the host)")
-	for _, c := range r.Connections {
-		dst := c.Dst
-		if c.DstPort != 0 {
-			dst += ":" + strconv.Itoa(c.DstPort)
-		}
-		fmt.Fprintf(w, "  %-4s %-22s %4d×  %s\n", c.Protocol, dst, c.Count, c.Reason)
-	}
-	none(len(r.Connections))
-	section("text addressed to an AI agent (a signal, not proof)")
-	for _, a := range r.AddressesAnAgent {
-		where := a.Where
-		if a.File != "" {
-			where += " " + a.File
-		}
-		fmt.Fprintf(w, "  %s:%d: %s\n", where, a.Line, a.Text)
-	}
-	none(len(r.AddressesAnAgent))
-	for _, warn := range r.Warnings {
-		fmt.Fprintln(w, "\nWARNING: "+warn)
-	}
-
-	s := r.Summary
-	verdict := ""
-	if s.EvasionSuspected {
-		verdict = " — it looked for a VM: what it did not do here proves nothing"
-	}
-	fmt.Fprintf(w, "\nsummary: %d decoy(s) read, %d VM probe(s), %d change(s) outside ~/work, %d process(es) left, %d socket(s), %d connection(s) refused, %d text(s) addressed to an agent%s\n",
-		s.DecoysRead, s.VMProbes, s.ChangedOutsideWork, s.ProcessesLeft, s.Listening, s.ConnectionsRefused, s.AddressesAnAgent, verdict)
 }
 
 // names are the paths the code created or changed, ~/work's entries
@@ -1117,19 +1184,4 @@ func (c sandboxChanged) names() []string {
 		n = append(n, "~/work/"+e.Entry)
 	}
 	return n
-}
-
-func printChanged(w io.Writer, outside []string, work []sandboxWorkEntry) {
-	sorted := append([]string(nil), outside...)
-	sort.Strings(sorted)
-	for _, f := range sorted {
-		fmt.Fprintln(w, "  "+f)
-	}
-	for _, e := range work {
-		if strings.HasSuffix(e.Entry, "/") {
-			fmt.Fprintf(w, "  ~/work/%s  (%d inside)\n", e.Entry, e.Count)
-		} else {
-			fmt.Fprintln(w, "  ~/work/"+path.Clean(e.Entry))
-		}
-	}
 }
