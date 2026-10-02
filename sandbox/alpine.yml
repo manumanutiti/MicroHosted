@@ -39,6 +39,6 @@ run:
   # are decoys.
   - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
-  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch
+  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch
 
 mem_mb: 256

@@ -89,14 +89,14 @@ printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xp
 
 echo "$tok" > "$S/token"
 
-# Where there is audit (ubuntu.yml): every file the user opens, looks up or
-# runs, found or not — the report picks out the ones that tell a VM apart.
-# After the decoys, which the user wrote.
+# Where there is audit (build.yml): every file the user opens, looks up or
+# runs, found or not — the report picks out the ones that tell a VM apart —
+# and what changes who it is, makes it start again, or reaches out
+# (auditrules, mh-sandbox-lib). After the decoys, which the user wrote.
 if command -v auditctl >/dev/null; then
-	auditctl -a always,exit -F arch=b64 -F uid="$(id -u "$U")" \
-		-S open,openat,openat2,stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,execve \
-		-k mh-sandbox >/dev/null
+	auditrules
 	auditctl --reset-lost >/dev/null 2>&1
+	auditctl --reset_backlog_wait_time_actual >/dev/null 2>&1
 fi
 
 # The clock: last, so that everything above is before it.

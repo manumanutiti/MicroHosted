@@ -30,7 +30,47 @@ type alertKind struct {
 	Means    string // one line: why it matters
 }
 
-var alertKinds = map[string]alertKind{}
+// alertKinds: how each is found is in classify (sandbox/sbin/mh-sandbox-lib);
+// docs/sandbox.md lists them for a person.
+var alertKinds = map[string]alertKind{
+	// From audit's syscall rules (auditrules, mh-sandbox-lib).
+	"privesc_attempt": {sevHigh, "tried to become root, or to reach into the kernel",
+		"a syscall that changes who the process is (setuid(0)…) refused, or one ordinary programs never make as a user: mount, chroot, bpf, a kernel module, keyctl, userfaultfd, perf_event_open, ASLR turned off"},
+	"namespace": {sevWarn, "entered a new namespace",
+		"unshare or setns: container tools and browsers' sandboxes (Chromium, Playwright) do it; so do container escapes and kernel exploits, for the privileges a user namespace gives"},
+	"ptrace": {sevWarn, "traced a process",
+		"ptrace: debuggers and strace do it; malware does it to read or inject into another process, or to detect a debugger"},
+	"persistence": {sevHigh, "made itself start again",
+		"wrote (or tried to) where code is run later without being asked: ~/.ssh/authorized_keys, a systemd user unit, autostart, cron, /etc's startup files"},
+	"shell_rc": {sevWarn, "changed the shell's startup files",
+		"~/.bashrc, ~/.profile…: run by every new shell. Installers (nvm, rustup) add a line too; malware hides a command there"},
+	"system_write": {sevWarn, "tried to write a system file",
+		"a write in /etc, as the sandbox's user (refused unless the file is writable by anyone)"},
+	"connect": {sevInfo, "tried to connect",
+		"which program tried to reach what, seen inside the VM (connections lists what the network refused); :53 (dns) is a name lookup"},
+	// From the command lines run (execve).
+	"reverse_shell": {sevHigh, "reverse shell",
+		"a shell joined to a network connection (bash -i >& /dev/tcp/…, nc -e, socat exec:, a Python socket dup2'd onto a shell): someone else's shell on this machine"},
+	"dev_tcp": {sevWarn, "connected through bash's /dev/tcp",
+		"a connection without a network tool: connectivity checks do it, and hand-made requests that avoid curl"},
+	"pipe_to_shell": {sevWarn, "ran what it downloaded",
+		"curl … | sh: installers (rustup, nvm) do it; so does malware's first stage"},
+	"obfuscated_exec": {sevHigh, "ran hidden code",
+		"decoded and ran at once (base64 -d | sh, exec(b64decode(…))): code that hides what it runs from whoever reads it"},
+	"dropper": {sevHigh, "ran a binary it wrote in a temporary directory",
+		"a program written (not compiled) after the sandbox was prepared, in /tmp, /var/tmp or /dev/shm, then run: a downloaded payload"},
+	"dropped_exec": {sevWarn, "ran a program it wrote",
+		"a binary written (not by a compiler or linker) after the sandbox was prepared, or a script written in a temporary directory, then run: unpacked releases do it; so do payloads"},
+	"antiforensics": {sevHigh, "covered its tracks",
+		"history turned off or cleared, a file's times reset outside ~/work (touch -d/-r), shred, logs or the program it dropped removed"},
+	"miner": {sevHigh, "cryptocurrency miner",
+		"a miner by name or by its arguments (xmrig, stratum+tcp://, --donate-level, a mining pool)"},
+	"credential_search": {sevHigh, "searched for credentials",
+		"grep, find or locate for passwords, keys, tokens (id_rsa, .pem, AKIA…) outside ~/work: across home, /etc or the whole disk"},
+	// Audit's own state, at the end.
+	"audit_health": {sevWarn, "audit may have missed some",
+		"the disk filled up (audit stops recording), auditd stopped, or the kernel held the code back for audit to keep up: what is missing is unknown"},
+}
 
 // kindOf is what the CLI knows of kind, or a generic entry for one it does
 // not: shown, never dropped.

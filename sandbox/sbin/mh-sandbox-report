@@ -51,9 +51,12 @@ records() {
 	# probe found|absent COUNT PATH COMM — what tells a VM (or a container)
 	# apart: DMI, CPU flags, modules, PCI, a hypervisor's files, disk and MAC
 	# vendors, battery and sensors, and the tools that read them. Most do not
-	# exist here: asking is the tell. The path is the one the code asked for —
-	# through a symlink or relative to a directory of its own it shows under
-	# another name, and the CPUID instruction not at all.
+	# exist here: asking is the tell. absent: the lookup failed — not there,
+	# hidden from the user (/proc/1/cgroup: /proc is hidepid=2), or a file
+	# asked for as a directory. The path is the one the code asked for, made
+	# absolute against its working directory and without a trailing / —
+	# through a symlink, or relative to a directory it holds open, it shows
+	# under another name or not at all; the CPUID instruction never does.
 	#
 	# privesc found|absent COUNT PATH COMM — what a privilege escalation looks
 	# for: sudo's and the passwords' files, cron, the container runtimes'
@@ -73,11 +76,20 @@ records() {
 		printf 'section\texec\n'
 		printf 'commands\t%s\n' "$(grep -c "^exec$tab" "$S/audited")"
 		grep "^exec$tab" "$S/audited" | sort -t "$tab" -k2,2n | awk -v n="$maxexec" 'NR <= n' | cut -f 1,3-
+		# alert KIND COUNT WHAT BY — what code does when it means harm:
+		# each KIND's severity and meaning are in
+		# internal/cli/sandbox_kinds.go, how it is found in classify
+		# (mh-sandbox-lib). Then audit's own health: what it may have missed.
+		printf 'section\talerts\n'
+		grep "^alert$tab" "$S/audited" | sort -t "$tab" -k2,2 -k4,4
+		health
+		rm -f "$S/audited"
 	else
 		printf 'section\tprobes\n'
 		printf 'audit\toff\n'
 		printf 'section\tprivesc\n'
 		printf 'section\texec\n'
+		printf 'section\talerts\n'
 	fi
 
 	# file PATH, dir PATH — outside ~/work, one by one; work file|dir ENTRY
@@ -108,19 +120,45 @@ records() {
 	[ ! -s "$S/scan" ] || sed 's/^/agent\tinput\t/' "$S/scan"
 }
 
-# audited: the probe, privesc and exec records, from audit's raw log. Not
-# ausearch -i: code that walks the filesystem (linpeas) leaves hundreds of MB
-# of it, which ausearch takes minutes over. grep picks the PATH and EXECVE
-# records worth reading, then the SYSCALL records of those events (the
-# program's name), first, for classify (mh-sandbox-lib).
+# audited: the probe, privesc, exec and alert records, from audit's raw log.
+# Not ausearch -i: code that walks the filesystem (linpeas) leaves hundreds
+# of MB of it, which ausearch takes minutes over. One pass, oldest first —
+# reading the log is most of the time — keeps the events worth classifying:
+# a path that tells a VM apart or that a privilege escalation looks for, a
+# file created, a path relative to somewhere else than ~/work, a command
+# run, a syscall of auditrules' narrow rules; each with its SYSCALL and CWD
+# records, which come first.
 audited() {
-	hits=$S/audit.hits
-	cat /var/log/audit/audit.log* 2>/dev/null |
-		grep -aE "^type=PATH .* name=\"(/($vmdirs|$pedirs)[^\"]*|[^\"]*/($vmtools|$petools))\"|^type=EXECVE " > "$hits"
-	grep -aE '^type=PATH| a[0-9]+="-perm" ' "$hits" | grep -aoE 'msg=audit\([0-9.:]+\)' | sort -u > "$hits.ids"
-	cat /var/log/audit/audit.log* 2>/dev/null | grep -aF -f "$hits.ids" | grep -a '^type=SYSCALL' > "$hits.sys"
-	cat "$hits.sys" "$hits" | classify
-	rm -f "$hits" "$hits.ids" "$hits.sys"
+	cat $(auditlogs) 2>/dev/null |
+		awk -v pi="name=\"(/($vmdirs|$pedirs)|[^\"]*/($vmtools|$petools)\")|nametype=CREATE| name=[0-9A-F]" -v work="cwd=\"$H/work" '
+			/^type=SYSCALL/ { sys = $0; cwd = ""; keep = / key="mh-(privesc|persist|net)"| SYSCALL=execve /; if (keep) print; next }
+			/^type=CWD/ { cwd = $0; if (keep) print; next }
+			/^type=PATH/ {
+				if (!keep && ($0 ~ pi || / name="[^\/]/ && (index(cwd, work) != 1 || / name="[^"]*\.\./))) {
+					print sys; print cwd; keep = 1
+				}
+				if (keep) print
+				next
+			}
+			/^type=(EXECVE|SOCKADDR)/ { if (!keep) { print sys; keep = 1 } print }' |
+		classify
+}
+
+# health: alert audit_health … — what audit may have missed: auditd
+# stopped, the disk (nearly) full, the kernel holding the code back a second
+# or more for audit's backlog (a slowdown code can notice). Events lost are
+# in the audit record.
+health() {
+	auditctl -s | awk -v free="$(df -Pm / | awk 'NR == 2 { print $4 }')" \
+		-v adm="$(awk -F' *= *' '$1 == "admin_space_left" { print $2 + 0 }' /etc/audit/auditd.conf 2>/dev/null)" '
+		$1 == "pid" && $2 == 0 { print "alert\taudit_health\t1\tauditd is not running: nothing was recorded after it stopped\tauditd" }
+		$1 == "backlog_wait_time_actual" && $2 >= 1000 { printf "alert\taudit_health\t1\tthe kernel held the code back %d ms for audit to keep up\tkernel\n", $2 }
+		END {
+			if (adm != "" && free != "" && free <= adm)
+				printf "alert\taudit_health\t1\tthe disk is full: %d MB free, audit stops recording below %d MB (what the code did after is not here)\tauditd\n", free, adm
+			else if (adm != "" && free != "" && free <= 2 * adm)
+				printf "alert\taudit_health\t1\tthe disk is nearly full: %d MB free, audit stops recording below %d MB\tauditd\n", free, adm
+		}'
 }
 
 changed() {
@@ -154,9 +192,10 @@ human() {
 		$1 == "section" {
 			print ""
 			if ($2 == "decoys") print "== decoys (READ: opened; TAMPERED: written, or its times reset)"
-			if ($2 == "probes") print "== looking for a VM (absent: not in this VM; Node'"'"'s os.cpus() and build tools read /proc/cpuinfo too)"
-			if ($2 == "privesc") print "== looking for a way to root (sudo, the password files, cron, container sockets, setuid and writable files)"
+			if ($2 == "probes") print "== looking for a VM (absent: the lookup failed — not there, hidden from " u ", or not a directory; Node'"'"'s os.cpus() and build tools read /proc/cpuinfo too)"
+			if ($2 == "privesc") print "== looking for a way to root (sudo, the password files, cron, container sockets, setuid and writable files; absent as above)"
 			if ($2 == "exec")   print "== commands the code ran, in order (the first: mh-sandbox-run starting it)"
+			if ($2 == "alerts") print "== alerts: what code does when it means harm (count, kind, what, by)"
 			if ($2 == "files")  print "== files created or changed (in ~/work: counted per entry)"
 			if ($2 == "dirs")   print "== directories whose entries changed (a file created, renamed or deleted in them)"
 			if ($2 == "procs")  print "== processes left running as " u
@@ -172,6 +211,7 @@ human() {
 		$1 == "probe" || $1 == "privesc" { printf "  %3d %-7s %s by %s\n", $3, $2, $4, $5 }
 		$1 == "commands" && $2 > '"$maxexec"' { print "  (" $2 " distinct, the first '"$maxexec"' listed)" }
 		$1 == "exec"   { printf "  %4d× %s\n", $2, $3 }
+		$1 == "alert"  { printf "  %3d %-17s %s (by %s)\n", $3, $2, $4, $5 }
 		$1 == "file" || $1 == "dir" { print "  " $2 }
 		$1 == "work" && $3 ~ /\/$/ { printf "  %s%s  (%d inside)\n", w, $3, $4 }
 		$1 == "work" && $3 !~ /\/$/ { print "  " w $3 }

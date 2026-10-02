@@ -70,11 +70,48 @@ and runs nothing.
 | vm_probes | paths that tell a VM apart the code asked for — DMI, `/proc/cpuinfo`, PCI, modules, `/.dockerenv`, `systemd-detect-virt` — `absent` ones included: asking is the tell |
 | privesc | what a privilege escalation looks for — `/etc/shadow`, `/etc/sudoers`, cron, root's home, container sockets (docker, lxd), the kernel's hardening switches, `/proc/PID/mem`; `sudo`, `su`, `pkexec`, `doas`, `getcap` looked up or run (by name); `find -perm` searching for setuid (`-4000`) or writable (`-o=w`) files — `absent` ones included |
 | commands | every command line the code ran (from audit's `execve`), in the order it first ran it, with a count; the first 2000. The first lines are `mh-sandbox-run` starting it. `-v` prints them |
+| alerts | what code does when it means harm, each with a kind, a severity (`high`: what malicious code does; `warn`: unusual for ordinary code; `info`: worth knowing), what it did and the program that did it — table below |
 | changed | files and directories created or changed: outside `~/work` one by one, inside it one line per entry with a count |
 | processes | still running as the sandbox's user |
 | listening | sockets it opened |
 | connections | what it tried that the network refused (the host's view) |
 | addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "system prompt", chat-template tokens, invisible Unicode |
+
+A path in `vm_probes` and `privesc` is the one the code asked for, made
+absolute against its working directory (`cd /sys/class/dmi; cat
+id/product_name` is `/sys/class/dmi/id/product_name`) and without a trailing
+`/`. `absent` means the lookup failed: the path is not there, it is hidden
+from the sandbox's user (`/proc/1/cgroup`: other users' processes are hidden),
+or a file was asked for as a directory (`/proc/cmdline/`). The program is
+named by its file when its process name was cut at 15 characters
+(`systemd-detect-virt`, not `systemd-detect-`).
+
+| Alert | Severity | When |
+|---|---|---|
+| `privesc_attempt` | high | a syscall that changes who the process is refused (`setuid(0)`, `setresgid`, `capset`, `setgroups`), or one an ordinary program never makes as a user: `mount`, `chroot`, `pivot_root`, `bpf`, a kernel module, `keyctl`, `userfaultfd`, `perf_event_open`, `personality` turning ASLR off |
+| `namespace` | warn | `unshare`, `setns` — browsers' sandboxes (Playwright) do it too |
+| `ptrace` | warn | `ptrace` — debuggers do it too |
+| `persistence` | high | a write (refused ones too) to `~/.ssh/authorized_keys`, a systemd user unit, `~/.config/autostart`, cron, `/etc`'s startup files; `crontab`, `at`, `systemctl --user enable` run |
+| `shell_rc` | warn | a write to `~/.bashrc`, `~/.profile`… — installers (nvm, rustup) do it too |
+| `system_write` | warn | any other write to `/etc` |
+| `reverse_shell` | high | a shell joined to a connection: `bash -i >& /dev/tcp/…`, `nc -e`, `socat … exec:`, `mkfifo … \| sh -i \| nc`, a Python/Perl socket with a shell, `pty.spawn` |
+| `dev_tcp` | warn | bash's `/dev/tcp` or `/dev/udp` otherwise (a connectivity check, a hand-made request) |
+| `pipe_to_shell` | warn | `curl … \| sh`, `sh -c "$(curl …)"` — installers do it too |
+| `obfuscated_exec` | high | decoded and run at once: `base64 -d \| sh`, `xxd -r \| sh`, `exec(base64.b64decode(…))` |
+| `dropper` | high | a binary written after the sandbox was prepared, by anything but a compiler or linker, in `/tmp`, `/var/tmp` or `/dev/shm`, then run |
+| `dropped_exec` | warn | the same elsewhere (`~/work`), or a script written in a temporary directory and run |
+| `antiforensics` | high | history off or cleared (`HISTFILE=/dev/null`, `history -c`), `touch -d/-r` outside `~/work`, `shred`, logs or a dropped program removed |
+| `miner` | high | `xmrig`, `stratum+tcp://`, `--donate-level`, a mining pool's name |
+| `credential_search` | high | `grep -r`, `find -name`, `locate` for passwords, keys, tokens (`id_rsa`, `.pem`, `AKIA`…) outside `~/work` |
+| `connect` | info | which program tried to reach which address (`:53 (dns)`: a name lookup); loopback left out |
+| `audit_health` | warn | audit may have missed some: the disk nearly full (audit stops recording below `admin_space_left`, 150 MB), auditd stopped, the kernel holding the code back for audit to keep up |
+
+Shell builtins (`history -c`, `export HISTFILE=…`) and redirections (`>
+/dev/tcp/…`) show only when they are in a command line run (`bash -c '…'`),
+not inside a script file: audit sees programs started, not what a shell does
+within. The commands that make alerts are matched on their arguments: code
+that means to hide can split, encode or rename; an alert is evidence, its
+absence is not.
 
 `evasion_suspected` is true when the code looked for a VM — any probe but
 `/proc/cpuinfo` and `/proc/self/cgroup`, which ordinary programs read too
@@ -145,6 +182,7 @@ and a warning: everything from inside is then unknown, not empty.
     "evasion_suspected": true,
     "privesc": 3,
     "commands": 41,                // distinct command lines
+    "alerts": 1,
     "changed_outside_work": 2,
     "processes_left": 0,
     "listening": 0,
@@ -155,6 +193,7 @@ and a warning: everything from inside is then unknown, not empty.
   "vm_probes":   [{"path": "/sys/class/dmi/id/product_name", "found": false, "count": 1, "by": "python"}],
   "privesc":     [{"path": "find -perm -4000", "found": true, "count": 1, "by": "find"}],
   "commands":    [{"count": 3, "args": "find / -perm -4000"}],
+  "alerts":      [{"kind": "shell_rc", "severity": "warn", "count": 1, "what": "/home/dev/.bashrc", "by": "bash"}],
   "changed":     {"files": ["/home/dev/.bashrc"], "dirs": ["/tmp"],
                   "work_files": [{"entry": ".v/", "count": 203}], "work_dirs": [{"entry": ".v/", "count": 33}]},
   "processes":   [{"pid": 123, "args": "…"}],
@@ -167,7 +206,7 @@ and a warning: everything from inside is then unknown, not empty.
 ```
 
 Untrusted (the code's choice): `changed.*`, `vm_probes[].path` and `.by`,
-`privesc[].path` and `.by`, `commands[].args`,
+`privesc[].path` and `.by`, `commands[].args`, `alerts[].what` and `.by`,
 `processes[].args`, `addresses_an_agent[].file` and `.text`, `output`.
 
 ## Out of scope

