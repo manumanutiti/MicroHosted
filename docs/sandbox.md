@@ -40,7 +40,8 @@ COMMAND is one shell line, run as the sandbox's user in `~/work`.
 | `--timeout D` | for the fetch and the run each (default 5m, at most 10m) |
 | `--keep` | keep the VM (and its network) afterwards, to look inside |
 | `--json` | the report as JSON on stdout (schema below), everything in it |
-| `-v`, `--verbose` | live: each finding as it happens (below); then the report in full — every probe by every program, and every command the code ran. Without it, one line per path (the programs that asked named) and at most 15 per section |
+| `-o`, `--output` | print the code's own output too (its last 8 KiB, every line prefixed with `\|`); by default only what it did is reported |
+| `-v`, `--verbose` | live: each finding as it happens (below); then the report in full — every probe by every program, every command the code ran, what changed in `~/work`. Without it, one line per path (the programs that asked named) and at most 15 per category |
 
 The exit code is the command's. A sandbox that could not be set up exits 1
 and runs nothing.
@@ -76,6 +77,48 @@ and runs nothing.
 | connections | what it tried that the network refused (the host's view) |
 | addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "system prompt", chat-template tokens, invisible Unicode |
 
+### Reading it
+
+A verdict first, then only what was found, grouped and graded, the most
+serious first; one line names what was checked and found clean, so an empty
+category never reads as an unchecked one; the last line, the other views.
+
+```
+!! 2 high, 2 warn -- it read your credentials, searched for setuid binaries and tried to reach the
+   network
+   ./script.sh, sandbox:9, exit 0, 4.8s, 9 commands run
+
+[HIGH] decoy credentials (1)  fake secrets planted for this run
+  !  READ  ~/.aws/credentials  legitimately: the AWS CLI and SDKs read it
+
+[HIGH] looking for a way to root (2)  absent ones count: asking is the tell
+  !  x1  find -perm -4000  found   by find
+  *  x3  sudo              absent  by script.sh
+
+[WARN] connections refused (1)  seen by the host; nothing got out
+  *  tcp  1.1.1.1:80  x2  egress
+
+ok clean: no VM probes, no alerts, nothing changed outside ~/work, no processes left, no sockets, no
+   text addressed to an agent
+
+--output its output, -v everything, --json for agents
+```
+
+That is the plain form, for a pipe or a file (or `NO_COLOR`); on a terminal
+the same in color, with symbols. With nothing found the verdict is
+`nothing seen in this run (not proof it is safe)`; when the report from
+inside the VM failed, it is `INCOMPLETE`, and what is inside is unknown, not
+clean.
+
+| Grade | |
+|---|---|
+| high | a decoy read, tampered with or deleted; text addressed to an AI agent; a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
+| warn | every other privesc probe (`sudo`, `su`, cron, root's home, the kernel's switches, `find -perm` for writable files); a VM probe; a connection refused; a file or directory changed outside `~/work`; a process left; a listening socket |
+| info | a VM probe ordinary programs make too (`/proc/cpuinfo`, `/proc/self/cgroup`) |
+
+An alert (`alerts` in the JSON) is graded by its kind. The grades are a
+reading aid, not a verdict on the code: the report is what it did.
+
 `evasion_suspected` is true when the code looked for a VM — any probe but
 `/proc/cpuinfo` and `/proc/self/cgroup`, which ordinary programs read too
 (Node's `os.cpus()`, cgroup limits in Node, Go and the JVM). Then nothing
@@ -110,11 +153,13 @@ way to root, a connection the host refused.
 
 ```
 == live (-v): what it does, as it happens
-     +1s  privesc      find -perm -o=w found (by find)
-     +9s  privesc      /etc/shadow found (by newgrp)
-    +42s  DECOY READ   /home/dev/.aws/credentials
-    +60s  connection   udp 1.1.1.1:53 refused (egress)
+    +1s  [WARN]  privesc     find -perm -o=w found  (by find)
+    +9s  [HIGH]  privesc     /etc/shadow found  (by newgrp)
+   +42s  [HIGH]  decoy       READ  /home/dev/.aws/credentials
+   +60s  [WARN]  connection  udp 1.1.1.1:53 refused  (egress)
 ```
+
+Alerts from the image show there too, under their kind.
 
 The guest's side is the image's `mh-sandbox-watch`, which reads only what
 audit's log gained since the last look. The report at the end is the whole
@@ -138,6 +183,7 @@ and a warning: everything from inside is then unknown, not empty.
   "kept": false,
   "exit_code": 0,                  // the command's; 124 if it timed out
   "timed_out": false,
+  "duration_ms": 4810,             // the command's start to its end
   "complete": true,                // false: the VM's side could not be read
   "summary": {
     "decoys_read": 1,

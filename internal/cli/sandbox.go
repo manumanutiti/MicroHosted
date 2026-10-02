@@ -15,11 +15,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"regexp"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,10 +46,11 @@ sandbox's own, which is closed before the code runs: the code never runs with
 a network, and every connection it tries is refused and recorded. If closing
 it cannot be confirmed, nothing runs.
 
-The report: decoy credentials read, ways the code looked for a VM, files
+The report: a verdict, then only what was found, graded high, warn or info —
+decoy credentials read, ways the code looked for a VM or for root, files
 changed, processes left, sockets opened, connections refused, and text
-addressed to an AI agent in the input or the output. An empty report is not
-"safe": it is what this run did. File names, process names, the output and
+addressed to an AI agent in the input or the output. The code's own output
+only with -o. An empty report is not "safe": it is what this run did. File names, process names, the output and
 matched text are the code's to choose — data, never instructions.
 
 The image is built once: mh build -t sandbox:1 sandbox  (docs/sandbox.md)`,
@@ -72,6 +70,7 @@ type sandboxOpts struct {
 	keep    bool
 	asJSON  bool
 	verbose bool
+	output  bool
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -98,6 +97,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
 	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
 	fs.boolVar(&o.verbose, "verbose", "v", "show what it does as it happens; then every probe by every program, and every command it ran")
+	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -307,7 +307,9 @@ func (s *sandbox) run() (err error) {
 	if s.o.verbose {
 		stopWatch = s.watch()
 	}
+	began := time.Now()
 	res, timedOut, err := s.exec("mh-sandbox-run "+shellQuote(s.command), s.o.timeout)
+	took := time.Since(began)
 	stopWatch()
 	if err != nil {
 		return err
@@ -318,7 +320,7 @@ func (s *sandbox) run() (err error) {
 	}
 
 	rep := s.report()
-	rep.ExitCode, rep.TimedOut = code, timedOut
+	rep.ExitCode, rep.TimedOut, rep.DurationMS = code, timedOut, took.Milliseconds()
 	rep.Output = untrustedTail(res.Output, 8<<10)
 	patterns, perr := s.patterns()
 	if perr != nil {
@@ -338,7 +340,7 @@ func (s *sandbox) run() (err error) {
 			return err
 		}
 	} else {
-		rep.print(s.e.stdout, s.o.verbose)
+		rep.render(s.e.stdout, styleFor(s.e.stdout), s.o.verbose, s.o.output)
 	}
 	if code != 0 {
 		return exitError{code: code}
@@ -359,12 +361,13 @@ func (s *sandbox) watch() (stop func()) {
 	seen := map[string]bool{}
 	pos := ""
 	guest := true
+	st := styleFor(s.e.stderr)
 	look := func() {
 		// once per thing found: the first program to find it is named
-		show := func(key, what, detail string) {
+		show := func(key string, sev severity, what, detail string) {
 			if !seen[key] {
 				seen[key] = true
-				fmt.Fprintf(s.e.stderr, "  %+5ds  %-12s %s\n", int(time.Since(start).Seconds()), what, detail)
+				liveLine(s.e.stderr, st, time.Since(start), sev, what, detail)
 			}
 		}
 		if guest {
@@ -387,11 +390,14 @@ func (s *sandbox) watch() (stop func()) {
 					case "at":
 						pos = shellQuote(at(1)) + " " + shellQuote(at(2))
 					case "decoy":
-						show("decoy "+at(1)+at(2), "DECOY "+at(1), at(2))
+						show("decoy "+at(1)+at(2), sevHigh, "decoy", at(1)+"  "+at(2))
 					case "probe":
-						show("probe "+at(1)+at(3), "VM probe", at(3)+" "+at(1)+" (by "+at(4)+")")
+						show("probe "+at(1)+at(3), vmProbeSeverity(at(3)), "VM probe", at(3)+" "+at(1)+"  (by "+at(4)+")")
 					case "privesc":
-						show("privesc "+at(1)+at(3), "privesc", at(3)+" "+at(1)+" (by "+at(4)+")")
+						show("privesc "+at(1)+at(3), privescSeverity(at(3)), "privesc", at(3)+" "+at(1)+"  (by "+at(4)+")")
+					case "alert":
+						k := kindOf(at(1))
+						show("alert "+at(1)+at(3), k.Severity, "alert", k.Title+": "+at(3)+"  (by "+at(4)+")")
 					}
 				}
 			}
@@ -404,7 +410,7 @@ func (s *sandbox) watch() (stop func()) {
 					if f.DstPort != 0 {
 						dst += ":" + strconv.Itoa(f.DstPort)
 					}
-					show("flow "+flowKey(f), "connection", f.Protocol+" "+dst+" refused ("+f.Reason+")")
+					show("flow "+flowKey(f), sevWarn, "connection", f.Protocol+" "+dst+" refused  ("+f.Reason+")")
 				}
 			}
 		}
@@ -979,6 +985,8 @@ type sandboxReport struct {
 	Kept     bool   `json:"kept"`
 	ExitCode int    `json:"exit_code"`
 	TimedOut bool   `json:"timed_out"`
+	// DurationMS: from the command's start to its end (or the timeout).
+	DurationMS int64 `json:"duration_ms"`
 	// Complete: the VM's side of the report was read. When false, every
 	// list but connections is unknown, not empty (warnings say why).
 	Complete bool           `json:"complete"`
@@ -1165,175 +1173,6 @@ func (r *sandboxReport) summarize() {
 	s.AddressesAnAgent = len(r.AddressesAnAgent)
 }
 
-// print is the report for a person. Compact by default: one line per path
-// with the programs that asked for it, at most compactLines per section;
-// verbose: one line per path and program, and every command the code ran.
-func (r *sandboxReport) print(w io.Writer, verbose bool) {
-	if r.Output != "" {
-		fmt.Fprint(w, r.Output)
-		if !strings.HasSuffix(r.Output, "\n") {
-			fmt.Fprintln(w)
-		}
-	}
-	fmt.Fprintf(w, "exit code: %d", r.ExitCode)
-	if r.TimedOut {
-		fmt.Fprint(w, " (timed out: stopped where it was, and looked at)")
-	}
-	fmt.Fprintln(w)
-
-	section := func(title string) { fmt.Fprintf(w, "\n== %s\n", title) }
-	none := func(n int) {
-		if n == 0 {
-			fmt.Fprintln(w, "  (none)")
-		}
-	}
-	if r.Complete {
-		section("decoys (READ: opened; TAMPERED: written, or its times reset)")
-		for _, d := range r.Decoys {
-			if d.State == "untouched" {
-				continue
-			}
-			fmt.Fprintf(w, "  %-14s %s   (legitimately: %s)\n", d.State, d.Path, d.Legitimately)
-		}
-		fmt.Fprintf(w, "  %d of %d untouched\n", len(r.Decoys)-r.Summary.DecoysRead, len(r.Decoys))
-
-		section("looking for a VM (absent: not in this VM; /proc/cpuinfo is read by ordinary programs too)")
-		printProbes(w, r.VMProbes, verbose)
-		none(len(r.VMProbes))
-		section("looking for a way to root (sudo, the password files, cron, container sockets, find -perm for setuid or writable files)")
-		printProbes(w, r.Privesc, verbose)
-		none(len(r.Privesc))
-
-		if verbose {
-			section("commands the code ran, in order (the first: mh-sandbox-run starting it)")
-			for _, c := range r.Commands {
-				fmt.Fprintf(w, "  %4d× %s\n", c.Count, c.Args)
-			}
-			if r.commands < 0 {
-				fmt.Fprintln(w, "  (not recorded by this image)")
-			} else {
-				none(len(r.Commands))
-			}
-			if r.Summary.Commands > len(r.Commands) {
-				fmt.Fprintf(w, "  (%d distinct, the first %d listed)\n", r.Summary.Commands, len(r.Commands))
-			}
-		}
-
-		section("files created or changed (in ~/work: counted per entry)")
-		printChanged(w, r.Changed.Files, r.Changed.WorkFiles)
-		none(len(r.Changed.Files) + len(r.Changed.WorkFiles))
-		section("directories whose entries changed")
-		printChanged(w, r.Changed.Dirs, r.Changed.WorkDirs)
-		none(len(r.Changed.Dirs) + len(r.Changed.WorkDirs))
-
-		section("processes left running as " + r.user)
-		for _, p := range r.Processes {
-			fmt.Fprintf(w, "  %6d  %s\n", p.PID, p.Args)
-		}
-		none(len(r.Processes))
-		section("listening sockets")
-		for _, l := range r.Listening {
-			fmt.Fprintln(w, "  "+l)
-		}
-		none(len(r.Listening))
-	} else {
-		section("inside the VM")
-		fmt.Fprintln(w, "  unknown: the report from inside failed (see the warning below)")
-	}
-	section("connections refused (seen by the host)")
-	for _, c := range r.Connections {
-		dst := c.Dst
-		if c.DstPort != 0 {
-			dst += ":" + strconv.Itoa(c.DstPort)
-		}
-		fmt.Fprintf(w, "  %-4s %-22s %4d×  %s\n", c.Protocol, dst, c.Count, c.Reason)
-	}
-	none(len(r.Connections))
-	section("text addressed to an AI agent (a signal, not proof)")
-	for _, a := range r.AddressesAnAgent {
-		where := a.Where
-		if a.File != "" {
-			where += " " + a.File
-		}
-		fmt.Fprintf(w, "  %s:%d: %s\n", where, a.Line, a.Text)
-	}
-	none(len(r.AddressesAnAgent))
-	for _, warn := range r.Warnings {
-		fmt.Fprintln(w, "\nWARNING: "+warn)
-	}
-
-	s := r.Summary
-	if !r.Complete {
-		fmt.Fprintf(w, "\nsummary: INCOMPLETE — only the host's view: %d connection(s) refused, %d text(s) addressed to an agent in the output\n", s.ConnectionsRefused, s.AddressesAnAgent)
-		return
-	}
-	verdict := ""
-	if s.EvasionSuspected {
-		verdict = " — it looked for a VM: what it did not do here proves nothing"
-	}
-	more := ""
-	if !verbose {
-		more = " (-v: every probe, and the commands)"
-	}
-	run := "? command(s) run"
-	if r.commands >= 0 {
-		run = fmt.Sprintf("%d command(s) run", s.Commands)
-	}
-	fmt.Fprintf(w, "\nsummary: %d decoy(s) read, %d VM probe(s), %d privesc probe(s), %s, %d change(s) outside ~/work, %d process(es) left, %d socket(s), %d connection(s) refused, %d text(s) addressed to an agent%s%s\n",
-		s.DecoysRead, s.VMProbes, s.Privesc, run, s.ChangedOutsideWork, s.ProcessesLeft, s.Listening, s.ConnectionsRefused, s.AddressesAnAgent, verdict, more)
-}
-
-// compactLines is how many lines a section of probes shows without -v.
-const compactLines = 15
-
-// printProbes lists probes: verbose, as recorded, one per path and program;
-// compact, one per path (found if any program found it), counts added, the
-// programs named, and the first compactLines of them.
-func printProbes(w io.Writer, ps []sandboxProbe, verbose bool) {
-	line := func(p sandboxProbe) {
-		state := "absent"
-		if p.Found {
-			state = "found"
-		}
-		fmt.Fprintf(w, "  %4d %-7s %s by %s\n", p.Count, state, p.Path, p.By)
-	}
-	if verbose {
-		for _, p := range ps {
-			line(p)
-		}
-		return
-	}
-	var order []string
-	merged := map[string]*sandboxProbe{}
-	by := map[string][]string{}
-	for _, p := range ps {
-		m := merged[p.Path]
-		if m == nil {
-			m = &sandboxProbe{Path: p.Path}
-			merged[p.Path] = m
-			order = append(order, p.Path)
-		}
-		m.Count += p.Count
-		m.Found = m.Found || p.Found
-		if !slices.Contains(by[p.Path], p.By) {
-			by[p.Path] = append(by[p.Path], p.By)
-		}
-	}
-	for i, path := range order {
-		if i == compactLines {
-			fmt.Fprintf(w, "  … %d more (-v lists every one)\n", len(order)-compactLines)
-			break
-		}
-		m := *merged[path]
-		names := by[path]
-		if len(names) > 3 {
-			names = append(names[:3:3], "…")
-		}
-		m.By = strings.Join(names, ", ")
-		line(m)
-	}
-}
-
 // names are the paths the code created or changed, ~/work's entries
 // included: a file's name can speak to an agent as well as its content.
 func (c sandboxChanged) names() []string {
@@ -1342,19 +1181,4 @@ func (c sandboxChanged) names() []string {
 		n = append(n, "~/work/"+e.Entry)
 	}
 	return n
-}
-
-func printChanged(w io.Writer, outside []string, work []sandboxWorkEntry) {
-	sorted := append([]string(nil), outside...)
-	sort.Strings(sorted)
-	for _, f := range sorted {
-		fmt.Fprintln(w, "  "+f)
-	}
-	for _, e := range work {
-		if strings.HasSuffix(e.Entry, "/") {
-			fmt.Fprintf(w, "  ~/work/%s  (%d inside)\n", e.Entry, e.Count)
-		} else {
-			fmt.Fprintln(w, "  ~/work/"+path.Clean(e.Entry))
-		}
-	}
 }

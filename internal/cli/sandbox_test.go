@@ -322,7 +322,7 @@ func (d *sandboxDaemon) mux() *http.ServeMux {
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-report"):
 			res.Output = "user\tdev\ndecoy\tREAD\t/home/dev/.netrc\tcurl\nprobe\tabsent\t1\t/sys/class/dmi/id/sys_vendor\tcat\n"
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-watch"):
-			res.Output = "decoy\tREAD\t/home/dev/.netrc\nprivesc\tfound\t1\tfind -perm -4000\tfind\nprivesc\tfound\t1\tfind -perm -4000\tother\nat\t5\t100\n"
+			res.Output = "decoy\tREAD\t/home/dev/.netrc\nprivesc\tfound\t1\tfind -perm -4000\tfind\nprivesc\tfound\t1\tfind -perm -4000\tother\nalert\tnew-kind\t1\tx\tsh\nat\t5\t100\n"
 		case strings.HasPrefix(req.Cmd, "cat /usr/share/mh-sandbox/agent-patterns"):
 			res.Output = "# comment\nignore (all )?previous instructions\n"
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-run '"):
@@ -462,42 +462,168 @@ func TestSandboxReportFailureKeepsTheRest(t *testing.T) {
 			}
 			continue
 		}
-		for _, want := range []string{"hello", "exit code: 3", "unknown: the report from inside failed", "1.1.1.1:53", "summary: INCOMPLETE"} {
+		if !strings.HasPrefix(out, "?? INCOMPLETE -- the report from inside the VM failed") {
+			t.Errorf("not INCOMPLETE first:\n%s", out)
+		}
+		for _, want := range []string{"exit 3", "inside the VM: unknown, not none", "udp  1.1.1.1:53  x3", "[HIGH] text addressed to an AI agent", "! warning: the report from inside the VM failed"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("no %q in:\n%s", want, out)
 			}
 		}
-		if strings.Contains(out, "(none)\n\n== connections") || strings.Contains(out, "untouched") {
-			t.Errorf("an unknown part reads as empty:\n%s", out)
+		if strings.Contains(out, "untouched") || strings.Contains(out, "no privesc") || strings.Contains(out, "hello") {
+			t.Errorf("an unknown part reads as empty, or the output shown unasked:\n%s", out)
 		}
 	}
 }
 
-func TestPrintProbes(t *testing.T) {
-	ps := []sandboxProbe{
+// renderReport is the person's report, plain (not a terminal).
+func renderReport(r *sandboxReport, verbose, output bool) string {
+	var b strings.Builder
+	r.render(&b, styleFor(&b), verbose, output)
+	return b.String()
+}
+
+func TestSandboxProbesCompactAndVerbose(t *testing.T) {
+	r := parseSandboxReport("user\tdev\n")
+	r.Complete = true
+	r.Privesc = []sandboxProbe{
 		{Path: "sudo", Found: false, Count: 3, By: "bash"},
 		{Path: "sudo", Found: false, Count: 1, By: "which"},
 		{Path: "/etc/shadow", Found: true, Count: 44, By: "newgrp"},
 	}
+	r.summarize()
+	out := renderReport(r, false, false)
+	// merged, one per path, the high one first
+	want := "[HIGH] looking for a way to root (2)  absent ones count: asking is the tell\n" +
+		"  !  x44  /etc/shadow  found   by newgrp\n" +
+		"  *  x4   sudo         absent  by bash, which\n"
+	if !strings.Contains(out, want) {
+		t.Errorf("compact:\n%s\nwant:\n%s", out, want)
+	}
+	if out := renderReport(r, true, false); !strings.Contains(out, "x3   sudo") || !strings.Contains(out, "x1   sudo") {
+		t.Errorf("verbose, one line per path and program:\n%s", out)
+	}
+	r.Privesc = nil
+	for i := range compactLines + 5 {
+		r.Privesc = append(r.Privesc, sandboxProbe{Path: fmt.Sprintf("/p%d", i), Count: 1, By: "x"})
+	}
+	if out := renderReport(r, false, false); !strings.Contains(out, "... 5 more (-v)") || strings.Contains(out, "/p15") {
+		t.Errorf("not capped:\n%s", out)
+	}
+	if out := renderReport(r, true, false); !strings.Contains(out, "/p19") {
+		t.Errorf("-v capped:\n%s", out)
+	}
+}
+
+func TestPrivescSeverity(t *testing.T) {
+	for p, want := range map[string]severity{
+		"find -perm -4000": sevHigh, "find -perm /u=s": sevHigh, "find -perm -2000": sevHigh, "find -perm -o=w": sevWarn,
+		"/etc/shadow": sevHigh, "/etc/sudoers.d": sevHigh, "/run/docker.sock": sevHigh, "/proc/PID/mem": sevHigh,
+		"sudo": sevWarn, "/etc/crontab": sevWarn, "/root": sevWarn, "/proc/sys/kernel/yama/ptrace_scope": sevWarn,
+	} {
+		if got := privescSeverity(p); got != want {
+			t.Errorf("%s: %v, want %v", p, got, want)
+		}
+	}
+}
+
+// A report with findings: the verdict first and graded, only the categories
+// found, one line for what is clean, the output only when asked for.
+func TestSandboxRenderFindings(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev",
+		"decoy\tREAD\t/home/dev/.aws/credentials\taws",
+		"decoy\tuntouched\t/home/dev/.netrc\tcurl",
+		"privesc\tfound\t1\tfind -perm -4000\tfind",
+		"privesc\tabsent\t2\tsudo\tbash",
+		"probe\tfound\t1\t/proc/cpuinfo\tnode",
+		"alert\tsome-new-kind\t2\tdid a thing\tsh",
+		"commands\t7",
+		"exec\t1\tcat /home/dev/.aws/credentials",
+	}, "\n"))
+	r.Complete, r.Target, r.Image, r.ExitCode, r.DurationMS = true, "./x.sh", "sandbox:8", 0, 4200
+	r.Connections = []sandboxConn{{Protocol: "tcp", Dst: "1.1.1.1", DstPort: 80, Count: 3, Reason: "egress"}}
+	r.Output = "SECRET-OUTPUT-LINE\n"
+	r.summarize()
+	out := renderReport(r, false, false)
+	lines := strings.Split(out, "\n")
+	if lines[0] != "!! 2 high, 3 warn, 1 info -- it read your credentials, searched for setuid binaries and 2 more" {
+		t.Errorf("verdict:\n%s", out)
+	}
+	for _, want := range []string{
+		"./x.sh, sandbox:8, exit 0, 4.2s, 7 commands run",
+		"[HIGH] decoy credentials (1)", "READ  ~/.aws/credentials  legitimately: aws",
+		"[WARN] some-new-kind (1)", "x2  did a thing  by sh",
+		"[WARN] connections refused (1)", "tcp  1.1.1.1:80  x3  egress",
+		"[INFO] looking for a VM (1)",
+		"ok clean: nothing changed outside ~/work", "no processes left", "no sockets",
+		"--output its output, -v everything, --json for agents",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in:\n%s", want, out)
+		}
+	}
+	for _, not := range []string{"SECRET-OUTPUT-LINE", "untouched", "cat /home", "\x1b"} {
+		if strings.Contains(out, not) {
+			t.Errorf("%q in the default view:\n%s", not, out)
+		}
+	}
+	if strings.Index(out, "[HIGH]") > strings.Index(out, "[WARN]") || strings.Index(out, "[WARN]") > strings.Index(out, "[INFO]") {
+		t.Errorf("not most serious first:\n%s", out)
+	}
+	for _, l := range lines {
+		if len([]rune(l)) > viewWidth {
+			t.Errorf("line over %d columns: %q", viewWidth, l)
+		}
+	}
+
+	// --output: the output, each line marked, before the verdict.
+	out = renderReport(r, false, true)
+	if !strings.Contains(out, "| SECRET-OUTPUT-LINE\n") || strings.Index(out, "SECRET") > strings.Index(out, "!! ") || strings.Contains(out, "--output its output") {
+		t.Errorf("--output:\n%s", out)
+	}
+	// -v: the commands too, last, and not counted as findings
+	if out := renderReport(r, true, false); !strings.Contains(out, "x1  cat /home/dev/.aws/credentials") || !strings.HasPrefix(out, lines[0]+"\n") {
+		t.Errorf("-v without the commands, or counting them:\n%s", out)
+	}
+}
+
+// Nothing found must not read as safe; looking for a VM makes it prove less.
+func TestSandboxRenderEmpty(t *testing.T) {
+	r := parseSandboxReport("user\tdev\ndecoy\tuntouched\t/home/dev/.netrc\tcurl\ncommands\t2\n")
+	r.Complete, r.Target, r.Image = true, "./x.sh", "sandbox:8"
+	r.summarize()
+	out := renderReport(r, false, false)
+	if !strings.HasPrefix(out, "== nothing seen in this run (not proof it is safe)\n") {
+		t.Errorf("empty verdict:\n%s", out)
+	}
+	if !strings.Contains(out, "ok clean: decoys 1/1 untouched, no privesc probes, no VM probes") || strings.Contains(out, "[") {
+		t.Errorf("empty report:\n%s", out)
+	}
+	if strings.Contains(strings.ToLower(out), "safe\n") && !strings.Contains(out, "not proof it is safe") {
+		t.Errorf("reads as safe:\n%s", out)
+	}
+
+	r.VMProbes = []sandboxProbe{{Path: "/sys/class/dmi/id/sys_vendor", Count: 1, By: "cat"}}
+	r.summarize()
+	if out := renderReport(r, false, false); !strings.Contains(out, "it looked for a VM: what it did not do here proves nothing") {
+		t.Errorf("evasion not said:\n%s", out)
+	}
+}
+
+// On a terminal: color and symbols; the code's strings never carry an escape.
+func TestSandboxRenderColor(t *testing.T) {
+	r := parseSandboxReport("user\tdev\ndecoy\tREAD\t/home/dev/.netrc\x1b[2J\tcurl\n")
+	r.Complete = true
+	r.summarize()
 	var b strings.Builder
-	printProbes(&b, ps, false)
-	want := "     4 absent  sudo by bash, which\n    44 found   /etc/shadow by newgrp\n"
-	if b.String() != want {
-		t.Errorf("compact:\n%s\nwant:\n%s", b.String(), want)
+	r.render(&b, viewStyle{color: true}, false, false)
+	out := b.String()
+	if !strings.Contains(out, "\x1b[") || !strings.Contains(out, "⚠") || !strings.Contains(out, "●") {
+		t.Errorf("no color:\n%s", out)
 	}
-	b.Reset()
-	printProbes(&b, ps, true)
-	if strings.Count(b.String(), "\n") != 3 {
-		t.Errorf("verbose, one line each:\n%s", b.String())
-	}
-	many := make([]sandboxProbe, compactLines+5)
-	for i := range many {
-		many[i] = sandboxProbe{Path: fmt.Sprintf("/p%d", i), Count: 1, By: "x"}
-	}
-	b.Reset()
-	printProbes(&b, many, false)
-	if !strings.Contains(b.String(), "… 5 more (-v lists every one)") {
-		t.Errorf("not capped:\n%s", b.String())
+	if strings.Contains(out, "\x1b[2J") || !strings.Contains(out, ".netrc?[2J") {
+		t.Errorf("the code's escape reached the terminal:\n%q", out)
 	}
 }
 
@@ -513,7 +639,7 @@ func TestSandboxVerboseIsLive(t *testing.T) {
 	if code != 3 {
 		t.Fatalf("exit %d; stderr %s", code, errOut)
 	}
-	for _, want := range []string{"DECOY READ", "/home/dev/.netrc", "privesc", "find -perm -4000 found (by find)", "connection", "udp 1.1.1.1:53 refused"} {
+	for _, want := range []string{"[HIGH]  decoy       READ  /home/dev/.netrc", "[HIGH]  privesc     find -perm -4000 found  (by find)", "[WARN]  connection  udp 1.1.1.1:53 refused", "[WARN]  alert       new-kind: x  (by sh)"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("no %q live in:\n%s", want, errOut)
 		}
