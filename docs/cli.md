@@ -449,6 +449,20 @@ Each spec is a **project** — its `name:`, or its directory's name — and sees
 only its own VMs and networks: `mh up` in two directories runs both. Its VMs
 are named `<project>-<function>-<n>`.
 
+### Untrusted code: `mh sandbox`
+
+Runs a directory, a file, an archive or an https git URL in a fresh VM built
+from `sandbox/`, with decoy credentials around it and the network cut before
+it runs, and reports what it did. docs/sandbox.md has the whole of it.
+
+```bash
+mh build -t sandbox:1 sandbox                                    # once
+mh sandbox ./install.sh                                          # a file: runs it
+mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'   # dependencies first, with a network
+mh sandbox https://github.com/x/y 'make test' --apt build-essential
+mh sandbox ./release.tgz 'bash setup.sh' --json                  # for an agent
+```
+
 ### Platform
 
 ```bash

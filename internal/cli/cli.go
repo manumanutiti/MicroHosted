@@ -177,6 +177,9 @@ func dispatch(e *env, args []string, global *flagSet) error {
 			if s := findShortcut(args[1]); s != nil {
 				return runCommand(e, findGroup(s.group), s.cmd, []string{"--help"}, "mh "+s.name)
 			}
+			if args[1] == sandboxCmd.name {
+				return sandboxCmd.run(e, sandboxCmd, "mh sandbox", []string{"--help"})
+			}
 		}
 		printHelp(e.stdout, global)
 		return nil
@@ -204,6 +207,9 @@ func dispatch(e *env, args []string, global *flagSet) error {
 	}
 	if isProjectVerb(name) {
 		return runProject(e, e.hostFlag, name, args[1:])
+	}
+	if name == sandboxCmd.name {
+		return sandboxCmd.run(e, sandboxCmd, "mh sandbox", args[1:])
 	}
 	return usagef("mh", "unknown command %q", name)
 }
@@ -262,6 +268,7 @@ Common commands (VMs):
 		fmt.Fprintf(tw, "  %s\t%s\n", s.name, g.find(s.cmd).summary)
 	}
 	tw.Flush()
+	fmt.Fprintf(w, "\nUntrusted code:\n  %-11s%s\n", sandboxCmd.name, sandboxCmd.summary)
 	printProjectHelp(w)
 	fmt.Fprint(w, "\nManagement commands:\n")
 	for _, g := range groups {

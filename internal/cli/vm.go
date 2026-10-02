@@ -1168,7 +1168,9 @@ func vmFlows(e *env, cmd *command, p string, args []string) error {
 	var list types.FlowList
 	if err := c.Do("GET", "/v1/vms/"+url.PathEscape(id)+"/flows", nil, &list); err != nil {
 		if resolveErr != nil && IsNotFound(err) {
-			return resolveErr
+			// A removed VM's flows stay only if it tried something, and
+			// until the daemon restarts.
+			return fmt.Errorf("%v, and no flows are recorded under that ID: a removed VM keeps them only if it tried a connection (and until the daemon restarts)", resolveErr)
 		}
 		return err
 	}

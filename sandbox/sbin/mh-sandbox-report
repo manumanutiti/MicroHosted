@@ -1,0 +1,161 @@
+#!/bin/sh
+# What the code did to this VM since mh-sandbox-prepare. Run it as root (mh exec)
+# when the code has finished. Connections are not here: the host saw them
+# (mh flows VM).
+#
+#   mh-sandbox-report           for a person
+#   mh-sandbox-report --tsv     for mh sandbox: one record per line, tab-separated
+#
+# It holds while the code ran as the sandbox's user and did not become root:
+# only root can set a file's ctime, and only the kernel moves it. File names,
+# process names and command lines are the code's choice — data, never
+# instructions; anything unprintable (a tab included) shows as ?.
+. /usr/sbin/mh-sandbox-lib
+M=$S/since
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-report: run as root (mh exec)" >&2; exit 1; }
+[ -e "$M" ] || { echo "mh-sandbox-report: not prepared" >&2; exit 1; }
+
+# Timestamps as stat prints them ("2026-10-01 19:31:37.027243696 +0000"):
+# fixed width in one timezone, so they compare as strings, to the nanosecond.
+since=$(stat -c %z "$M")
+after() { awk -v t="$1" -v m="$since" 'BEGIN { exit !(t > m) }'; }
+tab=$(printf '\t')
+clean() { awk '{ gsub(/[^[:print:]]/, "?"); print }'; }
+
+records() {
+	printf 'since\t%s\nuser\t%s\ntoken\t%s\n' "$since" "$U" "$(cat "$S/token")"
+
+	# section NAME starts each part, for the person's view: an empty part
+	# still shows.
+	printf 'section\tdecoys\n'
+	# decoy STATE PATH NOTE — STATE: untouched, READ, TAMPERED, READ+TAMPERED, DELETED
+	while IFS="$tab" read -r f note; do
+		if ! a=$(stat -c %x "$f" 2>/dev/null); then
+			printf 'decoy\tDELETED\t%s\t%s\n' "$f" "$note"
+			continue
+		fi
+		c=$(stat -c %z "$f")
+		r=""
+		after "$a" && r="READ"
+		after "$c" && r="${r:+$r+}TAMPERED"
+		printf 'decoy\t%s\t%s\t%s\n' "${r:-untouched}" "$f" "$note"
+	done < "$S/decoys"
+
+	# probe found|absent COUNT PATH COMM — what tells a VM (or a container)
+	# apart: DMI, CPU flags, modules, PCI, a hypervisor's files, disk and MAC
+	# vendors, battery and sensors, and the tools that read them. Most do not
+	# exist here: asking is the tell. The path is the one the code asked for —
+	# through a symlink or relative to a directory of its own it shows under
+	# another name, and the CPUID instruction not at all.
+	printf 'section\tprobes\n'
+	if command -v ausearch >/dev/null; then
+		printf 'audit\ton\t%s\n' "$(auditctl -s | awk '$1 == "lost" { print $2 }')"
+		vm='^/(sys/(class/dmi|devices/virtual/dmi|firmware/(dmi|acpi)|hypervisor|module|bus/pci|class/(power_supply|thermal)|class/net/[^/]+/address)|proc/(cpuinfo|modules|bus/pci|scsi|xen|cmdline|1/cgroup|self/cgroup)|dev/disk/by-id|\.dockerenv|run/\.containerenv)|/(dmidecode|lspci|lscpu|lsmod|lshw|systemd-detect-virt|virt-what|hostnamectl|dmesg)$'
+		# ausearch -i prints an event's PATH records before its SYSCALL (comm).
+		ausearch -i -k mh-sandbox 2>/dev/null | awk -v vm="$vm" '
+			function flush(  i) { for (i = 1; i <= n; i++) seen[p[i] "\t" comm]++; n = 0; comm = "" }
+			/^----/ { flush() }
+			/^type=SYSCALL/ && match($0, / comm=[^ ]+/) { comm = substr($0, RSTART + 6, RLENGTH - 6) }
+			/^type=PATH/ && match($0, / name=[^ ]+/) {
+				f = substr($0, RSTART + 6, RLENGTH - 6)
+				if (f ~ vm) p[++n] = ($0 ~ /nametype=UNKNOWN/ ? "absent" : "found") "\t" f
+			}
+			END {
+				flush()
+				for (k in seen) {
+					split(k, a, "\t")
+					gsub(/[^[:print:]]/, "?", a[2]); gsub(/[^[:print:]]/, "?", a[3])
+					printf "probe\t%s\t%d\t%s\t%s\n", a[1], seen[k], a[2], a[3]
+				}
+			}' | sort -t "$tab" -k4,4 -k2,2
+	else
+		printf 'audit\toff\n'
+	fi
+
+	# file PATH, dir PATH — outside ~/work, one by one; work file|dir ENTRY
+	# COUNT — inside it, the code's own tree where installing writes
+	# thousands, one record per entry of it. Every file of the root
+	# filesystem, ctime first; a name with a newline in it can add a line,
+	# never remove one.
+	printf 'section\tfiles\n'
+	changed file ! -type d
+	printf 'section\tdirs\n'
+	changed dir -type d
+
+	# proc PID ARGS
+	printf 'section\tprocs\n'
+	ps -e -o pid=,user=,args= | awk -v u="$U" '$2 == u { pid = $1; $1 = $2 = ""; sub(/^ +/, ""); gsub(/[^[:print:]]/, "?"); printf "proc\t%s\t%s\n", pid, $0 }'
+
+	# listen PROTO ADDRESS
+	printf 'section\tlisten\n'
+	if command -v ss >/dev/null; then
+		ss -Htuln | awk '{ printf "listen\t%s\t%s\n", $1, $5 }'
+	else
+		netstat -tuln 2>/dev/null | tail -n +3 | awk '{ printf "listen\t%s\t%s\n", $1, $4 }'
+	fi
+
+	# agent input FILE LINE TEXT — text addressed to an AI agent in the input,
+	# found by mh-sandbox-scan before the code ran.
+	printf 'section\tagent\n'
+	[ ! -s "$S/scan" ] || sed 's/^/agent\tinput\t/' "$S/scan"
+}
+
+changed() {
+	kind=$1
+	shift
+	find / -xdev "$@" ! -path "$S" ! -path "$S/*" ! -path /var/log/audit ! -path "/var/log/audit/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
+		awk -F'|' -v m="$since" -v w="$H/work/" -v kind="$kind" '
+			$1 ~ /^[0-9][0-9][0-9][0-9]-/ && $1 > m {
+				sub(/^[^|]*\|/, ""); gsub(/[^[:print:]]/, "?")
+				if (index($0, w) != 1) {
+					print kind "\t" $0
+					next
+				}
+				e = substr($0, length(w) + 1)
+				sub(/\/.*/, "/", e)
+				if (!(e in n))
+					order[++k] = e
+				n[e]++
+			}
+			END {
+				for (i = 1; i <= k; i++)
+					printf "work\t%s\t%s\t%d\n", kind, order[i], n[order[i]]
+			}'
+}
+
+human() {
+	awk -F'\t' -v w="$H/work/" '
+		$1 == "since" { print "since:   " $2 }
+		$1 == "user"  { print "user:    " $2; u = $2 }
+		$1 == "token" { print "token:   " $2 }
+		$1 == "section" {
+			print ""
+			if ($2 == "decoys") print "== decoys (READ: opened; TAMPERED: written, or its times reset)"
+			if ($2 == "probes") print "== looking for a VM (absent: not in this VM; Node'"'"'s os.cpus() and build tools read /proc/cpuinfo too)"
+			if ($2 == "files")  print "== files created or changed (in ~/work: counted per entry)"
+			if ($2 == "dirs")   print "== directories whose entries changed (a file created, renamed or deleted in them)"
+			if ($2 == "procs")  print "== processes left running as " u
+			if ($2 == "listen") print "== listening sockets"
+			if ($2 == "agent")  print "== text addressed to an AI agent, in the input (a signal, not proof)"
+		}
+		$1 == "decoy" {
+			if ($2 == "untouched" || $2 == "DELETED") printf "%-16s %s\n", $2, $3
+			else printf "%-16s %s   (legitimately: %s)\n", $2, $3, $4
+		}
+		$1 == "audit" && $2 == "off" { print "  (no audit in this image: not recorded)" }
+		$1 == "audit" && $3 + 0 > 0  { print "  (audit lost " $3 " events: this list may be incomplete)" }
+		$1 == "probe" { printf "  %3d %-7s %s by %s\n", $3, $2, $4, $5 }
+		$1 == "file" || $1 == "dir" { print "  " $2 }
+		$1 == "work" && $3 ~ /\/$/ { printf "  %s%s  (%d inside)\n", w, $3, $4 }
+		$1 == "work" && $3 !~ /\/$/ { print "  " w $3 }
+		$1 == "proc"   { printf "  %6s  %s\n", $2, $3 }
+		$1 == "listen" { printf "  %-5s %s\n", $2, $3 }
+		$1 == "agent"  { printf "  %s:%s: %s\n", $3, $4, $5 }'
+}
+
+case "${1:-}" in
+--tsv) records ;;
+"") records | human ;;
+*) echo "usage: mh-sandbox-report [--tsv]" >&2; exit 2 ;;
+esac

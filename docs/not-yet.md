@@ -86,7 +86,7 @@ stage, with a threat model of its own.
 
 ### Why not now, and what would change it
 
-For the sandbox (orchestrator/examples/sandbox) it brings little: code runs
+For the sandbox (`mh sandbox`, docs/sandbox.md) it brings little: code runs
 without a network, and dependencies are fetched by the package manager — not
 the code — with the internet but not the LAN, before the network is cut.
 It would be worth doing when long-running VMs need to reach services by name
@@ -98,7 +98,7 @@ network with a resolver allowed becomes a case to close.
 ## Quarantine: cut off, but not filtered or recorded
 
 **Status: to work on next (noted 2026-10-02).** Found while building the
-sandbox's fetch step (orchestrator/examples/sandbox), which now avoids
+sandbox's fetch step (`mh sandbox`, docs/sandbox.md), which now avoids
 quarantine and closes a network of its own instead.
 
 ### What was measured
@@ -141,7 +141,7 @@ Leaning: 2, with 1 as a stopgap if it must be closed sooner.
 
 ### And the sandbox's fetch
 
-`mh-sandbox` cuts a network of its own (`mh network update --no-out`) rather
+`mh sandbox` cuts a network of its own (`mh network update --no-out`) rather
 than quarantining: the VM stays on its bridge, behind the port filter, and
 every attempt is recorded as `egress`. Once quarantine filters and records
 (option 2), it becomes a second line for it: close the network, then

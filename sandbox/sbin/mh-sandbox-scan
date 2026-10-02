@@ -1,0 +1,40 @@
+#!/bin/sh
+# Looks in ~/work — the code and what was fetched for it — for text addressed
+# to an AI agent: the phrases in /usr/share/mh-sandbox/agent-patterns, in a
+# file or in a file's name, and invisible Unicode (zero-width, bidirectional
+# controls, tag characters) that hides text from a person and not from a
+# model. Run it as root (mh exec), after mh-sandbox-prepare and before the
+# code runs; mh-sandbox-report lists what it found.
+#
+# Root reads, never writes or follows a link: grep -r does not follow
+# symlinks below the top, and skips devices and FIFOs (-D skip). At most 200
+# findings. A signal, never a defence: see the patterns' file.
+. /usr/sbin/mh-sandbox-lib
+P=/usr/share/mh-sandbox/agent-patterns
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-scan: run as root (mh exec)" >&2; exit 1; }
+[ -e "$S/since" ] || { echo "mh-sandbox-scan: not prepared" >&2; exit 1; }
+cd "$H/work" || exit 1
+
+# In $S, not /tmp: a file the tool made after the clock started would show in
+# the report as the code's.
+pat=$S/patterns
+grep -v -e '^#' -e '^$' "$P" > "$pat"
+
+# FILE <TAB> LINE <TAB> TEXT, unprintable as ?, the text cut at 160.
+# Fields are joined with \001 until the end: a file name may hold a colon or
+# a tab, never a NUL (grep -Z ends the name with one).
+{
+	grep -rIinoEZ -D skip --exclude-dir=.git -f "$pat" . 2>/dev/null | tr '\000' '\001' |
+		awk '{ i = index($0, "\001"); r = substr($0, i + 1); j = index(r, ":")
+		       print substr($0, 1, i) substr(r, 1, j - 1) "\001" substr(r, j + 1) }'
+	LC_ALL=C.UTF-8 grep -rIlP -D skip --exclude-dir=.git '[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E0000}-\x{E007F}]' . 2>/dev/null |
+		awk '{ print $0 "\0010\001(invisible Unicode characters)" }'
+	find . -path ./.git -prune -o -print 2>/dev/null | grep -iE -f "$pat" | awk '{ print $0 "\0010\001(its name)" }'
+} | awk -F'\001' '{
+	sub(/^\.\//, "", $1)
+	for (i = 1; i <= 3; i++) gsub(/[^[:print:]]/, "?", $i)
+	printf "%s\t%s\t%s\n", $1, $2, substr($3, 1, 160)
+}' | head -n 200 > "$S/scan"
+rm -f "$pat"
+echo "scanned: $(wc -l < "$S/scan") finding(s)"

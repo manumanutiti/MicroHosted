@@ -16,7 +16,9 @@
 . /usr/sbin/mh-sandbox-lib
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-run: run as root (mh exec)" >&2; exit 1; }
+fetch=
 if [ "${1:-}" = --fetch ]; then
+	fetch=1
 	shift
 	[ ! -e "$S/since" ] || { echo "mh-sandbox-run: --fetch is before mh-sandbox-prepare, and this VM is prepared" >&2; exit 1; }
 else
@@ -25,3 +27,15 @@ fi
 [ $# -gt 0 ] || { echo "usage: mh-sandbox-run [--fetch] COMMAND..." >&2; exit 2; }
 
 asuser 'mkdir -p "$HOME/work" && cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
+rc=$?
+# A fetch ends when its connections have closed (at most 10 s): cut while one
+# is still closing, its last packets are refused and recorded as if the code
+# had sent them.
+if [ -n "$fetch" ] && command -v ss >/dev/null; then
+	i=0
+	while [ $i -lt 50 ] && [ -n "$(ss -Htn state all exclude listening exclude time-wait exclude closed)" ]; do
+		sleep 0.2
+		i=$((i + 1))
+	done
+fi
+exit $rc

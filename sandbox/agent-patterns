@@ -1,0 +1,27 @@
+# Text addressed to an AI agent: phrases that make no sense in code or its
+# documentation unless they are meant for a model reading them. Extended
+# regular expressions, matched case-insensitively, one per line; # starts a
+# comment. Read by mh-sandbox-scan (grep -E) on the code before it runs, and
+# by mh sandbox (Go regexp) on its output: write only what both understand —
+# literals, ( | ), ?, +, *, [ ], no \b, no back-references.
+#
+# A signal, never a defence: base64, another language or a split phrase evade
+# it. A match in an LLM application's own prompts is expected; read the line.
+ignore (all |any )?(of )?(the |your |my )?(previous|prior|above|earlier|preceding|former) (instructions|prompts?|messages|rules|orders|directions|context)
+disregard (all |any )?(of )?(the |your )?(previous|prior|above|earlier|preceding|former|system)
+forget (all |everything )?(of )?(the |your )?(previous|prior|above|earlier) (instructions|prompts?|rules|context)
+override (the |your )?(system|safety) (prompt|instructions|rules)
+(new|updated|real|actual|hidden) (system )?instructions *:
+system prompt
+(do not|don't|never) (tell|inform|alert|show|mention (this|it) to) the user
+without (telling|informing|alerting|asking) the user
+(note|message|instructions?) (to|for) (the |any )?(ai|llm|assistant|agent|model|claude|chatgpt|copilot|cursor|gemini)
+if you are an? (ai|llm|assistant|agent|language model|coding agent)
+(dear|attention|hey) (ai|llm|assistant|agent|claude|chatgpt|copilot|cursor|gemini)
+as an ai (language model|assistant|agent)
+you are (now )?(an? )?(ai|llm|assistant|agent|language model) (that|who|with|and)
+(claude|chatgpt|copilot|cursor|gemini|assistant|agent), (please )?(ignore|run|execute|you must|immediately)
+<\|(im_start|im_end|system|user|assistant|endoftext)\|>
+\[/?INST\]
+<</?SYS>>
+</?(system|system-reminder|instructions)>
