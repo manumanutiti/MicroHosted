@@ -1,0 +1,6 @@
+# Alpine with Python 3. The site itself is not in the image: microse.yml
+# ships site/ with files:, so editing a page needs no rebuild.
+# By hand: mh build orchestrator/examples/website
+name: website
+base: alpine:3.22
+packages: [python3]

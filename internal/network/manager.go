@@ -350,6 +350,9 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 	if err := ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
 		return nil, err
 	}
+	if err := ValidateEgressPorts(req.Egress, req.EgressPorts); err != nil {
+		return nil, err
+	}
 	if err := ValidateIngressRules(req.AllowedIngress, m.ManagedIfaceNames()); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidIngress, err)
 	}
@@ -411,6 +414,7 @@ func (m *Manager) create(req types.CreateNetworkRequest) (*types.Network, error)
 		Egress:         req.Egress,
 		EgressIface:    req.EgressIface,
 		EgressPrivate:  req.EgressPrivate,
+		EgressPorts:    req.EgressPorts,
 		AllowedEgress:  req.AllowedEgress,
 		AllowedIngress: req.AllowedIngress,
 		Intra:          req.Intra,
@@ -489,10 +493,14 @@ func (m *Manager) UpdateEgress(name string, req types.UpdateNetworkEgressRequest
 	if err := ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
 		return nil, err
 	}
+	if err := ValidateEgressPorts(req.Egress, req.EgressPorts); err != nil {
+		return nil, err
+	}
 	return m.updatePolicy(name, func(n *types.Network) error {
 		n.Egress = req.Egress
 		n.EgressIface = req.EgressIface
 		n.EgressPrivate = req.EgressPrivate
+		n.EgressPorts = req.EgressPorts
 		n.AllowedEgress = req.AllowedEgress
 		return nil
 	})
@@ -925,6 +933,22 @@ func (m *Manager) Rules() RulesStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.rules
+}
+
+// ResolveFlow names the network whose bridge is iface and the VM holding src
+// on it — the attribution of a flow-log record (see FlowResolver). Empty when
+// iface is not one of the bridges: a quarantined TAP is the VM manager's to
+// name.
+func (m *Manager) ResolveFlow(iface, src string) (network, vm string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, mn := range m.nets {
+		if mn.net.Bridge == iface {
+			vm, _ = mn.subnet.Holder(src)
+			return name, vm
+		}
+	}
+	return "", ""
 }
 
 // Leases returns, per network, the VM IDs holding an address on it — what the

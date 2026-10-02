@@ -1,0 +1,7 @@
+Lab 1 — DNS
+
+1. Which address does www.school.lan have? Is it an A record?  dig www.school.lan
+2. Who is the authority for school.lan?                          dig NS school.lan
+3. What name has 172.30.80.11?                                   dig -x 172.30.80.11
+4. Where is the MQTT broker, and on which port?                  dig SRV _mqtt._tcp.school.lan
+5. Ask for google.com. Why is the answer REFUSED?

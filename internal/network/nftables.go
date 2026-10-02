@@ -2,10 +2,12 @@ package network
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 
 	"microhosted/pkg/types"
 )
@@ -30,6 +32,19 @@ const BridgePrefix = "mhbr"
 // a host interface of the operator's named tap* cannot be managed or used for
 // egress (see IsOwnDeviceName).
 const TapPrefix = "tap"
+
+// FlowLogGroup is the NFLOG group the ruleset sends its records of dropped
+// guest traffic to. The daemon is its only reader; nothing goes to the kernel
+// log, so a guest cannot flood the host's journal.
+const FlowLogGroup = 77
+
+// flowLogLimit caps the records per guest address, over every logged drop
+// together (the meter @mhlograte). The guest is untrusted and can make drops
+// at line rate; past the limit its packets are still dropped, only no longer
+// recorded. The limit lives in the LOG rule and never in a drop rule: a rule
+// whose limit is exceeded does not match, and a drop that does not match
+// sends the packet on to the chain's `policy accept`.
+const flowLogLimit = "limit rate 10/second burst 20 packets"
 
 // IsOwnDeviceName reports whether name is in this daemon's device namespace
 // (BridgePrefix or TapPrefix), which the ruleset matches by prefix and so
@@ -85,14 +100,41 @@ type HostService struct {
 //   - ingress: a managed interface's only inbound holes are the networks'
 //     AllowedIngress rules, each a prerouting DNAT to one guest address plus
 //     the two forward legs of that DNATed flow. The host never listens.
+//
+// Drops of guest traffic are recorded to FlowLogGroup when the kernel can
+// (see flowLogAvailable); without it the policy is the same, only unrecorded.
 func ApplyNftables(networks []types.Network, managed []ManagedIface) error {
-	script := renderNftables(networks, managed)
+	script := renderNftables(networks, managed, flowLogAvailable())
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("applying nftables: %w\n--- ruleset ---\n%s\n--- nft said ---\n%s", err, script, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+var (
+	flowLogOnce sync.Once
+	flowLogOK   bool
+)
+
+// flowLogAvailable reports whether the kernel accepts the flow-log rules
+// (nft_log, nfnetlink_log, nft_limit and dynamic sets), checked once with
+// `nft -c` on the empty ruleset rendered with them. A kernel without them must
+// not cost the policy: a rule it rejects fails the whole atomic apply, and
+// with it every network. So the answer decides whether they are rendered at
+// all, and a no is said out loud.
+func flowLogAvailable() bool {
+	flowLogOnce.Do(func() {
+		cmd := exec.Command("nft", "-c", "-f", "-")
+		cmd.Stdin = strings.NewReader(renderNftables(nil, nil, true))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("network: flow log unavailable, dropped guest traffic will not be recorded: %v: %s", err, strings.TrimSpace(string(out)))
+			return
+		}
+		flowLogOK = true
+	})
+	return flowLogOK
 }
 
 // renderNftables produces the `nft -f` script. The leading
@@ -103,7 +145,12 @@ func ApplyNftables(networks []types.Network, managed []ManagedIface) error {
 // `policy accept` and the drops name bridges, so the rules that keep a bridge
 // this ruleset does not know about dark (see the forward chain) must be in
 // force at all times, not only when there is something to protect.
-func renderNftables(networks []types.Network, managed []ManagedIface) string {
+//
+// With flowLog, each drop of traffic a guest sent is preceded by a rule that
+// records it (writeFlowLog): the same match, no verdict. Drops of traffic
+// towards a guest or from outside are not recorded — what is wanted is what
+// the guest tried.
+func renderNftables(networks []types.Network, managed []ManagedIface, flowLog bool) string {
 	var b strings.Builder
 
 	// Ensure-then-delete so the recreate below is an atomic replace.
@@ -134,6 +181,13 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// they opt in (EgressPrivate): see PrivateRanges.
 	fmt.Fprintf(&b, "\tset mhprivate {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\telements = { %s }\n\t}\n", strings.Join(PrivateRanges, ", "))
 
+	// The meter behind flowLogLimit: one element per guest address, forgotten
+	// a minute after its last record. When it is full a new address is not
+	// recorded; it is dropped all the same.
+	if flowLog {
+		b.WriteString("\tset mhlograte {\n\t\ttype ipv4_addr\n\t\tsize 65536\n\t\tflags dynamic,timeout\n\t\ttimeout 1m\n\t}\n")
+	}
+
 	// guest → host: drop new connections coming in from any bridge, but let
 	// established/related through so host-initiated flows (e.g. SSH into a VM)
 	// still get their replies. Matched by prefix, not by @mhbridges: a bridge
@@ -145,8 +199,10 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// TapPrefix): nothing from it reaches the host — ahead of the established
 	// accept, so a flow the VM had open while on its bridge (or a host-opened
 	// one it answers) does not survive the cut either.
+	writeFlowLog(&b, flowLog, fmt.Sprintf("iifname \"%s*\"", TapPrefix), "quarantine")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", TapPrefix)
 	b.WriteString("\t\tct state established,related accept\n")
+	writeFlowLog(&b, flowLog, fmt.Sprintf("iifname \"%s*\"", BridgePrefix), "host")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", BridgePrefix)
 	// A managed interface reaches only the host services the operator listed
 	// (typically udp/67 when the host runs that segment's DHCP), and nothing
@@ -199,6 +255,7 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// Nor is a detached TAP a way through the host, in either direction (see
 	// TapPrefix): the host must never route a quarantined VM's packets
 	// anywhere, nor route anything to it.
+	writeFlowLog(&b, flowLog, fmt.Sprintf("iifname \"%s*\"", TapPrefix), "quarantine")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" drop\n", TapPrefix)
 	fmt.Fprintf(&b, "\t\toifname \"%s*\" drop\n", TapPrefix)
 	// A bridge of ours that this ruleset does not list is dark, first thing,
@@ -207,6 +264,7 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// up before its rules, a bridge a crash left behind. Everything below is
 	// drops keyed on known bridges under `policy accept`, so without these two
 	// rules such a bridge would be the one place with no policy at all.
+	writeFlowLog(&b, flowLog, fmt.Sprintf("iifname \"%s*\" iifname != @mhbridges", BridgePrefix), "unlisted")
 	fmt.Fprintf(&b, "\t\tiifname \"%s*\" iifname != @mhbridges drop\n", BridgePrefix)
 	fmt.Fprintf(&b, "\t\toifname \"%s*\" oifname != @mhbridges drop\n", BridgePrefix)
 	// Cross-segment isolation: drop forwarding between two DIFFERENT bridges.
@@ -214,6 +272,7 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// O(N²) — 150 networks would mean 22350 rules, each traversed by every
 	// forwarded packet). The @mhsame exemption keeps same-bridge traffic
 	// reachable even if br_netfilter is on.
+	writeFlowLog(&b, flowLog, "iifname @mhbridges oifname @mhbridges iifname . oifname != @mhsame", "cross")
 	b.WriteString("\t\tiifname @mhbridges oifname @mhbridges iifname . oifname != @mhsame drop\n")
 	// Rules naming a managed interface come first, ahead of every drop that
 	// would otherwise catch them: the per-network egress drop below (a managed
@@ -286,8 +345,12 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 	// packets on the segment through a rule that never named it. Outbound too,
 	// not just inbound: an `egress: true` network would otherwise reach the
 	// whole segment.
+	// Only the outbound half is recorded, and only from our bridges: it is
+	// the guest reaching for a device no rule names. The inbound half is the
+	// segment's own chatter.
 	for _, m := range managed {
 		fmt.Fprintf(&b, "\t\tiifname %q drop\n", m.Name)
+		writeFlowLog(&b, flowLog, fmt.Sprintf("iifname @mhbridges oifname %q", m.Name), "managed")
 		fmt.Fprintf(&b, "\t\toifname %q drop\n", m.Name)
 	}
 	// No-egress networks: drop anything leaving the bridge towards the WAN
@@ -300,12 +363,29 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 			// Full egress, through its one interface only: anything towards
 			// a non-bridge that is not that interface — the LAN behind a
 			// second NIC, a VPN, a Docker bridge — dies here.
+			writeFlowLog(&b, flowLog, fmt.Sprintf("iifname %q oifname != @mhbridges oifname != %q", n.Bridge, n.EgressIface), "iface")
 			fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges oifname != %q drop\n", n.Bridge, n.EgressIface)
 			// And through that interface, the internet only: on a host whose
 			// one NIC carries both the internet and the LAN, the interface
 			// alone would let the VM reach the router and every device.
 			if !n.EgressPrivate {
+				writeFlowLog(&b, flowLog, fmt.Sprintf("iifname %q oifname != @mhbridges ip daddr @mhprivate", n.Bridge), "private")
 				fmt.Fprintf(&b, "\t\tiifname %q oifname != @mhbridges ip daddr @mhprivate drop\n", n.Bridge)
+			}
+			// And, when it names ports, through those only: anything that is
+			// not tcp or udp (ICMP too), then tcp and udp to any other port.
+			// Drops after the ones above, so it can only take away.
+			if len(n.EgressPorts) > 0 {
+				notL4 := fmt.Sprintf("iifname %q oifname != @mhbridges meta l4proto != { tcp, udp }", n.Bridge)
+				writeFlowLog(&b, flowLog, notL4, "port")
+				fmt.Fprintf(&b, "\t\t%s drop\n", notL4)
+				ports := make([]string, len(n.EgressPorts))
+				for i, p := range n.EgressPorts {
+					ports[i] = fmt.Sprintf("%s . %d", p.Protocol, p.Port)
+				}
+				notPort := fmt.Sprintf("iifname %q oifname != @mhbridges meta l4proto . th dport != { %s }", n.Bridge, strings.Join(ports, ", "))
+				writeFlowLog(&b, flowLog, notPort, "port")
+				fmt.Fprintf(&b, "\t\t%s drop\n", notPort)
 			}
 			continue
 		}
@@ -320,6 +400,7 @@ func renderNftables(networks []types.Network, managed []ManagedIface) string {
 				fmt.Fprintf(&b, "\t\tiifname \"%s\" oifname != @mhbridges ip daddr %s meta l4proto icmp accept\n", n.Bridge, r.IP)
 			}
 		}
+		writeFlowLog(&b, flowLog, fmt.Sprintf("iifname \"%s\" oifname != @mhbridges", n.Bridge), "egress")
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" oifname != @mhbridges drop\n", n.Bridge)
 	}
 	b.WriteString("\t}\n")
@@ -368,6 +449,38 @@ var PrivateRanges = []string{
 	"240.0.0.0/4",
 }
 
+// maxEgressPorts bounds a network's EgressPorts: a handful is the use (web,
+// DNS, a registry's port), and every one lands in the ruleset.
+const maxEgressPorts = 32
+
+// ValidateEgressPorts vets EgressPorts: only with full egress, which it
+// narrows; tcp or udp, a port in 1-65535, no repeats, at most maxEgressPorts.
+func ValidateEgressPorts(egress bool, ports []types.PortRule) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	if !egress {
+		return fmt.Errorf("egress_ports narrows egress: it needs egress (and egress_iface); without it, allowed_egress names ports already")
+	}
+	if len(ports) > maxEgressPorts {
+		return fmt.Errorf("egress_ports: %d ports, at most %d", len(ports), maxEgressPorts)
+	}
+	seen := make(map[types.PortRule]bool, len(ports))
+	for i, p := range ports {
+		if p.Protocol != "tcp" && p.Protocol != "udp" {
+			return fmt.Errorf("egress_ports %d: protocol %q must be tcp or udp", i, p.Protocol)
+		}
+		if p.Port < 1 || p.Port > 65535 {
+			return fmt.Errorf("egress_ports %d: port %d must be in 1-65535", i, p.Port)
+		}
+		if seen[p] {
+			return fmt.Errorf("egress_ports %d: %s:%d given twice", i, p.Protocol, p.Port)
+		}
+		seen[p] = true
+	}
+	return nil
+}
+
 // ValidateEgressPrivate refuses EgressPrivate on a network without full
 // egress, where it would mean nothing.
 func ValidateEgressPrivate(egress, private bool) error {
@@ -385,6 +498,21 @@ func ValidateEgressPrivate(egress, private bool) error {
 // enforce is closed. Manager.UnenforcedRules reports it.
 func egressOpen(n types.Network) bool {
 	return n.Egress && n.EgressIface != ""
+}
+
+// writeFlowLog emits, when flowLog is on, the rule that records a drop: the
+// drop's match (or a narrower one), rate-limited per guest address, logged to
+// FlowLogGroup as "mh drop <reason>" and without a verdict, so the drop that
+// follows it still decides. It does not match on `ct state new`: a dropped
+// flow is never confirmed by conntrack, so each of its packets is new anyway.
+// The record needs nothing else to be read: the prefix says the verdict and
+// why, the input device which network, and the packet's own source, pinned by
+// the port filter, which guest.
+func writeFlowLog(b *strings.Builder, flowLog bool, match, reason string) {
+	if !flowLog {
+		return
+	}
+	fmt.Fprintf(b, "\t\t%s update @mhlograte { ip saddr %s } log group %d prefix \"mh drop %s\"\n", match, flowLogLimit, FlowLogGroup, reason)
 }
 
 // writeSet emits a named set, leaving out the elements line when there are

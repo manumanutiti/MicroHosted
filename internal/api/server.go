@@ -24,7 +24,7 @@ import (
 // integration point Stage 7 originally planned for — it exists from the
 // start here so a panel can be built against it without reshaping the
 // manager underneath.
-func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg SystemConfig) *http.Server {
+func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, flows *network.FlowLog, sysCfg SystemConfig) *http.Server {
 	mux := http.NewServeMux()
 
 	// Events: what happens to VMs and to the host, pushed (see events.go).
@@ -55,6 +55,10 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			return
 		}
 		if err := network.ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := network.ValidateEgressPorts(req.Egress, req.EgressPorts); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -121,6 +125,10 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			return
 		}
 		if err := network.ValidateEgressPrivate(req.Egress, req.EgressPrivate); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := network.ValidateEgressPorts(req.Egress, req.EgressPorts); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -327,6 +335,23 @@ func NewServer(mgr *vm.Manager, netmgr *network.Manager, bus *events.Bus, sysCfg
 			return
 		}
 		writeJSON(w, http.StatusOK, liveVMResponse(record))
+	})
+
+	// What a VM tried and the ruleset refused, oldest first (docs/networking.md,
+	// "Flow log"). A destroyed VM's records stay while the daemon runs, so an
+	// id that is no longer a VM still answers if the log holds it. recording
+	// false means the host is not recording: an empty list then proves nothing.
+	mux.HandleFunc("GET /v1/vms/{id}/flows", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if _, ok := mgr.Get(id); !ok && (flows == nil || !flows.Known(id)) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("vm %q not found", id))
+			return
+		}
+		if flows == nil {
+			writeJSON(w, http.StatusOK, types.FlowList{Flows: []types.Flow{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, flows.ByVM(id))
 	})
 
 	// Blocks until the VM's guest agent answers the host's probe after its

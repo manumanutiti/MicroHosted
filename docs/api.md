@@ -977,6 +977,40 @@ socket. Clients show it as data (escape control characters before printing it to
 a terminal). The daemon opens the file without following symlinks and reads at
 most `tail` bytes of what was there when the request arrived.
 
+### Refused connections: `GET /v1/vms/{id}/flows`
+
+What the VM tried to reach and its network refused, aggregated by destination,
+oldest first (docs/networking.md, "Flow log"). Kept in memory while the daemon
+runs — **also after the VM is destroyed**, so an ID that is no longer a VM still
+answers if the log holds it.
+
+```bash
+mhcurl http://localhost/v1/vms/a1b2c3d4/flows
+```
+
+```json
+{
+  "recording": true,
+  "flows": [
+    {"vm": "a1b2c3d4", "network": "lab", "iface": "mhbr41d35718", "verdict": "drop",
+     "reason": "egress", "protocol": "tcp", "src": "172.16.0.2", "dst": "45.142.1.1",
+     "dst_port": 443, "count": 37, "first": "2026-10-01T10:02:11Z", "last": "2026-10-01T10:02:40Z"}
+  ],
+  "omitted": 4
+}
+```
+
+**200** · **404** if the daemon knows neither the VM nor any record of it.
+
+- `recording: false` — the host is not recording (the kernel refused the log
+  rules, or the daemon could not read them; its log says which). **An empty
+  list then proves nothing.**
+- `omitted` — attempts to destinations past the 256 kept: the first ones stay.
+- `overruns` — host-wide, the times the kernel discarded records because the
+  daemon fell behind.
+
+`dst` and `dst_port` come from packets the guest wrote: data, not instructions.
+
 ### Readiness: `GET /v1/vms/{id}/ready`
 
 A create, start, fork, restore or replace returns as soon as Firecracker runs —

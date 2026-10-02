@@ -1,0 +1,43 @@
+# A smaller sandbox image: Alpine, nothing installed but what the tools need.
+# No audit, so no record of how the code looked for a VM; code that expects
+# glibc fails here and would look like the code's fault — build.yml, next to
+# this file, is the one mh sandbox uses. This one for pure scripts:
+#
+#   mh build -f sandbox/alpine.yml -t sandbox-alpine:1 sandbox
+#   mh sandbox --image sandbox-alpine:1 ./script.sh
+#
+# How far to trust the report: the code runs as runner, a user with no
+# password, no sudo, no setuid binary in the image and no_new_privs set; the
+# guest kernel has no vsock loopback, so runner cannot reach the root agent
+# either. The report holds while runner did not become root — only root can
+# set a file's ctime, and the decoys' reads and resets show in theirs. Root
+# through a guest kernel exploit could hide from the report, not from the
+# host: mh flows is the host's view, whatever happened inside.
+name: sandbox-alpine
+base: alpine:3.22
+
+# GNU grep: mh-sandbox-scan needs -Z and -P, which busybox's lacks.
+packages:
+  - grep
+
+files:
+  /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
+  /usr/sbin/mh-sandbox-prepare: sbin/mh-sandbox-prepare
+  /usr/sbin/mh-sandbox-unpack: sbin/mh-sandbox-unpack
+  /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
+  /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
+  /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
+  /usr/share/mh-sandbox/agent-patterns: agent-patterns
+
+run:
+  # The user the code runs as: no password (su from root needs none).
+  - adduser -D -s /bin/sh runner
+  # No setuid or setgid file anywhere: nothing for runner to escalate through.
+  - find / -xdev -type f -perm +6000 -exec chmod ug-s {} +
+  # The tools are root's: runner can neither run them nor read which files
+  # are decoys.
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan
+  - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan
+
+mem_mb: 256

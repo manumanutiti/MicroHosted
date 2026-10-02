@@ -1,0 +1,77 @@
+# The image mh sandbox runs code in (docs/sandbox.md): Ubuntu 24.04, so that
+# code expecting glibc — native npm modules, manylinux wheels, prebuilt
+# binaries (esbuild, Prisma, Playwright) — runs as it would on a developer's
+# machine. The code runs as dev, in bash, in ~/work. alpine.yml, next to this
+# file, is a smaller one without audit.
+#
+#   mh build -t sandbox:1 sandbox
+#   mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
+#
+# By hand, what mh sandbox does without a network to fetch on:
+#
+#   tar -czf /tmp/code.tgz -C ./code .
+#   VM=$(mh run sandbox:1 --wait)
+#   mh cp /tmp/code.tgz $VM:/root/code.tgz
+#   mh exec $VM mh-sandbox-prepare /root/code.tgz   # decoys, audit, the clock
+#   mh exec $VM mh-sandbox-scan                     # text addressed to an AI agent
+#   mh exec -t 5m $VM mh-sandbox-run 'npm ci && npm test'
+#   mh exec $VM mh-sandbox-report
+#   mh flows $VM
+#   mh rm $VM
+#
+# For the report to stay exact:
+#   - root is locked: the base leaves it with an empty password for the
+#     serial console, and su with an empty password is root for anyone;
+#   - the code becomes dev with setpriv, not su: no PAM, no session, no log;
+#   - systemd writes nothing on its own once booted: the journal is kept in
+#     memory and every timer is masked. A prepared VM where nothing runs
+#     reports nothing — anything in the report is the code's.
+name: sandbox
+base: ubuntu:24.04
+
+# A developer's machine: git, curl, Python. Add the code's toolchain
+# (nodejs npm, golang, build-essential…). procps and iproute2 are the
+# report's (ps, ss); auditd too: which paths the code asked for that tell a
+# VM apart (/sys/class/dmi, /proc/cpuinfo…), found or not.
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - python3
+  - python3-venv
+  - procps
+  - iproute2
+  - auditd
+
+files:
+  /usr/sbin/mh-sandbox-lib: sbin/mh-sandbox-lib
+  /usr/sbin/mh-sandbox-prepare: sbin/mh-sandbox-prepare
+  /usr/sbin/mh-sandbox-unpack: sbin/mh-sandbox-unpack
+  /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
+  /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
+  /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
+  /usr/share/mh-sandbox/agent-patterns: agent-patterns
+
+run:
+  # The user the code runs as: a home from /etc/skel, bash, no password, no
+  # sudo (not installed).
+  - useradd -m -s /bin/bash dev
+  - echo U=dev > /etc/mh-sandbox.conf && chmod 0600 /etc/mh-sandbox.conf
+  - passwd -l root
+  # No setuid or setgid file anywhere (su, passwd, mount, chsh…): nothing
+  # for dev to escalate through. Root needs none of them.
+  - find / -xdev -type f -perm /6000 -exec chmod ug-s {} +
+  # Quiet once booted: the journal in memory, no timer (apt, logrotate,
+  # tmpfiles, fstrim…). What is left writing is the code.
+  - mkdir -p /etc/systemd/journald.conf.d && printf '[Journal]\nStorage=volatile\n' > /etc/systemd/journald.conf.d/mh-sandbox.conf
+  - systemctl list-unit-files --type=timer --no-legend | awk '{print $1}' | xargs -r systemctl mask
+  # audit's log is never rotated away: the first thing the code asks for is
+  # often the one that matters.
+  - sed -i 's/^max_log_file_action = .*/max_log_file_action = keep_logs/' /etc/audit/auditd.conf
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan
+  - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan
+
+mem_mb: 512
+# Room for audit's log: every file the code opens is in it.
+disk_mb: 2048

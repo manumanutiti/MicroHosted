@@ -1,0 +1,23 @@
+# The Ansible control node: Ubuntu 24.04 with ansible-core, and playbook/
+# in /etc/ansible, where ansible and ansible-playbook look without being
+# told. The five nodes it manages are node/build.yml.
+#
+#   mh build orchestrator/examples/ansible      # mh up does it the first time
+#
+# steps: so a change to the playbook reruns only its COPY and the syntax
+# check: apt comes from the cache.
+
+name: ansible-control
+base: ubuntu:24.04
+
+packages:
+  - ansible-core                # ansible, ansible-playbook and the builtin modules
+  - openssh-client
+
+steps:
+  - copy: {/etc/ansible/: playbook/}
+  - run: cd /etc/ansible && ansible-playbook --syntax-check site.yml   # a broken playbook fails the build
+
+# No command: systemd keeps control up; you work in it with mh exec.
+vcpus: 1
+mem_mb: 256

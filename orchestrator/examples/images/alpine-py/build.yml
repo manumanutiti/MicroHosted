@@ -1,6 +1,0 @@
-# Alpine with Python 3, for the examples whose services are Python scripts
-# shipped with files: (website.yaml, intranet.yaml), which say
-# build: images/alpine-py. By hand: mh build orchestrator/examples/images/alpine-py
-name: alpine-py
-base: alpine:3.22
-packages: [python3]

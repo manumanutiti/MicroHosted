@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"microhosted/pkg/types"
 )
@@ -818,5 +819,85 @@ func TestLogsThroughAPI(t *testing.T) {
 	f := newFakeAPI(t, mux)
 	if code, out, errOut := f.run("", "logs", "web", "-n", "2"); code != 0 || out != "line 2\nline 3\n" {
 		t.Errorf("exit %d stdout %q stderr %q", code, out, errOut)
+	}
+}
+
+func TestFlows(t *testing.T) {
+	at := time.Date(2026, 10, 1, 10, 2, 11, 0, time.Local)
+	list := types.FlowList{Recording: true, Omitted: 4, Flows: []types.Flow{{
+		VM: "deadbeef", Verdict: "drop", Reason: "egress", Protocol: "tcp",
+		Dst: "45.142.1.1", DstPort: 443, Count: 37, First: at, Last: at.Add(29 * time.Second),
+	}}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{{ID: "deadbeef", Name: "sbx"}}))
+	mux.HandleFunc("GET /v1/vms/deadbeef/flows", reply(list))
+	f := newFakeAPI(t, mux)
+
+	code, out, errOut := f.run("", "flows", "sbx")
+	if code != 0 || errOut != "" {
+		t.Fatalf("exit %d stderr %q", code, errOut)
+	}
+	for _, want := range []string{"egress", "45.142.1.1:443", "37", "2026-10-01 10:02:11", "10:02:40", "4 more attempts"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// When the host is not recording, an empty table must not pass for "the VM
+// tried nothing".
+func TestFlowsNotRecording(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{{ID: "deadbeef"}}))
+	mux.HandleFunc("GET /v1/vms/deadbeef/flows", reply(types.FlowList{Flows: []types.Flow{}}))
+	f := newFakeAPI(t, mux)
+	if code, _, errOut := f.run("", "flows", "deadbeef"); code != 0 || !strings.Contains(errOut, "not recording") {
+		t.Errorf("exit %d stderr %q: want a warning that nothing is recorded", code, errOut)
+	}
+}
+
+// A destroyed VM is no longer listed; its full ID still reaches its records,
+// and a reference that matches nothing still says so.
+func TestFlowsOfDestroyedVM(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/vms", reply([]types.VMResponse{}))
+	mux.HandleFunc("GET /v1/vms/deadbeef/flows", reply(types.FlowList{Recording: true, Flows: []types.Flow{{Reason: "host", Dst: "10.0.0.1"}}}))
+	mux.HandleFunc("GET /v1/vms/nope/flows", replyStatus(http.StatusNotFound, map[string]string{"error": "vm \"nope\" not found"}))
+	f := newFakeAPI(t, mux)
+	if code, out, errOut := f.run("", "flows", "deadbeef"); code != 0 || !strings.Contains(out, "10.0.0.1") {
+		t.Errorf("destroyed VM by ID: exit %d stdout %q stderr %q", code, out, errOut)
+	}
+	if code, _, errOut := f.run("", "flows", "nope"); code == 0 || !strings.Contains(errOut, "nope") {
+		t.Errorf("unknown VM: exit %d stderr %q", code, errOut)
+	}
+}
+
+func TestNetworkCreatePorts(t *testing.T) {
+	var got types.CreateNetworkRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/networks", func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		reply(types.NetworkResponse{Name: got.Name, Egress: true, EgressIface: got.EgressIface, EgressPorts: got.EgressPorts})(w, r)
+	})
+	f := newFakeAPI(t, mux)
+	code, out, errOut := f.run("", "network", "create", "fetch", "--internet", "eth0", "--ports", "tcp:80,tcp:443", "--ports", "udp:53")
+	if code != 0 {
+		t.Fatalf("exit %d stderr %q", code, errOut)
+	}
+	want := []types.PortRule{{Protocol: "tcp", Port: 80}, {Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}}
+	if !reflect.DeepEqual(got.EgressPorts, want) || !got.Egress {
+		t.Errorf("sent %+v", got)
+	}
+	if !strings.Contains(out, "internet@eth0 ports tcp:80,tcp:443,udp:53") {
+		t.Errorf("listing does not show the ports:\n%s", out)
+	}
+	for _, args := range [][]string{
+		{"network", "create", "x", "--ports", "tcp:443"},                      // without --internet
+		{"network", "create", "x", "--internet", "eth0", "--ports", "tcp-443"}, // malformed
+		{"network", "update", "x", "--ports", "tcp:443"},
+	} {
+		if code, _, _ := f.run("", args...); code == 0 {
+			t.Errorf("%v accepted", args)
+		}
 	}
 }

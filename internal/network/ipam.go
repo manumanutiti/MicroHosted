@@ -183,6 +183,24 @@ func (s *Subnet) IPOf(vmID string) (string, bool) {
 	return uint32ToIP(v).String(), true
 }
 
+// Holder returns the VM holding ip, if any. Linear in the leases: it runs
+// for flow-log records, which the ruleset rate-limits.
+func (s *Subnet) Holder(ip string) (string, bool) {
+	parsed := net.ParseIP(ip).To4()
+	if parsed == nil {
+		return "", false
+	}
+	v := binary.BigEndian.Uint32(parsed)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for vmID, held := range s.used {
+		if held == v {
+			return vmID, true
+		}
+	}
+	return "", false
+}
+
 // Release frees the address held by vmID.
 func (s *Subnet) Release(vmID string) {
 	s.mu.Lock()

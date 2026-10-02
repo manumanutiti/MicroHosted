@@ -74,7 +74,32 @@ subnet** (per-network IPAM). The guest's gateway is the bridge's.
     parser that can only talk to its MQTT broker (`203.0.113.7:8883/tcp`) and
     nothing else.
 
+## Internet on some ports only (`egress_ports`)
+
+Full egress (`--internet IFACE`) opens every port. `--ports` narrows it:
+
+```bash
+mh network create fetch --internet eth0 --ports tcp:80,tcp:443,udp:53
+```
+
+Two drops, after the interface and private-range ones: anything that is not
+tcp or udp (ICMP included), then tcp and udp to any other port. Only drops, so
+it can take away from `--internet` and never add to it: the LAN stays closed
+even on an allowed port. Both are recorded in the flow log as `port`.
+
+Not the same as `--out tcp:0.0.0.0/0:443`, which **must not be used for
+"the internet"**: an `--out` rule names destinations and leaves through any
+interface that is not a bridge, so `0.0.0.0/0` there reaches the LAN, a VPN
+and Docker's networks on that port. `--internet` is one interface, without the
+private ranges.
+
+`PUT /v1/networks/{name}/egress` replaces the whole policy, ports included:
+an update with `--internet` and no `--ports` opens every port again.
+
 ## Fine-grained egress (`allowed_egress`)
+
+Rules name addresses, not domain names; egress by name was studied and
+deferred — why, and the approach chosen for it: [not-yet.md](not-yet.md#egress-by-domain-name-dns-allowlist).
 
 Each rule is `{ip, protocol, port}`: `ip` is an IPv4 or IPv4 CIDR **in canonical
 form**, `protocol` ∈ {`tcp`, `udp`, `icmp`} (lowercase), and `port` (1–65535) is
@@ -295,6 +320,77 @@ conntrack entry can't sneak through an established accept, and the `conntrack(8)
 binary isn't needed to flush anything. Replies (return traffic from the WAN)
 aren't touched by any drop (they're all scoped by bridge `iifname`), they pass via
 policy accept.
+
+### Flow log: what a guest tried and was refused
+
+Every drop of traffic a **guest sent** is preceded by a rule that records it
+to NFLOG group 77 (`network.FlowLogGroup`), with the reason in the prefix:
+
+| Prefix | The guest tried to reach |
+|---|---|
+| `mh drop host` | the host itself (`input`) |
+| `mh drop quarantine` | anything, from a quarantined TAP — in practice, almost never (below) |
+| `mh drop egress` | outside, from a network with no egress or not to one of its `allowed_egress` |
+| `mh drop iface` | outside through an interface that is not its `egress_iface` (a VPN, Docker, a second NIC) |
+| `mh drop private` | a private or special range from a full-egress network: the LAN, the router, cloud metadata |
+| `mh drop managed` | a device on a managed segment that no rule names |
+| `mh drop cross` | another network |
+| `mh drop unlisted` | anything, from a bridge of ours the ruleset does not list |
+
+Nothing else is needed to read a record: the input device gives the network,
+and the source address — pinned to its TAP by the port filter — the VM. What
+arrives from outside (a managed segment's own traffic, anything towards a
+quarantined TAP) is dropped without a record.
+
+**A quarantined VM is cut off, not watched.** Its frames still carry the
+bridge's MAC as their destination, and its TAP is on no bridge: the host
+discards them as addressed to another host before netfilter sees them, so the
+`quarantine` rules rarely match anything and what the VM tries is not
+recorded (seen 2026-10-01: a quarantined guest's packets left it, none
+reached the log). To keep recording what a VM tries after cutting it off, cut
+its **network** instead (`mh network update NET --no-out`, a network of its
+own): it stays on its bridge and every attempt is dropped and recorded as
+`egress`. Recording a quarantined TAP itself would take a `netdev` ingress
+hook on it — not done.
+
+- **The policy does not change.** A log rule carries the drop's match and no
+  verdict; the drop after it is the same rule as without the flow log
+  (`TestFlowLogLeavesPolicyUnchanged`).
+- **Bounded.** Records are limited per guest address (10/s, burst 20) through
+  the meter `@mhlograte` (65 536 addresses, forgotten after a minute). The limit
+  is on the log rule and never on the drop: past the rate the rule does not
+  match, and a drop that does not match lets the packet on to `policy accept`
+  (`TestFlowLogNeverConditionsAVerdict`). Past the limit a guest's packets are
+  still dropped, only not recorded.
+- **Never at the policy's expense.** At the first apply the daemon checks the
+  ruleset with the log rules with `nft -c` (needs `nft_log`, `nfnetlink_log`,
+  `nft_limit` and dynamic sets). If the kernel refuses them they are not
+  rendered, and the daemon says so in its log: a rule the kernel rejects would
+  fail the whole atomic apply, and with it every network.
+
+The daemon reads group 77 (`network.FlowLog`, `internal/network/flowlog.go`)
+and keeps, in memory, what each guest tried, aggregated by destination:
+verdict, reason, protocol, destination and port, with a count and the first
+and last time. The source port is not kept — each retry has a new one.
+
+- **Attributed on arrival.** The input device and the source address name the
+  network and the VM holding that address *then*; a quarantined TAP names its
+  VM directly. A VM destroyed afterwards keeps its records, and whoever gets
+  its address next does not inherit them.
+- **Bounded, earliest first.** 256 destinations per guest: past that, new
+  destinations are counted (`omitted`), not kept, so a guest cannot push its
+  first attempts out by trying many more. 4 096 guests: past that, the one
+  heard from longest ago is forgotten. When the daemon's socket fills, the
+  kernel discards records and the daemon counts the times (`overruns`).
+- **Only what is needed.** The kernel copies 64 bytes of each packet — the IP
+  header and the port — and nothing more of what the guest sent.
+- **Optional.** If the daemon cannot bind the group (no `nfnetlink_log`,
+  another reader on it) it says so and runs without: the drops are in the
+  ruleset either way.
+
+It is lost on restart. `MH_NET_E2E=1 go test ./internal/network -run EndToEnd`,
+as root in a throwaway namespace, checks it against the kernel: a guest in a
+netns on a bridge of ours, the ruleset, and the reader.
 
 ## Egress and coexistence with the host firewall (READ — a source of subtle bugs)
 

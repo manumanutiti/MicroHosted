@@ -1,0 +1,12 @@
+; 172.30.80.0/24 → names (dig -x 172.30.80.11).
+$TTL 300
+@   IN SOA  ns.school.lan. admin.school.lan. ( 2026093001 3600 600 86400 300 )
+    IN NS   ns.school.lan.
+
+10  IN PTR  ns.school.lan.
+11  IN PTR  db.school.lan.
+12  IN PTR  portal.school.lan.
+13  IN PTR  ftp.school.lan.
+14  IN PTR  mqtt.school.lan.
+15  IN PTR  ntp.school.lan.
+20  IN PTR  student.school.lan.

@@ -1,0 +1,9 @@
+zone "school.lan" {
+    type master;
+    file "/etc/bind/db.school.lan";
+};
+
+zone "80.30.172.in-addr.arpa" {
+    type master;
+    file "/etc/bind/db.172.30.80";
+};

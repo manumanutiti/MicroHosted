@@ -11,17 +11,15 @@
 # Requirements: the engine manages wlan0 (--managed-iface wlan0); ingress
 # rules only exist on managed interfaces, whose policy is deny-by-default.
 #
-#   (the image is built by mh build the first time plan/apply/run needs it:
-#    build: images/alpine-py below; sudo once)
-#   mh up  -f website.yaml
-#   mh down -f website.yaml
+#   cd orchestrator/examples/website
+#   mh up            # builds build.yml the first time (sudo once)
+#   mh down
 #
-# Edit website/index.html or website/serve.py and `mh apply -f
-# website.yaml` while it runs: the site is replaced by a VM with the new version
-# (about a second down).
+# Edit site/index.html or site/serve.py and mh apply while it runs: the site
+# is replaced by a VM with the new version (about a second down).
 
 version: 1
-name: website             # the project: this directory holds three specs, each its own
+name: website
 
 budget: { max_vms: 2, max_mem_mb: 256, workers: 1 }
 
@@ -34,12 +32,12 @@ networks:
 
 functions:
   site:
-    build: images/alpine-py
+    build: .
     network: web-demo
     ip: 172.30.30.10          # the ingress rule's to_ip
     files:
-      /srv/www/index.html: { from: website/index.html }
-      /srv/www/serve.py:   { from: website/serve.py }
+      /srv/www/index.html: { from: site/index.html }
+      /srv/www/serve.py:   { from: site/serve.py }
     command: python3 /srv/www/serve.py 8080 /srv/www/index.html
     health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/", every: 10s, timeout: 3s, failures: 3 }
     lifecycle: { mode: persistent, recycle: never }

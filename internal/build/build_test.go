@@ -751,7 +751,7 @@ func (l *listRunner) Output(context.Context, string, ...string) ([]byte, error) 
 // The image specs the orchestrator's examples build stay valid.
 func TestExampleImageSpecs(t *testing.T) {
 	files, _ := filepath.Glob("../../orchestrator/examples/*/build.yml")
-	more, _ := filepath.Glob("../../orchestrator/examples/*/*/build.yml") // images/…, stack/…
+	more, _ := filepath.Glob("../../orchestrator/examples/*/*/build.yml") // stack/db, classroom/dns…
 	files = append(files, more...)
 	if len(files) < 7 {
 		t.Fatalf("example image specs found: %v", files)

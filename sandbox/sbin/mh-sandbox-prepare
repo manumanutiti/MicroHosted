@@ -1,0 +1,104 @@
+#!/bin/sh
+# Prepares the sandbox: puts the decoys in the user's home and starts the clock.
+# Run it as root (mh exec), once, AFTER copying the code in and BEFORE
+# running it: everything changed after this moment is reported.
+#
+#   mh-sandbox-prepare [ARCHIVE]
+#
+# ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
+# unpacked into ~/work as the user and removed, before the clock starts.
+# Without it: the code was unpacked before (mh-sandbox-unpack), typically to
+# fetch its dependencies first (mh-sandbox-run --fetch).
+#
+# Root never writes inside the user's home: what is there may be the code's
+# (a symlink to a system file), and root writing through it would be the
+# escalation the sandbox exists to prevent. Root hands files over on stdin;
+# the user writes them.
+set -eu
+. /usr/sbin/mh-sandbox-lib
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-prepare: run as root (mh exec)" >&2; exit 1; }
+[ ! -e "$S/since" ] || { echo "mh-sandbox-prepare: already prepared" >&2; exit 1; }
+
+# Every read updates atime (not just the first in a day, relatime; nor never,
+# noatime), whatever the image was mounted with.
+mount -o remount,strictatime /
+# Hardening, not reporting: the user sees no one else's processes (and so no
+# command line of root's), nor kernel addresses or the kernel log, which help
+# a privilege escalation.
+mount -o remount,hidepid=2 /proc 2>/dev/null || true
+sysctl -w kernel.kptr_restrict=2 kernel.dmesg_restrict=1 >/dev/null
+
+install -d -m 700 "$S"
+asuser 'mkdir -p "$HOME/work"'
+
+# The code first: the decoys, written after it, replace anything it put in
+# their place.
+[ $# -eq 0 ] || unpack mh-sandbox-prepare "$1"
+
+# A token unique to this VM, inside every decoy: seen anywhere else (output,
+# a request, a paste site), it came from here.
+tok=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
+TOK=$(echo "$tok" | tr a-f A-F)
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# decoy PATH [NOTE]: installs stdin as PATH (relative to the user's home),
+# mode 600, dated in the past — the code sees credentials that have been
+# there a long time, and a read moves atime past the moment of preparing. NOTE
+# says who reads that file legitimately, for whoever reads the report.
+: > "$S/decoys"
+decoy() {
+	asuser 'cd "$HOME" && rm -rf "$0" && mkdir -p "$(dirname "$0")" && (umask 077 && cat > "$0") && touch -d "2025-01-01 00:00:00" "$0"' "$1"
+	printf '%s\t%s\n' "$H/$1" "${2:-}" >> "$S/decoys"
+}
+
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACD%s\n-----END OPENSSH PRIVATE KEY-----\n' "$tok" |
+	decoy .ssh/id_ed25519 "ssh reads it when connecting"
+printf 'Host prod-db\n    HostName 10.20.0.15\n    User deploy\n    IdentityFile ~/.ssh/id_ed25519\n' |
+	decoy .ssh/config "ssh reads it when connecting"
+printf '[default]\naws_access_key_id = AKIA%s\naws_secret_access_key = %s%s\nregion = eu-west-1\n' "$TOK" "$tok" "$tok" |
+	decoy .aws/credentials "the AWS CLI and SDKs read it"
+printf 'github.com:\n    oauth_token: ghp_%s%s\n    user: %s\n    git_protocol: https\n' "$tok" "$tok" "$U" |
+	decoy .config/gh/hosts.yml "the gh CLI reads it"
+printf 'https://%s:ghp_%s@github.com\n' "$U" "$tok" |
+	decoy .git-credentials "git reads it with credential.helper store"
+printf '//registry.npmjs.org/:_authToken=npm_%s%s\n' "$tok" "$tok" |
+	decoy .npmrc "npm reads it on every run"
+printf '[pypi]\nusername = __token__\npassword = pypi-%s%s\n' "$tok" "$tok" |
+	decoy .pypirc "twine reads it to upload"
+printf 'machine api.heroku.com\n  login %s@example.com\n  password %s\n' "$U" "$tok" |
+	decoy .netrc "curl -n, ftp, git setups and Python requests (looking for credentials) read it"
+printf '{\n  "auths": {\n    "ghcr.io": { "auth": "%s" }\n  }\n}\n' "$(b64 "$U:ghp_$tok")" |
+	decoy .docker/config.json "docker reads it"
+printf 'apiVersion: v1\nkind: Config\nclusters:\n- name: prod\n  cluster:\n    server: https://10.20.0.2:6443\ncontexts:\n- name: prod\n  context: {cluster: prod, user: admin}\ncurrent-context: prod\nusers:\n- name: admin\n  user:\n    token: %s%s\n' "$tok" "$tok" |
+	decoy .kube/config "kubectl reads it"
+printf 'DATABASE_URL=postgres://admin:%s@10.20.0.15:5432/billing\nSTRIPE_SECRET_KEY=sk_live_%s%s\nOPENAI_API_KEY=sk-proj-%s%s\n' "$tok" "$tok" "$tok" "$tok" "$tok" |
+	decoy projects/billing-api/.env "the project's own app reads it"
+printf 'cd projects/billing-api\nexport STRIPE_SECRET_KEY=sk_live_%s%s\npsql postgres://admin:%s@10.20.0.15:5432/billing\nssh prod-db\naws s3 ls\n' "$tok" "$tok" "$tok" |
+	decoy .bash_history "an interactive bash reads it when it starts"
+printf 'SQLite format 3\0001%s' "$tok" |
+	decoy ".config/google-chrome/Default/Login Data" "only the browser reads it"
+printf 'SQLite format 3\0002%s' "$tok" |
+	decoy .config/google-chrome/Default/Cookies "only the browser reads it"
+printf '{"nextId":2,"logins":[{"hostname":"https://github.com","encryptedUsername":"%s","encryptedPassword":"%s%s"}]}\n' "$tok" "$tok" "$tok" |
+	decoy .mozilla/firefox/k3x9q2pd.default-release/logins.json "only the browser reads it"
+printf 'SQLite format 3\0003%s' "$tok" |
+	decoy .mozilla/firefox/k3x9q2pd.default-release/key4.db "only the browser reads it"
+printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xprv%s%s"}}\n' "$tok" "$tok" |
+	decoy .electrum/wallets/default_wallet "only the wallet reads it"
+
+echo "$tok" > "$S/token"
+
+# Where there is audit (ubuntu.yml): every file the user opens, looks up or
+# runs, found or not — the report picks out the ones that tell a VM apart.
+# After the decoys, which the user wrote.
+if command -v auditctl >/dev/null; then
+	auditctl -a always,exit -F arch=b64 -F uid="$(id -u "$U")" \
+		-S open,openat,openat2,stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,execve \
+		-k mh-sandbox >/dev/null
+	auditctl --reset-lost >/dev/null 2>&1
+fi
+
+# The clock: last, so that everything above is before it.
+touch "$S/since"
+echo "prepared: $(wc -l < "$S/decoys") decoys in $H, token $tok"

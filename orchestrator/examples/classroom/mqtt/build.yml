@@ -1,0 +1,23 @@
+# The school's message broker: Mosquitto (MQTT), open to the lab network.
+# ../microse.yml's sensor function publishes a reading every 30 s.
+#
+#   mh build orchestrator/examples/classroom/mqtt
+#   mosquitto_sub -h mqtt -t 'school/#' -v      # from the student VM
+
+name: school-mqtt
+base: ubuntu:24.04
+
+packages:
+  - mosquitto
+  - mosquitto-clients           # for the health check
+
+files:
+  /etc/mosquitto/conf.d/school.conf: school.conf
+
+# No command: systemd starts mosquitto.
+health:
+  command: mosquitto_sub -h 127.0.0.1 -t '$SYS/broker/uptime' -C 1 -W 2 >/dev/null
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

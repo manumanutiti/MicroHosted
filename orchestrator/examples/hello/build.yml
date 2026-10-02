@@ -1,0 +1,5 @@
+# The plainest image: Alpine's busybox and the engine's agent, nothing else.
+# microse.yml, next to it, says build: . and mh up builds it the first time.
+# By hand: mh build orchestrator/examples/hello
+name: hello
+base: alpine:3.22

@@ -725,7 +725,7 @@ Each slice is usable on its own and validated on test hardware before the next.
 
 **Status (2026-09-28):** a first cut spanning O1 and the basics of O2/O3 is in
 `orchestrator/` (`mh-orchestrator validate | plan | apply | run | status |
-down`, first example in `orchestrator/examples/first.yaml`). Unit-tested against
+down`, first example in `orchestrator/examples/hello/microse.yml`). Unit-tested against
 an in-memory engine, and run on ARM64 test hardware (2026-09-28) with the first
 example: all three modes answered correctly (a transaction cycle, boot to
 result, in ~170 ms; a VM reaching the persistent function over its network),
@@ -737,7 +737,7 @@ a persistent function that never starts backed off (5, 10, 20, 40 s) and went
 *degraded* after 5 attempts; stopping the orchestrator mid-window destroyed the
 window's VM and reported the cycle as interrupted; a leftover cycle VM was
 removed by the next apply; a quarantined VM of a removed function was kept.
-Then `orchestrator/examples/intranet.yaml` (files: added to the orchestrator for
+Then `orchestrator/examples/intranet/microse.yml` (files: added to the orchestrator for
 it): three Python services on one intra segment plus clients; destroying the
 database (kv) was healed in ~6 s while the app answered 503 without failing;
 killing the app's process was healed after 3 failed checks, with a failure

@@ -1,0 +1,22 @@
+; school.lan — one line per machine of ../../microse.yml.
+$TTL 300
+@           IN SOA  ns.school.lan. admin.school.lan. (
+                    2026093001  ; serial: bump it on every change
+                    3600        ; refresh
+                    600         ; retry
+                    86400       ; expire
+                    300 )       ; negative-answer TTL
+            IN NS   ns
+            IN A    172.30.80.12                ; school.lan itself is the portal
+            IN TXT  "MicroHosted classroom lab"
+
+ns          IN A    172.30.80.10
+db          IN A    172.30.80.11
+portal      IN A    172.30.80.12
+ftp         IN A    172.30.80.13
+mqtt        IN A    172.30.80.14
+ntp         IN A    172.30.80.15
+student     IN A    172.30.80.20
+
+www         IN CNAME portal                     ; an alias
+_mqtt._tcp  IN SRV  0 0 1883 mqtt               ; where a service is: priority weight port host

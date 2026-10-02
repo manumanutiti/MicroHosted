@@ -1,20 +1,20 @@
-# First plant spec: the three lifecycle modes on a plain Alpine image.
+# Hello: the three lifecycle modes on a plain Alpine image, with shell
+# one-liners. Start here.
 #
-#   (the image is built by mh build the first time plan/apply/run needs it:
-#    build: images/alpine below; sudo once)
-#   mh validate -f first.yaml
-#   mh plan     -f first.yaml
-#   mh up      -f first.yaml      # Ctrl-C to stop; results on stdout
-#   mh status   -f first.yaml
-#   mh down     -f first.yaml      # remove everything it created
+#   cd orchestrator/examples/hello
+#   mh validate      # ./microse.yml on its own
+#   mh plan          # builds build.yml the first time (sudo once), then what would change
+#   mh up            # Ctrl-C to stop; one JSON line per finished cycle on stdout
+#   mh status
+#   mh down          # remove everything it created
 #
-# build: images/alpine makes the image from images/alpine/build.yml; the
+# build: . makes the image from ./build.yml; the
 # orchestrator then pins what mh build printed (alpine:sha-…@sha256:…): the
 # digest is what the engine boots, so a spec never runs other bytes than the
 # ones named. image: name:version@sha256:… names an existing image instead.
 
 version: 1
-name: first             # the project: this directory holds three specs, each its own
+name: hello
 
 budget:
   max_vms: 6            # worst case here: 1 persistent + 2 workers = 3 VMs
@@ -29,7 +29,7 @@ networks:
 functions:
   # Static: always on, replaced if it dies or fails its health check.
   server:
-    build: images/alpine
+    build: .
     network: demo
     ip: 172.30.10.2
     command: 'while true; do printf "HTTP/1.0 200 OK\r\n\r\nhello from %s, running as %s\n" "$(hostname)" "$(whoami)" | nc -l -p 8080 >/dev/null; done'
@@ -38,21 +38,21 @@ functions:
 
   # Disposable: a fresh VM every 30 s runs one command and is destroyed.
   whoami:
-    build: images/alpine
+    build: .
     network: none       # no network at all; reachable over vsock only
     command: 'echo "$(whoami) on Alpine $(cat /etc/alpine-release), $(uname -m), up $(cut -d" " -f1 /proc/uptime)s"'
     lifecycle: { mode: transaction, every: 30s, timeout: 10s }
 
   # Disposable, talking to the static one over the network.
   probe:
-    build: images/alpine
+    build: .
     network: demo
     command: wget -qO- -T 3 http://172.30.10.2:8080/
     lifecycle: { mode: transaction, every: 30s, timeout: 10s }
 
   # Disposable with a duration: runs 20 s every 2 minutes, then goes.
   ticker:
-    build: images/alpine
+    build: .
     network: none
     command: 'while true; do date -u +%T; sleep 5; done'
     lifecycle: { mode: window, every: 2m, duration: 20s }

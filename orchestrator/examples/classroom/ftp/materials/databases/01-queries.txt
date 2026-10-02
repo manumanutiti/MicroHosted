@@ -1,0 +1,6 @@
+Lab 1 — Queries   (psql -h db -U student school)
+
+1. List the subjects and who teaches them.
+2. The average grade per subject.
+3. The best student of each group.
+4. Try: INSERT INTO grades VALUES (1,1,10); — why is it refused?

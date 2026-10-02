@@ -1,0 +1,8 @@
+options {
+    directory "/var/cache/bind";
+    listen-on { any; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion no;               // authoritative only: school.lan and its reverse
+    dnssec-validation no;
+};

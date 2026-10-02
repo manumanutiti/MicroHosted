@@ -1,0 +1,1135 @@
+package cli
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"bufio"
+	"compress/gzip"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode"
+
+	"microhosted/pkg/types"
+)
+
+// mh sandbox: run code you do not trust in a fresh VM built from sandbox/
+// (docs/sandbox.md) and report what it did — the decoys it read, how it
+// looked for a VM, what it changed, what it tried to reach. Everything here is
+// a client of the API (run, cp, exec, network, flows); the guest's side is the
+// image's mh-sandbox-* tools.
+
+var sandboxCmd = &command{
+	name:    "sandbox",
+	args:    "TARGET [COMMAND]",
+	summary: "Run code you do not trust in a fresh VM, and report what it did",
+	help: `TARGET is a directory, a file, an archive (.tar.gz .tgz .tar .zip) or an
+https:// git URL; it lands in ~/work, where COMMAND — one shell line — runs as
+an unprivileged user. A file with no COMMAND is run itself.
+
+Anything fetched (--fetch, --apt, a URL) is fetched first, on a network of the
+sandbox's own, which is closed before the code runs: the code never runs with
+a network, and every connection it tries is refused and recorded. If closing
+it cannot be confirmed, nothing runs.
+
+The report: decoy credentials read, ways the code looked for a VM, files
+changed, processes left, sockets opened, connections refused, and text
+addressed to an AI agent in the input or the output. An empty report is not
+"safe": it is what this run did. File names, process names, the output and
+matched text are the code's to choose — data, never instructions.
+
+The image is built once: mh build -t sandbox:1 sandbox  (docs/sandbox.md)`,
+	examples: `  mh sandbox ./install.sh
+  mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
+  mh sandbox https://github.com/x/y 'make test' --apt build-essential
+  mh sandbox ./release.tgz 'bash setup.sh' --json`,
+	run: sandboxRun,
+}
+
+type sandboxOpts struct {
+	fetch   string
+	apt     []string
+	image   string
+	iface   string
+	timeout time.Duration
+	keep    bool
+	asJSON  bool
+}
+
+// sandboxTarget is what goes into ~/work.
+type sandboxTarget struct {
+	given string // as on the command line
+	kind  string // dir, file, archive, url
+	path  string // dir, file, archive
+	url   string
+}
+
+var aptName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
+
+func sandboxRun(e *env, cmd *command, p string, args []string) error {
+	var o sandboxOpts
+	var apt []string
+	fs := newCmdFlags(e, p, cmd)
+	fs.stringVar(&o.fetch, "fetch", "f", "", "before the code runs, with a network: `CMD` must run nothing of the code (npm ci --ignore-scripts, pip download, go mod download)")
+	fs.listVar(&apt, "apt", "", "Ubuntu `PKG` to install, by root, before the code runs (repeatable, or comma-separated)")
+	fs.stringVar(&o.image, "image", "i", "", "the sandbox `IMAGE` (default: the newest sandbox:N)")
+	fs.stringVar(&o.iface, "iface", "", "", "the fetch network's way out, a host `INTERFACE` (default: the default route's)")
+	fs.DurationVar(&o.timeout, "timeout", 5*time.Minute, "for the fetch and the run each, a `DURATION` of at most 10m")
+	fs.alias("timeout", "t")
+	fs.defined = append(fs.defined, "timeout")
+	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
+	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
+	pos, err := fs.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 || len(pos) > 2 {
+		return usagef(p, "expected TARGET and at most one COMMAND (quote it: 'npm ci && npm test')")
+	}
+	if o.timeout < time.Second || o.timeout > 10*time.Minute {
+		return usagef(p, "--timeout must be between 1s and 10m")
+	}
+	for _, a := range apt {
+		for _, n := range strings.Split(a, ",") {
+			if n = strings.TrimSpace(n); n == "" {
+				continue
+			}
+			if !aptName.MatchString(n) {
+				return usagef(p, "--apt %q: not a package name", n)
+			}
+			o.apt = append(o.apt, n)
+		}
+	}
+	t, err := sandboxClassify(pos[0])
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
+	command := ""
+	if len(pos) == 2 {
+		command = pos[1]
+	}
+	if command == "" {
+		if t.kind != "file" {
+			return usagef(p, "a %s needs a COMMAND to run in it", t.kind)
+		}
+		name := filepath.Base(t.path)
+		command = "./" + shellQuote(name) // packed executable: a chmod here would show as a change
+	}
+	// The guest's agent reads one line.
+	if strings.ContainsAny(command+o.fetch, "\n\r") {
+		return usagef(p, "COMMAND and --fetch must be one line each")
+	}
+	c, err := e.api()
+	if err != nil {
+		return err
+	}
+	s := &sandbox{e: e, c: c, o: o, t: t, command: command}
+	return s.run()
+}
+
+// sandboxClassify tells what TARGET is.
+func sandboxClassify(given string) (sandboxTarget, error) {
+	t := sandboxTarget{given: given}
+	switch {
+	case strings.HasPrefix(given, "https://"):
+		u, err := url.Parse(given)
+		if err != nil || u.Host == "" || strings.ContainsAny(given, " \t'\"\\") {
+			return t, fmt.Errorf("%s: not a URL to clone", given)
+		}
+		t.kind, t.url = "url", given
+		return t, nil
+	case strings.Contains(given, "://") || strings.HasPrefix(given, "git@"):
+		return t, fmt.Errorf("%s: only https:// URLs are cloned", given)
+	}
+	fi, err := os.Stat(given)
+	if err != nil {
+		return t, err
+	}
+	t.path = given
+	switch {
+	case fi.IsDir():
+		t.kind = "dir"
+	case !fi.Mode().IsRegular():
+		return t, fmt.Errorf("%s: not a directory, a file or an archive", given)
+	case archiveKind(given) != "":
+		t.kind = "archive"
+	default:
+		t.kind = "file"
+	}
+	return t, nil
+}
+
+func archiveKind(name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(n, ".tar.gz"), strings.HasSuffix(n, ".tgz"):
+		return "tgz"
+	case strings.HasSuffix(n, ".tar"):
+		return "tar"
+	case strings.HasSuffix(n, ".zip"):
+		return "zip"
+	}
+	return ""
+}
+
+// sandbox is one run: the VM, its network, what to clean up.
+type sandbox struct {
+	e       *env
+	c       *Client
+	o       sandboxOpts
+	t       sandboxTarget
+	command string
+
+	image   string
+	vm      string
+	network string // the run's own, when something is fetched
+	once    sync.Once
+	// before is what the host had refused before the code ran: the fetch's
+	// last packets, cut mid-close. The report is what came after. The guest
+	// lets the fetch's connections close before the cut (mh-sandbox-run
+	// --fetch); a server that still resends its FIN later gets an ACK that
+	// shows here, under the fetch's own destination.
+	before map[string]uint64
+}
+
+func (s *sandbox) say(format string, a ...any) {
+	fmt.Fprintf(s.e.stderr, "== "+format+"\n", a...)
+}
+
+func (s *sandbox) needsNetwork() bool {
+	return s.o.fetch != "" || len(s.o.apt) > 0 || s.t.kind == "url"
+}
+
+func (s *sandbox) run() (err error) {
+	if s.image, err = sandboxImage(s.c, s.o.image); err != nil {
+		return err
+	}
+	// Packed before anything is created: a bad archive costs no VM.
+	var tgz string
+	if s.t.kind != "url" {
+		if tgz, err = packTarget(s.t); err != nil {
+			return err
+		}
+		defer os.Remove(tgz)
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	go func() {
+		if _, ok := <-stop; ok {
+			fmt.Fprintln(s.e.stderr, "\ninterrupted")
+			s.o.keep = false
+			s.cleanup()
+			os.Exit(130)
+		}
+	}()
+	defer s.cleanup()
+
+	id := randomID()
+	netName := "default"
+	labels := map[string]string{"managed-by": "mh-sandbox"}
+	if s.needsNetwork() {
+		iface := s.o.iface
+		if iface == "" {
+			if iface, err = defaultRouteIface("/proc/net/route"); err != nil {
+				return err
+			}
+		}
+		// Its own network: closed without touching anyone else's, the VM
+		// staying on its bridge — recorded — once it is.
+		req := types.CreateNetworkRequest{
+			Name: "sbx-" + id, Labels: labels, Egress: true, EgressIface: iface,
+			EgressPorts: []types.PortRule{{Protocol: "tcp", Port: 80}, {Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}},
+		}
+		var n types.NetworkResponse
+		if err := s.c.Do("POST", "/v1/networks", req, &n); err != nil {
+			return fmt.Errorf("creating the fetch network: %w", err)
+		}
+		s.network, netName = n.Name, n.Name
+		s.say("VM (%s on %s: internet@%s, ports tcp:80,tcp:443,udp:53, to fetch)", s.image, netName, iface)
+	} else {
+		s.say("VM (%s on %s: no way out)", s.image, netName)
+	}
+	var vm types.VMResponse
+	if err := s.c.Do("POST", "/v1/vms", types.CreateVMRequest{Image: s.image, Network: netName, Name: "sbx-" + id, Labels: labels}, &vm); err != nil {
+		return err
+	}
+	s.vm = vm.ID
+	fmt.Fprintln(s.e.stderr, s.vm)
+	if err := s.c.Do("GET", fmt.Sprintf("/v1/vms/%s/ready?timeout_ms=%d", s.vm, 60000), nil, nil); err != nil {
+		return fmt.Errorf("the VM's agent did not answer: %w", err)
+	}
+	if tgz != "" {
+		if err := s.upload(tgz, "/root/code.tgz"); err != nil {
+			return err
+		}
+	}
+
+	prepare := "mh-sandbox-prepare /root/code.tgz"
+	if s.needsNetwork() {
+		if err := s.fetchPhase(tgz != ""); err != nil {
+			return err
+		}
+		prepare = "mh-sandbox-prepare"
+	}
+	if err := s.root(prepare, time.Minute); err != nil {
+		return err
+	}
+	if err := s.root("mh-sandbox-scan", 2*time.Minute); err != nil {
+		return err
+	}
+
+	if s.before, err = s.flowCounts(); err != nil {
+		return err
+	}
+	s.say("run: %s", s.command)
+	res, timedOut, err := s.exec("mh-sandbox-run "+shellQuote(s.command), s.o.timeout)
+	if err != nil {
+		return err
+	}
+	code := res.ExitCode
+	if timedOut {
+		code = 124
+	}
+
+	rep, err := s.report()
+	if err != nil {
+		return err
+	}
+	rep.ExitCode, rep.TimedOut = code, timedOut
+	rep.Output = untrustedTail(res.Output, 8<<10)
+	patterns, perr := s.patterns()
+	if perr != nil {
+		rep.Warnings = append(rep.Warnings, "no agent patterns in the image ("+perr.Error()+"): the output was not scanned")
+	}
+	rep.AddressesAnAgent = append(rep.AddressesAnAgent, scanText("output", res.Output, patterns)...)
+	for _, name := range rep.Changed.names() {
+		for _, a := range scanText("created", name, patterns) {
+			a.File, a.Line = name, 0
+			rep.AddressesAnAgent = append(rep.AddressesAnAgent, a)
+		}
+	}
+	rep.summarize()
+
+	if s.o.asJSON {
+		if err := printJSON(s.e.stdout, rep); err != nil {
+			return err
+		}
+	} else {
+		rep.print(s.e.stdout)
+	}
+	if code != 0 {
+		return exitError{code: code}
+	}
+	return nil
+}
+
+// fetchPhase brings in what the code needs while there is a network — no
+// decoy yet, nothing reported — then closes the network's way out and
+// confirms it on the daemon's account. If it cannot, nothing runs.
+func (s *sandbox) fetchPhase(unpack bool) error {
+	if unpack {
+		if err := s.root("mh-sandbox-unpack /root/code.tgz", time.Minute); err != nil {
+			return err
+		}
+	}
+	failed := ""
+	if s.t.kind == "url" {
+		s.say("clone: %s", s.t.url)
+		if r, _, err := s.exec("mh-sandbox-run --fetch "+shellQuote("GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 -- "+shellQuote(s.t.url)+" ."), s.o.timeout); err != nil {
+			return err
+		} else if r.ExitCode != 0 {
+			fmt.Fprint(s.e.stderr, r.Output)
+			failed = fmt.Sprintf("the clone failed (exit %d)", r.ExitCode)
+		}
+	}
+	if failed == "" && len(s.o.apt) > 0 {
+		s.say("apt: %s", strings.Join(s.o.apt, " "))
+		cmd := "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq --no-install-recommends " + strings.Join(s.o.apt, " ")
+		if r, _, err := s.exec(cmd, s.o.timeout); err != nil {
+			return err
+		} else if r.ExitCode != 0 {
+			fmt.Fprint(s.e.stderr, r.Output)
+			failed = fmt.Sprintf("apt failed (exit %d)", r.ExitCode)
+		}
+	}
+	if failed == "" && s.o.fetch != "" {
+		s.say("fetch: %s", s.o.fetch)
+		r, timedOut, err := s.exec("mh-sandbox-run --fetch "+shellQuote(s.o.fetch), s.o.timeout)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(s.e.stderr, r.Output)
+		if timedOut {
+			failed = "the fetch timed out"
+		} else if r.ExitCode != 0 {
+			failed = fmt.Sprintf("the fetch failed (exit %d)", r.ExitCode)
+		}
+	}
+
+	s.say("cutting the network")
+	path := "/v1/networks/" + url.PathEscape(s.network)
+	var n types.NetworkResponse
+	if err := s.c.Do("PUT", path+"/egress", types.UpdateNetworkEgressRequest{}, &n); err != nil {
+		s.o.keep = false
+		return fmt.Errorf("could not close %s's way out, nothing runs: %w", s.network, err)
+	}
+	if err := s.c.Do("GET", path, nil, &n); err != nil || n.Egress || len(n.AllowedEgress) > 0 {
+		s.o.keep = false
+		return fmt.Errorf("%s's way out is not confirmed closed: nothing runs", s.network)
+	}
+	fmt.Fprintf(s.e.stderr, "%s: no way out\n", s.network)
+	if failed != "" {
+		return fmt.Errorf("%s: not running the code", failed)
+	}
+	return nil
+}
+
+func (s *sandbox) cleanup() {
+	s.once.Do(func() {
+		if s.o.keep && s.vm != "" {
+			where := ""
+			if s.network != "" {
+				where = " on " + s.network
+			}
+			fmt.Fprintf(s.e.stderr, "kept: %s%s (mh rm %s", s.vm, where, s.vm)
+			if s.network != "" {
+				fmt.Fprintf(s.e.stderr, "; mh network rm %s", s.network)
+			}
+			fmt.Fprintln(s.e.stderr, " when done)")
+			return
+		}
+		if s.vm != "" {
+			if err := s.c.Do("DELETE", "/v1/vms/"+s.vm, nil, nil); err != nil {
+				fmt.Fprintf(s.e.stderr, "mh: could not remove VM %s: %v\n", s.vm, err)
+			} else {
+				fmt.Fprintf(s.e.stderr, "removed %s\n", s.vm)
+			}
+		}
+		if s.network != "" {
+			if err := s.c.Do("DELETE", "/v1/networks/"+url.PathEscape(s.network), nil, nil); err != nil {
+				fmt.Fprintf(s.e.stderr, "mh: could not remove network %s: %v\n", s.network, err)
+			}
+		}
+	})
+}
+
+// exec runs cmd as root in the VM. timedOut: the daemon stopped waiting —
+// the command may still be running.
+func (s *sandbox) exec(cmd string, timeout time.Duration) (types.ExecResponse, bool, error) {
+	var res types.ExecResponse
+	err := s.c.Do("POST", "/v1/vms/"+s.vm+"/exec", types.ExecRequest{Cmd: cmd, TimeoutMS: timeout.Milliseconds()}, &res)
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusGatewayTimeout {
+		return res, true, nil
+	}
+	return res, false, err
+}
+
+// root runs one of the image's tools; its failure stops the sandbox.
+func (s *sandbox) root(cmd string, timeout time.Duration) error {
+	r, timedOut, err := s.exec(cmd, timeout)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w", cmd, err)
+	case timedOut:
+		return fmt.Errorf("%s: timed out", cmd)
+	case r.ExitCode == 127:
+		return fmt.Errorf("%s: not in image %s — rebuild it from sandbox/ (docs/sandbox.md)", strings.Fields(cmd)[0], s.image)
+	case r.ExitCode != 0:
+		return fmt.Errorf("%s (exit %d): %s", cmd, r.ExitCode, strings.TrimSpace(r.Output))
+	}
+	fmt.Fprint(s.e.stderr, r.Output)
+	return nil
+}
+
+func (s *sandbox) upload(local, remote string) error {
+	f, err := os.Open(local)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return s.c.Stream("PUT", "/v1/vms/"+s.vm+"/files?path="+url.QueryEscape(remote), f, fi.Size())
+}
+
+func (s *sandbox) report() (*sandboxReport, error) {
+	r, timedOut, err := s.exec("mh-sandbox-report --tsv", 2*time.Minute)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("report: %w", err)
+	case timedOut:
+		return nil, errors.New("report: timed out")
+	case r.ExitCode != 0:
+		return nil, fmt.Errorf("report (exit %d): %s", r.ExitCode, strings.TrimSpace(r.Output))
+	}
+	rep := parseSandboxReport(r.Output)
+	rep.Target, rep.Image, rep.VM, rep.Kept = s.t.given, s.image, s.vm, s.o.keep
+	var flows types.FlowList
+	if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err != nil {
+		rep.Warnings = append(rep.Warnings, "the host's flows could not be read: "+err.Error())
+	} else {
+		if !flows.Recording {
+			rep.Warnings = append(rep.Warnings, "this host is not recording refused connections: an empty list proves nothing")
+		}
+		if flows.Overruns > 0 {
+			rep.Warnings = append(rep.Warnings, "the daemon missed flow records: counts may be low")
+		}
+		for _, f := range flows.Flows {
+			if n := f.Count - s.before[flowKey(f)]; n > 0 {
+				rep.Connections = append(rep.Connections, sandboxConn{Protocol: f.Protocol, Dst: f.Dst, DstPort: f.DstPort, Count: n, Reason: f.Reason})
+			}
+		}
+	}
+	return rep, nil
+}
+
+func flowKey(f types.Flow) string {
+	return fmt.Sprintf("%s %s %d %s", f.Protocol, f.Dst, f.DstPort, f.Reason)
+}
+
+// flowCounts is what the host has refused from the VM so far.
+func (s *sandbox) flowCounts() (map[string]uint64, error) {
+	var flows types.FlowList
+	if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err != nil {
+		return nil, fmt.Errorf("reading the host's flows: %w", err)
+	}
+	m := map[string]uint64{}
+	for _, f := range flows.Flows {
+		m[flowKey(f)] = f.Count
+	}
+	return m, nil
+}
+
+// patterns are the image's: one list for the input (grep, in the guest) and
+// the output (here).
+func (s *sandbox) patterns() ([]*regexp.Regexp, error) {
+	r, _, err := s.exec("cat /usr/share/mh-sandbox/agent-patterns", 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if r.ExitCode != 0 {
+		return nil, errors.New(strings.TrimSpace(r.Output))
+	}
+	return compilePatterns(r.Output), nil
+}
+
+func compilePatterns(text string) []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, l := range strings.Split(text, "\n") {
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		if re, err := regexp.Compile("(?i)" + l); err == nil {
+			out = append(out, re)
+		}
+	}
+	return out
+}
+
+// scanText finds text addressed to an agent in one of the code's outputs:
+// a pattern, or a character that hides text from a person.
+func scanText(where, text string, patterns []*regexp.Regexp) []sandboxAgentText {
+	var out []sandboxAgentText
+	for i, line := range strings.Split(text, "\n") {
+		for _, re := range patterns {
+			if m := re.FindString(line); m != "" {
+				out = append(out, sandboxAgentText{Where: where, Line: i + 1, Text: untrusted(m, 160)})
+			}
+		}
+		if strings.IndexFunc(line, invisible) >= 0 {
+			out = append(out, sandboxAgentText{Where: where, Line: i + 1, Text: "(invisible Unicode characters)"})
+		}
+		if len(out) >= 200 {
+			break
+		}
+	}
+	return out
+}
+
+func invisible(r rune) bool {
+	return r >= 0x200B && r <= 0x200F || r >= 0x202A && r <= 0x202E || r >= 0x2060 && r <= 0x2064 ||
+		r >= 0x2066 && r <= 0x2069 || r == 0xFEFF || r >= 0xE0000 && r <= 0xE007F
+}
+
+// untrusted makes a string the code chose safe to print: no control
+// character (a terminal escape, a carriage return hiding a line), at most n
+// bytes.
+func untrusted(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || invisible(r) || r == unicode.ReplacementChar {
+			return '?'
+		}
+		return r
+	}, s)
+	if len(s) > n {
+		s = s[:n] + "…"
+	}
+	return s
+}
+
+// untrustedTail is the end of the command's output, where the failure is.
+func untrustedTail(s string, n int) string {
+	if len(s) > n {
+		s = "…" + s[len(s)-n:]
+	}
+	return untrusted(s, n+len("…"))
+}
+
+// sandboxImage is the image to run: the one asked for, which must exist, or
+// the newest sandbox:N.
+func sandboxImage(c *Client, ref string) (string, error) {
+	if ref != "" {
+		if _, err := getImage(c, ref); err != nil {
+			return "", fmt.Errorf("image %s: %w", ref, err)
+		}
+		return ref, nil
+	}
+	var imgs []types.ImageResponse
+	if err := c.Do("GET", "/v1/images", nil, &imgs); err != nil {
+		return "", err
+	}
+	best, bestN := "", -1
+	for _, img := range imgs {
+		for _, tag := range img.Tags {
+			v, ok := strings.CutPrefix(tag, "sandbox:")
+			if n, err := strconv.Atoi(v); ok && err == nil && n > bestN {
+				best, bestN = tag, n
+			}
+		}
+	}
+	if best == "" {
+		return "", errors.New("no sandbox image: build one once, from the repository's root: mh build -t sandbox:1 sandbox")
+	}
+	return best, nil
+}
+
+// defaultRouteIface reads the host's routing table for the interface of its
+// default route: the fetch network's way out.
+func defaultRouteIface(routes string) (string, error) {
+	f, err := os.Open(routes)
+	if err != nil {
+		return "", fmt.Errorf("finding the host's way out: %w (give --iface)", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fl := strings.Fields(sc.Text())
+		if len(fl) > 2 && fl[1] == "00000000" && fl[0] != "Iface" {
+			return fl[0], nil
+		}
+	}
+	return "", errors.New("the host has no default route: give --iface")
+}
+
+func randomID() string {
+	b := make([]byte, 3)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// ---------------------------------------------------------------------------
+// The target, packed into a .tar.gz the guest unpacks as the sandbox's user.
+// Archives are repacked rather than passed through: one format for the guest,
+// and every name checked here — none absolute, none with "..".
+// ---------------------------------------------------------------------------
+
+func packTarget(t sandboxTarget) (string, error) {
+	out, err := os.CreateTemp("", "mh-sandbox-*.tgz")
+	if err != nil {
+		return "", err
+	}
+	gz := gzip.NewWriter(out)
+	tw := tar.NewWriter(gz)
+	switch t.kind {
+	case "dir":
+		err = packDir(tw, t.path)
+	case "file":
+		err = packFile(tw, t.path, filepath.Base(t.path), 0o755)
+	case "archive":
+		err = repack(tw, t.path)
+	}
+	for _, c := range []io.Closer{tw, gz, out} {
+		if cerr := c.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		os.Remove(out.Name())
+		return "", fmt.Errorf("%s: %w", t.given, err)
+	}
+	return out.Name(), nil
+}
+
+func packDir(tw *tar.Writer, root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case fi.Mode().IsRegular():
+			return packFile(tw, p, rel, 0)
+		case fi.IsDir():
+			return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: rel + "/", Mode: int64(fi.Mode().Perm()), ModTime: fi.ModTime()})
+		case fi.Mode()&fs.ModeSymlink != 0:
+			target, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: rel, Linkname: target, Mode: 0o777, ModTime: fi.ModTime()})
+		}
+		return nil // devices, FIFOs, sockets: not code
+	})
+}
+
+// packFile adds the file at p as name; a non-zero mode replaces its own.
+func packFile(tw *tar.Writer, p, name string, mode os.FileMode) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if mode == 0 {
+		mode = fi.Mode().Perm()
+	}
+	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: int64(mode), Size: fi.Size(), ModTime: fi.ModTime()}); err != nil {
+		return err
+	}
+	_, err = io.Copy(tw, f)
+	return err
+}
+
+// safeName is an archive member's name if it stays inside ~/work.
+func safeName(name string) (string, error) {
+	n := strings.TrimPrefix(strings.ReplaceAll(name, "\\", "/"), "./")
+	if n == "" || strings.HasPrefix(n, "/") {
+		return "", fmt.Errorf("member %q: an absolute name", name)
+	}
+	for _, part := range strings.Split(n, "/") {
+		if part == ".." {
+			return "", fmt.Errorf("member %q: it climbs out with ..", name)
+		}
+	}
+	return n, nil
+}
+
+func repack(tw *tar.Writer, p string) error {
+	if archiveKind(p) == "zip" {
+		return repackZip(tw, p)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var r io.Reader = f
+	if archiveKind(p) == "tgz" {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		r = gz
+	}
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		name, err := safeName(h.Name)
+		if err != nil {
+			return err
+		}
+		switch h.Typeflag {
+		case tar.TypeReg, tar.TypeDir, tar.TypeSymlink:
+		case tar.TypeLink:
+			return fmt.Errorf("member %q: hard links are not taken", h.Name)
+		default:
+			continue // devices, FIFOs: not code
+		}
+		out := &tar.Header{Typeflag: h.Typeflag, Name: name, Linkname: h.Linkname, Mode: h.Mode & 0o777, Size: h.Size, ModTime: h.ModTime}
+		if h.Typeflag != tar.TypeReg {
+			out.Size = 0
+		}
+		if err := tw.WriteHeader(out); err != nil {
+			return err
+		}
+		if h.Typeflag == tar.TypeReg {
+			if _, err := io.Copy(tw, tr); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func repackZip(tw *tar.Writer, p string) error {
+	zr, err := zip.OpenReader(p)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	for _, zf := range zr.File {
+		name, err := safeName(zf.Name)
+		if err != nil {
+			return err
+		}
+		mode := zf.Mode()
+		h := &tar.Header{Name: name, Mode: int64(mode.Perm()), ModTime: zf.Modified}
+		switch {
+		case mode.IsDir():
+			h.Typeflag = tar.TypeDir
+			if !strings.HasSuffix(h.Name, "/") {
+				h.Name += "/"
+			}
+			if h.Mode == 0 {
+				h.Mode = 0o755
+			}
+		case mode&fs.ModeSymlink != 0:
+			rc, err := zf.Open()
+			if err != nil {
+				return err
+			}
+			target, err := io.ReadAll(io.LimitReader(rc, 4096))
+			rc.Close()
+			if err != nil {
+				return err
+			}
+			h.Typeflag, h.Linkname = tar.TypeSymlink, string(target)
+		case mode.IsRegular():
+			h.Typeflag, h.Size = tar.TypeReg, int64(zf.UncompressedSize64)
+			if h.Mode == 0 {
+				h.Mode = 0o644
+			}
+		default:
+			continue
+		}
+		if err := tw.WriteHeader(h); err != nil {
+			return err
+		}
+		if h.Typeflag == tar.TypeReg {
+			rc, err := zf.Open()
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(tw, rc)
+			rc.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The report.
+// ---------------------------------------------------------------------------
+
+// sandboxReport is what --json prints (docs/sandbox.md). Fields marked
+// untrusted hold strings the code chose.
+type sandboxReport struct {
+	Target   string         `json:"target"`
+	Image    string         `json:"image"`
+	VM       string         `json:"vm"`
+	Kept     bool           `json:"kept"`
+	ExitCode int            `json:"exit_code"`
+	TimedOut bool           `json:"timed_out"`
+	Summary  sandboxSummary `json:"summary"`
+
+	Decoys           []sandboxDecoy     `json:"decoys"`
+	VMProbes         []sandboxProbe     `json:"vm_probes"` // untrusted: path, by
+	Changed          sandboxChanged     `json:"changed"`   // untrusted
+	Processes        []sandboxProc      `json:"processes"` // untrusted: args
+	Listening        []string           `json:"listening"`
+	Connections      []sandboxConn      `json:"connections"`
+	AddressesAnAgent []sandboxAgentText `json:"addresses_an_agent"` // untrusted: file, text
+	Output           string             `json:"output"`             // untrusted
+	Warnings         []string           `json:"warnings"`
+
+	user string
+}
+
+type sandboxSummary struct {
+	DecoysRead         int  `json:"decoys_read"`
+	VMProbes           int  `json:"vm_probes"`
+	EvasionSuspected   bool `json:"evasion_suspected"`
+	ChangedOutsideWork int  `json:"changed_outside_work"`
+	ProcessesLeft      int  `json:"processes_left"`
+	Listening          int  `json:"listening"`
+	ConnectionsRefused int  `json:"connections_refused"`
+	AddressesAnAgent   int  `json:"addresses_an_agent"`
+}
+
+type sandboxDecoy struct {
+	Path         string `json:"path"`
+	State        string `json:"state"`
+	Legitimately string `json:"legitimately"`
+}
+
+type sandboxProbe struct {
+	Path  string `json:"path"`
+	Found bool   `json:"found"`
+	Count int    `json:"count"`
+	By    string `json:"by"`
+}
+
+type sandboxWorkEntry struct {
+	Entry string `json:"entry"`
+	Count int    `json:"count"`
+}
+
+type sandboxChanged struct {
+	Files     []string           `json:"files"`
+	Dirs      []string           `json:"dirs"`
+	WorkFiles []sandboxWorkEntry `json:"work_files"`
+	WorkDirs  []sandboxWorkEntry `json:"work_dirs"`
+}
+
+type sandboxProc struct {
+	PID  int    `json:"pid"`
+	Args string `json:"args"`
+}
+
+type sandboxConn struct {
+	Protocol string `json:"protocol"`
+	Dst      string `json:"dst"`
+	DstPort  int    `json:"dst_port,omitempty"`
+	Count    uint64 `json:"count"`
+	Reason   string `json:"reason"`
+}
+
+type sandboxAgentText struct {
+	Where string `json:"where"` // input, output
+	File  string `json:"file,omitempty"`
+	Line  int    `json:"line"`
+	Text  string `json:"text"`
+}
+
+// parseSandboxReport reads mh-sandbox-report --tsv. Lines it does not know
+// are skipped: a newer image may say more.
+func parseSandboxReport(tsv string) *sandboxReport {
+	r := &sandboxReport{
+		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Processes: []sandboxProc{}, Listening: []string{},
+		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{},
+		Changed: sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
+	}
+	for _, line := range strings.Split(tsv, "\n") {
+		f := strings.Split(line, "\t")
+		at := func(i int) string {
+			if i < len(f) {
+				return untrusted(f[i], 512)
+			}
+			return ""
+		}
+		num := func(i int) int { n, _ := strconv.Atoi(at(i)); return n }
+		switch f[0] {
+		case "user":
+			r.user = at(1)
+		case "decoy":
+			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3)})
+		case "audit":
+			if at(1) == "off" {
+				r.Warnings = append(r.Warnings, "no audit in this image: how the code looked for a VM is not recorded")
+			} else if n := num(2); n > 0 {
+				r.Warnings = append(r.Warnings, fmt.Sprintf("audit lost %d events: vm_probes may be incomplete", n))
+			}
+		case "probe":
+			r.VMProbes = append(r.VMProbes, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
+		case "file":
+			r.Changed.Files = append(r.Changed.Files, at(1))
+		case "dir":
+			r.Changed.Dirs = append(r.Changed.Dirs, at(1))
+		case "work":
+			w := sandboxWorkEntry{Entry: at(2), Count: num(3)}
+			if at(1) == "dir" {
+				r.Changed.WorkDirs = append(r.Changed.WorkDirs, w)
+			} else {
+				r.Changed.WorkFiles = append(r.Changed.WorkFiles, w)
+			}
+		case "proc":
+			r.Processes = append(r.Processes, sandboxProc{PID: num(1), Args: at(2)})
+		case "listen":
+			r.Listening = append(r.Listening, at(1)+" "+at(2))
+		case "agent":
+			r.AddressesAnAgent = append(r.AddressesAnAgent, sandboxAgentText{Where: at(1), File: at(2), Line: num(3), Text: at(4)})
+		}
+	}
+	return r
+}
+
+// commonProbes are read by ordinary programs too — Node's os.cpus(), cgroup
+// limits read by Node, Go and the JVM — so they alone do not suggest evasion.
+var commonProbes = map[string]bool{"/proc/cpuinfo": true, "/proc/self/cgroup": true}
+
+func (r *sandboxReport) summarize() {
+	s := &r.Summary
+	for _, d := range r.Decoys {
+		if d.State != "untouched" {
+			s.DecoysRead++
+		}
+	}
+	s.VMProbes = len(r.VMProbes)
+	for _, p := range r.VMProbes {
+		if !commonProbes[p.Path] {
+			s.EvasionSuspected = true
+		}
+	}
+	s.ChangedOutsideWork = len(r.Changed.Files) + len(r.Changed.Dirs)
+	s.ProcessesLeft = len(r.Processes)
+	s.Listening = len(r.Listening)
+	for _, c := range r.Connections {
+		s.ConnectionsRefused += int(c.Count)
+	}
+	s.AddressesAnAgent = len(r.AddressesAnAgent)
+}
+
+func (r *sandboxReport) print(w io.Writer) {
+	if r.Output != "" {
+		fmt.Fprint(w, r.Output)
+		if !strings.HasSuffix(r.Output, "\n") {
+			fmt.Fprintln(w)
+		}
+	}
+	fmt.Fprintf(w, "exit code: %d", r.ExitCode)
+	if r.TimedOut {
+		fmt.Fprint(w, " (timed out: it may still have been running)")
+	}
+	fmt.Fprintln(w)
+
+	section := func(title string) { fmt.Fprintf(w, "\n== %s\n", title) }
+	none := func(n int) {
+		if n == 0 {
+			fmt.Fprintln(w, "  (none)")
+		}
+	}
+	section("decoys (READ: opened; TAMPERED: written, or its times reset)")
+	for _, d := range r.Decoys {
+		if d.State == "untouched" {
+			continue
+		}
+		fmt.Fprintf(w, "  %-14s %s   (legitimately: %s)\n", d.State, d.Path, d.Legitimately)
+	}
+	fmt.Fprintf(w, "  %d of %d untouched\n", len(r.Decoys)-r.Summary.DecoysRead, len(r.Decoys))
+
+	section("looking for a VM (absent: not in this VM; /proc/cpuinfo is read by ordinary programs too)")
+	for _, p := range r.VMProbes {
+		state := "absent"
+		if p.Found {
+			state = "found"
+		}
+		fmt.Fprintf(w, "  %3d %-7s %s by %s\n", p.Count, state, p.Path, p.By)
+	}
+	none(len(r.VMProbes))
+
+	section("files created or changed (in ~/work: counted per entry)")
+	printChanged(w, r.Changed.Files, r.Changed.WorkFiles)
+	none(len(r.Changed.Files) + len(r.Changed.WorkFiles))
+	section("directories whose entries changed")
+	printChanged(w, r.Changed.Dirs, r.Changed.WorkDirs)
+	none(len(r.Changed.Dirs) + len(r.Changed.WorkDirs))
+
+	section("processes left running as " + r.user)
+	for _, p := range r.Processes {
+		fmt.Fprintf(w, "  %6d  %s\n", p.PID, p.Args)
+	}
+	none(len(r.Processes))
+	section("listening sockets")
+	for _, l := range r.Listening {
+		fmt.Fprintln(w, "  "+l)
+	}
+	none(len(r.Listening))
+	section("connections refused (seen by the host)")
+	for _, c := range r.Connections {
+		dst := c.Dst
+		if c.DstPort != 0 {
+			dst += ":" + strconv.Itoa(c.DstPort)
+		}
+		fmt.Fprintf(w, "  %-4s %-22s %4d×  %s\n", c.Protocol, dst, c.Count, c.Reason)
+	}
+	none(len(r.Connections))
+	section("text addressed to an AI agent (a signal, not proof)")
+	for _, a := range r.AddressesAnAgent {
+		where := a.Where
+		if a.File != "" {
+			where += " " + a.File
+		}
+		fmt.Fprintf(w, "  %s:%d: %s\n", where, a.Line, a.Text)
+	}
+	none(len(r.AddressesAnAgent))
+	for _, warn := range r.Warnings {
+		fmt.Fprintln(w, "\nWARNING: "+warn)
+	}
+
+	s := r.Summary
+	verdict := ""
+	if s.EvasionSuspected {
+		verdict = " — it looked for a VM: what it did not do here proves nothing"
+	}
+	fmt.Fprintf(w, "\nsummary: %d decoy(s) read, %d VM probe(s), %d change(s) outside ~/work, %d process(es) left, %d socket(s), %d connection(s) refused, %d text(s) addressed to an agent%s\n",
+		s.DecoysRead, s.VMProbes, s.ChangedOutsideWork, s.ProcessesLeft, s.Listening, s.ConnectionsRefused, s.AddressesAnAgent, verdict)
+}
+
+// names are the paths the code created or changed, ~/work's entries
+// included: a file's name can speak to an agent as well as its content.
+func (c sandboxChanged) names() []string {
+	n := append(append([]string(nil), c.Files...), c.Dirs...)
+	for _, e := range c.WorkFiles {
+		n = append(n, "~/work/"+e.Entry)
+	}
+	return n
+}
+
+func printChanged(w io.Writer, outside []string, work []sandboxWorkEntry) {
+	sorted := append([]string(nil), outside...)
+	sort.Strings(sorted)
+	for _, f := range sorted {
+		fmt.Fprintln(w, "  "+f)
+	}
+	for _, e := range work {
+		if strings.HasSuffix(e.Entry, "/") {
+			fmt.Fprintf(w, "  ~/work/%s  (%d inside)\n", e.Entry, e.Count)
+		} else {
+			fmt.Fprintln(w, "  ~/work/"+path.Clean(e.Entry))
+		}
+	}
+}

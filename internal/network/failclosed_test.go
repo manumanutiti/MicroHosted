@@ -262,6 +262,8 @@ func TestRenderedRulesetParses(t *testing.T) {
 		"mixed": {
 			{Name: "lab", Bridge: "mhbraaaa", Subnet: "172.16.0.0/24"},
 			{Name: "build", Bridge: "mhbrbbbb", Subnet: "172.17.0.0/24", Egress: true, EgressIface: "eth0"},
+			{Name: "fetch", Bridge: "mhbreeee", Subnet: "172.19.0.0/24", Egress: true, EgressIface: "eth0",
+				EgressPorts: []types.PortRule{{Protocol: "tcp", Port: 443}, {Protocol: "udp", Port: 53}}},
 			{Name: "old", Bridge: "mhbrdddd", Subnet: "172.18.0.0/24", Egress: true},
 			{Name: "ot", Bridge: "mhbrcccc", Subnet: "172.16.9.0/24", AllowedEgress: []types.EgressRule{
 				{Iface: "wlan0", IP: "192.168.50.52", Protocol: "tcp", Port: 502},
@@ -273,7 +275,7 @@ func TestRenderedRulesetParses(t *testing.T) {
 	}
 	for name, nets := range cases {
 		cmd := exec.Command("nft", "-c", "-f", "-")
-		cmd.Stdin = strings.NewReader(renderNftables(nets, managedWlan()))
+		cmd.Stdin = strings.NewReader(renderNftables(nets, managedWlan(), true))
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Errorf("%s: nft -c rejected the ruleset: %v\n%s", name, err, out)
 		}

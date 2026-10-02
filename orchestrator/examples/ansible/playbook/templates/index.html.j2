@@ -1,0 +1,4 @@
+<!doctype html>
+<title>{{ inventory_hostname }}</title>
+<h1>{{ inventory_hostname }}</h1>
+<p>Configured by Ansible — {{ ansible_distribution }} {{ ansible_distribution_version }}, kernel {{ ansible_kernel }}, group {{ group_names | join(', ') }}.</p>

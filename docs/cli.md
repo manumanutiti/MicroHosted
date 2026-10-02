@@ -30,6 +30,7 @@ The VM verbs you use most also exist at the top level, like `docker ps`,
 | `mh stop` / `mh start` | `mh vm stop` / `start` | | `mh inspect` | `mh vm inspect` |
 | `mh rm` | `mh vm rm` | | `mh images` | `mh template ls` |
 | `mh cp` | `mh vm cp` | | `mh health` / `mh info` | `mh system health` / `info` |
+| `mh flows` | `mh vm flows` | | | |
 
 **The verb may also come first**: `mh create vm base-alpine`,
 `mh list network` and `mh change network lab --intra` are rewritten to the
@@ -104,6 +105,8 @@ mh cp a1b2:/etc/os-release -                # to stdout
 
 mh logs a1b2 -n 50                          # console log (through the API)
 mh logs -f a1b2                             # follow (read from the host's disk)
+mh flows a1b2                               # connections it tried that its network refused
+mh flows a1b2 --json                        # with "recording": false if the host is not recording
 
 mh stop a1b2 && mh start a1b2               # power off keeping disk + IP, boot again
 mh vm update a1b2 --autostart               # boot it again on its own after a host reboot
@@ -150,6 +153,7 @@ Everything not listed is dropped, both ways. (The API calls these
 mh network create lab                       # isolated: nothing in or out, VMs can't see each other
 mh network create build --internet eth0     # the internet, through eth0 only (NAT); not the LAN
 mh network create dev --internet eth0 --private   # the LAN behind eth0 too
+mh network create fetch --internet eth0 --ports tcp:80,tcp:443,udp:53   # the internet on these ports only
 mh network create lab2 --intra --subnet 10.10.0.0/24
 mh network create iot --out tcp:203.0.113.7:8883 --out icmp:203.0.113.7
 mh network create ot-52 --out tcp:192.168.50.52:502@wlan0
@@ -444,6 +448,20 @@ mh validate            # the file on its own
 Each spec is a **project** — its `name:`, or its directory's name — and sees
 only its own VMs and networks: `mh up` in two directories runs both. Its VMs
 are named `<project>-<function>-<n>`.
+
+### Untrusted code: `mh sandbox`
+
+Runs a directory, a file, an archive or an https git URL in a fresh VM built
+from `sandbox/`, with decoy credentials around it and the network cut before
+it runs, and reports what it did. docs/sandbox.md has the whole of it.
+
+```bash
+mh build -t sandbox:1 sandbox                                    # once
+mh sandbox ./install.sh                                          # a file: runs it
+mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'   # dependencies first, with a network
+mh sandbox https://github.com/x/y 'make test' --apt build-essential
+mh sandbox ./release.tgz 'bash setup.sh' --json                  # for an agent
+```
 
 ### Platform
 

@@ -1,0 +1,104 @@
+# A school network for a class on services and protocols: the teacher runs
+# mh up, and every server of a small school is there — DNS, a database, a
+# web portal, FTP, MQTT, NTP — each in its own microVM, plus a student
+# machine with the client of each protocol. One image per service, each an
+# Ubuntu build.yml of a few lines: apt installs it, systemd runs it.
+#
+#   school 172.30.80.0/24 (intra: the VMs see each other; no internet)
+#     dns      .10  ns.school.lan      DNS  53    BIND 9, zones in dns/
+#     db       .11  db.school.lan      SQL  5432  PostgreSQL 16, db/school.sql
+#     portal   .12  www.school.lan     HTTP 80    services + grades from db
+#     ftp      .13  ftp.school.lan     FTP  21    course materials, ftp/materials/
+#     mqtt     .14  mqtt.school.lan    MQTT 1883  Mosquitto
+#     ntp      .15  ntp.school.lan     NTP  123   chrony
+#     student  .20  student.school.lan            the clients; school-check
+#     sensor   —    a fresh VM every 30 s publishes a temperature to MQTT
+#
+#   cd orchestrator/examples/classroom
+#   mh up -d         # builds the seven images the first time (sudo; a few minutes)
+#   mh status
+#   mh exec classroom-student-1 school-check   # every protocol, from a client
+#   mh exec classroom-student-1 bash           # a student's shell: dig, psql, curl, lftp…
+#   open http://172.30.80.12/ in a browser on this host
+#   mh down
+#
+# Every VM resolves names through dns (resolv.conf below). Break it —
+# mh exec classroom-dns-1 'systemctl stop named' — and the portal loses the
+# database ("could not translate host name"), the sensor's cycle fails
+# (mh failures sensor: "Lookup error"), until the health check replaces dns
+# with a fresh one, about 20 s later. mh status shows both.
+#
+# The class's machines reaching the portal: an allowed_ingress rule on a
+# managed interface, as in ../website/microse.yml.
+
+version: 1
+name: classroom
+
+budget:
+  max_vms: 10           # the eight, plus a replacement during an update
+  max_mem_mb: 2560      # 10 × 256
+
+networks:
+  school:
+    subnet: 172.30.80.0/24
+    intra: true
+
+functions:
+  dns:
+    build: dns
+    network: school
+    ip: 172.30.80.10
+    lifecycle: { mode: persistent }
+    files: &resolver
+      /etc/resolv.conf: { from: resolv.conf }
+
+  db:
+    build: db
+    network: school
+    ip: 172.30.80.11      # db/build.yml lets the portal and the student in, by address
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  portal:
+    build: portal
+    network: school
+    ip: 172.30.80.12
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  ftp:
+    build: ftp
+    network: school
+    ip: 172.30.80.13
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  mqtt:
+    build: mqtt
+    network: school
+    ip: 172.30.80.14
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  ntp:
+    build: ntp
+    network: school
+    ip: 172.30.80.15
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  student:
+    build: student
+    network: school
+    ip: 172.30.80.20
+    lifecycle: { mode: persistent }
+    files: *resolver
+
+  # A sensor in the lab: boots, publishes one reading (retained: a new
+  # subscriber gets the last one at once) and is gone.
+  sensor:
+    build: student
+    network: school
+    command: mosquitto_pub -h mqtt.school.lan -r -t school/lab1/temperature -m "$(awk 'BEGIN{srand(); printf "%.1f", 19 + rand() * 6}')"
+    lifecycle: { mode: transaction, every: 30s, timeout: 20s }
+    files: *resolver

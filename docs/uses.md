@@ -151,7 +151,7 @@ Two ways, depending on how the host is set up:
   `--managed-iface`): add to the network
   `allowed_ingress: [{ iface: wlan0, src_ip: 192.168.1.0/24, protocol: tcp, port: 8080, to_ip: 10.88.0.11 }]`
   — DNAT to the VM, no listener on the host. See
-  `orchestrator/examples/website.yaml`.
+  `orchestrator/examples/website/microse.yml`.
 - **A reverse proxy on the host** (an unmanaged interface, TLS termination,
   several sites on one port): the host reaches the network's addresses through
   its bridge, so `proxy_pass http://10.88.0.11:8080;` in the host's nginx (or

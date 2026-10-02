@@ -118,6 +118,33 @@ func parseRules(specs []string) ([]types.EgressRule, error) {
 	return out, nil
 }
 
+// --ports on the command line: PROTO:PORT, comma-separated or repeated
+// (tcp:80,tcp:443 --ports udp:53). The shape here, validity at the daemon.
+const portSyntax = "PROTO:PORT[,PROTO:PORT…]"
+
+func parsePorts(specs []string) ([]types.PortRule, error) {
+	var out []types.PortRule
+	for _, spec := range specs {
+		for _, s := range strings.Split(spec, ",") {
+			proto, port, ok := strings.Cut(strings.TrimSpace(s), ":")
+			n, err := strconv.Atoi(port)
+			if !ok || err != nil {
+				return nil, fmt.Errorf("port %q: want PROTO:PORT, e.g. tcp:443", s)
+			}
+			out = append(out, types.PortRule{Protocol: proto, Port: n})
+		}
+	}
+	return out, nil
+}
+
+func formatPorts(ports []types.PortRule) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = fmt.Sprintf("%s:%d", p.Protocol, p.Port)
+	}
+	return strings.Join(parts, ",")
+}
+
 // IN rules on the command line: PROTO:SRC:PORT@IFACE=VM_IP
 //
 //	tcp:192.168.50.60:1883@wlan0=172.16.9.2
@@ -187,10 +214,14 @@ func describeEgress(n types.NetworkResponse) string {
 		if n.EgressIface == "" {
 			return "CLOSED (internet without an interface: set one with --internet IFACE)"
 		}
+		out := "internet@" + n.EgressIface
 		if n.EgressPrivate {
-			return "internet+private@" + n.EgressIface
+			out = "internet+private@" + n.EgressIface
 		}
-		return "internet@" + n.EgressIface
+		if len(n.EgressPorts) > 0 {
+			out += " ports " + formatPorts(n.EgressPorts)
+		}
+		return out
 	}
 	if len(n.AllowedEgress) == 0 {
 		return "none"
@@ -217,6 +248,8 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	fs.listVar(&allow, "out", "", "allow an OUT flow: `RULE` = "+ruleSyntax+" (repeatable)")
 	fs.stringVar(&req.EgressIface, "internet", "", "", "allow outbound to the internet through host interface `IFACE` (NAT), e.g. eth0, instead of --out rules; private and special addresses (the LAN, 10/8, 172.16/12, 192.168/16, link-local…) stay closed")
 	fs.boolVar(&req.EgressPrivate, "private", "", "with --internet: reach private and special addresses too (the LAN behind IFACE)")
+	var ports []string
+	fs.listVar(&ports, "ports", "", "with --internet: only these `PORTS` = "+portSyntax+"; everything else out is dropped, ICMP included")
 	fs.listVar(&ingress, "in", "", "allow an IN flow: `RULE` = "+ingressSyntax+" (repeatable; needs --subnet)")
 	fs.stringVar(&req.Subnet, "subnet", "", "", "`CIDR`, e.g. 10.10.0.0/24 (default: a free /24)")
 	fs.boolVar(&req.Intra, "intra", "", "let the network's VMs reach each other; off by default")
@@ -243,6 +276,12 @@ func netCreate(e *env, cmd *command, p string, args []string) error {
 	}
 	if req.EgressPrivate && !req.Egress {
 		return usagef(p, "--private widens --internet: give --internet IFACE too")
+	}
+	if req.EgressPorts, err = parsePorts(ports); err != nil {
+		return usagef(p, "%v", err)
+	}
+	if len(req.EgressPorts) > 0 && !req.Egress {
+		return usagef(p, "--ports narrows --internet: give --internet IFACE too (--out rules name their ports already)")
 	}
 	if req.AllowedIngress, err = parseIngressRules(ingress); err != nil {
 		return usagef(p, "%v", err)
@@ -384,6 +423,8 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	fs.boolVar(&noEgress, "no-out", "", "close all outbound")
 	fs.stringVar(&egressIface, "internet", "", "", "allow outbound to the internet through host interface `IFACE`, e.g. eth0 (replaces the OUT rules; private and special addresses stay closed)")
 	fs.boolVar(&egressPrivate, "private", "", "with --internet: reach private and special addresses too (the LAN behind IFACE)")
+	var ports []string
+	fs.listVar(&ports, "ports", "", "with --internet: only these `PORTS` = "+portSyntax+" (without it, --internet opens every port)")
 	fs.listVar(&addIngress, "in", "", "add an IN `RULE` = "+ingressSyntax+" (repeatable)")
 	fs.listVar(&rmIngress, "rm-in", "", "remove an IN `RULE` (repeatable)")
 	fs.listVar(&ingress, "set-in", "", "REPLACE all IN rules with these `RULE`s (repeatable)")
@@ -411,6 +452,13 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	egress := egressIface != ""
 	if egressPrivate && !egress {
 		return usagef(p, "--private widens --internet: give --internet IFACE too")
+	}
+	egressPorts, err := parsePorts(ports)
+	if err != nil {
+		return usagef(p, "%v", err)
+	}
+	if len(egressPorts) > 0 && !egress {
+		return usagef(p, "--ports narrows --internet: give --internet IFACE too")
 	}
 	modes := 0
 	for _, set := range []bool{egress, noEgress, len(allow) > 0, len(addAllow)+len(rmAllow) > 0} {
@@ -470,7 +518,7 @@ func netUpdate(e *env, cmd *command, p string, args []string) error {
 	if modes == 1 {
 		// The API replaces the whole policy; --out/--rm-out are the CLI
 		// merging onto what is there now.
-		req := types.UpdateNetworkEgressRequest{Egress: egress, EgressIface: egressIface, EgressPrivate: egressPrivate, AllowedEgress: allowRules}
+		req := types.UpdateNetworkEgressRequest{Egress: egress, EgressIface: egressIface, EgressPrivate: egressPrivate, EgressPorts: egressPorts, AllowedEgress: allowRules}
 		if len(addRules)+len(rmRules) > 0 {
 			cur, err := getNetwork(c, name)
 			if err != nil {

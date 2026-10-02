@@ -285,6 +285,22 @@ func main() {
 	defer stopMonitor()
 	go mgr.Monitor(monitorCtx, 2*time.Second)
 
+	// What guests tried and the ruleset refused (docs/networking.md, "Flow
+	// log"). Not running costs the record, never the policy: the drops are in
+	// the ruleset either way.
+	flows := network.NewFlowLog(network.DefaultFlowLimits, func(iface, src string) (string, string) {
+		if nw, vm := netmgr.ResolveFlow(iface, src); nw != "" {
+			return nw, vm
+		}
+		vm, nw := mgr.ByTap(iface)
+		return nw, vm
+	})
+	go func() {
+		if err := flows.Run(monitorCtx); err != nil {
+			log.Printf("WARNING: flow log not running, dropped guest traffic is not recorded: %v", err)
+		}
+	}()
+
 	// Boot the autostart VMs only now: the orphan sweep above would delete the
 	// TAPs Start creates. In the background so the API serves meanwhile — a
 	// fleet boots one VM at a time, and each shows as stopped until its turn.
@@ -299,7 +315,7 @@ func main() {
 		}
 		return p
 	}
-	srv := api.NewServer(mgr, netmgr, bus, api.SystemConfig{
+	srv := api.NewServer(mgr, netmgr, bus, flows, api.SystemConfig{
 		DBPath:      absOr(*dbPath),
 		CatalogPath: absOr(*catalogPath),
 		StartedAt:   time.Now(),

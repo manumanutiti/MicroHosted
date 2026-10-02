@@ -1,0 +1,29 @@
+# A student's machine: the client of every protocol in the lab, and
+# school-check, which tries them all. ../microse.yml also runs it as the
+# sensor that publishes to MQTT.
+#
+#   mh build orchestrator/examples/classroom/student
+#   mh exec classroom-student-1 school-check
+
+name: school-student
+base: ubuntu:24.04
+
+packages:
+  - bind9-dnsutils              # dig, host, nslookup
+  - postgresql-client-16        # psql
+  - curl                        # HTTP, FTP
+  - lftp                        # an interactive FTP client
+  - mosquitto-clients           # mosquitto_pub, mosquitto_sub
+  - ntpsec-ntpdig               # ntpdig: ask an NTP server the time
+  - netcat-openbsd              # nc: raw TCP and UDP
+  - iputils-ping
+  - less
+
+files:
+  /usr/local/bin/school-check: school-check
+
+run:
+  - bash -n /usr/local/bin/school-check
+
+# No command: systemd keeps it up; students work in it with mh exec.
+mem_mb: 256

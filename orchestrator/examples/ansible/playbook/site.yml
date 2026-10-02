@@ -1,0 +1,60 @@
+# The lab's playbook — replace it with yours (and inventory.ini with your
+# groups). Run it from the host (-t: mh exec gives up after 30 s by default):
+#   mh exec -t 5m ansible-control-1 'ansible-playbook /etc/ansible/site.yml'
+
+- name: Every node
+  hosts: all
+  become: true
+  tasks:
+    - name: Message of the day, from facts
+      ansible.builtin.template:
+        src: templates/motd.j2
+        dest: /etc/motd
+        mode: "0644"
+
+    - name: Every node knows the others by name
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+      loop: "{{ groups['all'] }}"
+
+- name: Web servers
+  hosts: web
+  become: true
+  tasks:
+    - name: nginx is installed (the image has it, nothing to download)
+      ansible.builtin.apt:
+        name: nginx-light
+        state: present
+
+    - name: A page naming the node
+      ansible.builtin.template:
+        src: templates/index.html.j2
+        dest: /var/www/html/index.html
+        mode: "0644"
+
+    - name: nginx runs, now and at boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+- name: Workers
+  hosts: workers
+  become: true
+  tasks:
+    - name: A deploy account
+      ansible.builtin.user:
+        name: deploy
+        shell: /bin/bash
+
+- name: Check the result from the workers
+  hosts: workers
+  tasks:
+    - name: Each web server answers with its own page
+      ansible.builtin.uri:
+        url: "http://{{ item }}/"
+        return_content: true
+      register: page
+      failed_when: item not in page.content
+      loop: "{{ groups['web'] }}"
