@@ -47,3 +47,85 @@ unpack() {
 	rm -f "$2"
 	touch "$S/unpacked"
 }
+
+# What the audit log is read for (mh-sandbox-report, mh-sandbox-watch): the
+# paths that tell a VM apart (vm*), and those a privilege escalation looks
+# for (pe*) — directories as a prefix, tools by name in any directory.
+# /etc/ld.so.preload is not one: the loader looks for it in every program.
+vmdirs='sys/(class/dmi|devices/virtual/dmi|firmware/(dmi|acpi)|hypervisor|module|bus/pci|class/(power_supply|thermal)|class/net/[^/"]+/address)|proc/(cpuinfo|modules|bus/pci|scsi|xen|cmdline|1/cgroup|self/cgroup)|dev/disk/by-id|\.dockerenv|run/\.containerenv'
+vmtools='dmidecode|lspci|lscpu|lsmod|lshw|systemd-detect-virt|virt-what|hostnamectl|dmesg'
+pedirs='etc/(sudoers|shadow|gshadow|crontab|cron\.|anacrontab|doas\.conf|polkit-1|exports)|var/spool/cron|root(/|"|$)|(var/)?run/(docker|containerd|podman|lxd|snapd)|var/lib/(lxd|docker)|proc/sys/kernel/(yama|unprivileged|kptr_restrict|randomize_va_space|modprobe)|proc/[0-9]+/mem'
+petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
+
+# classify: raw audit records on stdin, an event's SYSCALL record before its
+# PATH and EXECVE ones (as auditd writes them) — out:
+#   probe|privesc STATE COUNT PATH COMM
+#   exec FIRST COUNT ARGS   (FIRST: the event's serial, to order by)
+# Names the code chose with a space or a quote in them are hex in the log,
+# and none of the paths above.
+classify() {
+	awk -v vmd="^/($vmdirs)" -v vmt="/($vmtools)\$" -v ped="^/($pedirs)" -v pet="/($petools)\$" '
+		function id(  ) { return match($0, /msg=audit\([0-9.:]+\)/) ? substr($0, RSTART, RLENGTH) : "" }
+		# an argument is "quoted", or hex when it has a space, a quote or a
+		# control character in it
+		function arg(v,  i, out) {
+			if (v ~ /^"/) return substr(v, 2, length(v) - 2)
+			out = ""
+			for (i = 1; i < length(v); i += 2)
+				out = out sprintf("%c", 16 * (index("0123456789ABCDEF", toupper(substr(v, i, 1))) - 1) + index("0123456789ABCDEF", toupper(substr(v, i + 1, 1))) - 1)
+			return out
+		}
+		/^type=SYSCALL/ {
+			if (match($0, / comm=[^ ]+/)) {
+				c = substr($0, RSTART + 6, RLENGTH - 6)
+				gsub(/"/, "", c)
+				comm[id()] = c
+			}
+			next
+		}
+		/^type=EXECVE/ {
+			c = comm[id()]
+			if (c == "") c = "?"
+			s = $0; cmd = ""
+			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 300) {
+				v = substr(s, RSTART + 1, RLENGTH - 1); sub(/^[^=]*=/, "", v)
+				cmd = cmd (cmd == "" ? "" : " ") arg(v)
+				s = substr(s, RSTART + RLENGTH)
+			}
+			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
+			gsub(/[^[:print:]]/, "?", cmd)
+			if (!(cmd in ran)) { split(id(), n, ":"); first[cmd] = n[2] + 0 }
+			ran[cmd]++
+			# every -perm VALUE of one find: -4000 setuid, -2000 setgid, -o=w writable
+			s = $0
+			while (match(s, /"-perm" a[0-9]+="[^"]*"/)) {
+				v = substr(s, RSTART, RLENGTH); sub(/.*="/, "", v); sub(/"$/, "", v)
+				seen["privesc\tfound\tfind -perm " v "\t" c]++
+				s = substr(s, RSTART + RLENGTH)
+			}
+			next
+		}
+		/^type=PATH/ && match($0, / name="[^"]*"/) {
+			f = substr($0, RSTART + 7, RLENGTH - 8)
+			st = $0 ~ /nametype=UNKNOWN/ ? "absent" : "found"
+			c = comm[id()]
+			if (c == "") c = "?"
+			if (f ~ vmd || f ~ vmt) {
+				seen["probe\t" st "\t" f "\t" c]++
+			} else if (f ~ pet) {
+				sub(/.*\//, "", f)
+				seen["privesc\t" st "\t" f "\t" c]++
+			} else if (f ~ ped) {
+				sub(/^\/proc\/[0-9]+\//, "/proc/PID/", f)
+				seen["privesc\t" st "\t" f "\t" c]++
+			}
+		}
+		END {
+			for (k in ran) printf "exec\t%d\t%d\t%s\n", first[k], ran[k], k
+			for (k in seen) {
+				split(k, a, "\t")
+				gsub(/[^[:print:]]/, "?", a[3]); gsub(/[^[:print:]]/, "?", a[4])
+				printf "%s\t%s\t%d\t%s\t%s\n", a[1], a[2], seen[k], a[3], a[4]
+			}
+		}'
+}

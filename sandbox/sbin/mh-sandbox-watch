@@ -1,0 +1,67 @@
+#!/bin/sh
+# What the code has done since the last look, while it runs: mh sandbox -v
+# asks every few seconds, to print each finding as it happens. Run it as root
+# (mh exec), after mh-sandbox-prepare:
+#
+#   mh-sandbox-watch [INODE OFFSET]
+#
+# INODE OFFSET is where the last look stopped in audit's log (its last line,
+# "at INODE OFFSET"); without it, the log is read from its start. Out, tab-
+# separated, as mh-sandbox-report --tsv:
+#   decoy READ|TAMPERED|… PATH        every decoy touched so far
+#   probe|privesc STATE COUNT PATH COMM
+#   exec FIRST COUNT ARGS
+#   at INODE OFFSET
+# The report stays the whole account: this is a view of it as it grows, and a
+# look that falls behind (the log rotated twice between two) misses some.
+. /usr/sbin/mh-sandbox-lib
+M=$S/since
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-watch: run as root (mh exec)" >&2; exit 1; }
+[ -e "$M" ] || { echo "mh-sandbox-watch: not prepared" >&2; exit 1; }
+
+since=$(stat -c %z "$M")
+tab=$(printf '\t')
+log=/var/log/audit/audit.log
+
+# Decoys: their times, as the report reads them.
+while IFS="$tab" read -r f note; do
+	a=$(stat -c %x "$f" 2>/dev/null) || { printf 'decoy\tDELETED\t%s\n' "$f"; continue; }
+	c=$(stat -c %z "$f")
+	r=$(awk -v a="$a" -v c="$c" -v m="$since" 'BEGIN { r = a > m ? "READ" : ""; if (c > m) r = r (r ? "+" : "") "TAMPERED"; print r }')
+	[ -z "$r" ] || printf 'decoy\t%s\t%s\n' "$r" "$f"
+done < "$S/decoys"
+
+command -v auditctl >/dev/null || exit 0
+
+# chunk FILE FROM TO: its bytes FROM..TO, up to the last whole line; prints
+# how many bytes that is on fd 3.
+chunk() {
+	tail -c +"$(($2 + 1))" "$1" 2>/dev/null | head -c "$(($3 - $2))" > "$S/watch.chunk"
+	n=$(($3 - $2))
+	if [ "$n" -gt 0 ] && [ "$(tail -c 1 "$S/watch.chunk" | od -An -c | tr -d ' ')" != '\n' ]; then
+		n=$((n - $(tail -n 1 "$S/watch.chunk" | wc -c)))
+	fi
+	head -c "$n" "$S/watch.chunk"
+	echo "$n" >&3
+}
+
+ino=${1:-}
+off=${2:-0}
+now=$(stat -c %i "$log" 2>/dev/null) || exit 0
+old=
+if [ -n "$ino" ] && [ "$ino" != "$now" ]; then
+	# Rotated since the last look: the rest of that file, under its new name,
+	# then the new one from its start.
+	old=$(find /var/log/audit -maxdepth 1 -inum "$ino" 2>/dev/null | head -n 1)
+	[ -n "$old" ] || old=-
+fi
+start=$off
+[ -z "$old" ] || start=0
+size=$(stat -c %s "$log")
+{
+	[ -z "$old" ] || [ "$old" = - ] || chunk "$old" "$off" "$(stat -c %s "$old")" 3>/dev/null
+	chunk "$log" "$start" "$size" 3> "$S/watch.n"
+} | classify
+printf 'at\t%s\t%s\n' "$now" "$((start + $(cat "$S/watch.n" 2>/dev/null || echo 0)))"
+rm -f "$S/watch.chunk" "$S/watch.n"

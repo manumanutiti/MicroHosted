@@ -39,7 +39,8 @@ COMMAND is one shell line, run as the sandbox's user in `~/work`.
 | `--iface IFACE` | the fetch network's way out (default: the host's default route) |
 | `--timeout D` | for the fetch and the run each (default 5m, at most 10m) |
 | `--keep` | keep the VM (and its network) afterwards, to look inside |
-| `--json` | the report as JSON on stdout (schema below) |
+| `--json` | the report as JSON on stdout (schema below), everything in it |
+| `-v`, `--verbose` | live: each finding as it happens (below); then the report in full — every probe by every program, and every command the code ran. Without it, one line per path (the programs that asked named) and at most 15 per section |
 
 The exit code is the command's. A sandbox that could not be set up exits 1
 and runs nothing.
@@ -67,6 +68,8 @@ and runs nothing.
 |---|---|
 | decoys | a fake credential read (`READ`) or written (`TAMPERED`). Each says who reads that file legitimately. |
 | vm_probes | paths that tell a VM apart the code asked for — DMI, `/proc/cpuinfo`, PCI, modules, `/.dockerenv`, `systemd-detect-virt` — `absent` ones included: asking is the tell |
+| privesc | what a privilege escalation looks for — `/etc/shadow`, `/etc/sudoers`, cron, root's home, container sockets (docker, lxd), the kernel's hardening switches, `/proc/PID/mem`; `sudo`, `su`, `pkexec`, `doas`, `getcap` looked up or run (by name); `find -perm` searching for setuid (`-4000`) or writable (`-o=w`) files — `absent` ones included |
+| commands | every command line the code ran (from audit's `execve`), in the order it first ran it, with a count; the first 2000. The first lines are `mh-sandbox-run` starting it. `-v` prints them |
 | changed | files and directories created or changed: outside `~/work` one by one, inside it one line per entry with a count |
 | processes | still running as the sandbox's user |
 | listening | sockets it opened |
@@ -99,6 +102,32 @@ The scan for text addressed to an agent is a signal, not a defence: it is
 evaded by base64, another language or a split phrase. Code that has such text
 has no business having it.
 
+### Live, with `-v`
+
+While the code runs, `mh sandbox -v` looks every 2 seconds and prints each
+finding once, the moment it shows: a decoy read, a probe for a VM or for a
+way to root, a connection the host refused.
+
+```
+== live (-v): what it does, as it happens
+     +1s  privesc      find -perm -o=w found (by find)
+     +9s  privesc      /etc/shadow found (by newgrp)
+    +42s  DECOY READ   /home/dev/.aws/credentials
+    +60s  connection   udp 1.1.1.1:53 refused (egress)
+```
+
+The guest's side is the image's `mh-sandbox-watch`, which reads only what
+audit's log gained since the last look. The report at the end is the whole
+account; the live view can miss what the log wrote and rotated between two
+looks.
+
+If the code is still running when the timeout comes, it is stopped
+(SIGSTOP) where it is and looked at: what it left running is still listed.
+
+If the report from inside the VM fails, the rest is still printed — the
+output, the exit code, the host's connections — with `"complete": false`
+and a warning: everything from inside is then unknown, not empty.
+
 ## JSON
 
 ```json
@@ -109,10 +138,13 @@ has no business having it.
   "kept": false,
   "exit_code": 0,                  // the command's; 124 if it timed out
   "timed_out": false,
+  "complete": true,                // false: the VM's side could not be read
   "summary": {
     "decoys_read": 1,
     "vm_probes": 2,
     "evasion_suspected": true,
+    "privesc": 3,
+    "commands": 41,                // distinct command lines
     "changed_outside_work": 2,
     "processes_left": 0,
     "listening": 0,
@@ -121,6 +153,8 @@ has no business having it.
   },
   "decoys":      [{"path": "/home/dev/.netrc", "state": "READ", "legitimately": "curl -n, …"}],
   "vm_probes":   [{"path": "/sys/class/dmi/id/product_name", "found": false, "count": 1, "by": "python"}],
+  "privesc":     [{"path": "find -perm -4000", "found": true, "count": 1, "by": "find"}],
+  "commands":    [{"count": 3, "args": "find / -perm -4000"}],
   "changed":     {"files": ["/home/dev/.bashrc"], "dirs": ["/tmp"],
                   "work_files": [{"entry": ".v/", "count": 203}], "work_dirs": [{"entry": ".v/", "count": 33}]},
   "processes":   [{"pid": 123, "args": "…"}],
@@ -133,6 +167,7 @@ has no business having it.
 ```
 
 Untrusted (the code's choice): `changed.*`, `vm_probes[].path` and `.by`,
+`privesc[].path` and `.by`, `commands[].args`,
 `processes[].args`, `addresses_an_agent[].file` and `.text`, `output`.
 
 ## Out of scope

@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -163,6 +164,10 @@ func TestParseSandboxReport(t *testing.T) {
 		"audit\ton\t0",
 		"probe\tfound\t1\t/proc/cpuinfo\tnode",
 		"probe\tabsent\t2\t/sys/class/dmi/id/product_name\tpython",
+		"privesc\tfound\t1\tfind -perm -4000\tfind",
+		"privesc\tabsent\t3\tsudo\tbash",
+		"commands\t2500",
+		"exec\t1\tid", "exec\t3\tfind / -perm -4000",
 		"file\t/home/dev/.bashrc", "dir\t/tmp",
 		"work\tfile\t.v/\t203", "work\tfile\tout.txt\t1", "work\tdir\t.v/\t33",
 		"proc\t812\tsleep 999",
@@ -174,12 +179,15 @@ func TestParseSandboxReport(t *testing.T) {
 	r := parseSandboxReport(tsv)
 	r.Connections = []sandboxConn{{Protocol: "udp", Dst: "1.1.1.1", DstPort: 53, Count: 4, Reason: "egress"}}
 	r.summarize()
-	want := sandboxSummary{DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
+	want := sandboxSummary{DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, Privesc: 2, Commands: 2500, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
 	if r.Summary != want {
 		t.Errorf("summary = %+v\nwant      %+v", r.Summary, want)
 	}
 	if len(r.Changed.WorkFiles) != 2 || r.Changed.WorkFiles[0] != (sandboxWorkEntry{".v/", 203}) || len(r.Changed.WorkDirs) != 1 {
 		t.Errorf("work = %+v / %+v", r.Changed.WorkFiles, r.Changed.WorkDirs)
+	}
+	if len(r.Commands) != 2 || r.Commands[1] != (sandboxCommand{3, "find / -perm -4000"}) {
+		t.Errorf("commands = %+v", r.Commands)
 	}
 	if r.Processes[0] != (sandboxProc{812, "sleep 999"}) {
 		t.Errorf("processes = %+v", r.Processes)
@@ -266,6 +274,8 @@ type sandboxDaemon struct {
 	// ran: the code's command was run. Before it the host had refused one
 	// packet (the fetch's, cut mid-close), after it four.
 	ran bool
+	// reportFails: mh-sandbox-report does not answer in time.
+	reportFails bool
 }
 
 func (d *sandboxDaemon) mux() *http.ServeMux {
@@ -306,8 +316,13 @@ func (d *sandboxDaemon) mux() *http.ServeMux {
 		d.mu.Unlock()
 		res := types.ExecResponse{}
 		switch {
+		case strings.HasPrefix(req.Cmd, "mh-sandbox-report") && d.reportFails:
+			http.Error(w, `{"error":"timed out"}`, http.StatusGatewayTimeout)
+			return
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-report"):
 			res.Output = "user\tdev\ndecoy\tREAD\t/home/dev/.netrc\tcurl\nprobe\tabsent\t1\t/sys/class/dmi/id/sys_vendor\tcat\n"
+		case strings.HasPrefix(req.Cmd, "mh-sandbox-watch"):
+			res.Output = "decoy\tREAD\t/home/dev/.netrc\nprivesc\tfound\t1\tfind -perm -4000\tfind\nprivesc\tfound\t1\tfind -perm -4000\tother\nat\t5\t100\n"
 		case strings.HasPrefix(req.Cmd, "cat /usr/share/mh-sandbox/agent-patterns"):
 			res.Output = "# comment\nignore (all )?previous instructions\n"
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-run '"):
@@ -417,5 +432,104 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A report that fails inside the VM costs that part, not the rest: the
+// output, the exit code and the host's connections are printed, and the
+// report says it is incomplete rather than empty.
+func TestSandboxReportFailureKeepsTheRest(t *testing.T) {
+	for _, asJSON := range []bool{false, true} {
+		d := &sandboxDaemon{reportFails: true}
+		f := newFakeAPI(t, d.mux())
+		script := filepath.Join(t.TempDir(), "install me.sh")
+		must(t, os.WriteFile(script, []byte("echo hi\n"), 0o755))
+		args := []string{"sandbox", script}
+		if asJSON {
+			args = append(args, "--json")
+		}
+		code, out, errOut := f.run("", args...)
+		if code != 3 {
+			t.Fatalf("exit %d, want the command's 3; stderr %s", code, errOut)
+		}
+		if asJSON {
+			var rep sandboxReport
+			if err := json.Unmarshal([]byte(out), &rep); err != nil {
+				t.Fatalf("not JSON: %v\n%s", err, out)
+			}
+			if rep.Complete || rep.Summary.ConnectionsRefused != 3 || !strings.Contains(rep.Output, "hello") || len(rep.Warnings) == 0 {
+				t.Errorf("report %+v", rep)
+			}
+			continue
+		}
+		for _, want := range []string{"hello", "exit code: 3", "unknown: the report from inside failed", "1.1.1.1:53", "summary: INCOMPLETE"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("no %q in:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "(none)\n\n== connections") || strings.Contains(out, "untouched") {
+			t.Errorf("an unknown part reads as empty:\n%s", out)
+		}
+	}
+}
+
+func TestPrintProbes(t *testing.T) {
+	ps := []sandboxProbe{
+		{Path: "sudo", Found: false, Count: 3, By: "bash"},
+		{Path: "sudo", Found: false, Count: 1, By: "which"},
+		{Path: "/etc/shadow", Found: true, Count: 44, By: "newgrp"},
+	}
+	var b strings.Builder
+	printProbes(&b, ps, false)
+	want := "     4 absent  sudo by bash, which\n    44 found   /etc/shadow by newgrp\n"
+	if b.String() != want {
+		t.Errorf("compact:\n%s\nwant:\n%s", b.String(), want)
+	}
+	b.Reset()
+	printProbes(&b, ps, true)
+	if strings.Count(b.String(), "\n") != 3 {
+		t.Errorf("verbose, one line each:\n%s", b.String())
+	}
+	many := make([]sandboxProbe, compactLines+5)
+	for i := range many {
+		many[i] = sandboxProbe{Path: fmt.Sprintf("/p%d", i), Count: 1, By: "x"}
+	}
+	b.Reset()
+	printProbes(&b, many, false)
+	if !strings.Contains(b.String(), "… 5 more (-v lists every one)") {
+		t.Errorf("not capped:\n%s", b.String())
+	}
+}
+
+// -v shows what the code does as it runs: each finding once, the guest's
+// and the host's, and every look after the first starts where the last
+// stopped.
+func TestSandboxVerboseIsLive(t *testing.T) {
+	d := &sandboxDaemon{}
+	f := newFakeAPI(t, d.mux())
+	script := filepath.Join(t.TempDir(), "install me.sh")
+	must(t, os.WriteFile(script, []byte("echo hi\n"), 0o755))
+	code, _, errOut := f.run("", "sandbox", script, "-v")
+	if code != 3 {
+		t.Fatalf("exit %d; stderr %s", code, errOut)
+	}
+	for _, want := range []string{"DECOY READ", "/home/dev/.netrc", "privesc", "find -perm -4000 found (by find)", "connection", "udp 1.1.1.1:53 refused"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("no %q live in:\n%s", want, errOut)
+		}
+	}
+	if n := strings.Count(errOut, "find -perm -4000"); n != 1 {
+		t.Errorf("find -perm -4000 shown %d times, want once:\n%s", n, errOut)
+	}
+	var watches []string
+	d.mu.Lock()
+	for _, c := range d.execs {
+		if strings.HasPrefix(c, "mh-sandbox-watch") {
+			watches = append(watches, c)
+		}
+	}
+	d.mu.Unlock()
+	if len(watches) < 2 || watches[0] != "mh-sandbox-watch " || watches[len(watches)-1] != "mh-sandbox-watch 5 100" {
+		t.Errorf("watches %q: want the first from the start, the next from 5 100", watches)
 	}
 }

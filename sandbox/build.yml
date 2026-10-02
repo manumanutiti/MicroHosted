@@ -50,6 +50,7 @@ files:
   /usr/sbin/mh-sandbox-run: sbin/mh-sandbox-run
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
   /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
+  /usr/sbin/mh-sandbox-watch: sbin/mh-sandbox-watch
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
 
 run:
@@ -68,9 +69,12 @@ run:
   # audit's log is never rotated away: the first thing the code asks for is
   # often the one that matters.
   - sed -i 's/^max_log_file_action = .*/max_log_file_action = keep_logs/' /etc/audit/auditd.conf
-  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan
+  # Files of 256 MB, not 8: mh sandbox -v follows the log as it grows, and
+  # code that walks the filesystem writes megabytes a second.
+  - sed -i 's/^max_log_file = .*/max_log_file = 256/' /etc/audit/auditd.conf
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
-  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan
+  - sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch
 
 mem_mb: 512
 # Room for audit's log: every file the code opens is in it.

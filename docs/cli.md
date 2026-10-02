@@ -461,6 +461,7 @@ mh sandbox ./install.sh                                          # a file: runs 
 mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'   # dependencies first, with a network
 mh sandbox https://github.com/x/y 'make test' --apt build-essential
 mh sandbox ./release.tgz 'bash setup.sh' --json                  # for an agent
+mh sandbox ./linpeas.sh -v                                       # what it does as it happens, then everything
 ```
 
 ### Platform
