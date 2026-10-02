@@ -1,0 +1,23 @@
+# The school's clock: chrony serving NTP to the lab. With no internet it has
+# no upstream: it serves its own clock (local stratum 8), which is enough to
+# keep the lab's machines agreeing with each other.
+#
+#   mh build orchestrator/examples/classroom/ntp
+#   ntpdig ntp.school.lan                      # from the student VM
+
+name: school-ntp
+base: ubuntu:24.04
+
+packages:
+  - chrony
+
+files:
+  /etc/chrony/chrony.conf: chrony.conf
+
+# No command: systemd starts chronyd.
+health:
+  command: chronyc -n tracking >/dev/null
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

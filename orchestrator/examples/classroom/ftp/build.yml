@@ -1,0 +1,26 @@
+# The school's file server: vsftpd, anonymous and read-only, serving the
+# course materials in materials/. FTP is two connections — control on 21,
+# data on a passive port (40000-40100 here) — which is what makes it worth
+# a class.
+#
+#   mh build orchestrator/examples/classroom/ftp
+#   curl ftp://ftp.school.lan/networks/        # from the student VM
+
+name: school-ftp
+base: ubuntu:24.04
+
+packages:
+  - vsftpd
+  - curl                        # for the health check
+
+files:
+  /etc/vsftpd.conf: vsftpd.conf
+  /srv/ftp/: materials/
+
+# No command: systemd starts vsftpd.
+health:
+  command: curl -fsS -m 2 ftp://127.0.0.1/ >/dev/null
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

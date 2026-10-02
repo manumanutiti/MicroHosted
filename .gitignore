@@ -47,3 +47,6 @@ docs/*.pdf
 .vscode/
 .idea/
 *.swp
+
+# Keys the examples generate locally (orchestrator/examples/ansible)
+orchestrator/examples/*/keys/

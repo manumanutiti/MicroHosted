@@ -1,0 +1,9 @@
+Lab 2 — One protocol per server
+
+HTTP   curl -v http://portal.school.lan/          read the request and response headers
+FTP    curl -v --disable-epsv ftp://ftp.school.lan/README.txt
+                                                  find 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2):
+                                                  the data port is p1*256+p2
+MQTT   mosquitto_sub -h mqtt -t 'school/#' -v     who publishes, how often?
+NTP    ntpdig ntp.school.lan                      the offset between this VM and the server
+SQL    psql -h db -U student school               see databases/01-queries.txt

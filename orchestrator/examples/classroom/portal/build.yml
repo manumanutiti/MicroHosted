@@ -1,0 +1,30 @@
+# The school's portal: a page listing every service of the lab — what it
+# is, its name and protocol, how to try it — and the grades read live from
+# the database. Python (stdlib + psycopg2 from apt) run by systemd.
+#
+#   mh build orchestrator/examples/classroom/portal
+#   curl http://portal.school.lan/        # or http://172.30.80.12/ from the host
+
+name: school-portal
+base: ubuntu:24.04
+
+packages:
+  - python3
+  - python3-psycopg2
+  - curl                        # for the health check
+
+files:
+  /opt/portal/portal.py: portal.py
+  /etc/systemd/system/portal.service: portal.service
+
+run:
+  - python3 -m py_compile /opt/portal/portal.py
+  - systemctl enable portal.service
+
+# No command: systemd starts portal.service.
+health:
+  command: curl -fsS -m 2 http://127.0.0.1/health
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

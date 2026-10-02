@@ -255,7 +255,7 @@ orchestrator.
 ### Open: a plant spec that works on another host (noted 2026-09-28)
 
 **The problem, as a newcomer meets it.** Someone clones the repo and tries
-`orchestrator/examples/website.yaml`. Its `image:` carries the digest of the
+`orchestrator/examples/website/microse.yml`. Its `image:` carries the digest of the
 author's build, which no other host has, and the first thing they see is
 
 ```

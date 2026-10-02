@@ -1,0 +1,44 @@
+# A machine for Ansible to manage: Ubuntu 24.04 with SSH, Python and sudo —
+# what any server Ansible reaches over SSH needs. ../microse.yml runs five.
+#
+#   mh build orchestrator/examples/ansible/node
+#
+# The image carries the software (nginx, installed and disabled); the
+# playbook in ../control configures and starts it. apt: state=present finds
+# it installed, so the lab network stays closed: no internet needed.
+
+name: ansible-node
+base: ubuntu:24.04
+
+packages:
+  - openssh-server
+  - python3                     # Ansible's modules run with it on the node
+  - python3-apt                 # the apt module's; without it, it runs apt-get update to install it
+  - sudo
+  - nginx-light                 # for the playbook's web group
+
+run:
+  # The account Ansible logs in as: key only, passwordless sudo. The key
+  # (../keys/id_lab.pub) arrives with files: in ../microse.yml.
+  - useradd --create-home --shell /bin/bash --uid 2000 ansible
+  - install -d -m 0700 -o ansible -g ansible /home/ansible/.ssh
+  - echo 'ansible ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible && chmod 0440 /etc/sudoers.d/ansible && visudo -c
+  - printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n' > /etc/ssh/sshd_config.d/10-lab.conf
+  # The package made host keys in the build: every VM would share them.
+  # Each VM makes its own instead, when sshd first starts (ssh-keygen -A
+  # only makes missing ones; the empty line clears the unit's own list).
+  - rm -f /etc/ssh/ssh_host_*
+  - |
+    mkdir -p /etc/systemd/system/ssh.service.d
+    printf '[Service]\nExecStartPre=\nExecStartPre=/usr/bin/ssh-keygen -A\nExecStartPre=/usr/sbin/sshd -t\n' > /etc/systemd/system/ssh.service.d/10-hostkeys.conf
+  # nginx is the playbook's to start.
+  - systemctl disable nginx.service
+
+# No command: systemd starts sshd. Healthy while sshd answers.
+health:
+  command: ssh-keyscan -T 2 127.0.0.1 2>/dev/null | grep -q ssh-ed25519
+  every: 10s
+  timeout: 3s
+
+vcpus: 1
+mem_mb: 256

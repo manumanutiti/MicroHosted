@@ -1,0 +1,25 @@
+#!/bin/bash
+# Tries every service of school.lan, the way a client does, and says which
+# answer. Exit 0 when all of them do.
+set -o pipefail
+fails=0
+check() {
+  local what=$1; shift
+  if out=$("$@" 2>&1 | head -n 1) && [ -n "$out" ]; then
+    printf '  ok    %-26s %s\n' "$what" "$out"
+  else
+    printf '  FAIL  %-26s %s\n' "$what" "${out:-no answer}"
+    fails=$((fails + 1))
+  fi
+}
+
+ip=$(hostname -I | cut -d' ' -f1)
+echo "school.lan, from $(dig +short -x "$ip" | sed 's/\.$//') ($ip):"
+check "DNS   ns.school.lan"      dig +short +time=2 www.school.lan
+check "SQL   db.school.lan"      psql -h db -U student -d school -Atc 'select count(*) || '"' grades'"' from grades'
+check "HTTP  portal.school.lan"  curl -fsS -m 3 -o /dev/null -w 'HTTP %{http_code}, %{size_download} bytes' http://portal.school.lan/
+check "FTP   ftp.school.lan"     curl -fsS -m 3 ftp://ftp.school.lan/README.txt
+check "MQTT  mqtt.school.lan"    mosquitto_sub -h mqtt.school.lan -t '$SYS/broker/version' -C 1 -W 3
+check "NTP   ntp.school.lan"     ntpdig -t 2 ntp.school.lan
+[ "$fails" -eq 0 ] && echo "all services answer" || echo "$fails service(s) do not answer"
+exit "$fails"

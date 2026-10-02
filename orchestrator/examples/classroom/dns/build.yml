@@ -1,0 +1,31 @@
+# The school's DNS: BIND 9, authoritative for school.lan and its reverse
+# zone, and nothing else (no recursion: the network has no internet).
+# The zones are plain files to read in class: SOA, NS, A, CNAME, TXT, SRV
+# and PTR records.
+#
+#   mh build orchestrator/examples/classroom/dns
+#   dig @172.30.80.10 portal.school.lan       # from the host, or any VM
+
+name: school-dns
+base: ubuntu:24.04
+
+packages:
+  - bind9
+  - bind9-dnsutils              # dig, for the health check and for class
+
+files:
+  /etc/bind/named.conf.options: named.conf.options
+  /etc/bind/named.conf.local: named.conf.local
+  /etc/bind/db.school.lan: db.school.lan
+  /etc/bind/db.172.30.80: db.172.30.80
+
+run:
+  - named-checkconf -z          # a broken zone fails the build, not the class
+
+# No command: systemd starts named.
+health:
+  command: dig +short +time=2 @127.0.0.1 ns.school.lan | grep -qx 172.30.80.10
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

@@ -106,12 +106,11 @@ func TestParseRejects(t *testing.T) {
 // The examples shipped with the orchestrator stay valid, and every build:
 // names an image spec that exists.
 func TestExamplesValid(t *testing.T) {
-	files, _ := filepath.Glob("../examples/*.yaml")
 	plants, _ := filepath.Glob("../examples/*/microse.yml")
-	if len(files) == 0 || len(plants) == 0 {
+	if len(plants) == 0 {
 		t.Fatal("no examples found")
 	}
-	for _, f := range append(files, plants...) {
+	for _, f := range plants {
 		// An example that needs variables ships them in env.example, the
 		// .env its user copies and fills in.
 		vars, err := ReadEnvFile(filepath.Dir(f))

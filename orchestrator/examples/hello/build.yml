@@ -1,6 +1,5 @@
-# The plain Alpine image the examples run: busybox, the engine's agent,
-# nothing else. The plant specs that use it say build: images/alpine, and
-# mh plan / mh up build it the first time (mh build; later runs find it
-# built). By hand: mh build orchestrator/examples/images/alpine
-name: alpine
+# The plainest image: Alpine's busybox and the engine's agent, nothing else.
+# microse.yml, next to it, says build: . and mh up builds it the first time.
+# By hand: mh build orchestrator/examples/hello
+name: hello
 base: alpine:3.22

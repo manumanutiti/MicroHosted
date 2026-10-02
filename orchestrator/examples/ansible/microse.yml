@@ -1,0 +1,64 @@
+# A lab to try a playbook on: five fresh Ubuntu machines reachable over SSH
+# and a control node holding the playbook. Break it, fix the playbook, run
+# it again; mh down and nothing is left.
+#
+#   lab 172.30.70.0/24 (intra: the VMs see each other; no internet)
+#     control  .10        ansible-core + playbook/     (build.yml)
+#     node1-3  .11-.13    group web                    (node/build.yml)
+#     node4-5  .14-.15    group workers
+#
+#   cd orchestrator/examples/ansible
+#   ssh-keygen -t ed25519 -N '' -C ansible-lab -f keys/id_lab   # once: the lab's key (git ignores keys/)
+#   mh up -d         # builds both images the first time (sudo; Ubuntu takes a few minutes)
+#   mh status        # the VMs' names: ansible-control-1, ansible-node1-1…
+#   mh exec ansible-control-1 'ansible all -m ping'
+#   mh exec -t 5m ansible-control-1 'ansible-playbook /etc/ansible/site.yml'
+#                    # -t: mh exec gives up after 30 s by default
+#   curl http://172.30.70.11/                 # node1's page, from this host
+#   mh down
+#
+# The loop: edit playbook/ and mh apply — the control image is rebuilt (only
+# the playbook's COPY) and control replaced; the nodes stay as the last run
+# left them. Run the playbook again: a correct one reports changed=0.
+#
+# To start from clean machines, replace a node (mh rm ansible-node2-1: a new
+# one takes its address within seconds) or all of them (mh down && mh up -d).
+#
+# The nodes have no internet: the image carries the packages (node/build.yml)
+# and the playbook configures them. A playbook that downloads needs egress on
+# the network (see ../github-runner/microse.yml).
+
+version: 1
+name: ansible
+
+budget:
+  max_vms: 7            # the six, plus a replacement during an update
+  max_mem_mb: 1792      # 7 × 256
+
+networks:
+  lab:
+    subnet: 172.30.70.0/24
+    intra: true
+
+functions:
+  control:
+    build: .
+    network: lab
+    ip: 172.30.70.10
+    lifecycle: { mode: persistent }
+    secrets:
+      /etc/ansible/id_lab: { from: keys/id_lab }      # mode 0400, root's: ansible.cfg's private_key_file
+
+  # Five nodes from one image: each a function, as each has its own address
+  # in inventory.ini. The first one's settings are reused (<<: *node).
+  node1: &node
+    build: node
+    network: lab
+    ip: 172.30.70.11
+    lifecycle: { mode: persistent }
+    files:
+      /home/ansible/.ssh/authorized_keys: { from: keys/id_lab.pub, mode: "0600", uid: 2000, gid: 2000 }
+  node2: { <<: *node, ip: 172.30.70.12 }
+  node3: { <<: *node, ip: 172.30.70.13 }
+  node4: { <<: *node, ip: 172.30.70.14 }
+  node5: { <<: *node, ip: 172.30.70.15 }

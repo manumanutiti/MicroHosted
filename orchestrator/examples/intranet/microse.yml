@@ -1,6 +1,7 @@
 # A small intranet: three machines on one segment that talk to each other, a
 # few clients that use them, and an outsider on another network that must not
-# get in. The services are plain Python (stdlib only) shipped with files:.
+# get in. The services are plain Python (stdlib only) in services/, shipped
+# with files:; every VM runs the one image build.yml makes.
 #
 #   office 172.30.20.0/24 (intra: VMs see each other)
 #     kv    .10  in-memory key-value store (HTTP :6379)       ← the database
@@ -9,26 +10,26 @@
 #   guest  172.30.21.0/24 (a separate segment)
 #     outsider   checks that it cannot reach the office
 #
-#   (the images are built by mh build the first time plan/apply/run needs them:
-#    build: images/alpine-py and images/alpine below; sudo once)
-#   mh up      -f intranet.yaml
-#   mh status   -f intranet.yaml
-#   mh failures -f intranet.yaml FUNCTION
-#   mh down     -f intranet.yaml
+#   cd orchestrator/examples/intranet
+#   mh up            # builds build.yml the first time (sudo once)
+#   mh status
+#   mh failures FUNCTION
+#   mh down
 #
 # Things to try while it runs:
-#   mh rm kv-1          kv is replaced within seconds; its data is gone (the
+#   mh rm intranet-kv-1
+#                       kv is replaced within seconds; its data is gone (the
 #                       visit counter starts over) and app answers 503 meanwhile
-#   mh exec app-1 'pkill python3'
+#   mh exec intranet-app-1 'pkill python3'
 #                       app's health fails 3 times, then a fresh app replaces it
-#   mh quarantine logs-1
+#   mh quarantine intranet-logs-1
 #                       logs is cut off in place (kept for forensics) and a
 #                       fresh one takes its address
-#   mh exec kv-1 'wget -qO- http://172.30.20.12:8080/tail'
+#   mh exec intranet-kv-1 'wget -qO- http://172.30.20.12:8080/tail'
 #                       any office machine reaches any other
 
 version: 1
-name: intranet             # the project: this directory holds three specs, each its own
+name: intranet
 
 budget:
   max_vms: 8            # worst case: 3 services + 2 workers = 5 VMs
@@ -45,33 +46,33 @@ networks:
 functions:
   # ── the three machines of the intranet (static) ──────────────────────
   kv:
-    build: images/alpine-py
+    build: .
     network: office
     ip: 172.30.20.10
     files:
-      /opt/intranet/kv.py: { from: intranet/kv.py }
+      /opt/intranet/kv.py: { from: services/kv.py }
     command: python3 /opt/intranet/kv.py 6379
     health: { command: "wget -qO- -T 2 http://127.0.0.1:6379/health", every: 10s, timeout: 3s, failures: 3 }
     lifecycle: { mode: persistent, recycle: never }
     labels: { tier: data }
 
   app:
-    build: images/alpine-py
+    build: .
     network: office
     ip: 172.30.20.11
     files:
-      /opt/intranet/app.py: { from: intranet/app.py }
+      /opt/intranet/app.py: { from: services/app.py }
     command: python3 /opt/intranet/app.py 8080 172.30.20.10:6379 172.30.20.12:514
     health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/health", every: 10s, timeout: 3s, failures: 3 }
     lifecycle: { mode: persistent, recycle: never }
     labels: { tier: web }
 
   logs:
-    build: images/alpine-py
+    build: .
     network: office
     ip: 172.30.20.12
     files:
-      /opt/intranet/logs.py: { from: intranet/logs.py }
+      /opt/intranet/logs.py: { from: services/logs.py }
     command: python3 /opt/intranet/logs.py 8080
     health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/health", every: 10s, timeout: 3s, failures: 3 }
     lifecycle: { mode: persistent, recycle: never }
@@ -80,14 +81,14 @@ functions:
   # ── users of the intranet (disposable) ───────────────────────────────
   # An employee opening the web app.
   visitor:
-    build: images/alpine
+    build: .
     network: office
     command: wget -qO- -T 3 http://172.30.20.11:8080/
     lifecycle: { mode: transaction, every: 20s, timeout: 10s }
 
   # An auditor reading the database and the collected logs.
   audit:
-    build: images/alpine
+    build: .
     network: office
     command: 'echo "kv: $(wget -qO- -T 3 http://172.30.20.10:6379/)"; wget -qO- -T 3 "http://172.30.20.12:8080/tail?n=5"'
     lifecycle: { mode: transaction, every: 1m, timeout: 15s }
@@ -95,7 +96,7 @@ functions:
   # A burst of traffic: 30 s of requests every 3 minutes. The command must
   # still be running when the window ends, so it loops forever.
   rush:
-    build: images/alpine
+    build: .
     network: office
     command: 'while true; do wget -qO- -T 2 http://172.30.20.11:8080/ >/dev/null 2>&1; sleep 0.2; done'
     lifecycle: { mode: window, every: 3m, duration: 30s }
@@ -103,7 +104,7 @@ functions:
   # Segmentation check: from the guest network the office must be
   # unreachable. Succeeds (exit 0) only while it is.
   outsider:
-    build: images/alpine
+    build: .
     network: guest
     command: 'for ip in 172.30.20.10:6379 172.30.20.11:8080 172.30.20.12:8080; do if wget -qO- -T 2 "http://$ip/health" >/dev/null 2>&1; then echo "BREACH: guest reached $ip"; exit 1; fi; done; echo "office unreachable from guest, as it should be"'
     lifecycle: { mode: transaction, every: 1m, timeout: 20s }

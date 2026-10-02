@@ -1,0 +1,6 @@
+# Alpine with Python 3, for every VM of the intranet: the services are the
+# scripts in services/, shipped by microse.yml with files:, and the clients
+# only need busybox's wget. By hand: mh build orchestrator/examples/intranet
+name: intranet
+base: alpine:3.22
+packages: [python3]

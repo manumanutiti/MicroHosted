@@ -13,7 +13,7 @@
 # Nothing changed, nothing is built.
 #
 # To reach it from the LAN: an allowed_ingress rule on a managed interface
-# (see ../website.yaml), or a reverse proxy on the host (docs/uses.md).
+# (see ../website/microse.yml), or a reverse proxy on the host (docs/uses.md).
 
 version: 1
 

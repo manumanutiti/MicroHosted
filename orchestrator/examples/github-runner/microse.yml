@@ -41,7 +41,7 @@ budget:
 
 networks:
   runners:
-    subnet: 172.30.60.0/24
+    subnet: 172.30.61.0/24
     egress: true
     egress_iface: ${EGRESS_IFACE:?set EGRESS_IFACE in .env to the host interface that reaches the internet (ip route get 1.1.1.1)}
 

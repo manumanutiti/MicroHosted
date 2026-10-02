@@ -1,0 +1,43 @@
+# The school's database: PostgreSQL 16 with a small "school" database —
+# students, subjects, grades — loaded from school.sql at build time.
+#
+#   mh build orchestrator/examples/classroom/db
+#   psql -h db.school.lan -U student school      # from the student VM
+#
+# Who may connect is by address (pg_hba.conf): the portal as "portal", the
+# student VM as "student", both read-only and without a password — the
+# engine lets each VM send only from its own address. A network shared with
+# anything else would use passwords from secrets: instead.
+
+name: school-db
+base: ubuntu:24.04
+
+packages:
+  - postgresql-16
+
+files:
+  /opt/school/school.sql: school.sql
+
+run:
+  - pg_conftool 16 main set listen_addresses '*'
+  - |
+    cat >> /etc/postgresql/16/main/pg_hba.conf <<'HBA'
+    host school portal  172.30.80.12/32 trust
+    host school student 172.30.80.20/32 trust
+    HBA
+  # The roles and the data, with the server up for this step only.
+  - >-
+    pg_ctlcluster 16 main start &&
+    runuser -u postgres -- createuser portal &&
+    runuser -u postgres -- createuser student &&
+    runuser -u postgres -- createdb school &&
+    runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q -d school -f /opt/school/school.sql &&
+    pg_ctlcluster 16 main stop
+
+# No command: systemd starts PostgreSQL.
+health:
+  command: pg_isready -q -h 127.0.0.1
+  every: 10s
+  timeout: 3s
+
+mem_mb: 256

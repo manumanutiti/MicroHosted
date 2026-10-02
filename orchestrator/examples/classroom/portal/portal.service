@@ -1,0 +1,13 @@
+[Unit]
+Description=School portal
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/portal/portal.py
+# A throwaway user, allowed to bind port 80 and nothing more.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

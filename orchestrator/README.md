@@ -16,21 +16,8 @@ orchestrator/
   spec/                  strict YAML parsing and full validation
   engine/                engine API client (pkg/types only)
   orch/                  plan, apply, cycles, supervision, status
-  examples/              plant specs and the images they build
-    alpine-nginx/          build.yml (nginx serving site/, every field
-                           commented) + microse.yml that runs it with build: .
-    app-ubuntu/            the same on Ubuntu 24.04: a Python service
-    stack/                 three tiers, three images, one microse.yml: db
-                           (PostgreSQL, Ubuntu), api (Node.js, Ubuntu), web
-                           (nginx, Alpine) — for trying the build cache
-    images/                build.yml of the images the flat examples use:
-                           alpine, alpine-py
-    first.yaml             the three modes with shell one-liners
-    website.yaml           one VM serving a page (a random word per refresh) to
-                           the plant LAN through an ingress rule (website/)
-    intranet.yaml          three services on one segment (kv, app, logs),
-                           clients, a traffic burst and a segmentation check;
-                           services in intranet/*.py, shipped with files:
+  examples/              one directory per project: microse.yml + its build.yml
+                         (index: examples/README.md)
 ```
 
 ## Usage
@@ -49,7 +36,7 @@ mh status                         # functions, VMs, health, last failures, orpha
 mh failures web                   # why web's VMs failed
 mh down                           # stop the project's up and remove what it created
 
-mh up -d -f examples/first.yaml   # any other file: -f
+mh up -d -f ../hello/microse.yml  # any other file: -f
 ```
 
 `mh up` is `mh-orchestrator run`; every verb above is also `mh-orchestrator
