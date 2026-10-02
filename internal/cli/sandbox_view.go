@@ -494,14 +494,18 @@ func renderCategory(w io.Writer, st viewStyle, c category, verbose bool) {
 		rs := []rune(s)
 		return string(rs[:n-1]) + "…"
 	}
+	// A column is as wide as its widest value up to alignMax; a longer one
+	// (an outlier path) runs on rather than pushing every line's tail out.
+	const alignMax = 40
 	var widths []int
 	for _, f := range items {
 		for i, col := range f.cols {
-			n := min(utf8.RuneCountInString(col), colMax)
 			if i == len(widths) {
 				widths = append(widths, 0)
 			}
-			widths[i] = max(widths[i], n)
+			if n := utf8.RuneCountInString(col); n <= alignMax {
+				widths[i] = max(widths[i], n)
+			}
 		}
 	}
 	for _, f := range items {
@@ -518,7 +522,7 @@ func renderCategory(w io.Writer, st viewStyle, c category, verbose bool) {
 			}
 			pad := widths[i] - utf8.RuneCountInString(col)
 			b.WriteString(col + strings.Repeat(" ", max(pad, 0)))
-			used += widths[i]
+			used += max(widths[i], utf8.RuneCountInString(col))
 		}
 		if f.tail != "" {
 			tail := clipTo(f.tail, max(viewWidth-used-2, 24))

@@ -534,6 +534,7 @@ func TestSandboxRenderFindings(t *testing.T) {
 		"user\tdev",
 		"decoy\tREAD\t/home/dev/.aws/credentials\taws",
 		"decoy\tuntouched\t/home/dev/.netrc\tcurl",
+		"decoy\tREAD\t/home/dev/.mozilla/firefox/" + strings.Repeat("k", 60) + "/logins.json\tonly the browser reads it, and only while it runs",
 		"privesc\tfound\t1\tfind -perm -4000\tfind",
 		"privesc\tabsent\t2\tsudo\tbash",
 		"probe\tfound\t1\t/proc/cpuinfo\tnode",
@@ -547,12 +548,12 @@ func TestSandboxRenderFindings(t *testing.T) {
 	r.summarize()
 	out := renderReport(r, false, false)
 	lines := strings.Split(out, "\n")
-	if lines[0] != "!! 2 high, 3 warn, 1 info -- it read your credentials, searched for setuid binaries and 2 more" {
+	if lines[0] != "!! 3 high, 3 warn, 1 info -- it read your credentials, searched for setuid binaries and 2 more" {
 		t.Errorf("verdict:\n%s", out)
 	}
 	for _, want := range []string{
 		"./x.sh, sandbox:8, exit 0, 4.2s, 7 commands run",
-		"[HIGH] decoy credentials (1)", "READ  ~/.aws/credentials  legitimately: aws",
+		"[HIGH] decoy credentials (2)", "READ  ~/.aws/credentials  legitimately: aws",
 		"[WARN] some-new-kind (1)", "x2  did a thing  by sh",
 		"[WARN] connections refused (1)", "tcp  1.1.1.1:80  x3  egress",
 		"[INFO] looking for a VM (1)",
