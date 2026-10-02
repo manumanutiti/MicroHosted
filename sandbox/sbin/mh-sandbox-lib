@@ -57,75 +57,381 @@ vmtools='dmidecode|lspci|lscpu|lsmod|lshw|systemd-detect-virt|virt-what|hostname
 pedirs='etc/(sudoers|shadow|gshadow|crontab|cron\.|anacrontab|doas\.conf|polkit-1|exports)|var/spool/cron|root(/|"|$)|(var/)?run/(docker|containerd|podman|lxd|snapd)|var/lib/(lxd|docker)|proc/sys/kernel/(yama|unprivileged|kptr_restrict|randomize_va_space|modprobe)|proc/[0-9]+/mem'
 petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 
-# classify: raw audit records on stdin, an event's SYSCALL record before its
-# PATH and EXECVE ones (as auditd writes them) — out:
-#   probe|privesc STATE COUNT PATH COMM
-#   exec FIRST COUNT ARGS   (FIRST: the event's serial, to order by)
-# Names the code chose with a space or a quote in them are hex in the log,
-# and none of the paths above.
+# auditrules: what mh-sandbox-prepare asks audit to record, for U. The first
+# rule an event matches names it (key=), so the narrow ones come first.
+#   mh-persist  writes (and chmod, rename, delete) where code makes itself
+#               start again: the shell's startup files, ~/.ssh, ~/.config
+#               (systemd, autostart), /etc — refused ones too
+#   mh-privesc  syscalls that change who a process is or what the kernel lets
+#               it do: ordinary programs run as a user call none of them
+#   mh-net      connect: which program tried to reach what (the host sees
+#               what was sent, not who sent it)
+#   mh-sandbox  every file opened, looked up or run, found or not
+auditrules() {
+	_r="-a always,exit -F arch=b64 -F uid=$(id -u "$U")"
+	for _f in .bashrc .profile .bash_profile .bash_login .bash_logout .zshrc .zprofile .zshenv .zlogin .xprofile .xinitrc .pam_environment; do
+		auditctl $_r -F path="$H/$_f" -F perm=wa -k mh-persist >/dev/null
+	done
+	for _d in "$H/.ssh" "$H/.config" /etc /var/spool/cron; do
+		[ ! -d "$_d" ] || auditctl $_r -F dir="$_d" -F perm=wa -k mh-persist >/dev/null
+	done
+	auditctl $_r -S setuid,setgid,setreuid,setregid,setresuid,setresgid,setgroups,setfsuid,setfsgid,capset,ptrace,personality,mount,umount2,pivot_root,chroot,unshare,setns,bpf,init_module,finit_module,delete_module,kexec_load,iopl,ioperm,keyctl,add_key,request_key,userfaultfd,perf_event_open \
+		-k mh-privesc >/dev/null
+	auditctl $_r -S connect -k mh-net >/dev/null
+	auditctl $_r -S open,openat,openat2,stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,execve,creat \
+		-k mh-sandbox >/dev/null
+}
+
+# auditlogs: audit's log files, oldest first (audit.log.N is older than
+# audit.log.N-1; audit.log is the one being written).
+auditlogs() {
+	ls /var/log/audit/audit.log.* 2>/dev/null | awk -F. '{ print $NF "\t" $0 }' | sort -rn | cut -f2
+	[ ! -e /var/log/audit/audit.log ] || echo /var/log/audit/audit.log
+}
+
+# classify [STATE]: raw audit records on stdin, as auditd writes them (an
+# event's SYSCALL, then EXECVE, CWD, PATH, SOCKADDR) — out:
+#   probe|privesc STATE COUNT PATH BY
+#   exec FIRST COUNT ARGS     (FIRST: the event's serial, to order by)
+#   alert KIND COUNT WHAT BY  (KIND: internal/cli/sandbox_kinds.go)
+# STATE, a file, carries what one call learnt to the next (mh-sandbox-watch
+# reads the log in pieces): the files the code created, the dropped ones it
+# ran, the program each process started. Paths are made absolute (relative
+# ones against the event's working directory, when relative to it) and
+# normal (no //, /./, .., trailing /). BY is the program: its file's name
+# where its process name was cut at 15 characters; for a command, the
+# program that started it, when that one was started by exec too (a forked
+# subshell is not: then the command's own). Names with a space, a quote or a
+# control character in them are hex in the log, decoded here.
 classify() {
-	awk -v vmd="^/($vmdirs)" -v vmt="/($vmtools)\$" -v ped="^/($pedirs)" -v pet="/($petools)\$" '
-		function id(  ) { return match($0, /msg=audit\([0-9.:]+\)/) ? substr($0, RSTART, RLENGTH) : "" }
+	awk -v vmd="^/($vmdirs)" -v vmt="/($vmtools)\$" -v ped="^/($pedirs)" -v pet="/($petools)\$" \
+		-v home="$H" -v state="${1:-}" '
+		function id() { return match($0, /msg=audit\([0-9.:]+\)/) ? substr($0, RSTART, RLENGTH) : "" }
 		# an argument is "quoted", or hex when it has a space, a quote or a
 		# control character in it
 		function arg(v,  i, out) {
 			if (v ~ /^"/) return substr(v, 2, length(v) - 2)
+			if (v == "(null)") return ""
 			out = ""
 			for (i = 1; i < length(v); i += 2)
 				out = out sprintf("%c", 16 * (index("0123456789ABCDEF", toupper(substr(v, i, 1))) - 1) + index("0123456789ABCDEF", toupper(substr(v, i + 1, 1))) - 1)
 			return out
 		}
-		/^type=SYSCALL/ {
-			if (match($0, / comm=[^ ]+/)) {
-				c = substr($0, RSTART + 6, RLENGTH - 6)
-				gsub(/"/, "", c)
-				comm[id()] = c
+		# a field of the record (the enriched part starts after \035)
+		function field(k) { return match($0, " " k "=(\"[^\"]*\"|[^ \035]+)") ? substr($0, RSTART + length(k) + 2, RLENGTH - length(k) - 2) : "" }
+		function num(h,  i, n) {
+			n = 0; h = toupper(h)
+			for (i = 1; i <= length(h); i++) n = n * 16 + index("0123456789ABCDEF", substr(h, i, 1)) - 1
+			return n == 4294967295 ? -1 : n
+		}
+		function base(p) { sub(/.*\//, "", p); return p }
+		# without //, /./, .. or a trailing /: what the kernel looked up
+		# (symlinks aside)
+		function norm(p,  n, i, k, seg, st, out) {
+			if (p !~ /\/\/|\/\.(\/|\.|$)|.\/$/) return p
+			n = split(p, seg, "/"); k = 0
+			for (i = 1; i <= n; i++) {
+				if (seg[i] == "" || seg[i] == ".") continue
+				if (seg[i] == "..") { if (k > 0) k--; continue }
+				st[++k] = seg[i]
 			}
+			out = ""
+			for (i = 1; i <= k; i++) out = out "/" st[i]
+			return out == "" ? "/" : out
+		}
+		function abs(p, cwd) {
+			if (p !~ /^\//) { if (cwd == "") return ""; p = cwd "/" p }
+			return norm(p)
+		}
+		function alert(kind, what, who) {
+			gsub(/[^[:print:]]/, "?", what); gsub(/[^[:print:]]/, "?", who)
+			if (length(what) > 200) what = substr(what, 1, 200) "..."
+			alerts[kind "\t" what "\t" who]++
+		}
+		# in ~/work or a temporary directory: the code'"'"'s own
+		function own(p) { return p == work || index(p, work "/") == 1 || p ~ /^\/(tmp|var\/tmp|dev\/shm)(\/|$)/ }
+		# what a command line says, by its words: ARGS, its arguments
+		# joined by \001; CWD, where it ran
+		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat) {
+			n = split(args, t, "\001")
+			cmd = t[1]
+			for (i = 2; i <= n; i++) cmd = cmd " " t[i]
+			lc = tolower(cmd)
+			a0 = base(t[1])
+			# by: the program that ran it, where known
+			who = pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : by[e]
+			# bash'"'"'s /dev/tcp: a connection without a network tool —
+			# a shell when its input or output is joined to it
+			dt = lc ~ /\/dev\/(tcp|udp)\/[^ \/]+\/[0-9]/
+			if (dt && lc !~ /(sh +-i|0>&1|0<&|<&0|>& *0( |$|;)|exec +[0-9]+<>|\| *(\/bin\/)?(ba|da|z)?sh( |$|;)|while +read)/)
+				alert("dev_tcp", cmd, who)
+			else if (dt ||
+			    a0 ~ /^(nc|ncat|netcat|nc\.traditional|nc\.openbsd)$/ && lc ~ / -[a-z]*[ec]( |\/|$)|--(sh-|lua-)?exec/ ||
+			    a0 == "socat" && lc ~ /(exec|system):/ ||
+			    lc ~ /(^|[ ;&|(\/])(ba|da|z)?sh +-i/ && lc ~ /(>&|<&|mkfifo|\| *(nc|ncat|telnet|openssl) )/ ||
+			    lc ~ /(^|[ \/])(nc|ncat|netcat|telnet|openssl +s_client)[^|]*\| *(\/usr)?(\/bin\/)?(ba|da|z)?sh( |$|;)/ ||
+			    lc ~ /pty\.spawn/ ||
+			    a0 ~ /^(python[0-9.]*|perl|ruby|php[0-9.]*|node|lua[0-9.]*)$/ && lc ~ /socket/ && lc ~ /(subprocess|dup2|\/bin\/(ba)?sh|spawn|child_process|popen|exec)/)
+				alert("reverse_shell", cmd, who)
+			if (lc ~ /(base64 +(-[a-z]*d|--decode)|xxd +-r|openssl +(enc +|base64 +)?-[a-z]*d|\| *rev *\|)[^;&]*\| *(\/usr)?(\/bin\/)?((ba|da|z)?sh|python[0-9.]*|perl|ruby|php)( |$|;)/ ||
+			    lc ~ /(exec|eval)\(.*(b64decode|base64|decompress|fromcharcode|atob\(|unhexlify|codecs\.decode)/ ||
+			    lc ~ /eval +["'"'"']?\$\(.*base64 +(-[a-z]*d|--decode)/)
+				alert("obfuscated_exec", cmd, who)
+			if (lc ~ /(curl|wget)[^|;&]*\| *(sudo +)?(\/usr)?(\/bin\/)?(ba|da|z|k)?sh( |$|;)/ ||
+			    lc ~ /(^|[ ;&|(\/])((ba|da|z)?sh +-c +|eval +|source +|\. +)["'"'"']?(\$\(|<\() *(curl|wget) /)
+				alert("pipe_to_shell", cmd, who)
+			if (lc ~ /(^|[^a-z])(xmrig|xmr-stak|cpuminer|minerd|cgminer|bfgminer|ethminer|nbminer|lolminer|t-rex)([^a-z]|$)|stratum\+(tcp|ssl|tls):\/\/|--donate-level|nicehash|supportxmr|minexmr|moneroocean|hashvault|nanopool\.org|2miners|--coin[= ]+(monero|xmr)|(-a|--algo)[= ]+(cryptonight|randomx|rx\/0)/)
+				alert("miner", cmd, who)
+			# history off, timestamps reset, traces wiped
+			if (lc ~ /histfile=\/dev\/null|unset +([a-z_ ]* )?histfile|history +-[a-z]*c|hist(file)?size=0|set +\+o +history|ln +-[a-z]*s[a-z]* +\/dev\/null/ ||
+			    a0 ~ /^(shred|wipe|srm)$/)
+				alert("antiforensics", cmd, who)
+			if (a0 == "touch" && lc ~ / (-[a-z]*[dtr]|--date|--reference)/)
+				for (i = 2; i <= n; i++)
+					if (t[i] ~ /^\// && !own(norm(t[i]))) { alert("antiforensics", cmd, who); break }
+			if (a0 == "rm" || a0 == "unlink")
+				for (i = 2; i <= n; i++) {
+					x = abs(t[i], cwd)
+					if (x != "" && (x in ran || x ~ /^\/var\/log\/|\/\.(bash|zsh|python|mysql|psql|node_repl)_?history$/)) { alert("antiforensics", cmd, who); break }
+				}
+			# looking for credentials beyond the code'"'"'s own tree: what
+			# it looks for (find'"'"'s -name, -path…; grep'"'"'s pattern; any
+			# word of locate'"'"'s), where (a directory not its own)
+			sens = "passw|secret|api[_-]?key|apikey|private[_ -]?key|id_(rsa|dsa|ecdsa|ed25519)|\\.pem|akia|aws_(access|secret)|credential|\\.kdbx|wallet|\\.ovpn|\\.p12|\\.pfx|\\.ppk|authorized_keys|netrc|git-credentials|pgpass|htpasswd|token|shadow"
+			if (a0 ~ /^(locate|plocate|mlocate)$/ && lc ~ sens)
+				alert("credential_search", cmd, who)
+			else if (a0 == "find") {
+				pat = wide = tgt = 0
+				for (i = 2; i <= n; i++) {
+					if (t[i] ~ /^-(i?name|i?path|i?wholename|i?regex)$/ && i < n) {
+						if (tolower(t[++i]) ~ sens) pat = 1
+					} else if (t[i] !~ /^[-(!]/ && i == tgt + 2) {
+						tgt++
+						x = abs(t[i], cwd)
+						if (x != "" && !own(x)) wide = 1
+					}
+				}
+				if (!tgt && cwd != "" && !own(cwd)) wide = 1
+				if (pat && wide) alert("credential_search", cmd, who)
+			} else if (a0 ~ /^(grep|egrep|fgrep|rgrep|rg|ag|ack)$/) {
+				rec = a0 !~ /^[ef]?grep$/
+				pat = wide = tgt = 0
+				for (i = 2; i <= n; i++) {
+					if (t[i] ~ /^(-e|--regexp)$/ && i < n) { pat = pat || tolower(t[++i]) ~ sens; pat = pat + 0; tgt = -1; continue }
+					if (t[i] ~ /^(-e.|--regexp=)/) { pat = tolower(t[i]) ~ sens || pat; tgt = -1; continue }
+					if (t[i] ~ /^(-[ABCmdDf]|--(include|exclude|exclude-dir|max-count|context|before-context|after-context|file|glob|type))$/) { i++; continue }
+					if (t[i] ~ /^--?[a-zA-Z]/) { if (t[i] ~ /^-[a-zA-Z]*[rR]|^--(dereference-)?recursive/) rec = 1; continue }
+					if (tgt == 0) { pat = tolower(t[i]) ~ sens; tgt = -1; continue }
+					x = abs(t[i], cwd)
+					if (x != "" && !own(x)) wide = 1
+					tgt = -2
+				}
+				if (tgt != -2 && cwd != "" && !own(cwd)) wide = 1
+				if (rec && pat && wide) alert("credential_search", cmd, who)
+			}
+			if (a0 == "crontab" && lc !~ / -l( |$)/ || a0 == "at" || a0 == "systemctl" && lc ~ / --user / && lc ~ / (enable|link|edit)/)
+				alert("persistence", cmd, who)
+		}
+		# a write where code makes itself start again: F, the path; E, the event
+		function persist(f, e,  w) {
+			w = f (ok[e] ? "" : " (refused)")
+			if (f ~ "^" home "/\\.ssh/(authorized_keys2?|rc|environment)$" ||
+			    f ~ "^" home "/\\.config/(systemd/user|autostart|environment\\.d)(/|$)" ||
+			    f ~ /^\/etc\/(crontab|cron\.|systemd\/|init\.d\/|rc\.local|profile|bash\.bashrc|environment|ld\.so\.|update-motd\.d\/|sudoers|passwd|shadow|group|ssh\/|pam\.d\/|xdg\/autostart\/)/ ||
+			    f ~ /^\/var\/spool\/cron/)
+				alert("persistence", w, by[e])
+			else if (f ~ "^" home "/\\.(bashrc|profile|bash_profile|bash_login|bash_logout|zshrc|zprofile|zshenv|zlogin|xprofile|xinitrc|pam_environment)$")
+				alert("shell_rc", w, by[e])
+			else if (f ~ /^\/etc\//)
+				alert("system_write", w, by[e])
+		}
+		# a create refused leaves only its directory'"'"'s record: that, then
+		function parents(  k) {
+			for (k in par) { persist(par[k] "/*", k); delete par[k] }
+		}
+		function sf(k) { return match(sys, " " k "=(\"[^\"]*\"|[^ \035]+)") ? substr(sys, RSTART + length(k) + 2, RLENGTH - length(k) - 2) : "" }
+		# syscall E: reads the event'"'"'s SYSCALL record (the last one seen;
+		# an event whose records came apart is the program "?")
+		function syscall(e,  c, x, k, s, n, v) {
+			if (e in by) return
+			if (e != sysid) { by[e] = "?"; return }
+			sc[e] = sf("SYSCALL")
+			c = arg(sf("comm")); x = arg(sf("exe"))
+			exe[e] = x; x = base(x)
+			by[e] = c == "" ? "?" : length(c) >= 15 && index(x, c) == 1 ? x : c
+			exb[e] = x
+			ppid[e] = sf("ppid")
+			ok[e] = sf("success") == "yes"
+			# what each process started as: the report reads only some
+			# events, every exec among them
+			if (sc[e] == "execve" && ok[e]) pcomm[sf("pid")] = by[e]
+			a0[e] = sf("a0")
+			k = arg(sf("key")); key[e] = k
+			if (k == "mh-privesc") {
+				s = sc[e]
+				if (s == "personality") {
+					# ASLR off (ADDR_NO_RANDOMIZE), for an exploit to know
+					# where things are; asking for the current one is not
+					if (a0[e] == "ffffffff" || int(num(a0[e]) / 262144) % 2 != 1) return
+					s = s " ADDR_NO_RANDOMIZE"
+				} else if (s ~ /^set(res|re|fs)?[ug]id$/) {
+					# allowed, a user can only set its own ids (programs
+					# dropping privileges they do not have; setpriv
+					# starting the code): worth it when refused, or root
+					n = s ~ /^setres/ ? 3 : s ~ /^setre/ ? 2 : 1
+					v = sprintf("%.0f", num(a0[e]))
+					if (n > 1) v = v "," sprintf("%.0f", num(sf("a1")))
+					if (n > 2) v = v "," sprintf("%.0f", num(sf("a2")))
+					if (ok[e] && ("," v ",") !~ /,0,/) return
+					s = s "(" v ")"
+				} else if (s ~ /^(capset|setgroups)$/ && ok[e]) {
+					# allowed, only dropping what it has: iproute2'"'"'s ip
+					return
+				}
+				s = s (ok[e] ? " allowed" : " refused")
+				alert(sc[e] == "ptrace" ? "ptrace" : sc[e] ~ /^(unshare|setns)$/ ? "namespace" : "privesc_attempt", s, by[e])
+			}
+		}
+		BEGIN {
+			work = home "/work"
+			if (state != "") {
+				while ((getline l < state) > 0) {
+					split(l, sv, "\t")
+					if (sv[1] == "c") made[sv[2]] = sv[3]
+					else if (sv[1] == "x") ran[sv[2]] = 1
+					else if (sv[1] == "p") pcomm[sv[2]] = was[sv[2]] = sv[3]
+				}
+				close(state)
+			}
+		}
+		/^type=SYSCALL/ {
+			parents()
+			sys = $0; sysid = id()
+			# read now if it is one of the narrow rules'"'"' or an exec, else
+			# when a record of the event needs it (most never do)
+			if (/ key="mh-(privesc|persist|net)"| SYSCALL=execve /) syscall(sysid)
+			next
+		}
+		/^type=CWD/ {
+			e = id()
+			cwd[e] = arg(field("cwd"))
+			if (e in pend) { command(e, pend[e], cwd[e]); delete pend[e] }
 			next
 		}
 		/^type=EXECVE/ {
-			c = comm[id()]
-			if (c == "") c = "?"
-			s = $0; cmd = ""
-			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 300) {
+			e = id()
+			s = $0; cmd = ""; args = ""
+			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 4000) {
 				v = substr(s, RSTART + 1, RLENGTH - 1); sub(/^[^=]*=/, "", v)
-				cmd = cmd (cmd == "" ? "" : " ") arg(v)
+				v = arg(v); gsub(/[^[:print:]]/, "?", v)
+				cmd = cmd (cmd == "" ? "" : " ") v
+				args = args (args == "" ? "" : "\001") v
 				s = substr(s, RSTART + RLENGTH)
 			}
+			pend[e] = args
 			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
-			gsub(/[^[:print:]]/, "?", cmd)
-			if (!(cmd in ran)) { split(id(), n, ":"); first[cmd] = n[2] + 0 }
-			ran[cmd]++
+			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0 }
+			nran[cmd]++
 			# every -perm VALUE of one find: -4000 setuid, -2000 setgid, -o=w writable
 			s = $0
 			while (match(s, /"-perm" a[0-9]+="[^"]*"/)) {
 				v = substr(s, RSTART, RLENGTH); sub(/.*="/, "", v); sub(/"$/, "", v)
-				seen["privesc\tfound\tfind -perm " v "\t" c]++
+				seen["privesc\tfound\tfind -perm " v "\t" by[e]]++
 				s = substr(s, RSTART + RLENGTH)
 			}
 			next
 		}
-		/^type=PATH/ && match($0, / name="[^"]*"/) {
-			f = substr($0, RSTART + 7, RLENGTH - 8)
-			st = $0 ~ /nametype=UNKNOWN/ ? "absent" : "found"
-			c = comm[id()]
+		/^type=SOCKADDR/ {
+			e = id()
+			if (key[e] != "mh-net") next
+			if (match($0, /saddr_fam=inet6? laddr=[^ ]+ lport=[0-9]+/)) {
+				split(substr($0, RSTART, RLENGTH), sw, /[ =]/)
+				ad = sw[4]; pt = sw[6]
+				if (sw[2] == "inet6") ad = "[" ad "]"
+			} else if (match($0, /saddr=0200[0-9A-F]+/)) {
+				s = substr($0, RSTART + 6, 16)
+				pt = num(substr(s, 5, 4))
+				ad = num(substr(s, 9, 2)) "." num(substr(s, 11, 2)) "." num(substr(s, 13, 2)) "." num(substr(s, 15, 2))
+			} else next
+			# loopback is the code talking to itself (a test server), but
+			# for a resolver
+			if (ad ~ /^127\.|^\[::1\]$|^\[::ffff:127\./ && pt != 53) next
+			alert("connect", ad ":" pt (pt == 53 ? " (dns)" : ""), by[e])
+			next
+		}
+		/^type=PATH/ && match($0, / name=("[^"]*"|[0-9A-F]+)/) {
+			n = arg(substr($0, RSTART + 6, RLENGTH - 6))
+			e = id()
+			nt = field("nametype")
+			rel = n !~ /^\//
+			if (rel && cwd[e] == "") next
+			f = norm(rel ? cwd[e] "/" n : n)
+			vm = f ~ vmd || f ~ vmt
+			pe = !vm && (f ~ pet || f ~ ped)
+			if (!vm && !pe && nt != "CREATE" && !(e in key)) next
+			syscall(e)
+			s = sc[e]
+			# relative to the working directory, or to a directory the
+			# program holds open (unknown here: left out)
+			if (rel && (s ~ /at2?$/ && s != "creat" || s == "statx") && a0[e] != "ffffff9c") next
+			c = by[e]
 			if (c == "") c = "?"
-			if (f ~ vmd || f ~ vmt) {
+			if (f ~ /^\//) {
+				if (nt == "CREATE") {
+					made[f] = exb[e]
+					if (state != "") print "c\t" f "\t" exb[e] > (state ".new")
+				}
+				if (key[e] == "mh-persist")
+					if (nt != "PARENT") { persist(f, e); delete par[e] }
+					else if (!ok[e]) par[e] = f
+				# a program the code wrote, then ran: a binary (the kernel
+				# runs the file itself), or a script in a temporary
+				# directory. Not what a compiler or a linker wrote.
+				if (s == "execve" && field("item") == "0" && ok[e]) {
+					x = f in made ? f : exe[e] in made ? exe[e] : ""
+					if (x != "" && made[x] !~ /(^|-)(ld(\.(bfd|gold|lld))?|lld|mold|collect2|cc1(plus)?|gcc[-0-9.]*|g\+\+[-0-9.]*|cc|c\+\+|clang(\+\+)?[-0-9.]*|rustc|go|link|compile|tcc|zig|ghc|javac|nim|as|strip|objcopy)$/) {
+						tmp = x ~ /^\/(tmp|var\/tmp|dev\/shm)\//
+						bin = x == exe[e]
+						if (bin || tmp) {
+							alert(bin && tmp ? "dropper" : "dropped_exec", x " (written by " made[x] ")", pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c)
+							ran[x] = 1
+							if (state != "") print "x\t" x > (state ".new")
+						}
+					}
+				}
+			}
+			st = nt == "UNKNOWN" ? "absent" : "found"
+			if (vm) {
 				seen["probe\t" st "\t" f "\t" c]++
+			} else if (!pe) {
 			} else if (f ~ pet) {
-				sub(/.*\//, "", f)
-				seen["privesc\t" st "\t" f "\t" c]++
+				seen["privesc\t" st "\t" base(f) "\t" c]++
 			} else if (f ~ ped) {
 				sub(/^\/proc\/[0-9]+\//, "/proc/PID/", f)
 				seen["privesc\t" st "\t" f "\t" c]++
 			}
 		}
 		END {
-			for (k in ran) printf "exec\t%d\t%d\t%s\n", first[k], ran[k], k
+			parents()
+			for (e in pend) command(e, pend[e], "")
+			for (k in nran) printf "exec\t%d\t%d\t%s\n", first[k], nran[k], k
 			for (k in seen) {
 				split(k, a, "\t")
 				gsub(/[^[:print:]]/, "?", a[3]); gsub(/[^[:print:]]/, "?", a[4])
 				printf "%s\t%s\t%d\t%s\t%s\n", a[1], a[2], seen[k], a[3], a[4]
 			}
+			for (k in alerts) {
+				split(k, a, "\t")
+				printf "alert\t%s\t%d\t%s\t%s\n", a[1], alerts[k], a[2], a[3]
+			}
+			if (state != "") {
+				# the program each process started, to name who ran a
+				# command whose parent started in an earlier piece
+				for (k in pcomm) if (was[k] != pcomm[k]) print "p\t" k "\t" pcomm[k] > (state ".new")
+				close(state ".new")
+			}
 		}'
+	# what this call learnt, for the next
+	[ -z "${1:-}" ] || [ ! -e "$1.new" ] || { cat "$1.new" >> "$1"; rm -f "$1.new"; }
 }
+

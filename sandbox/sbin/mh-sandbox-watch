@@ -9,9 +9,13 @@
 # "at INODE OFFSET"); without it, the log is read from its start. Out, tab-
 # separated, as mh-sandbox-report --tsv:
 #   decoy READ|TAMPERED|… PATH        every decoy touched so far
-#   probe|privesc STATE COUNT PATH COMM
+#   probe|privesc STATE COUNT PATH BY
 #   exec FIRST COUNT ARGS
+#   alert KIND COUNT WHAT BY
 #   at INODE OFFSET
+# Counts are of this look. What one look learnt that the next needs (the
+# files the code created, to tell a dropped program when it runs) is kept in
+# $S/watch.state; a look from the start starts it again.
 # The report stays the whole account: this is a view of it as it grows, and a
 # look that falls behind (the log rotated twice between two) misses some.
 . /usr/sbin/mh-sandbox-lib
@@ -47,6 +51,7 @@ chunk() {
 }
 
 ino=${1:-}
+[ -n "$ino" ] || rm -f "$S/watch.state"
 off=${2:-0}
 now=$(stat -c %i "$log" 2>/dev/null) || exit 0
 old=
@@ -62,6 +67,6 @@ size=$(stat -c %s "$log")
 {
 	[ -z "$old" ] || [ "$old" = - ] || chunk "$old" "$off" "$(stat -c %s "$old")" 3>/dev/null
 	chunk "$log" "$start" "$size" 3> "$S/watch.n"
-} | classify
+} | classify "$S/watch.state"
 printf 'at\t%s\t%s\n' "$now" "$((start + $(cat "$S/watch.n" 2>/dev/null || echo 0)))"
 rm -f "$S/watch.chunk" "$S/watch.n"
