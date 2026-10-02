@@ -988,6 +988,7 @@ type sandboxReport struct {
 	VMProbes         []sandboxProbe     `json:"vm_probes"` // untrusted: path, by
 	Privesc          []sandboxProbe     `json:"privesc"`   // untrusted: path, by
 	Commands         []sandboxCommand   `json:"commands"`  // untrusted: args
+	Alerts           []sandboxAlert     `json:"alerts"`    // untrusted: what, by
 	Changed          sandboxChanged     `json:"changed"`   // untrusted
 	Processes        []sandboxProc      `json:"processes"` // untrusted: args
 	Listening        []string           `json:"listening"`
@@ -1006,6 +1007,7 @@ type sandboxSummary struct {
 	EvasionSuspected   bool `json:"evasion_suspected"`
 	Privesc            int  `json:"privesc"`
 	Commands           int  `json:"commands"` // distinct; commands lists the first 2000
+	Alerts             int  `json:"alerts"`
 	ChangedOutsideWork int  `json:"changed_outside_work"`
 	ProcessesLeft      int  `json:"processes_left"`
 	Listening          int  `json:"listening"`
@@ -1038,6 +1040,16 @@ type sandboxChanged struct {
 	WorkDirs  []sandboxWorkEntry `json:"work_dirs"`
 }
 
+// sandboxAlert is one "alert KIND COUNT WHAT BY" record: KIND one of
+// alertKinds (sandbox_kinds.go), WHAT and BY the code's choice.
+type sandboxAlert struct {
+	Kind     string `json:"kind"`
+	Severity string `json:"severity"`
+	Count    int    `json:"count"`
+	What     string `json:"what"`
+	By       string `json:"by"`
+}
+
 type sandboxCommand struct {
 	Count int    `json:"count"`
 	Args  string `json:"args"`
@@ -1067,7 +1079,7 @@ type sandboxAgentText struct {
 // are skipped: a newer image may say more.
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
-		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Processes: []sandboxProc{}, Listening: []string{},
+		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
 		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{},
 		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
 		commands: -1,
@@ -1098,6 +1110,8 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			r.Privesc = append(r.Privesc, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
 		case "commands":
 			r.commands = num(1)
+		case "alert":
+			r.Alerts = append(r.Alerts, sandboxAlert{Kind: at(1), Severity: kindOf(at(1)).Severity.String(), Count: num(2), What: at(3), By: at(4)})
 		case "exec":
 			r.Commands = append(r.Commands, sandboxCommand{Count: num(1), Args: at(2)})
 		case "file":
@@ -1140,6 +1154,7 @@ func (r *sandboxReport) summarize() {
 		}
 	}
 	s.Privesc = len(r.Privesc)
+	s.Alerts = len(r.Alerts)
 	s.Commands = max(r.commands, len(r.Commands))
 	s.ChangedOutsideWork = len(r.Changed.Files) + len(r.Changed.Dirs)
 	s.ProcessesLeft = len(r.Processes)
