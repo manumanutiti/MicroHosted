@@ -462,7 +462,9 @@ mh sandbox ./install.sh -o                                       # its own outpu
 mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'   # dependencies first, with a network
 mh sandbox https://github.com/x/y 'make test' --apt build-essential
 mh sandbox ./release.tgz 'bash setup.sh' --json                  # for an agent
-mh sandbox ./linpeas.sh -v                                       # what it does as it happens, then everything
+mh sandbox ./linpeas.sh --live                                   # each finding as it happens
+mh sandbox ./install.sh --rules sandbox/rules/example.yml       # rules of your own (any file, repeatable)
+mh sandbox ./linpeas.sh -v                                       # every finding
 ```
 
 ### Platform

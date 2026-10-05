@@ -1,0 +1,64 @@
+# Rules of your own for mh sandbox (docs/sandbox.md, "Your own rules").
+# Read only when named on the command line, from wherever the file is:
+#
+#   mh sandbox ./install.sh --rules sandbox/rules/example.yml
+#   mh sandbox ./repo 'npm test' --rules team.yml --rules this-project.yml
+#
+# No file is read on its own; the code under test never supplies rules.
+
+# detect: findings of your own. Each is an alert titled "your rule NAME",
+# graded by its severity (high, warn — the default — or info), counted in
+# the verdict like any other.
+detect:
+  # A path opened, run or asked for (not a stat alone, which listing its
+  # directory does). ~/ is the sandbox user's home; a / at the end matches
+  # the directory and everything inside it.
+  - name: browser-profiles
+    severity: high
+    means: saved passwords and cookies of Brave, Chromium, Opera
+    path: ~/.config/BraveSoftware/
+  - name: chromium-profile
+    severity: high
+    means: saved passwords and cookies of Chromium
+    path: ~/.config/chromium/
+  - name: gnupg
+    severity: high
+    means: GPG private keys
+    path: ~/.gnupg/
+
+  # A command line run: a POSIX extended regex (as grep -E: no \d, no \b),
+  # matched against the whole line, case-sensitive.
+  - name: wallet-cli
+    severity: high
+    means: a cryptocurrency wallet's command line used
+    command: '(^|/)(solana|bitcoin-cli|electrum|monero-wallet-cli)( |$)'
+  - name: clipboard
+    means: read or wrote the clipboard (clippers swap wallet addresses)
+    command: '(^|/)(xclip|xsel|wl-copy|wl-paste)( |$)'
+
+  # A connection the code tried: an address, a range, :PORT, or both.
+  - name: tor-ports
+    means: Tor's usual ports
+    connect: ':9050'
+  - name: telegram-api
+    severity: high
+    means: Telegram's API ranges, where stealers send what they took
+    connect: 149.154.160.0/20
+
+# accept: findings you have checked and consider expected, in your setup.
+# What one matches is graded info and listed under "accepted by your
+# rules" with its why: never hidden. kind is an alert's kind (shell_rc,
+# dropped_exec…), rule:NAME, or decoy, vm_probe, privesc, changed,
+# connection, process, listening. A what (a regex on what the report says
+# with -v, ~ for the home) or a by (the program, exactly), or both; and a
+# why.
+accept:
+  - kind: vm_probe
+    by: lscpu
+    why: our CI scripts print lscpu
+  - kind: changed
+    what: '^~/\.local/lib/python3\.[0-9]+/site-packages/'
+    why: pip install --user, in the projects we test
+  - kind: connection
+    what: ':53$'
+    why: name lookups; refused anyway, the sandbox has no network

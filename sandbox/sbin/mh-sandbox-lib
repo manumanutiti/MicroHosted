@@ -15,12 +15,14 @@ SH=/bin/sh
 if setpriv --help 2>&1 | grep -q -- --reuid; then
 	# util-linux: no PAM, no session, nothing logged — the system writes
 	# nothing that the report would show — and a clean environment.
+	# UV_USE_IO_URING=0: Node (libuv ≥ 1.45) opens files through io_uring,
+	# which audit does not see — a decoy read by Node would have no reader.
 	asuser() {
 		_s=$1
 		shift
 		setpriv --reuid="$U" --regid="$U" --init-groups --no-new-privs \
 			env -i HOME="$H" USER="$U" LOGNAME="$U" SHELL="$SH" LANG=C.UTF-8 \
-			PATH=/usr/local/bin:/usr/bin:/bin \
+			PATH=/usr/local/bin:/usr/bin:/bin UV_USE_IO_URING=0 \
 			/bin/sh -c "$_s" "$@"
 	}
 else
@@ -52,9 +54,9 @@ unpack() {
 # paths that tell a VM apart (vm*), and those a privilege escalation looks
 # for (pe*) — directories as a prefix, tools by name in any directory.
 # /etc/ld.so.preload is not one: the loader looks for it in every program.
-vmdirs='sys/(class/dmi|devices/virtual/dmi|firmware/(dmi|acpi)|hypervisor|module|bus/pci|class/(power_supply|thermal)|class/net/[^/"]+/address)|proc/(cpuinfo|modules|bus/pci|scsi|xen|cmdline|1/cgroup|self/cgroup)|dev/disk/by-id|\.dockerenv|run/\.containerenv'
+vmdirs='sys/(class/dmi|devices/virtual/dmi|firmware/(dmi|acpi)|hypervisor|module|bus/pci|class/(power_supply|thermal)|class/net/[^/"]+/address)|proc/(cpuinfo|modules|bus/pci|scsi|xen|cmdline|1/cgroup|self/cgroup)|dev/disk/by-id|[.]dockerenv|run/[.]containerenv'
 vmtools='dmidecode|lspci|lscpu|lsmod|lshw|systemd-detect-virt|virt-what|hostnamectl|dmesg'
-pedirs='etc/(sudoers|shadow|gshadow|crontab|cron\.|anacrontab|doas\.conf|polkit-1|exports)|var/spool/cron|root(/|"|$)|(var/)?run/(docker|containerd|podman|lxd|snapd)|var/lib/(lxd|docker)|proc/sys/kernel/(yama|unprivileged|kptr_restrict|randomize_va_space|modprobe)|proc/[0-9]+/mem'
+pedirs='etc/(sudoers|shadow|gshadow|crontab|cron[.]|anacrontab|doas[.]conf|polkit-1|exports)|var/spool/cron|root(/|"|$)|(var/)?run/(docker|containerd|podman|lxd|snapd)|var/lib/(lxd|docker)|proc/sys/kernel/(yama|unprivileged|kptr_restrict|randomize_va_space|modprobe)|proc/[0-9]+/mem'
 petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 
 # auditrules: what mh-sandbox-prepare asks audit to record, for U. The first
@@ -63,7 +65,8 @@ petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 #               start again: the shell's startup files, ~/.ssh, ~/.config
 #               (systemd, autostart), /etc — refused ones too
 #   mh-privesc  syscalls that change who a process is or what the kernel lets
-#               it do: ordinary programs run as a user call none of them
+#               it do: ordinary programs run as a user call none of them;
+#               and io_uring_setup, file access audit does not see
 #   mh-net      connect: which program tried to reach what (the host sees
 #               what was sent, not who sent it)
 #   mh-sandbox  every file opened, looked up or run, found or not
@@ -75,7 +78,7 @@ auditrules() {
 	for _d in "$H/.ssh" "$H/.config" /etc /var/spool/cron; do
 		[ ! -d "$_d" ] || auditctl $_r -F dir="$_d" -F perm=wa -k mh-persist >/dev/null
 	done
-	auditctl $_r -S setuid,setgid,setreuid,setregid,setresuid,setresgid,setgroups,setfsuid,setfsgid,capset,ptrace,personality,mount,umount2,pivot_root,chroot,unshare,setns,bpf,init_module,finit_module,delete_module,kexec_load,iopl,ioperm,keyctl,add_key,request_key,userfaultfd,perf_event_open \
+	auditctl $_r -S setuid,setgid,setreuid,setregid,setresuid,setresgid,setgroups,setfsuid,setfsgid,capset,ptrace,personality,mount,umount2,pivot_root,chroot,unshare,setns,bpf,init_module,finit_module,delete_module,kexec_load,iopl,ioperm,keyctl,add_key,request_key,userfaultfd,perf_event_open,io_uring_setup \
 		-k mh-privesc >/dev/null
 	auditctl $_r -S connect -k mh-net >/dev/null
 	auditctl $_r -S open,openat,openat2,stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,execve,creat \
@@ -93,7 +96,11 @@ auditlogs() {
 # event's SYSCALL, then EXECVE, CWD, PATH, SOCKADDR) — out:
 #   probe|privesc STATE COUNT PATH BY
 #   exec FIRST COUNT ARGS     (FIRST: the event's serial, to order by)
-#   alert KIND COUNT WHAT BY  (KIND: internal/cli/sandbox_kinds.go)
+#   alert KIND COUNT WHAT BY  (KIND: internal/cli/sandbox_kinds.go, or
+#                             rule:NAME, the user's: internal/cli/sandbox_rules.go)
+#   decoyby open COUNT PATH BY  (a decoy opened, and by which program: the
+#                               report's READ comes from its atime, which
+#                               does not say who)
 # STATE, a file, carries what one call learnt to the next (mh-sandbox-watch
 # reads the log in pieces): the files the code created, the dropped ones it
 # ran, the program each process started. Paths are made absolute (relative
@@ -105,7 +112,7 @@ auditlogs() {
 # control character in them are hex in the log, decoded here.
 classify() {
 	awk -v vmd="^/($vmdirs)" -v vmt="/($vmtools)\$" -v ped="^/($pedirs)" -v pet="/($petools)\$" \
-		-v home="$H" -v state="${1:-}" '
+		-v home="$H" -v state="${1:-}" -v decoys="$S/decoys" -v rules="$S/rules" '
 		function id() { return match($0, /msg=audit\([0-9.:]+\)/) ? substr($0, RSTART, RLENGTH) : "" }
 		# an argument is "quoted", or hex when it has a space, a quote or a
 		# control character in it
@@ -150,6 +157,9 @@ classify() {
 		}
 		# in ~/work or a temporary directory: the code'"'"'s own
 		function own(p) { return p == work || index(p, work "/") == 1 || p ~ /^\/(tmp|var\/tmp|dev\/shm)(\/|$)/ }
+		# the certificate authorities'"'"' directories: a search there for
+		# .pem is finding a CA bundle, not a key
+		function certs(p) { return p ~ /^\/(etc\/(ssl|pki|ca-certificates)|usr\/(local\/)?share\/ca-certificates)(\/|$)/ }
 		# what a command line says, by its words: ARGS, its arguments
 		# joined by \001; CWD, where it ran
 		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat) {
@@ -163,6 +173,17 @@ classify() {
 			# bash'"'"'s /dev/tcp: a connection without a network tool —
 			# a shell when its input or output is joined to it
 			dt = lc ~ /\/dev\/(tcp|udp)\/[^ \/]+\/[0-9]/
+			# what a command line connects to, for the connection not to be
+			# said twice (below, SOCKADDR): its process, and where
+			if (dt) {
+				devtcp[epid[e]] = 1
+				x = lc
+				while (match(x, /\/dev\/(tcp|udp)\/[^ \/]+\/[0-9]+/)) {
+					split(substr(x, RSTART, RLENGTH), sw, "/")
+					devtcp[sw[4] ":" sw[5]] = 1
+					x = substr(x, RSTART + RLENGTH)
+				}
+			}
 			if (dt && lc !~ /(sh +-i|0>&1|0<&|<&0|>& *0( |$|;)|exec +[0-9]+<>|\| *(\/bin\/)?(ba|da|z)?sh( |$|;)|while +read)/)
 				alert("dev_tcp", cmd, who)
 			else if (dt ||
@@ -208,10 +229,10 @@ classify() {
 					} else if (t[i] !~ /^[-(!]/ && i == tgt + 2) {
 						tgt++
 						x = abs(t[i], cwd)
-						if (x != "" && !own(x)) wide = 1
+						if (x != "" && !own(x) && !certs(x)) wide = 1
 					}
 				}
-				if (!tgt && cwd != "" && !own(cwd)) wide = 1
+				if (!tgt && cwd != "" && !own(cwd) && !certs(cwd)) wide = 1
 				if (pat && wide) alert("credential_search", cmd, who)
 			} else if (a0 ~ /^(grep|egrep|fgrep|rgrep|rg|ag|ack)$/) {
 				rec = a0 !~ /^[ef]?grep$/
@@ -223,14 +244,16 @@ classify() {
 					if (t[i] ~ /^--?[a-zA-Z]/) { if (t[i] ~ /^-[a-zA-Z]*[rR]|^--(dereference-)?recursive/) rec = 1; continue }
 					if (tgt == 0) { pat = tolower(t[i]) ~ sens; tgt = -1; continue }
 					x = abs(t[i], cwd)
-					if (x != "" && !own(x)) wide = 1
+					if (x != "" && !own(x) && !certs(x)) wide = 1
 					tgt = -2
 				}
-				if (tgt != -2 && cwd != "" && !own(cwd)) wide = 1
+				if (tgt != -2 && cwd != "" && !own(cwd) && !certs(cwd)) wide = 1
 				if (rec && pat && wide) alert("credential_search", cmd, who)
 			}
 			if (a0 == "crontab" && lc !~ / -l( |$)/ || a0 == "at" || a0 == "systemctl" && lc ~ / --user / && lc ~ / (enable|link|edit)/)
 				alert("persistence", cmd, who)
+			for (i = 1; i <= nuc; i++)
+				if (cmd ~ ucx[i]) alert("rule:" ucn[i], cmd, who)
 		}
 		# a write where code makes itself start again: F, the path; E, the event
 		function persist(f, e,  w) {
@@ -261,6 +284,7 @@ classify() {
 			by[e] = c == "" ? "?" : length(c) >= 15 && index(x, c) == 1 ? x : c
 			exb[e] = x
 			ppid[e] = sf("ppid")
+			epid[e] = sf("pid")
 			ok[e] = sf("success") == "yes"
 			# what each process started as: the report reads only some
 			# events, every exec among them
@@ -269,6 +293,12 @@ classify() {
 			k = arg(sf("key")); key[e] = k
 			if (k == "mh-privesc") {
 				s = sc[e]
+				# io_uring opens and reads files without the syscalls
+				# audit records: what goes through it is not here
+				if (s == "io_uring_setup") {
+					alert("io_uring", s (ok[e] ? "" : " refused"), by[e])
+					return
+				}
 				if (s == "personality") {
 					# ASLR off (ADDR_NO_RANDOMIZE), for an exploit to know
 					# where things are; asking for the current one is not
@@ -294,6 +324,22 @@ classify() {
 		}
 		BEGIN {
 			work = home "/work"
+			while ((getline l < decoys) > 0) { split(l, sv, "\t"); decoy[sv[1]] = 1 }
+			close(decoys)
+			# the user'"'"'s rules (internal/cli/sandbox_rules.go): a path, a command
+			# line, each an ERE; ~ at a path'"'"'s start is the home
+			while ((getline l < rules) > 0) {
+				split(l, sv, "\t")
+				if (sv[1] == "path") {
+					x = sv[3]
+					if (substr(x, 1, 2) == "^~") x = "^" home substr(x, 3)
+					urx[++nur] = x; urn[nur] = sv[2]
+					urall = urall (nur > 1 ? "|" : "") "(" x ")"
+				} else if (sv[1] == "command") {
+					ucx[++nuc] = sv[3]; ucn[nuc] = sv[2]
+				}
+			}
+			close(rules)
 			if (state != "") {
 				while ((getline l < state) > 0) {
 					split(l, sv, "\t")
@@ -357,6 +403,10 @@ classify() {
 			# for a resolver
 			if (ad ~ /^127\.|^\[::1\]$|^\[::ffff:127\./ && pt != 53) next
 			alert("connect", ad ":" pt (pt == 53 ? " (dns)" : ""), by[e])
+			# the shell itself connected: bash'"'"'s /dev/tcp in a script,
+			# which no command line shows (unless one did, above)
+			if (exb[e] ~ /^(bash|zsh|ksh)$/ && pt != 53 && !(epid[e] in devtcp) && !(ppid[e] in devtcp) && !((ad ":" pt) in devtcp))
+				alert("dev_tcp", ad ":" pt " (from a script: bash connected itself)", by[e])
 			next
 		}
 		/^type=PATH/ && match($0, / name=("[^"]*"|[0-9A-F]+)/) {
@@ -366,9 +416,15 @@ classify() {
 			rel = n !~ /^\//
 			if (rel && cwd[e] == "") next
 			f = norm(rel ? cwd[e] "/" n : n)
+			# perl looks up the shadow password after every getpw* (glibc
+			# getspnam: /etc/passwd read, then /etc/shadow): for a home
+			# directory, ~, File::HomeDir. Not a probe, below.
+			if (f == "/etc/passwd") { syscall(e); if (sc[e] ~ /^open/ && key[e] != "mh-persist") pw[epid[e]] = 1 }
 			vm = f ~ vmd || f ~ vmt
 			pe = !vm && (f ~ pet || f ~ ped)
-			if (!vm && !pe && nt != "CREATE" && !(e in key)) next
+			dk = f in decoy
+			ur = nur && f ~ urall
+			if (!vm && !pe && !dk && !ur && nt != "CREATE" && !(e in key)) next
 			syscall(e)
 			s = sc[e]
 			# relative to the working directory, or to a directory the
@@ -376,6 +432,11 @@ classify() {
 			if (rel && (s ~ /at2?$/ && s != "creat" || s == "statx") && a0[e] != "ffffff9c") next
 			c = by[e]
 			if (c == "") c = "?"
+			# a rule'"'"'s path: opened, run or asked about (access) — not a
+			# stat alone, which listing its directory does
+			if (ur && s !~ /^(stat|lstat|newfstatat|fstatat64|statx)$/)
+				for (i = 1; i <= nur; i++)
+					if (f ~ urx[i]) alert("rule:" urn[i], f, c)
 			if (f ~ /^\//) {
 				if (nt == "CREATE") {
 					made[f] = exb[e]
@@ -393,7 +454,9 @@ classify() {
 						tmp = x ~ /^\/(tmp|var\/tmp|dev\/shm)\//
 						bin = x == exe[e]
 						if (bin || tmp) {
-							alert(bin && tmp ? "dropper" : "dropped_exec", x " (written by " made[x] ")", pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c)
+							# a script: what it runs is recorded command by
+							# command (a test suite helper, a git hook)
+							alert(!bin ? "dropped_script" : tmp ? "dropper" : "dropped_exec", x " (written by " made[x] ")", pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c)
 							ran[x] = 1
 							if (state != "") print "x\t" x > (state ".new")
 						}
@@ -401,6 +464,8 @@ classify() {
 				}
 			}
 			st = nt == "UNKNOWN" ? "absent" : "found"
+			# who opened a decoy (a stat does not read it)
+			if (dk && s ~ /^(open|openat|openat2|creat)$/) seen["decoyby\topen\t" f "\t" c]++
 			if (vm) {
 				seen["probe\t" st "\t" f "\t" c]++
 			} else if (!pe) {
@@ -411,6 +476,7 @@ classify() {
 				# find, os.walk in Python stat every entry): an escalation
 				# opens these files or asks whether it may (open, access).
 				if (s ~ /^(stat|lstat|newfstatat|fstatat64|statx)$/) next
+				if (f == "/etc/shadow" && pw[epid[e]] && exb[e] ~ /^perl/) next
 				sub(/^\/proc\/[0-9]+\//, "/proc/PID/", f)
 				seen["privesc\t" st "\t" f "\t" c]++
 			}

@@ -185,7 +185,7 @@ func TestParseSandboxReport(t *testing.T) {
 	r := parseSandboxReport(tsv)
 	r.Connections = []sandboxConn{{Protocol: "udp", Dst: "1.1.1.1", DstPort: 53, Count: 4, Reason: "egress"}}
 	r.summarize()
-	want := sandboxSummary{DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, Privesc: 2, Commands: 2500, Alerts: 4, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
+	want := sandboxSummary{High: 1, Warn: 1, DecoysRead: 1, VMProbes: 2, EvasionSuspected: true, Privesc: 2, Commands: 2500, Alerts: 4, ChangedOutsideWork: 2, ProcessesLeft: 1, Listening: 1, ConnectionsRefused: 4, AddressesAnAgent: 1}
 	if r.Summary != want {
 		t.Errorf("summary = %+v\nwant      %+v", r.Summary, want)
 	}
@@ -234,7 +234,7 @@ func TestAlertKindsKnown(t *testing.T) {
 		}
 	}
 	// chosen by a conditional in classify
-	for _, k := range []string{"privesc_attempt", "namespace", "ptrace", "dropper", "dropped_exec"} {
+	for _, k := range []string{"privesc_attempt", "namespace", "ptrace", "dropper", "dropped_exec", "dropped_script"} {
 		emitted[k] = true
 	}
 	if len(emitted) < 10 {
@@ -291,8 +291,80 @@ func TestAgentPatterns(t *testing.T) {
 			t.Errorf("false positive on %q: %+v", miss, got)
 		}
 	}
-	if got := scanText("output", "a​b", nil); len(got) != 1 {
-		t.Errorf("zero-width space not caught: %+v", got)
+	// What hides text, not every invisible character: one zero-width joiner
+	// is in emoji and names, a right-to-left override in a name (pip's
+	// AUTHORS.txt has two) hides nothing that runs.
+	for line, want := range map[string]bool{
+		"a\u200b\u200b\u200bb":              true,
+		"hi\U000E0041\U000E0042":            true,
+		"a\u200bb":                          false,
+		"family \U0001F468\u200d\U0001F469": false,
+		"\ufeffimport os":                   false,
+		"Muha Ajjan\u202e":                  false,
+	} {
+		if got := scanText("output", line, nil); (len(got) > 0) != want {
+			t.Errorf("%q: %+v, want caught %v", line, got, want)
+		}
+	}
+	if got := scanText("created", "invoice\u202efdp.exe", nil); len(got) != 1 {
+		t.Errorf("a name's right-to-left override not caught: %+v", got)
+	}
+}
+
+// A decoy read only by its own tool (npm, ~/.npmrc) is info; by anything
+// else, or by a program audit did not see, high.
+func TestSandboxDecoyReaders(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev",
+		"decoy\tREAD\t/home/dev/.npmrc\tnpm reads it\tnpm npx",
+		"decoyby\topen\t2\t/home/dev/.npmrc\tnpm",
+		"decoy\tREAD\t/home/dev/.aws/credentials\tthe AWS CLI reads it\taws",
+		"decoyby\topen\t1\t/home/dev/.aws/credentials\tcat",
+		"decoyby\topen\t1\t/home/dev/.aws/credentials\taws",
+		"decoy\tREAD\t/home/dev/.netrc\tcurl reads it\tcurl",
+		"decoy\tREAD+TAMPERED\t/home/dev/.kube/config\tkubectl reads it\tkubectl",
+		"decoyby\topen\t1\t/home/dev/.kube/config\tkubectl",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	want := map[string]string{".npmrc": "info", ".aws/credentials": "high", ".netrc": "high", ".kube/config": "high"}
+	for _, d := range r.Decoys {
+		if w := want[strings.TrimPrefix(d.Path, "/home/dev/")]; d.Severity != w {
+			t.Errorf("%s by %v: %s, want %s", d.Path, d.By, d.Severity, w)
+		}
+	}
+	if r.Decoys[1].By[0] != "aws ×1" || r.Decoys[1].By[1] != "cat ×1" || !r.Decoys[0].ByItsTool {
+		t.Errorf("decoys %+v", r.Decoys)
+	}
+	out := renderReport(r, true, false)
+	for _, w := range []string{"READ  ~/.npmrc  by npm ×2", "~/.netrc", "by a program audit did not see"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("no %q in:\n%s", w, out)
+		}
+	}
+	if r.Verdict != "suspicious" {
+		t.Errorf("verdict %s", r.Verdict)
+	}
+}
+
+// Outside ~/work: caches and temporary files are info and grouped; ~/work
+// itself is not outside; a file an alert names is not said twice.
+func TestSandboxChangedOutside(t *testing.T) {
+	lines := []string{"user\tdev", "alert\tshell_rc\t1\t/home/dev/.bashrc\tinstall.sh", "file\t/home/dev/.bashrc", "file\t/home/dev/.local/bin/tool",
+		"file\t/tmp/x.log", "dir\t/tmp", "dir\t/home/dev/work", "dir\t/home/dev", "dir\t/var/tmp"}
+	for i := range 40 {
+		lines = append(lines, fmt.Sprintf("file\t/home/dev/.cache/go-build/%02d/abc", i))
+	}
+	r := parseSandboxReport(strings.Join(lines, "\n"))
+	r.Complete = true
+	r.summarize()
+	var got []string
+	for _, f := range r.changedOutside("/home/dev", func(p string) string { return strings.Replace(p, "/home/dev", "~", 1) }, false) {
+		got = append(got, f.sev.String()+" "+f.short)
+	}
+	want := []string{"warn ~/.local/bin/tool", "info ~/.cache/go-build/ (40)", "info /tmp/x.log", "info /var/tmp/"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("changed outside:\n%q\nwant\n%q", got, want)
 	}
 }
 
@@ -372,7 +444,7 @@ func (d *sandboxDaemon) mux() *http.ServeMux {
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-report"):
 			res.Output = "user\tdev\ndecoy\tREAD\t/home/dev/.netrc\tcurl\nprobe\tabsent\t1\t/sys/class/dmi/id/sys_vendor\tcat\n"
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-watch"):
-			res.Output = "decoy\tREAD\t/home/dev/.netrc\nprivesc\tfound\t1\tfind -perm -4000\tfind\nprivesc\tfound\t1\tfind -perm -4000\tother\nalert\tnew-kind\t1\tx\tsh\nat\t5\t100\n"
+			res.Output = "decoy\tREAD\t/home/dev/.netrc\tcurl\ndecoy\tREAD\t/home/dev/.npmrc\tnpm\ndecoyby\topen\t1\t/home/dev/.npmrc\tnpm\nprivesc\tfound\t1\tfind -perm -4000\tfind\nprivesc\tfound\t1\tfind -perm -4000\tother\nalert\tnew-kind\t1\tx\tsh\nat\t5\t100\n"
 		case strings.HasPrefix(req.Cmd, "cat /usr/share/mh-sandbox/agent-patterns"):
 			res.Output = "# comment\nignore (all )?previous instructions\n"
 		case strings.HasPrefix(req.Cmd, "mh-sandbox-run '"):
@@ -463,14 +535,16 @@ func TestSandboxRunsNothingIfTheCutIsNotConfirmed(t *testing.T) {
 func TestSandboxUsage(t *testing.T) {
 	f := newFakeAPI(t, http.NewServeMux())
 	dir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(dir, "r.yml"), []byte("accept:\n  - kind: decoy\n    by: cat\n    why: mine\n"), 0o600))
 	for _, args := range [][]string{
 		{"sandbox"},
-		{"sandbox", dir},                                // a directory needs a command
-		{"sandbox", dir, "a", "b"},                      // the command is one argument
-		{"sandbox", dir, "ls", "--apt", "bad;rm"},       // not a package
-		{"sandbox", dir, "ls", "--timeout", "11m"},      // over exec's limit
-		{"sandbox", dir, "ls", "--fetch", "a\nb"},       // one line
-		{"sandbox", "http://example.com/x.git", "make"}, // https only
+		{"sandbox", dir},                                               // a directory needs a command
+		{"sandbox", dir, "a", "b"},                                     // the command is one argument
+		{"sandbox", dir, "ls", "--apt", "bad;rm"},                      // not a package
+		{"sandbox", dir, "ls", "--timeout", "11m"},                     // over exec's limit
+		{"sandbox", dir, "ls", "--fetch", "a\nb"},                      // one line
+		{"sandbox", "http://example.com/x.git", "make"},                // https only
+		{"sandbox", dir, "ls", "--rules", filepath.Join(dir, "r.yml")}, // rules from inside the code under test
 	} {
 		if code, _, _ := f.run("", args...); code != 2 {
 			t.Errorf("%q: exit %d, want 2", args, code)
@@ -515,7 +589,7 @@ func TestSandboxReportFailureKeepsTheRest(t *testing.T) {
 		if !strings.HasPrefix(out, "?? INCOMPLETE -- the report from inside the VM failed") {
 			t.Errorf("not INCOMPLETE first:\n%s", out)
 		}
-		for _, want := range []string{"exit 3", "inside the VM: unknown, not none", "udp  1.1.1.1:53  x3", "[HIGH] text addressed to an AI agent", "! warning: the report from inside the VM failed"} {
+		for _, want := range []string{"exit 3", "inside the VM: unknown, not none", "[WARN] tried to reach the network (1)", "*  udp  1.1.1.1:53  x3  DNS", "[HIGH] text addressed to an AI agent (1)", "! warning: the report from inside the VM failed"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("no %q in:\n%s", want, out)
 			}
@@ -542,11 +616,16 @@ func TestSandboxProbesCompactAndVerbose(t *testing.T) {
 		{Path: "/etc/shadow", Found: true, Count: 44, By: "newgrp"},
 	}
 	r.summarize()
+	// merged, one per path, the high one first; sudo looked up is info
+	cs := r.categories(viewStyle{}, false)
+	if len(cs) != 1 || len(cs[0].items) != 2 || cs[0].items[0].short != "/etc/shadow" || cs[0].items[1].cols[0] != "x4" || cs[0].items[1].tail != "by bash, which" {
+		t.Errorf("compact: %+v", cs)
+	}
 	out := renderReport(r, false, false)
-	// merged, one per path, the high one first
-	want := "[HIGH] looking for a way to root (2)  absent ones count: asking is the tell\n" +
-		"  !  x44  /etc/shadow  found   by newgrp\n" +
-		"  *  x4   sudo         absent  by bash, which\n"
+	// by what they go for: one line per theme, the programs that asked
+	want := "[HIGH] looked for a way to become root (2)  absent ones count: asking is the tell\n" +
+		"  !  password files   1  /etc/shadow  by newgrp\n" +
+		"  -  su, sudo… tools  1  sudo  by bash, which\n"
 	if !strings.Contains(out, want) {
 		t.Errorf("compact:\n%s\nwant:\n%s", out, want)
 	}
@@ -554,10 +633,10 @@ func TestSandboxProbesCompactAndVerbose(t *testing.T) {
 		t.Errorf("verbose, one line per path and program:\n%s", out)
 	}
 	r.Privesc = nil
-	for i := range compactLines + 5 {
+	for i := range 20 {
 		r.Privesc = append(r.Privesc, sandboxProbe{Path: fmt.Sprintf("/p%d", i), Count: 1, By: "x"})
 	}
-	if out := renderReport(r, false, false); !strings.Contains(out, "... 5 more (-v)") || strings.Contains(out, "/p15") {
+	if out := renderReport(r, false, false); !strings.Contains(out, "... 12 more (-v)") || strings.Contains(out, "/p19") {
 		t.Errorf("not capped:\n%s", out)
 	}
 	if out := renderReport(r, true, false); !strings.Contains(out, "/p19") {
@@ -569,7 +648,7 @@ func TestPrivescSeverity(t *testing.T) {
 	for p, want := range map[string]severity{
 		"find -perm -4000": sevHigh, "find -perm /u=s": sevHigh, "find -perm -2000": sevHigh, "find -perm -o=w": sevWarn,
 		"/etc/shadow": sevHigh, "/etc/sudoers.d": sevHigh, "/run/docker.sock": sevHigh, "/proc/PID/mem": sevHigh,
-		"sudo": sevWarn, "/etc/crontab": sevWarn, "/root": sevWarn, "/proc/sys/kernel/yama/ptrace_scope": sevWarn,
+		"sudo": sevInfo, "pkexec": sevInfo, "/etc/crontab": sevWarn, "/root": sevWarn, "/proc/sys/kernel/yama/ptrace_scope": sevWarn,
 	} {
 		if got := privescSeverity(p); got != want {
 			t.Errorf("%s: %v, want %v", p, got, want)
@@ -598,17 +677,24 @@ func TestSandboxRenderFindings(t *testing.T) {
 	r.summarize()
 	out := renderReport(r, false, false)
 	lines := strings.Split(out, "\n")
-	if lines[0] != "!! 3 high, 3 warn, 1 info -- it read your credentials, searched for setuid binaries and 2 more" {
+	if lines[0] != "XX SUSPICIOUS -- it read the decoy credentials and searched for setuid binaries" {
 		t.Errorf("verdict:\n%s", out)
 	}
+	if r.Verdict != "suspicious" || r.Summary.High != 3 || r.Summary.Warn != 2 || r.Summary.Info != 2 {
+		t.Errorf("verdict %s, summary %+v", r.Verdict, r.Summary)
+	}
+	// one block per kind: what it amounts to
 	for _, want := range []string{
-		"./x.sh, sandbox:8, exit 0, 4.2s, 7 commands run",
-		"[HIGH] decoy credentials (2)", "READ  ~/.aws/credentials  legitimately: aws",
-		"[WARN] some-new-kind (1)", "x2  did a thing  by sh",
-		"[WARN] connections refused (1)", "tcp  1.1.1.1:80  x3  egress",
-		"[INFO] looking for a VM (1)",
+		"   ./x.sh, sandbox:8, exit 0, 4.2s, 7 commands\n",
+		"[HIGH] decoy credentials read (2)  fake secrets planted for this run\n",
+		"  !  cloud: AWS, k8s  READ  ~/.aws/credentials\n",
+		"  !  browsers         READ  ~/.mozilla/firefox/kkkkkkkkkkkkkkkk",
+		"[HIGH] looked for a way to become root (2)", "  !  setuid search    1  find -perm -4000  by find\n",
+		"[WARN] some-new-kind (1)", "  *  x2  did a thing  by sh\n",
+		"[WARN] tried to reach the network (1)  refused by the host: nothing got out\n", "  *  tcp  1.1.1.1:80  x3\n",
+		"[INFO] also, ordinary on its own: looked for a VM (1)\n",
 		"ok clean: nothing changed outside ~/work", "no processes left", "no sockets",
-		"--output its output, -v everything, --json for agents",
+		"-v every finding, --live as it happens, -o its output, --json for programs",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("no %q in:\n%s", want, out)
@@ -630,12 +716,19 @@ func TestSandboxRenderFindings(t *testing.T) {
 
 	// --output: the output, each line marked, before the verdict.
 	out = renderReport(r, false, true)
-	if !strings.Contains(out, "| SECRET-OUTPUT-LINE\n") || strings.Index(out, "SECRET") > strings.Index(out, "!! ") || strings.Contains(out, "--output its output") {
+	if !strings.Contains(out, "| SECRET-OUTPUT-LINE\n") || strings.Index(out, "SECRET") > strings.Index(out, "XX ") || strings.Contains(out, "-o its output") {
 		t.Errorf("--output:\n%s", out)
 	}
-	// -v: the commands too, last, and not counted as findings
-	if out := renderReport(r, true, false); !strings.Contains(out, "x1  cat /home/dev/.aws/credentials") || !strings.HasPrefix(out, lines[0]+"\n") {
-		t.Errorf("-v without the commands, or counting them:\n%s", out)
+	// -v: every finding under its kind, the commands last, not counted
+	out = renderReport(r, true, false)
+	for _, want := range []string{"[HIGH] decoy credentials read (2)", "READ  ~/.aws/credentials", "legitimately, aws", "[WARN] some-new-kind (1)",
+		"x2  did a thing  by sh", "tcp  1.1.1.1:80  x3", "x1  cat /home/dev/.aws/credentials"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-v: no %q in:\n%s", want, out)
+		}
+	}
+	if !strings.HasPrefix(out, lines[0]+"\n") {
+		t.Errorf("-v counts otherwise:\n%s", out)
 	}
 }
 
@@ -645,7 +738,7 @@ func TestSandboxRenderEmpty(t *testing.T) {
 	r.Complete, r.Target, r.Image = true, "./x.sh", "sandbox:8"
 	r.summarize()
 	out := renderReport(r, false, false)
-	if !strings.HasPrefix(out, "== nothing seen in this run (not proof it is safe)\n") {
+	if !strings.HasPrefix(out, "== NOTHING SUSPICIOUS SEEN -- in this run, which is not proof it is safe\n") || r.Verdict != "clean" {
 		t.Errorf("empty verdict:\n%s", out)
 	}
 	if !strings.Contains(out, "ok clean: decoys 1/1 untouched, no privesc probes, no VM probes") || strings.Contains(out, "[") {
@@ -670,7 +763,7 @@ func TestSandboxRenderColor(t *testing.T) {
 	var b strings.Builder
 	r.render(&b, viewStyle{color: true}, false, false)
 	out := b.String()
-	if !strings.Contains(out, "\x1b[") || !strings.Contains(out, "⚠") || !strings.Contains(out, "●") {
+	if !strings.Contains(out, "\x1b[") || !strings.Contains(out, "✗ SUSPICIOUS") || !strings.Contains(out, " HIGH ") {
 		t.Errorf("no color:\n%s", out)
 	}
 	if strings.Contains(out, "\x1b[2J") || !strings.Contains(out, ".netrc?[2J") {
@@ -686,14 +779,17 @@ func TestSandboxVerboseIsLive(t *testing.T) {
 	f := newFakeAPI(t, d.mux())
 	script := filepath.Join(t.TempDir(), "install me.sh")
 	must(t, os.WriteFile(script, []byte("echo hi\n"), 0o755))
-	code, _, errOut := f.run("", "sandbox", script, "-v")
+	code, _, errOut := f.run("", "sandbox", script, "--live")
 	if code != 3 {
 		t.Fatalf("exit %d; stderr %s", code, errOut)
 	}
-	for _, want := range []string{"[HIGH]  decoy       READ  /home/dev/.netrc", "[HIGH]  privesc     find -perm -4000 found  (by find)", "[WARN]  connection  udp 1.1.1.1:53 refused", "[WARN]  alert       new-kind: x  (by sh)"} {
+	for _, want := range []string{"[HIGH]  decoy       READ  /home/dev/.netrc", "[INFO]  decoy       opened /home/dev/.npmrc  (by npm)", "[HIGH]  privesc     find -perm -4000 found  (by find)", "[WARN]  connection  udp 1.1.1.1:53 refused", "[WARN]  alert       new-kind: x  (by sh)"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("no %q live in:\n%s", want, errOut)
 		}
+	}
+	if strings.Contains(errOut, "READ  /home/dev/.npmrc") {
+		t.Errorf("a decoy read by its own tool shown as READ too:\n%s", errOut)
 	}
 	if n := strings.Count(errOut, "find -perm -4000"); n != 1 {
 		t.Errorf("find -perm -4000 shown %d times, want once:\n%s", n, errOut)
@@ -708,5 +804,45 @@ func TestSandboxVerboseIsLive(t *testing.T) {
 	d.mu.Unlock()
 	if len(watches) < 2 || watches[0] != "mh-sandbox-watch " || watches[len(watches)-1] != "mh-sandbox-watch 5 100" {
 		t.Errorf("watches %q: want the first from the start, the next from 5 100", watches)
+	}
+}
+
+func TestSandboxCompactHelpers(t *testing.T) {
+	for in, want := range map[string]string{
+		"/etc/shadow|/etc/gshadow":                "/etc/{shadow, gshadow}",
+		"/sys/class/dmi/id/a|/sys/class/dmi/id/b": "/sys/class/dmi/id/{a, b}",
+		"/.dockerenv|/proc/1/cgroup":              "/.dockerenv, /proc/1/cgroup",
+		"find -perm -4000|find -perm -2000":       "find -perm {-4000, -2000}",
+		"/root":                                   "/root",
+		"/etc/cron.d|/etc/cron.d/e2scrub_all":     "/etc/{cron.d, cron.d/e2scrub_all}",
+	} {
+		if got := joinPaths(strings.Split(in, "|")); got != want {
+			t.Errorf("joinPaths(%s) = %q, want %q", in, got, want)
+		}
+	}
+
+	// the same command on several directories is one line
+	got := groupCommands([]sandboxAlert{
+		{What: "find /etc -name id_rsa", Count: 1, By: "find"},
+		{What: "find /home -name id_rsa", Count: 2, By: "find"},
+		{What: "grep -r password /var/log", Count: 1, By: "grep"},
+	}, "x")
+	if len(got) != 2 || got[0].cols[0] != "x3" || got[0].cols[1] != "find -name id_rsa" || got[0].tail != "in /etc /home; by find" || got[1].cols[1] != "grep -r password /var/log" {
+		t.Errorf("groupCommands: %+v", got)
+	}
+
+	// each connection with who tried it, as audit saw it inside
+	r := parseSandboxReport("alert\tconnect\t2\t1.1.1.1:53 (dns)\tcurl\nalert\tconnect\t1\t10.0.0.1:4444\tbash\n")
+	r.Connections = []sandboxConn{{Protocol: "udp", Dst: "1.1.1.1", DstPort: 53, Count: 4, Reason: "egress"},
+		{Protocol: "tcp", Dst: "169.254.169.254", DstPort: 80, Count: 1, Reason: "egress"}}
+	c := r.network("x")
+	var lines []string
+	for _, f := range c.items {
+		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
+	}
+	want := []string{"warn udp 1.1.1.1:53 x4 | DNS; by curl", "warn tcp 169.254.169.254:80 x1 | cloud metadata: an instance's credentials",
+		"info ? 10.0.0.1:4444 x1 | a port reverse shells use; by bash; seen inside only"}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
 	}
 }

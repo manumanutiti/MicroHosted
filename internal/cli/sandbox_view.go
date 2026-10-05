@@ -14,23 +14,29 @@ import (
 )
 
 // The report for a person (mh sandbox without --json): a verdict first, then
-// only what was found, grouped by category and graded high, warn or info, then
-// one line naming what was checked and found clean — so an empty section
-// never reads as an unchecked one. -v adds everything: every probe by every
-// program, every command, what changed in ~/work. --output adds the program's
-// own output, every line of it prefixed so it cannot pass for the report.
+// one block per kind of finding, graded high, warn or info, its lines what
+// the findings amount to (sandbox_compact.go) — then one line naming what was
+// checked and found clean, so that an empty section never reads as an
+// unchecked one. -v prints every finding instead, and what is only detail:
+// every probe by every program, every command, what changed in ~/work. --output adds the
+// program's own output, every line of it prefixed so it cannot pass for the
+// report.
 //
 // Severities (the alerts' come from their kind, sandbox_kinds.go):
 //
-//	high  a decoy READ, TAMPERED or DELETED; text addressed to an AI agent;
-//	      privesc: find -perm for setuid/setgid files, /etc/shadow, /etc/gshadow,
-//	      /etc/sudoers*, a container runtime's socket, /proc/PID/mem
-//	warn  every other privesc probe (sudo, su, cron, root's home, the kernel's
-//	      switches, find -perm for writable files); a VM probe; a connection
-//	      refused; a file or directory changed outside ~/work; a process left;
-//	      a listening socket
-//	info  a VM probe ordinary programs make too (commonProbes); with -v, the
-//	      commands run and what changed in ~/work
+//	high  a decoy TAMPERED or DELETED, or READ by anything but its own tool;
+//	      text addressed to an AI agent; privesc: find -perm for
+//	      setuid/setgid files, /etc/shadow, /etc/gshadow, /etc/sudoers*, a
+//	      container runtime's socket, /proc/PID/mem
+//	warn  every other privesc probe (cron, root's home, the kernel's switches,
+//	      find -perm for writable files); a VM probe; a connection refused; a
+//	      file changed outside ~/work that is not a cache or a temporary file;
+//	      a process left; a listening socket
+//	info  a decoy read only by its own tool (npm, ~/.npmrc); a lookup of sudo,
+//	      su… (installers check for sudo); a VM probe ordinary programs make
+//	      too (commonProbes); a cache, a temporary file, a directory whose
+//	      entries changed; with -v, the commands run and what changed in
+//	      ~/work
 //
 // Everything the code chose — paths, names, arguments, its output — arrives
 // here through untrusted(): no escape of its own reaches the terminal, and no
@@ -92,24 +98,26 @@ func (st viewStyle) mark(s severity) string {
 // viewWidth is the width lines are kept to, where they can be.
 const viewWidth = 100
 
-// compactLines is how many findings a category shows without -v.
-const compactLines = 15
-
 // finding is one line under a category: columns aligned across the
-// category, then a tail.
+// category, then a tail. short is it in a few words, for the summary.
 type finding struct {
 	sev     severity
 	cols    []string
 	tail    string
 	tailDim bool
+	short   string
 }
 
 type category struct {
 	title  string // ours
 	note   string // ours: what it means, in a few words
-	phrase string // ours: for the verdict, "read your credentials"
+	phrase string // ours: for the verdict, "read the decoy credentials"
 	detail bool   // -v's detail, not a finding: not counted in the verdict
+	footer bool   // about the report, not the code (audit_health): a warning below
 	items  []finding
+	// compact: the default view's lines, what the items amount to (by
+	// theme, by command); nil: the items themselves.
+	compact []finding
 }
 
 func (c category) sev() severity {
@@ -118,6 +126,17 @@ func (c category) sev() severity {
 		s = max(s, f.sev)
 	}
 	return s
+}
+
+// count is the findings of severity at least min.
+func (c category) count(min severity) int {
+	n := 0
+	for _, f := range c.items {
+		if f.sev >= min {
+			n++
+		}
+	}
+	return n
 }
 
 // privescSeverity grades one privesc probe: high for what an escalation
@@ -135,6 +154,10 @@ func privescSeverity(p string) severity {
 	case p == "/etc/shadow", p == "/etc/gshadow", strings.HasPrefix(p, "/etc/sudoers"),
 		strings.HasPrefix(p, "/proc/PID/mem"):
 		return sevHigh
+	case !strings.Contains(p, "/"):
+		// a tool looked up by name (sudo, su, pkexec…): installers check
+		// for sudo; using it shows as what it reads
+		return sevInfo
 	case strings.HasSuffix(p, ".sock") || strings.HasSuffix(p, ".socket"):
 		for _, rt := range []string{"docker", "containerd", "podman", "lxd", "snapd"} {
 			if strings.Contains(p, rt) {
@@ -182,16 +205,17 @@ func mergeProbes(ps []sandboxProbe) []sandboxProbe {
 }
 
 // categories are the report's findings, most serious first. verbose: every
-// probe as recorded, and what is only detail (commands, ~/work).
+// probe as recorded, every file changed one by one, and what is only detail
+// (commands, ~/work).
 func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 	x := st.times()
 	home := ""
 	if r.user != "" {
-		home = "/home/" + r.user + "/"
+		home = "/home/" + r.user
 	}
 	tilde := func(p string) string {
-		if home != "" && strings.HasPrefix(p, home) {
-			return "~/" + p[len(home):]
+		if home != "" && (p == home || strings.HasPrefix(p, home+"/")) {
+			return "~" + p[len(home):]
 		}
 		return p
 	}
@@ -205,7 +229,7 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 			if p.Found {
 				state = "found"
 			}
-			out = append(out, finding{sev: grade(p.Path), cols: []string{x + strconv.Itoa(p.Count), tilde(p.Path), state}, tail: "by " + p.By, tailDim: true})
+			out = append(out, finding{sev: grade(p.Path), cols: []string{x + strconv.Itoa(p.Count), tilde(p.Path), state}, tail: "by " + p.By, tailDim: true, short: tilde(p.Path)})
 		}
 		if !verbose {
 			sort.SliceStable(out, func(i, j int) bool { return out[i].sev > out[j].sev })
@@ -215,17 +239,56 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 
 	var cs []category
 	if r.Complete {
-		c := category{title: "decoy credentials", note: "fake secrets planted for this run", phrase: "read your credentials"}
+		c := category{title: "decoy credentials read", note: "fake secrets planted for this run", phrase: "read the decoy credentials"}
+		own := category{title: "decoys read by their own tool", note: "npm reading ~/.npmrc: expected"}
 		for _, d := range r.Decoys {
-			if d.State == "untouched" {
+			if d.State == "untouched" || d.Accepted != "" {
 				continue
 			}
 			if d.State != "READ" {
-				c.phrase = "tampered with your credentials"
+				c.phrase = "tampered with the decoy credentials"
 			}
-			c.items = append(c.items, finding{sev: sevHigh, cols: []string{d.State, tilde(d.Path)}, tail: "legitimately: " + d.Legitimately, tailDim: true})
+			by := ""
+			if len(d.By) > 0 {
+				by = "by " + strings.Join(d.By, ", ")
+			} else if r.readers {
+				by = "by a program audit did not see"
+			}
+			f := finding{sev: sevHigh, cols: []string{d.State, tilde(d.Path)}, tail: by, tailDim: true, short: tilde(d.Path)}
+			if d.ByItsTool {
+				f.sev = sevInfo
+				own.items = append(own.items, f)
+				continue
+			}
+			if d.Legitimately != "" {
+				f.tail = strings.TrimPrefix(f.tail+"; legitimately, "+d.Legitimately, "; ")
+			}
+			c.items = append(c.items, f)
 		}
-		cs = append(cs, c)
+		if !verbose {
+			var ps []sandboxProbe
+			state := map[string]string{}
+			grade := map[string]severity{}
+			for _, d := range r.Decoys {
+				if d.State == "untouched" || d.ByItsTool || d.Accepted != "" {
+					continue
+				}
+				state[d.Path], grade[d.Path] = d.State, sevHigh
+				if len(d.counts) == 0 {
+					ps = append(ps, sandboxProbe{Path: d.Path, Found: true, Count: 1, By: "?"})
+				}
+				for n, k := range d.counts {
+					ps = append(ps, sandboxProbe{Path: d.Path, Found: true, Count: k, By: n})
+				}
+			}
+			c.compact = themed(ps, decoyThemes, func(p string) severity { return grade[p] }, tilde, func(p string) string { return state[p] })
+			if !r.readers {
+				for i := range c.compact {
+					c.compact[i].tail = ""
+				}
+			}
+		}
+		cs = append(cs, c, own)
 	}
 	c := category{title: "text addressed to an AI agent", note: "a signal, not proof", phrase: "has text addressed to an AI agent"}
 	for _, a := range r.AddressesAnAgent {
@@ -236,18 +299,22 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 		if a.Line > 0 {
 			where += ":" + strconv.Itoa(a.Line)
 		}
-		c.items = append(c.items, finding{sev: sevHigh, cols: []string{where}, tail: strconv.Quote(a.Text)})
+		c.items = append(c.items, finding{sev: sevHigh, cols: []string{where}, tail: strconv.Quote(a.Text), short: strconv.Quote(a.Text)})
 	}
 	cs = append(cs, c)
 	if r.Complete {
-		phrase := "looked for a way to root"
+		phrase := "looked for a way to become root"
 		for _, p := range r.Privesc {
 			if strings.HasPrefix(p.Path, "find -perm ") && privescSeverity(p.Path) == sevHigh {
 				phrase = "searched for setuid binaries"
 			}
 		}
-		cs = append(cs, category{title: "looking for a way to root", note: "absent ones count: asking is the tell", phrase: phrase,
-			items: probes(r.Privesc, privescSeverity)})
+		c := category{title: "looked for a way to become root", note: "absent ones count: asking is the tell", phrase: phrase,
+			items: probes(r.Privesc, privescSeverity)}
+		if !verbose {
+			c.compact = themed(r.Privesc, privescThemes, privescSeverity, tilde, nil)
+		}
+		cs = append(cs, c)
 
 		var kinds []string
 		byKind := map[string][]sandboxAlert{}
@@ -258,48 +325,60 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 			byKind[a.Kind] = append(byKind[a.Kind], a)
 		}
 		for _, k := range kinds {
-			kind := kindOf(k)
-			c := category{title: kind.Title, note: kind.Means, phrase: "set off " + strings.ToLower(kind.Title)}
+			if k == "connect" {
+				continue // with the connections, below: who tried each
+			}
+			kind := r.rules.kindOf(k)
+			c := category{title: kind.Title, note: kind.Means, phrase: strings.ToLower(kind.Title), footer: k == "audit_health"}
+			if strings.HasPrefix(k, "rule:") {
+				c.phrase = "matched " + kind.Title
+			}
 			for _, a := range byKind[k] {
-				c.items = append(c.items, finding{sev: kind.Severity, cols: []string{x + strconv.Itoa(a.Count), tilde(a.What)}, tail: "by " + a.By, tailDim: true})
+				c.items = append(c.items, finding{sev: kind.Severity, cols: []string{x + strconv.Itoa(a.Count), tilde(a.What)}, tail: "by " + a.By, tailDim: true, short: tilde(a.What)})
+			}
+			if !verbose && commandKinds[k] {
+				c.compact = groupCommands(byKind[k], x)
+				for i := range c.compact {
+					c.compact[i].sev = kind.Severity
+				}
 			}
 			cs = append(cs, c)
 		}
 
-		cs = append(cs, category{title: "looking for a VM", note: "absent: not in this VM; asking is the tell", phrase: "looked for a VM",
-			items: probes(r.VMProbes, vmProbeSeverity)})
-	}
-	c = category{title: "connections refused", note: "seen by the host; nothing got out", phrase: "tried to reach the network"}
-	for _, n := range r.Connections {
-		dst := n.Dst
-		if n.DstPort != 0 {
-			dst += ":" + strconv.Itoa(n.DstPort)
-		}
-		c.items = append(c.items, finding{sev: sevWarn, cols: []string{n.Protocol, dst, x + strconv.FormatUint(n.Count, 10)}, tail: n.Reason, tailDim: true})
-	}
-	cs = append(cs, c)
-	if r.Complete {
-		c := category{title: "changed outside ~/work", phrase: "changed files outside ~/work"}
-		files := append([]string(nil), r.Changed.Files...)
-		sort.Strings(files)
-		for _, f := range files {
-			c.items = append(c.items, finding{sev: sevWarn, cols: []string{tilde(f)}})
-		}
-		dirs := append([]string(nil), r.Changed.Dirs...)
-		sort.Strings(dirs)
-		for _, d := range dirs {
-			c.items = append(c.items, finding{sev: sevWarn, cols: []string{tilde(d) + "/"}, tail: "entries changed", tailDim: true})
+		c = category{title: "looked for a VM", note: "absent: not in this VM; asking is the tell", phrase: "looked for a VM",
+			items: probes(r.VMProbes, vmProbeSeverity)}
+		if !verbose {
+			c.compact = themed(r.VMProbes, vmThemes, vmProbeSeverity, tilde, nil)
 		}
 		cs = append(cs, c)
+	}
+	cs = append(cs, r.network(x))
+	if r.Complete {
+		cs = append(cs, category{title: "changed outside ~/work", note: "caches and temporary files are info", phrase: "changed files outside ~/work",
+			items: r.changedOutside(home, tilde, verbose)})
 
 		c = category{title: "processes left running", note: "as " + r.user, phrase: "left processes running"}
+		var args []string
+		pids := map[string][]string{}
 		for _, p := range r.Processes {
-			c.items = append(c.items, finding{sev: sevWarn, cols: []string{strconv.Itoa(p.PID)}, tail: p.Args})
+			if _, ok := pids[p.Args]; !ok {
+				args = append(args, p.Args)
+			}
+			pids[p.Args] = append(pids[p.Args], strconv.Itoa(p.PID))
+		}
+		for _, a := range args {
+			col := pids[a][0]
+			if n := len(pids[a]); n > 1 && !verbose {
+				col = x + strconv.Itoa(n)
+			} else if n > 1 {
+				col = strings.Join(pids[a], ",")
+			}
+			c.items = append(c.items, finding{sev: sevWarn, cols: []string{col}, tail: a, short: a})
 		}
 		cs = append(cs, c)
 		c = category{title: "listening sockets", phrase: "opened listening sockets"}
 		for _, l := range r.Listening {
-			c.items = append(c.items, finding{sev: sevWarn, cols: []string{l}})
+			c.items = append(c.items, finding{sev: sevWarn, cols: []string{l}, short: l})
 		}
 		cs = append(cs, c)
 
@@ -324,6 +403,16 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 		}
 	}
 
+	c = category{title: "accepted by your rules", note: "checked before, by whoever wrote the rule: its why", phrase: "matched your accept rules"}
+	for _, a := range r.Accepted {
+		tail := "why: " + a.Why
+		if a.By != "" {
+			tail = "by " + a.By + "; " + tail
+		}
+		c.items = append(c.items, finding{sev: sevInfo, cols: []string{a.Kind, x + strconv.Itoa(a.Count), a.What}, tail: tail, tailDim: true, short: a.What})
+	}
+	cs = append(cs, c)
+
 	var found []category
 	for _, c := range cs {
 		if len(c.items) > 0 {
@@ -337,6 +426,118 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 		return found[i].sev() > found[j].sev()
 	})
 	return found
+}
+
+// homeCaches are where tools keep what they download or build, relative to
+// the home: written by every build, worth knowing only.
+var homeCaches = []string{".cache", ".npm", "go", ".cargo/registry", ".cargo/git", ".cargo/.package-cache", ".cargo/.package-cache-mutate", ".cargo/.global-cache", ".rustup", ".m2", ".gradle", ".nuget",
+	".yarn", ".pnpm-store", ".local/share", ".local/state", ".gitconfig", ".python_history", ".node_repl_history", ".lesshst", ".wget-hsts"}
+
+// changedSeverity grades a path changed outside ~/work: info for a cache, a
+// tool's own settings (~/.config, but where code makes itself start again),
+// a temporary file; warn for the rest — the shell's files, ~/.ssh,
+// ~/.local/bin, the system.
+func changedSeverity(p, home string) severity {
+	for _, t := range []string{"/tmp/", "/var/tmp/", "/dev/shm/"} {
+		if strings.HasPrefix(p, t) {
+			return sevInfo
+		}
+	}
+	rel, ok := strings.CutPrefix(p, home+"/")
+	if home == "" || !ok {
+		return sevWarn
+	}
+	for _, c := range homeCaches {
+		if rel == c || strings.HasPrefix(rel, c+"/") {
+			return sevInfo
+		}
+	}
+	if strings.HasPrefix(rel, ".config/") {
+		for _, s := range []string{"systemd", "autostart", "environment.d", "gh"} {
+			if strings.HasPrefix(rel, ".config/"+s+"/") {
+				return sevWarn
+			}
+		}
+		return sevInfo
+	}
+	return sevWarn
+}
+
+// changedOutside is what changed outside ~/work. Compact: files grouped by
+// where they are (~/.cache/go-build/, 1515 files), a directory only when
+// none of its files is listed (an entry removed or renamed), and not a file
+// an alert already names (~/.bashrc, made itself start again). verbose:
+// every one.
+func (r *sandboxReport) changedOutside(home string, tilde func(string) string, verbose bool) []finding {
+	var out []finding
+	alerted := map[string]bool{}
+	for _, a := range r.Alerts {
+		alerted[strings.TrimSuffix(a.What, " (refused)")] = true
+	}
+	files := append([]string(nil), r.Changed.Files...)
+	sort.Strings(files)
+	var groups []string
+	byGroup := map[string][]string{}
+	for _, f := range files {
+		if home != "" && (f == home+"/work" || strings.HasPrefix(f, home+"/work/")) {
+			continue // an older image counted ~/work itself
+		}
+		if alerted[f] && !verbose {
+			continue
+		}
+		g := tilde(f)
+		if !verbose {
+			depth := 2
+			if strings.HasPrefix(g, "~/") {
+				depth = 3
+			}
+			if segs := strings.Split(strings.TrimPrefix(g, "/"), "/"); len(segs) > depth {
+				g = strings.Join(segs[:depth], "/") + "/"
+				if !strings.HasPrefix(g, "~") {
+					g = "/" + g
+				}
+			}
+		}
+		if _, ok := byGroup[g]; !ok {
+			groups = append(groups, g)
+		}
+		byGroup[g] = append(byGroup[g], f)
+	}
+	for _, g := range groups {
+		fs := byGroup[g]
+		sev := sevInfo
+		for _, f := range fs {
+			sev = max(sev, changedSeverity(f, home))
+		}
+		f := finding{sev: sev, cols: []string{g}, short: g}
+		if len(fs) == 1 {
+			f.cols[0], f.short = tilde(fs[0]), tilde(fs[0])
+		} else {
+			f.tail, f.tailDim = strconv.Itoa(len(fs))+" files", true
+			f.short = g + " (" + strconv.Itoa(len(fs)) + ")"
+		}
+		out = append(out, f)
+	}
+	dirs := append([]string(nil), r.Changed.Dirs...)
+	sort.Strings(dirs)
+	for _, d := range dirs {
+		if home != "" && (d == home+"/work" || strings.HasPrefix(d, home+"/work/")) {
+			continue
+		}
+		listed := false
+		for _, f := range files {
+			if strings.HasPrefix(f, d+"/") {
+				listed = true
+				break
+			}
+		}
+		if listed && !verbose {
+			continue
+		}
+		out = append(out, finding{sev: sevInfo, cols: []string{tilde(d) + "/"}, tail: "entries changed", tailDim: true, short: tilde(d) + "/"})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].sev > out[j].sev })
+	return out
 }
 
 // cleanChecks names what was looked at and found clean.
@@ -375,53 +576,51 @@ func (r *sandboxReport) cleanChecks() []string {
 	return out
 }
 
-// render prints the report for a person.
+// render prints the report for a person: a verdict, then one line per kind
+// of finding (renderSummary), or with verbose every finding under its kind.
 func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) {
 	if output {
 		r.renderOutput(w, st)
 	}
-	cs := r.categories(st, verbose)
-	// The verdict counts the compact view's lines, -v or not.
+	// The verdict and the summary count the compact view, -v or not.
+	sum := r.categories(st, false)
 	counts := map[severity]int{}
-	var phrases []string
-	for _, c := range r.categories(st, false) {
+	phrases := map[severity][]string{}
+	var footer []string
+	for _, c := range sum {
+		if c.footer {
+			for _, f := range c.items {
+				footer = append(footer, f.short)
+			}
+			continue
+		}
 		for _, f := range c.items {
 			counts[f.sev]++
 		}
-		if c.sev() >= sevWarn && c.phrase != "" && !slices.Contains(phrases, c.phrase) {
-			phrases = append(phrases, c.phrase)
+		if s := c.sev(); s >= sevWarn && c.phrase != "" && !slices.Contains(phrases[s], c.phrase) {
+			phrases[s] = append(phrases[s], c.phrase)
 		}
 	}
 
-	// The verdict.
-	var tally []string
-	for _, s := range []severity{sevHigh, sevWarn, sevInfo} {
-		if counts[s] > 0 {
-			tally = append(tally, fmt.Sprintf("%d %s", counts[s], strings.ToLower(sevLabel[s])))
-		}
-	}
 	dash := st.pick(" — ", " -- ")
+	it := func(ps []string) string {
+		if len(ps) > 4 {
+			ps = append(ps[:3:3], fmt.Sprintf("%d more", len(ps)-3))
+		}
+		return "it " + andList(ps)
+	}
 	switch {
 	case !r.Complete:
 		head := st.paint("1;35", st.pick("✗ INCOMPLETE", "?? INCOMPLETE"))
 		fmt.Fprintln(w, head+dash+"the report from inside the VM failed: only the host's view below")
-	case counts[sevHigh]+counts[sevWarn] > 0:
-		sgr := sevColor[sevWarn]
-		if counts[sevHigh] > 0 {
-			sgr = sevColor[sevHigh]
-		}
-		what := phrases
-		if len(what) > 3 {
-			what = append(what[:2:2], fmt.Sprintf("%d more", len(phrases)-2))
-		}
-		line := strings.Join(tally, ", ") + dash + "it " + andList(what)
-		fmt.Fprintln(w, wrap(st.paint(sgr, st.pick("⚠", "!!"))+" "+st.bold(line), 3, viewWidth))
+	case counts[sevHigh] > 0:
+		head := st.paint(sevColor[sevHigh], st.pick("✗ SUSPICIOUS", "XX SUSPICIOUS"))
+		fmt.Fprintln(w, wrap(head+dash+st.bold(it(phrases[sevHigh])), 3, viewWidth))
+	case counts[sevWarn] > 0:
+		head := st.paint("1;"+sevColor[sevWarn], st.pick("⚠ REVIEW", "!! REVIEW"))
+		fmt.Fprintln(w, wrap(head+dash+st.bold(it(phrases[sevWarn])), 3, viewWidth))
 	default:
-		line := "nothing seen in this run (not proof it is safe)"
-		if len(tally) > 0 {
-			line = "nothing high or warn in this run, " + strings.Join(tally, ", ") + " (not proof it is safe)"
-		}
-		fmt.Fprintln(w, st.paint("1;32", st.pick("✓", "==")+" "+line))
+		fmt.Fprintln(w, st.paint("1;32", st.pick("✓", "==")+" NOTHING SUSPICIOUS SEEN")+dash+"in this run, which is not proof it is safe")
 	}
 	meta := []string{untrusted(r.Target, 200), r.Image, "exit " + strconv.Itoa(r.ExitCode)}
 	if r.TimedOut {
@@ -431,24 +630,40 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 		meta = append(meta, runDuration(time.Duration(r.DurationMS)*time.Millisecond))
 	}
 	if r.Complete && r.commands >= 0 {
-		meta = append(meta, fmt.Sprintf("%d commands run", r.Summary.Commands))
+		meta = append(meta, fmt.Sprintf("%d commands", r.Summary.Commands))
 	}
 	fmt.Fprintln(w, "   "+st.dim(strings.Join(meta, st.sep())))
 	if r.Summary.EvasionSuspected {
 		fmt.Fprintln(w, wrap("   "+st.paint(sevColor[sevWarn], st.pick("⚠", "!!")+" it looked for a VM: what it did not do here proves nothing"), 5, viewWidth))
 	}
 
-	for _, c := range cs {
-		fmt.Fprintln(w)
-		renderCategory(w, st, c, verbose)
+	fmt.Fprintln(w)
+	if verbose {
+		for _, c := range r.categories(st, true) {
+			renderCategory(w, st, c)
+			fmt.Fprintln(w)
+		}
+	} else {
+		renderCompact(w, st, sum)
 	}
 
-	fmt.Fprintln(w)
 	if !r.Complete {
 		fmt.Fprintln(w, st.paint("1;35", "inside the VM: unknown, not none")+" (decoys, probes, commands, files, processes)")
 	}
 	if clean := r.cleanChecks(); len(clean) > 0 {
 		fmt.Fprintln(w, wrap(st.paint("32", st.pick("✓", "ok"))+" "+st.dim("clean:")+" "+strings.Join(clean, ", "), 3, viewWidth))
+	}
+	if !verbose {
+		for _, f := range footer {
+			fmt.Fprintln(w, wrap(st.paint(sevColor[sevWarn], "! audit:")+" "+f+": some of what it did may be missing", 3, viewWidth))
+		}
+	}
+	if rs := r.rules; rs != nil && len(rs.Files) > 0 {
+		files := make([]string, len(rs.Files))
+		for i, f := range rs.Files {
+			files[i] = tildeHost(f)
+		}
+		fmt.Fprintln(w, wrap(st.dim(fmt.Sprintf("rules: %s (%d detect, %d accept)", strings.Join(files, ", "), len(rs.Detect), len(rs.Accept))), 3, viewWidth))
 	}
 	for _, warn := range r.Warnings {
 		fmt.Fprintln(w, wrap(st.paint(sevColor[sevWarn], "! warning:")+" "+warn, 3, viewWidth))
@@ -456,17 +671,18 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 	fmt.Fprintln(w)
 
 	var hints []string
-	if !output {
-		hints = append(hints, "--output its output")
-	}
 	if !verbose {
-		hints = append(hints, "-v everything")
+		hints = append(hints, "-v every finding")
 	}
-	hints = append(hints, "--json for agents")
+	hints = append(hints, "--live as it happens")
+	if !output {
+		hints = append(hints, "-o its output")
+	}
+	hints = append(hints, "--json for programs")
 	fmt.Fprintln(w, st.dim(strings.Join(hints, st.sep())))
 }
 
-func renderCategory(w io.Writer, st viewStyle, c category, verbose bool) {
+func renderCategory(w io.Writer, st viewStyle, c category) {
 	sev := c.sev()
 	head := st.badge(sev) + " " + st.bold(c.title) + " " + st.dim("("+strconv.Itoa(len(c.items))+")")
 	headLen := 6 + 1 + utf8.RuneCountInString(c.title) + 3 + len(strconv.Itoa(len(c.items)))
@@ -474,68 +690,12 @@ func renderCategory(w io.Writer, st viewStyle, c category, verbose bool) {
 		if headLen+2+utf8.RuneCountInString(c.note) <= viewWidth {
 			head += "  " + st.dim(c.note)
 		} else {
-			head += "\n       " + st.dim(c.note)
+			head += "\n" + wrap("       "+st.dim(c.note), 7, viewWidth)
 		}
 	}
 	fmt.Fprintln(w, head)
 
-	items := c.items
-	more := 0
-	if !verbose && len(items) > compactLines {
-		more = len(items) - compactLines
-		items = items[:compactLines]
-	}
-	// Compact: each column at most colMax wide, the line at most viewWidth.
-	const colMax = 60
-	clipTo := func(s string, n int) string {
-		if verbose || utf8.RuneCountInString(s) <= n {
-			return s
-		}
-		rs := []rune(s)
-		return string(rs[:n-1]) + "…"
-	}
-	// A column is as wide as its widest value up to alignMax; a longer one
-	// (an outlier path) runs on rather than pushing every line's tail out.
-	const alignMax = 40
-	var widths []int
-	for _, f := range items {
-		for i, col := range f.cols {
-			if i == len(widths) {
-				widths = append(widths, 0)
-			}
-			if n := utf8.RuneCountInString(col); n <= alignMax {
-				widths[i] = max(widths[i], n)
-			}
-		}
-	}
-	for _, f := range items {
-		var b strings.Builder
-		b.WriteString("  " + st.mark(f.sev))
-		used := 3
-		for i, col := range f.cols {
-			col = clipTo(col, colMax)
-			b.WriteString("  ")
-			used += 2
-			if i == len(f.cols)-1 && f.tail == "" {
-				b.WriteString(col)
-				break
-			}
-			pad := widths[i] - utf8.RuneCountInString(col)
-			b.WriteString(col + strings.Repeat(" ", max(pad, 0)))
-			used += max(widths[i], utf8.RuneCountInString(col))
-		}
-		if f.tail != "" {
-			tail := clipTo(f.tail, max(viewWidth-used-2, 24))
-			if f.tailDim {
-				tail = st.dim(tail)
-			}
-			b.WriteString("  " + tail)
-		}
-		fmt.Fprintln(w, strings.TrimRight(b.String(), " "))
-	}
-	if more > 0 {
-		fmt.Fprintln(w, "     "+st.dim(fmt.Sprintf("%s %d more (-v)", st.ell(), more)))
-	}
+	renderLines(w, st, c.items, false)
 }
 
 // renderOutput is the program's output, each line prefixed: nothing it
@@ -555,7 +715,7 @@ func (r *sandboxReport) renderOutput(w io.Writer, st viewStyle) {
 	fmt.Fprintln(w)
 }
 
-// liveLine is one finding as it happens (-v), in the report's grades.
+// liveLine is one finding as it happens (--live), in the report's grades.
 func liveLine(w io.Writer, st viewStyle, at time.Duration, sev severity, label, detail string) {
 	fmt.Fprintf(w, "  %5s  %s  %-11s %s\n", "+"+strconv.Itoa(int(at.Seconds()))+"s", st.badge(sev), label, detail)
 }

@@ -42,36 +42,39 @@ tok=$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')
 TOK=$(echo "$tok" | tr a-f A-F)
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 
-# decoy PATH [NOTE]: installs stdin as PATH (relative to the user's home),
-# mode 600, dated in the past — the code sees credentials that have been
-# there a long time, and a read moves atime past the moment of preparing. NOTE
-# says who reads that file legitimately, for whoever reads the report.
+# decoy PATH [NOTE [TOOLS]]: installs stdin as PATH (relative to the user's
+# home), mode 600, dated in the past — the code sees credentials that have
+# been there a long time, and a read moves atime past the moment of
+# preparing. NOTE says who reads that file legitimately, for whoever reads the
+# report; TOOLS, those programs by name (audit's comm or the executable's
+# name), space-separated: a read by them alone is the tool doing its job (npm
+# reading ~/.npmrc), not the code reaching for a secret.
 : > "$S/decoys"
 decoy() {
 	asuser 'cd "$HOME" && rm -rf "$0" && mkdir -p "$(dirname "$0")" && (umask 077 && cat > "$0") && touch -d "2025-01-01 00:00:00" "$0"' "$1"
-	printf '%s\t%s\n' "$H/$1" "${2:-}" >> "$S/decoys"
+	printf '%s\t%s\t%s\n' "$H/$1" "${2:-}" "${3:-}" >> "$S/decoys"
 }
 
 printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACD%s\n-----END OPENSSH PRIVATE KEY-----\n' "$tok" |
-	decoy .ssh/id_ed25519 "ssh reads it when connecting"
+	decoy .ssh/id_ed25519 "ssh reads it when connecting" "ssh scp sftp ssh-add"
 printf 'Host prod-db\n    HostName 10.20.0.15\n    User deploy\n    IdentityFile ~/.ssh/id_ed25519\n' |
-	decoy .ssh/config "ssh reads it when connecting"
+	decoy .ssh/config "ssh reads it when connecting" "ssh scp sftp"
 printf '[default]\naws_access_key_id = AKIA%s\naws_secret_access_key = %s%s\nregion = eu-west-1\n' "$TOK" "$tok" "$tok" |
-	decoy .aws/credentials "the AWS CLI and SDKs read it"
+	decoy .aws/credentials "the AWS CLI and SDKs read it" "aws"
 printf 'github.com:\n    oauth_token: ghp_%s%s\n    user: %s\n    git_protocol: https\n' "$tok" "$tok" "$U" |
-	decoy .config/gh/hosts.yml "the gh CLI reads it"
+	decoy .config/gh/hosts.yml "the gh CLI reads it" "gh"
 printf 'https://%s:ghp_%s@github.com\n' "$U" "$tok" |
-	decoy .git-credentials "git reads it with credential.helper store"
+	decoy .git-credentials "git reads it with credential.helper store" "git-credential-store"
 printf '//registry.npmjs.org/:_authToken=npm_%s%s\n' "$tok" "$tok" |
-	decoy .npmrc "npm reads it on every run"
+	decoy .npmrc "npm reads it on every run" "npm npx npm-cli.js npx-cli.js yarn pnpm"
 printf '[pypi]\nusername = __token__\npassword = pypi-%s%s\n' "$tok" "$tok" |
-	decoy .pypirc "twine reads it to upload"
+	decoy .pypirc "twine reads it to upload" "twine"
 printf 'machine api.heroku.com\n  login %s@example.com\n  password %s\n' "$U" "$tok" |
-	decoy .netrc "curl -n, ftp, git setups and Python requests (looking for credentials) read it"
+	decoy .netrc "curl -n, ftp, git setups, and Python's requests and pip on every request (a password for the host) read it" "curl ftp git-remote-http git-remote-https python python3 pip pip3"
 printf '{\n  "auths": {\n    "ghcr.io": { "auth": "%s" }\n  }\n}\n' "$(b64 "$U:ghp_$tok")" |
-	decoy .docker/config.json "docker reads it"
+	decoy .docker/config.json "docker reads it" "docker"
 printf 'apiVersion: v1\nkind: Config\nclusters:\n- name: prod\n  cluster:\n    server: https://10.20.0.2:6443\ncontexts:\n- name: prod\n  context: {cluster: prod, user: admin}\ncurrent-context: prod\nusers:\n- name: admin\n  user:\n    token: %s%s\n' "$tok" "$tok" |
-	decoy .kube/config "kubectl reads it"
+	decoy .kube/config "kubectl reads it" "kubectl helm"
 printf 'DATABASE_URL=postgres://admin:%s@10.20.0.15:5432/billing\nSTRIPE_SECRET_KEY=sk_live_%s%s\nOPENAI_API_KEY=sk-proj-%s%s\n' "$tok" "$tok" "$tok" "$tok" "$tok" |
 	decoy projects/billing-api/.env "the project's own app reads it"
 printf 'cd projects/billing-api\nexport STRIPE_SECRET_KEY=sk_live_%s%s\npsql postgres://admin:%s@10.20.0.15:5432/billing\nssh prod-db\naws s3 ls\n' "$tok" "$tok" "$tok" |

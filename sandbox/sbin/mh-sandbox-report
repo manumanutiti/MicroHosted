@@ -31,22 +31,32 @@ records() {
 	pkill -STOP -u "$U" 2>/dev/null
 
 	printf 'since\t%s\nuser\t%s\ntoken\t%s\n' "$since" "$U" "$(cat "$S/token")"
+	# rules N: the user's rules this image applied (classify)
+	[ ! -s "$S/rules" ] || printf 'rules\t%s\n' "$(grep -c . "$S/rules")"
+	audit=
+	if command -v auditctl >/dev/null; then
+		audit=1
+		audited > "$S/audited"
+	fi
 
 	# section NAME starts each part, for the person's view: an empty part
 	# still shows.
 	printf 'section\tdecoys\n'
-	# decoy STATE PATH NOTE — STATE: untouched, READ, TAMPERED, READ+TAMPERED, DELETED
-	while IFS="$tab" read -r f note; do
+	# decoy STATE PATH NOTE TOOLS — STATE: untouched, READ, TAMPERED,
+	# READ+TAMPERED, DELETED; TOOLS: the programs that read it legitimately,
+	# by name. decoyby open COUNT PATH BY: which program opened it (audit).
+	while IFS="$tab" read -r f note tools; do
 		if ! a=$(stat -c %x "$f" 2>/dev/null); then
-			printf 'decoy\tDELETED\t%s\t%s\n' "$f" "$note"
+			printf 'decoy\tDELETED\t%s\t%s\t%s\n' "$f" "$note" "$tools"
 			continue
 		fi
 		c=$(stat -c %z "$f")
 		r=""
 		after "$a" && r="READ"
 		after "$c" && r="${r:+$r+}TAMPERED"
-		printf 'decoy\t%s\t%s\t%s\n' "${r:-untouched}" "$f" "$note"
+		printf 'decoy\t%s\t%s\t%s\t%s\n' "${r:-untouched}" "$f" "$note" "$tools"
 	done < "$S/decoys"
+	[ -z "$audit" ] || grep "^decoyby$tab" "$S/audited"
 
 	# probe found|absent COUNT PATH COMM — what tells a VM (or a container)
 	# apart: DMI, CPU flags, modules, PCI, a hypervisor's files, disk and MAC
@@ -63,8 +73,7 @@ records() {
 	# sockets, root's home, the kernel's hardening switches, the tools that
 	# change user (by name: a lookup walks every directory of PATH), and
 	# find -perm, the search for setuid or writable files (by its -perm).
-	if command -v auditctl >/dev/null; then
-		audited > "$S/audited"
+	if [ -n "$audit" ]; then
 		printf 'section\tprobes\n'
 		printf 'audit\ton\t%s\n' "$(auditctl -s | awk '$1 == "lost" { print $2 }')"
 		grep "^probe$tab" "$S/audited" | sort -t "$tab" -k4,4 -k2,2
@@ -124,17 +133,34 @@ records() {
 # Not ausearch -i: code that walks the filesystem (linpeas) leaves hundreds
 # of MB of it, which ausearch takes minutes over. One pass, oldest first —
 # reading the log is most of the time — keeps the events worth classifying:
-# a path that tells a VM apart or that a privilege escalation looks for, a
-# file created, a path relative to somewhere else than ~/work, a command
+# a path that tells a VM apart or that a privilege escalation looks for
+# (and /etc/passwd: what perl reads before /etc/shadow, classify), a
+# file created, a path relative to somewhere else than ~/work, one in the
+# home outside ~/work (the decoys), a path of the user's rules, a command
 # run, a syscall of auditrules' narrow rules; each with its SYSCALL and CWD
 # records, which come first.
 audited() {
 	cat $(auditlogs) 2>/dev/null |
-		awk -v pi="name=\"(/($vmdirs|$pedirs)|[^\"]*/($vmtools|$petools)\")|nametype=CREATE| name=[0-9A-F]" -v work="cwd=\"$H/work" '
+		awk -v pi="name=\"(/($vmdirs|$pedirs|etc/passwd\")|[^\"]*/($vmtools|$petools)\")|nametype=CREATE| name=[0-9A-F]" -v work="cwd=\"$H/work" \
+			-v hn=" name=\"$H/" -v hw=" name=\"$H/work" -v home="$H" -v rules="$S/rules" '
+			# the rules'"'"' paths, as a PATH record names them
+			BEGIN {
+				while ((getline l < rules) > 0) {
+					split(l, sv, "\t")
+					if (sv[1] != "path") continue
+					x = substr(sv[3], 2)
+					if (substr(x, 1, 1) == "~") x = home substr(x, 2)
+					# the end of the name is its closing quote: (/|$) a
+					# directory or what is inside it, $ the file itself
+					if (substr(x, length(x) - 4) == "(/|$)") x = substr(x, 1, length(x) - 5) "(/|\")"
+					else if (substr(x, length(x)) == "$") x = substr(x, 1, length(x) - 1) "\""
+					up = up (up == "" ? "" : "|") "name=\"" x
+				}
+			}
 			/^type=SYSCALL/ { sys = $0; cwd = ""; keep = / key="mh-(privesc|persist|net)"| SYSCALL=execve /; if (keep) print; next }
 			/^type=CWD/ { cwd = $0; if (keep) print; next }
 			/^type=PATH/ {
-				if (!keep && ($0 ~ pi || / name="[^\/]/ && (index(cwd, work) != 1 || / name="[^"]*\.\./))) {
+				if (!keep && ($0 ~ pi || up != "" && $0 ~ up || index($0, hn) && !index($0, hw) || / name="[^\/]/ && (index(cwd, work) != 1 || / name="[^"]*\.\./))) {
 					print sys; print cwd; keep = 1
 				}
 				if (keep) print
@@ -168,6 +194,8 @@ changed() {
 		awk -F'|' -v m="$since" -v w="$H/work/" -v kind="$kind" '
 			$1 ~ /^[0-9][0-9][0-9][0-9]-/ && $1 > m {
 				sub(/^[^|]*\|/, ""); gsub(/[^[:print:]]/, "?")
+				# ~/work itself: its entries are the code'"'"'s own
+				if ($0 "/" == w) next
 				if (index($0, w) != 1) {
 					print kind "\t" $0
 					next
@@ -206,6 +234,7 @@ human() {
 			if ($2 == "untouched" || $2 == "DELETED") printf "%-16s %s\n", $2, $3
 			else printf "%-16s %s   (legitimately: %s)\n", $2, $3, $4
 		}
+		$1 == "decoyby" { printf "  %3d× opened %s by %s\n", $3, $4, $5 }
 		$1 == "audit" && $2 == "off" { print "  (no audit in this image: not recorded)" }
 		$1 == "audit" && $3 + 0 > 0  { print "  (audit lost " $3 " events: this list may be incomplete)" }
 		$1 == "probe" || $1 == "privesc" { printf "  %3d %-7s %s by %s\n", $3, $2, $4, $5 }

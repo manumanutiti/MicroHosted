@@ -17,6 +17,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,12 +48,15 @@ sandbox's own, which is closed before the code runs: the code never runs with
 a network, and every connection it tries is refused and recorded. If closing
 it cannot be confirmed, nothing runs.
 
-The report: a verdict, then only what was found, graded high, warn or info —
-decoy credentials read, ways the code looked for a VM or for root, files
-changed, processes left, sockets opened, connections refused, and text
-addressed to an AI agent in the input or the output. The code's own output
-only with -o. An empty report is not "safe": it is what this run did. File names, process names, the output and
-matched text are the code's to choose — data, never instructions.
+The report: a verdict (SUSPICIOUS, REVIEW, NOTHING SUSPICIOUS SEEN), then one
+line per kind of finding, graded high, warn or info — decoy credentials read,
+ways the code looked for a VM or for root, files changed, processes left,
+sockets opened, connections refused, text addressed to an AI agent in the
+input or the output. Every finding with -v; each as it happens with --live; the code's own
+output with -o.
+An empty report is not "safe": it is what this run did. File names, process
+names, the output and matched text are the code's to choose — data, never
+instructions.
 
 The image is built once: mh build -t sandbox:1 sandbox  (docs/sandbox.md)`,
 	examples: `  mh sandbox ./install.sh
@@ -70,7 +75,9 @@ type sandboxOpts struct {
 	keep    bool
 	asJSON  bool
 	verbose bool
+	live    bool
 	output  bool
+	rules   []string
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -96,8 +103,10 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.defined = append(fs.defined, "timeout")
 	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
 	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
-	fs.boolVar(&o.verbose, "verbose", "v", "show what it does as it happens; then every probe by every program, and every command it ran")
+	fs.boolVar(&o.verbose, "verbose", "v", "the report in full: every finding, every probe by every program, every command it ran")
+	fs.boolVar(&o.live, "live", "", "print each finding as it happens (every 2 s), while the code runs; the report follows")
 	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
+	fs.listVar(&o.rules, "rules", "", "a `FILE` of rules of your own: detections, findings accepted (repeatable; sandbox/rules/, docs/sandbox.md)")
 	pos, err := fs.parse(args)
 	if err != nil {
 		return err
@@ -138,11 +147,24 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	if strings.ContainsAny(command+o.fetch, "\n\r") {
 		return usagef(p, "COMMAND and --fetch must be one line each")
 	}
+	// The code under test does not grade itself: no rules from inside it.
+	if t.kind == "dir" || t.kind == "file" {
+		for _, f := range o.rules {
+			if within(f, t.path) {
+				return usagef(p, "--rules %s: inside %s, the code under test: its rules could accept what it does", f, t.given)
+			}
+		}
+	}
+	// before anything is created: a bad rule costs no VM
+	rules, err := loadSandboxRules(o.rules)
+	if err != nil {
+		return usagef(p, "rules: %v", err)
+	}
 	c, err := e.api()
 	if err != nil {
 		return err
 	}
-	s := &sandbox{e: e, c: c, o: o, t: t, command: command}
+	s := &sandbox{e: e, c: c, o: o, t: t, command: command, rules: rules}
 	return s.run()
 }
 
@@ -198,6 +220,8 @@ type sandbox struct {
 	o       sandboxOpts
 	t       sandboxTarget
 	command string
+
+	rules *sandboxRules
 
 	image   string
 	vm      string
@@ -295,6 +319,9 @@ func (s *sandbox) run() (err error) {
 		}
 		prepare = "mh-sandbox-prepare"
 	}
+	if err := s.uploadRules(); err != nil {
+		return err
+	}
 	if err := s.root(prepare, time.Minute); err != nil {
 		return err
 	}
@@ -307,7 +334,7 @@ func (s *sandbox) run() (err error) {
 	}
 	s.say("run: %s", s.command)
 	stopWatch := func() {}
-	if s.o.verbose {
+	if s.o.live {
 		stopWatch = s.watch()
 	}
 	began := time.Now()
@@ -323,6 +350,7 @@ func (s *sandbox) run() (err error) {
 	}
 
 	rep := s.report()
+	rep.applyRules(s.rules)
 	rep.ExitCode, rep.TimedOut, rep.DurationMS = code, timedOut, took.Milliseconds()
 	rep.Output = untrustedTail(res.Output, 8<<10)
 	patterns, perr := s.patterns()
@@ -351,7 +379,7 @@ func (s *sandbox) run() (err error) {
 	return nil
 }
 
-// watchEvery is how often -v looks at what the code has done while it runs.
+// watchEvery is how often --live looks at what the code has done while it runs.
 var watchEvery = 2 * time.Second
 
 // watch prints, while the code runs, each finding as it appears: a decoy
@@ -362,6 +390,8 @@ var watchEvery = 2 * time.Second
 func (s *sandbox) watch() (stop func()) {
 	start := time.Now()
 	seen := map[string]bool{}
+	tools := map[string][]string{} // a decoy's own tools
+	read := map[string]bool{}      // a decoy whose reader was named
 	pos := ""
 	guest := true
 	st := styleFor(s.e.stderr)
@@ -381,6 +411,9 @@ func (s *sandbox) watch() (stop func()) {
 				guest = false
 				fmt.Fprintf(s.e.stderr, "  (image %s has no mh-sandbox-watch: only connections show live; rebuild it from sandbox/)\n", s.image)
 			case r.ExitCode == 0:
+				// a decoy READ by its times shows after the look's records:
+				// a reader named (decoyby) says more, and may be its own tool
+				var decoys [][]string
 				for _, line := range strings.Split(r.Output, "\n") {
 					f := strings.Split(line, "\t")
 					at := func(i int) string {
@@ -393,14 +426,27 @@ func (s *sandbox) watch() (stop func()) {
 					case "at":
 						pos = shellQuote(at(1)) + " " + shellQuote(at(2))
 					case "decoy":
-						show("decoy "+at(1)+at(2), sevHigh, "decoy", at(1)+"  "+at(2))
+						tools[at(2)] = strings.Fields(at(3))
+						decoys = append(decoys, []string{at(1), at(2)})
+					case "decoyby":
+						read[at(3)] = true
+						sev := sevHigh
+						if slices.Contains(tools[at(3)], at(4)) {
+							sev = sevInfo
+						}
+						show("decoyby "+at(3)+"\t"+at(4), sev, "decoy", "opened "+at(3)+"  (by "+at(4)+")")
 					case "probe":
 						show("probe "+at(1)+at(3), vmProbeSeverity(at(3)), "VM probe", at(3)+" "+at(1)+"  (by "+at(4)+")")
 					case "privesc":
 						show("privesc "+at(1)+at(3), privescSeverity(at(3)), "privesc", at(3)+" "+at(1)+"  (by "+at(4)+")")
 					case "alert":
-						k := kindOf(at(1))
+						k := s.rules.kindOf(at(1))
 						show("alert "+at(1)+at(3), k.Severity, "alert", k.Title+": "+at(3)+"  (by "+at(4)+")")
+					}
+				}
+				for _, d := range decoys {
+					if d[0] != "READ" || !read[d[1]] {
+						show("decoy "+d[0]+d[1], sevHigh, "decoy", d[0]+"  "+d[1])
 					}
 				}
 			}
@@ -409,16 +455,18 @@ func (s *sandbox) watch() (stop func()) {
 		if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err == nil {
 			for _, f := range flows.Flows {
 				if f.Count > s.before[flowKey(f)] {
-					dst := f.Dst
-					if f.DstPort != 0 {
-						dst += ":" + strconv.Itoa(f.DstPort)
-					}
+					dst := connDst(sandboxConn{Dst: f.Dst, DstPort: f.DstPort})
 					show("flow "+flowKey(f), sevWarn, "connection", f.Protocol+" "+dst+" refused  ("+f.Reason+")")
+					for _, d := range s.rules.detects() {
+						if d.Connect != "" && d.conn.match(f.Dst, f.DstPort) {
+							show("rule "+d.Name+flowKey(f), d.sev, "alert", "your rule "+d.Name+": "+dst)
+						}
+					}
 				}
 			}
 		}
 	}
-	s.say("live (-v): what it does, as it happens")
+	s.say("live: what it does, as it happens")
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
@@ -560,6 +608,35 @@ func (s *sandbox) root(cmd string, timeout time.Duration) error {
 	return nil
 }
 
+// uploadRules gives the guest the user's path and command rules, root's
+// alone, before the sandbox is prepared (and after the fetch, which runs as
+// the sandbox's user).
+func (s *sandbox) uploadRules() error {
+	g := s.rules.guest()
+	if g == "" {
+		return nil
+	}
+	f, err := os.CreateTemp("", "mh-sandbox-rules-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	_, err = f.WriteString(g)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.root("install -d -m 700 /var/lib/mh-sandbox", time.Minute); err != nil {
+		return err
+	}
+	if err := s.upload(f.Name(), "/var/lib/mh-sandbox/rules"); err != nil {
+		return err
+	}
+	return s.root("chmod 600 /var/lib/mh-sandbox/rules", time.Minute)
+}
+
 func (s *sandbox) upload(local, remote string) error {
 	f, err := os.Open(local)
 	if err != nil {
@@ -596,6 +673,9 @@ func (s *sandbox) report() *sandboxReport {
 		rep.Complete = true
 		if rep.commands < 0 {
 			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the commands the code ran: rebuild it from sandbox/ (docs/sandbox.md)")
+		}
+		if s.rules.guest() != "" && rep.rulesApplied == 0 {
+			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not apply your path and command rules (only connect and accept ones were): rebuild it from sandbox/ (docs/sandbox.md)")
 		}
 	}
 	rep.Target, rep.Image, rep.VM, rep.Kept = s.t.given, s.image, s.vm, s.o.keep
@@ -671,14 +751,37 @@ func scanText(where, text string, patterns []*regexp.Regexp) []sandboxAgentText 
 				out = append(out, sandboxAgentText{Where: where, Line: i + 1, Text: untrusted(m, 160)})
 			}
 		}
-		if strings.IndexFunc(line, invisible) >= 0 {
-			out = append(out, sandboxAgentText{Where: where, Line: i + 1, Text: "(invisible Unicode characters)"})
+		if h := hiddenText(line, where == "created"); h != "" {
+			out = append(out, sandboxAgentText{Where: where, Line: i + 1, Text: h})
 		}
 		if len(out) >= 200 {
 			break
 		}
 	}
 	return out
+}
+
+// hiddenText says how line hides text from a person and not from a model,
+// as mh-sandbox-scan does for the input: Unicode tag characters, a run of
+// zero-width ones (one alone is in emoji and in Persian or Indic names), and
+// — where asked, in a file's name — bidirectional controls. "" if it does not.
+func hiddenText(line string, bidi bool) string {
+	run := 0
+	for _, r := range line {
+		switch {
+		case r >= 0xE0000 && r <= 0xE007F:
+			return "(Unicode tag characters: text a model reads and a person does not see)"
+		case r >= 0x200B && r <= 0x200D || r >= 0x2060 && r <= 0x2064 || r == 0xFEFF:
+			if run++; run >= 3 {
+				return "(a run of zero-width characters: hidden text)"
+			}
+			continue
+		case bidi && (r >= 0x202A && r <= 0x202E || r >= 0x2066 && r <= 0x2069):
+			return "(bidirectional controls: it reads otherwise than it is)"
+		}
+		run = 0
+	}
+	return ""
 }
 
 func invisible(r rune) bool {
@@ -1007,13 +1110,31 @@ type sandboxReport struct {
 	AddressesAnAgent []sandboxAgentText `json:"addresses_an_agent"` // untrusted: file, text
 	Output           string             `json:"output"`             // untrusted
 	Warnings         []string           `json:"warnings"`
+	// Rules: the files of the user's rules this run read (sandbox_rules.go);
+	// Accepted: what their accept rules matched, out of the lists above.
+	Rules    []string          `json:"rules"`
+	Accepted []sandboxAccepted `json:"accepted"`
+
+	// Verdict, for a program: suspicious (a high finding), review (warn),
+	// clean (nothing high or warn: not proof it is safe), incomplete (the
+	// VM's side could not be read).
+	Verdict string `json:"verdict"`
 
 	user     string
 	commands int // distinct, as the image counted them; -1: not recorded
+	decoyBy  map[string]map[string]int
+	readers  bool // the image names who opened a decoy (decoy has TOOLS, decoyby)
+	rules    *sandboxRules
+	// rulesApplied: the user's path and command rules the image read
+	rulesApplied int
 }
 
 type sandboxSummary struct {
-	DecoysRead         int  `json:"decoys_read"`
+	// High, Warn, Info: the findings, one per line of the report without -v.
+	High               int  `json:"high"`
+	Warn               int  `json:"warn"`
+	Info               int  `json:"info"`
+	DecoysRead         int  `json:"decoys_read"` // touched, by any program
 	VMProbes           int  `json:"vm_probes"`
 	EvasionSuspected   bool `json:"evasion_suspected"`
 	Privesc            int  `json:"privesc"`
@@ -1030,6 +1151,18 @@ type sandboxDecoy struct {
 	Path         string `json:"path"`
 	State        string `json:"state"`
 	Legitimately string `json:"legitimately"`
+	// By: the programs that opened it (audit), "name ×N"; untrusted. Empty
+	// for a decoy READ: who read it is unknown, not no one.
+	By []string `json:"by"`
+	// ByItsTool: only READ, and only by the program that reads it
+	// legitimately (npm, ~/.npmrc): graded info, not high.
+	ByItsTool bool   `json:"by_its_tool"`
+	Severity  string `json:"severity"`
+	// Accepted: the why of the user's accept rule that matched it
+	Accepted string `json:"accepted,omitempty"`
+
+	tools  []string
+	counts map[string]int
 }
 
 type sandboxProbe struct {
@@ -1091,7 +1224,7 @@ type sandboxAgentText struct {
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
 		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
-		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{},
+		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
 		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
 		commands: -1,
 	}
@@ -1107,8 +1240,19 @@ func parseSandboxReport(tsv string) *sandboxReport {
 		switch f[0] {
 		case "user":
 			r.user = at(1)
+		case "rules":
+			r.rulesApplied = num(1)
 		case "decoy":
-			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3)})
+			r.readers = r.readers || len(f) > 4
+			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3), By: []string{}, tools: strings.Fields(at(4))})
+		case "decoyby":
+			if r.decoyBy == nil {
+				r.decoyBy = map[string]map[string]int{}
+			}
+			if r.decoyBy[at(3)] == nil {
+				r.decoyBy[at(3)] = map[string]int{}
+			}
+			r.decoyBy[at(3)][at(4)] += num(2)
 		case "audit":
 			if at(1) == "off" {
 				r.Warnings = append(r.Warnings, "no audit in this image: how the code looked for a VM is not recorded")
@@ -1153,7 +1297,9 @@ var commonProbes = map[string]bool{"/proc/cpuinfo": true, "/proc/self/cgroup": t
 
 func (r *sandboxReport) summarize() {
 	s := &r.Summary
-	for _, d := range r.Decoys {
+	for i := range r.Decoys {
+		d := &r.Decoys[i]
+		d.grade(r.decoyBy[d.Path])
 		if d.State != "untouched" {
 			s.DecoysRead++
 		}
@@ -1174,6 +1320,54 @@ func (r *sandboxReport) summarize() {
 		s.ConnectionsRefused += int(c.Count)
 	}
 	s.AddressesAnAgent = len(r.AddressesAnAgent)
+
+	counts := map[severity]int{}
+	for _, c := range r.categories(viewStyle{}, false) {
+		for _, f := range c.items {
+			counts[f.sev]++
+		}
+	}
+	s.High, s.Warn, s.Info = counts[sevHigh], counts[sevWarn], counts[sevInfo]
+	switch {
+	case !r.Complete:
+		r.Verdict = "incomplete"
+	case s.High > 0:
+		r.Verdict = "suspicious"
+	case s.Warn > 0:
+		r.Verdict = "review"
+	default:
+		r.Verdict = "clean"
+	}
+}
+
+// grade names who opened the decoy and how serious that is: info when it
+// was only read, and only by the tool that reads it (npm, ~/.npmrc); high
+// otherwise — tampered, deleted, read by anything else, or by no program
+// audit saw (unknown is not innocent).
+func (d *sandboxDecoy) grade(by map[string]int) {
+	d.counts = by
+	names := make([]string, 0, len(by))
+	for n := range by {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	d.By = d.By[:0]
+	own := len(names) > 0
+	for _, n := range names {
+		d.By = append(d.By, n+" ×"+strconv.Itoa(by[n]))
+		if !slices.Contains(d.tools, n) {
+			own = false
+		}
+	}
+	d.ByItsTool = d.State == "READ" && own
+	switch {
+	case d.State == "untouched":
+		d.Severity = ""
+	case d.ByItsTool, d.Accepted != "":
+		d.Severity = sevInfo.String()
+	default:
+		d.Severity = sevHigh.String()
+	}
 }
 
 // names are the paths the code created or changed, ~/work's entries

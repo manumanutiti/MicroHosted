@@ -8,7 +8,9 @@
 # INODE OFFSET is where the last look stopped in audit's log (its last line,
 # "at INODE OFFSET"); without it, the log is read from its start. Out, tab-
 # separated, as mh-sandbox-report --tsv:
-#   decoy READ|TAMPERED|… PATH        every decoy touched so far
+#   decoy READ|TAMPERED|… PATH TOOLS  every decoy touched so far, and
+#                                     the programs that read it legitimately
+#   decoyby open COUNT PATH BY        which program opened one
 #   probe|privesc STATE COUNT PATH BY
 #   exec FIRST COUNT ARGS
 #   alert KIND COUNT WHAT BY
@@ -29,11 +31,11 @@ tab=$(printf '\t')
 log=/var/log/audit/audit.log
 
 # Decoys: their times, as the report reads them.
-while IFS="$tab" read -r f note; do
-	a=$(stat -c %x "$f" 2>/dev/null) || { printf 'decoy\tDELETED\t%s\n' "$f"; continue; }
+while IFS="$tab" read -r f note tools; do
+	a=$(stat -c %x "$f" 2>/dev/null) || { printf 'decoy\tDELETED\t%s\t%s\n' "$f" "$tools"; continue; }
 	c=$(stat -c %z "$f")
 	r=$(awk -v a="$a" -v c="$c" -v m="$since" 'BEGIN { r = a > m ? "READ" : ""; if (c > m) r = r (r ? "+" : "") "TAMPERED"; print r }')
-	[ -z "$r" ] || printf 'decoy\t%s\t%s\n' "$r" "$f"
+	[ -z "$r" ] || printf 'decoy\t%s\t%s\t%s\n' "$r" "$f" "$tools"
 done < "$S/decoys"
 
 command -v auditctl >/dev/null || exit 0

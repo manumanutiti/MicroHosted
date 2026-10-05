@@ -1,9 +1,9 @@
 #!/bin/sh
 # Looks in ~/work — the code and what was fetched for it — for text addressed
 # to an AI agent: the phrases in /usr/share/mh-sandbox/agent-patterns, in a
-# file or in a file's name, and invisible Unicode (zero-width, bidirectional
-# controls, tag characters) that hides text from a person and not from a
-# model. Run it as root (mh exec), after mh-sandbox-prepare and before the
+# file or in a file's name, and invisible Unicode that hides text from a
+# person and not from a model (tag characters, runs of zero-width ones,
+# bidirectional controls in code). Run it as root (mh exec), after mh-sandbox-prepare and before the
 # code runs; mh-sandbox-report lists what it found.
 #
 # Root reads, never writes or follows a link: grep -r does not follow
@@ -21,6 +21,23 @@ cd "$H/work" || exit 1
 pat=$S/patterns
 grep -v -e '^#' -e '^$' "$P" > "$pat"
 
+# invisible PCRE LABEL [--include…]: the first line of each file with PCRE
+# in it, as FILE \001 LINE \001 LABEL. What hides text, not every invisible
+# character: a single zero-width joiner is in emoji and in Persian or Indic
+# names, a BOM starts many files, and a right-to-left override in a name in
+# AUTHORS.txt (pip has two) hides nothing that runs — in code, it does.
+invisible() {
+	_p=$1 _l=$2
+	shift 2
+	LC_ALL=C.UTF-8 grep -rInPZ -D skip --exclude-dir=.git "$@" -e "$_p" . 2>/dev/null |
+		awk -v l="$_l" '{ i = index($0, "\000"); f = substr($0, 1, i - 1); if (f in seen) next; seen[f] = 1
+		       r = substr($0, i + 1); print f "\001" substr(r, 1, index(r, ":") - 1) "\001" l }'
+}
+code=
+for _e in c h cc cpp hpp cs go rs java kt swift scala js mjs cjs jsx ts tsx py rb php pl lua sh bash zsh ps1 sql; do
+	code="$code --include=*.$_e"
+done
+
 # FILE <TAB> LINE <TAB> TEXT, unprintable as ?, the text cut at 160.
 # Fields are joined with \001 until the end: a file name may hold a colon or
 # a tab, never a NUL (grep -Z ends the name with one).
@@ -28,8 +45,9 @@ grep -v -e '^#' -e '^$' "$P" > "$pat"
 	grep -rIinoEZ -D skip --exclude-dir=.git -f "$pat" . 2>/dev/null | tr '\000' '\001' |
 		awk '{ i = index($0, "\001"); r = substr($0, i + 1); j = index(r, ":")
 		       print substr($0, 1, i) substr(r, 1, j - 1) "\001" substr(r, j + 1) }'
-	LC_ALL=C.UTF-8 grep -rIlP -D skip --exclude-dir=.git '[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E0000}-\x{E007F}]' . 2>/dev/null |
-		awk '{ print $0 "\0010\001(invisible Unicode characters)" }'
+	invisible '[\x{E0000}-\x{E007F}]' '(Unicode tag characters: text a model reads and a person does not see)'
+	invisible '[\x{200B}-\x{200D}\x{2060}-\x{2064}\x{FEFF}]{3,}' '(a run of zero-width characters: hidden text)'
+	invisible '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' '(bidirectional controls in code: it reads otherwise than it runs)' $code
 	find . -path ./.git -prune -o -print 2>/dev/null | grep -iE -f "$pat" | awk '{ print $0 "\0010\001(its name)" }'
 } | awk -F'\001' '{
 	sub(/^\.\//, "", $1)
