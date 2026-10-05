@@ -39,11 +39,12 @@ mount -o remount,strictatime /
 mount -o remount,hidepid=2 /proc 2>/dev/null || true
 sysctl -w kernel.kptr_restrict=2 kernel.dmesg_restrict=1 >/dev/null
 # Out of memory, the kernel kills the code, never what reports on it: the
-# agent mh talks to (and every command it starts from now on), audit, init.
+# agent mh talks to (and every command it starts from now on), audit, init,
+# the journal (by its 15-character process name, as pgrep matches).
 # mh-sandbox-run puts the code at the other end (1000), where it cannot climb
 # back from. A build that outgrows the VM (go build in 512 MB) then fails as
 # itself instead of taking the report with it.
-for _p in 1 $(pgrep -x socat) $(pgrep -x auditd) $(pgrep -x systemd-journald); do
+for _p in 1 $(pgrep -x socat) $(pgrep -x auditd) $(pgrep -x systemd-journal); do
 	echo -1000 > "/proc/$_p/oom_score_adj" 2>/dev/null || true
 done
 
