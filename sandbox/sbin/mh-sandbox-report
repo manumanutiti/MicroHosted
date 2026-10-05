@@ -115,22 +115,42 @@ records() {
 	printf 'section\tprocs\n'
 	ps -e -o pid=,user=,args= | awk -v u="$U" '$2 == u { pid = $1; $1 = $2 = ""; sub(/^ +/, ""); gsub(/[^[:print:]]/, "?"); printf "proc\t%s\t%s\n", pid, $0 }'
 
-	# listen PROTO ADDRESS
+	# listen PROTO ADDRESS — the sockets the code listens on
 	printf 'section\tlisten\n'
 	if command -v ss >/dev/null; then
-		ss -Htuln | awk '{ printf "listen\t%s\t%s\n", $1, $5 }'
+		# the code's alone (uid:): not the sandbox's resolver and sinkhole
+		ss -Htulne | awk -v u=" uid:$(id -u "$U") " 'index($0 " ", u) { printf "listen\t%s\t%s\n", $1, $5 }'
 	else
 		netstat -tuln 2>/dev/null | tail -n +3 | awk '{ printf "listen\t%s\t%s\n", $1, $4 }'
 	fi
 
-	# dns COUNT TYPE NAME — the names the code looked up (mh-sandbox-dns),
-	# in the order first asked, the first 500; dns off: not recorded here.
-	printf 'section\tdns\n'
-	if [ -e "$S/dns" ]; then
-		awk -F'\t' 'NF == 2 { k = $1 "\t" $2; if (!(k in n)) o[++m] = k; n[k]++ }
-			END { for (i = 1; i <= m && i <= 500; i++) printf "dns\t%d\t%s\n", n[o[i]], o[i] }' "$S/dns"
+	# The code's network (mh-sandbox-net), in the order first seen, the first
+	# 500 of each:
+	#   net sinkhole|servfail|off   names answered into the sinkhole, none,
+	#                               or not recorded (no resolver here)
+	#   dns COUNT TYPE NAME         a name looked up
+	#   addr ADDRESS NAME           the sinkhole's address given to NAME
+	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT
+	#                               a request to the sinkhole; TOKEN 1: this
+	#                               run's decoy token was in it; BYTES summed
+	#   tls COUNT NAME              an HTTPS client that refused the
+	#                               sinkhole's certificate: only the name
+	printf 'section\tnet\n'
+	if [ -s "$S/net" ] && [ -e "$N/log" ]; then
+		printf 'net\t%s\n' "$(cat "$S/net")"
+		awk -F'\t' '
+			function add(kind, k, extra) { if (!((kind, k) in n)) { o[kind, ++m[kind]] = k; x[kind, k] = extra } n[kind, k]++ }
+			$1 == "dns" && NF == 3 { add("dns", $2 "\t" $3) }
+			$1 == "addr" && NF == 3 { if (++a <= 500) print }
+			$1 == "http" && NF == 7 { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; t[k] = t[k] || $6; p[k] = $7 }
+			$1 == "tls" && NF == 3 { add("tls", $2) }
+			END {
+				for (i = 1; i <= m["dns"] && i <= 500; i++) { k = o["dns", i]; printf "dns\t%d\t%s\n", n["dns", k], k }
+				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\n", n["http", k], k, b[k], t[k], p[k] }
+				for (i = 1; i <= m["tls"] && i <= 500; i++) { k = o["tls", i]; printf "tls\t%d\t%s\n", n["tls", k], k }
+			}' "$N/log"
 	else
-		printf 'dns\toff\n'
+		printf 'net\toff\n'
 	fi
 
 	# agent input FILE LINE TEXT — text addressed to an AI agent in the input,
@@ -200,7 +220,7 @@ health() {
 changed() {
 	kind=$1
 	shift
-	find / -xdev "$@" ! -path "$S" ! -path "$S/*" ! -path /var/log/audit ! -path "/var/log/audit/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
+	find / -xdev "$@" ! -path "$S" ! -path "$S/*" ! -path "$N" ! -path "$N/*" ! -path /var/log/audit ! -path "/var/log/audit/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
 		awk -F'|' -v m="$since" -v w="$H/work/" -v kind="$kind" '
 			$1 ~ /^[0-9][0-9][0-9][0-9]-/ && $1 > m {
 				sub(/^[^|]*\|/, ""); gsub(/[^[:print:]]/, "?")
@@ -238,7 +258,7 @@ human() {
 			if ($2 == "dirs")   print "== directories whose entries changed (a file created, renamed or deleted in them)"
 			if ($2 == "procs")  print "== processes left running as " u
 			if ($2 == "listen") print "== listening sockets"
-			if ($2 == "dns")    print "== names looked up (none answered)"
+			if ($2 == "net")    print "== its network (the sandbox'"'"'s own: nothing left the VM)"
 			if ($2 == "agent")  print "== text addressed to an AI agent, in the input (a signal, not proof)"
 		}
 		$1 == "decoy" {
@@ -257,8 +277,12 @@ human() {
 		$1 == "work" && $3 !~ /\/$/ { print "  " w $3 }
 		$1 == "proc"   { printf "  %6s  %s\n", $2, $3 }
 		$1 == "listen" { printf "  %-5s %s\n", $2, $3 }
-		$1 == "dns" && $2 == "off" { print "  (no resolver of the sandbox in this image: not recorded)" }
-		$1 == "dns" && $2 != "off" { printf "  %4d× %-5s %s\n", $2, $3, $4 }
+		$1 == "net" && $2 == "off" { print "  (no network of the sandbox in this image: names not recorded)" }
+		$1 == "net" && $2 == "servfail" { print "  (no name answered)" }
+		$1 == "net" && $2 == "sinkhole" { print "  (names answered into the sinkhole, which answers HTTP and HTTPS)" }
+		$1 == "dns"  { printf "  %4d× looked up %-5s %s\n", $2, $3, $4 }
+		$1 == "http" { printf "  %4d× %s %s  (%d bytes%s)\n", $2, $4, $5, $6, $7 ? ", WITH THE DECOY TOKEN" : "" }
+		$1 == "tls"  { printf "  %4d× https %s  (refused the sinkhole'"'"'s certificate)\n", $2, $3 }
 		$1 == "agent"  { printf "  %s:%s: %s\n", $3, $4, $5 }'
 }
 

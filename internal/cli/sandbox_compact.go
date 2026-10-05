@@ -462,30 +462,93 @@ func renderLines(w io.Writer, st viewStyle, items []finding, clip bool) {
 // what audit saw that the host did not.
 func (r *sandboxReport) network(x string) category {
 	c := category{title: "tried to reach the network", note: "refused by the host: nothing got out", phrase: "tried to reach the network"}
+	if r.Net == "sinkhole" {
+		c.note = "the sandbox's own network answered: nothing left the VM"
+	}
+	// who: the programs that connected to each destination (audit, inside),
+	// the sinkhole's addresses by the name they were given to
 	who := map[string]map[string]int{}
 	var inside []string
 	for _, a := range r.Alerts {
 		if a.Kind != "connect" {
 			continue
 		}
-		dst := strings.TrimSuffix(a.What, " (dns)")
+		dst := r.sinkName(strings.TrimSuffix(a.What, " (dns)"))
 		if who[dst] == nil {
 			who[dst] = map[string]int{}
 			inside = append(inside, dst)
 		}
 		who[dst][a.By] += a.Count
 	}
-	// the names first: what it meant to reach, where an address says little
-	for _, d := range r.DNS {
-		f := finding{sev: sevWarn, cols: []string{"dns", d.Name, x + strconv.Itoa(d.Count)}, tail: d.Type + ", not answered", tailDim: true, short: d.Name}
-		if r.token != "" && strings.Contains(d.Name, strings.ToLower(r.token)) {
+	by := func(dst string) string {
+		if len(who[dst]) == 0 {
+			return ""
+		}
+		return "by " + topNames(who[dst], 3)
+	}
+	join := func(parts ...string) string {
+		var out []string
+		for _, p := range parts {
+			if p != "" {
+				out = append(out, p)
+			}
+		}
+		return strings.Join(out, "; ")
+	}
+	seen := map[string]bool{}
+	secretSent := false // the phrase names the first request that carried one
+	// what it sent first: a secret going out is what matters most
+	for _, q := range r.Requests {
+		host := urlHost(q.URL)
+		dst := host + ":" + strconv.Itoa(defaultPort(q.Scheme, q.Port))
+		seen[dst] = true
+		f := finding{sev: sevWarn, cols: []string{q.Method, q.URL, x + strconv.Itoa(q.Count)}, tail: join(sizeOf(q.Bytes), by(dst)), tailDim: true, short: q.Method + " " + host}
+		if q.CarriesToken {
 			f.sev, f.tailDim = sevHigh, false
-			f.tail = d.Type + "; carries this run's decoy token: a secret sent out in a name"
-			c.phrase = "sent a decoy's secret out in a DNS name"
+			f.tail = join("carries this run's decoy token: a secret sent out", sizeOf(q.Bytes), by(dst))
+			if !secretSent {
+				c.phrase = "sent a decoy's secret to " + host
+			}
+			secretSent = true
 		}
 		c.items = append(c.items, f)
 	}
-	seen := map[string]bool{}
+	for _, t := range r.TLSRefused {
+		dst := t.Name + ":443"
+		seen[dst] = true
+		c.items = append(c.items, finding{sev: sevWarn, cols: []string{"https", t.Name, x + strconv.Itoa(t.Count)}, tail: join("refused the sinkhole's certificate (its own list of authorities): what it would send is unknown", by(dst)), tailDim: true, short: t.Name})
+	}
+	// the names: what it meant to reach, where an address says little; one
+	// line a name, its types together (A and AAAA are one lookup)
+	var names []string
+	types := map[string][]string{}
+	counts := map[string]int{}
+	for _, d := range r.DNS {
+		if _, ok := types[d.Name]; !ok {
+			names = append(names, d.Name)
+		}
+		types[d.Name] = append(types[d.Name], d.Type)
+		counts[d.Name] += d.Count
+	}
+	for _, name := range names {
+		answer := "not answered"
+		if r.Net == "sinkhole" {
+			answer = "no answer"
+			if slices.Contains(types[name], "A") {
+				answer = "answered into the sinkhole"
+			}
+		}
+		t := strings.Join(types[name], ", ")
+		f := finding{sev: sevWarn, cols: []string{"dns", name, x + strconv.Itoa(counts[name])}, tail: t + "; " + answer, tailDim: true, short: name}
+		if r.tokenIn(name) {
+			f.sev, f.tailDim = sevHigh, false
+			f.tail = "carries this run's decoy token: a secret sent out in a name; " + t
+			if !secretSent {
+				c.phrase = "sent a decoy's secret out in a DNS name"
+			}
+		}
+		c.items = append(c.items, f)
+	}
 	for _, n := range r.Connections {
 		dst := n.Dst
 		if strings.Contains(dst, ":") {
@@ -499,8 +562,8 @@ func (r *sandboxReport) network(x string) category {
 		if note := dstNote(n.Dst, n.DstPort); note != "" {
 			tail = append(tail, note)
 		}
-		if by := who[dst]; len(by) > 0 {
-			tail = append(tail, "by "+topNames(by, 3))
+		if b := by(dst); b != "" {
+			tail = append(tail, b)
 		}
 		if n.Reason != "egress" {
 			tail = append(tail, n.Reason)
@@ -508,22 +571,85 @@ func (r *sandboxReport) network(x string) category {
 		c.items = append(c.items, finding{sev: sevWarn, cols: []string{n.Protocol, dst, x + strconv.FormatUint(n.Count, 10)}, tail: strings.Join(tail, "; "), tailDim: true, short: dst})
 	}
 	for _, dst := range inside {
-		if seen[dst] {
+		// the resolver's own: the names it was asked are above
+		if seen[dst] || dst == sandboxResolver+":53" && len(r.DNS) > 0 {
 			continue
-		}
-		port := 0
-		if i := strings.LastIndex(dst, ":"); i >= 0 {
-			port, _ = strconv.Atoi(dst[i+1:])
-		}
-		tail := []string{"by " + topNames(who[dst], 3), "seen inside only"}
-		if note := dstNote(strings.Trim(dst[:max(strings.LastIndex(dst, ":"), 0)], "[]"), port); note != "" {
-			tail = append([]string{note}, tail...)
 		}
 		n := 0
 		for _, k := range who[dst] {
 			n += k
 		}
+		host, port := dst, 0
+		if i := strings.LastIndex(dst, ":"); i >= 0 {
+			host = dst[:i]
+			port, _ = strconv.Atoi(dst[i+1:])
+		}
+		if r.isSinkName(host) {
+			// a name the sinkhole answered, on a port it does not serve
+			c.items = append(c.items, finding{sev: sevWarn, cols: []string{"tcp", dst, x + strconv.Itoa(n)}, tail: join(dstNote("", port), "nothing listens there in the sinkhole", by(dst)), tailDim: true, short: dst})
+			continue
+		}
+		tail := []string{by(dst), "seen inside only"}
+		if note := dstNote(strings.Trim(host, "[]"), port); note != "" {
+			tail = append([]string{note}, tail...)
+		}
 		c.items = append(c.items, finding{sev: sevInfo, cols: []string{"?", dst, x + strconv.Itoa(n)}, tail: strings.Join(tail, "; "), tailDim: true, short: dst})
 	}
 	return c
+}
+
+// sinkName is ADDRESS:PORT with the sinkhole's address as the name it was
+// given to (evil.example:4444), or as it was.
+func (r *sandboxReport) sinkName(dst string) string {
+	i := strings.LastIndex(dst, ":")
+	if i < 0 {
+		return dst
+	}
+	if name, ok := r.sinkAddr[dst[:i]]; ok {
+		return name + dst[i:]
+	}
+	return dst
+}
+
+func (r *sandboxReport) isSinkName(host string) bool {
+	for _, n := range r.sinkAddr {
+		if n == host {
+			return true
+		}
+	}
+	return false
+}
+
+// urlHost is the host of a URL the sinkhole wrote down, without its port.
+func urlHost(u string) string {
+	_, rest, ok := strings.Cut(u, "://")
+	if !ok {
+		return u
+	}
+	host, _, _ := strings.Cut(rest, "/")
+	if h, _, ok := strings.Cut(host, ":"); ok && !strings.HasPrefix(host, "[") {
+		host = h
+	}
+	return host
+}
+
+// defaultPort is the port a request was sent to: the one the sinkhole saw.
+func defaultPort(scheme string, port int) int {
+	if port != 0 {
+		return port
+	}
+	if scheme == "https" {
+		return 443
+	}
+	return 80
+}
+
+func sizeOf(n int) string {
+	switch {
+	case n == 0:
+		return ""
+	case n < 1024:
+		return strconv.Itoa(n) + " bytes"
+	}
+	return strconv.Itoa(n/1024) + " KiB"
 }

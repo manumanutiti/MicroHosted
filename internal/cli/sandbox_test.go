@@ -880,22 +880,21 @@ func TestSandboxDNSNames(t *testing.T) {
 	}, "\n"))
 	r.Complete = true
 	r.summarize()
-	if r.Summary.DNSNames != 2 || !r.dnsSeen || r.Verdict != "suspicious" {
-		t.Errorf("dns_names %d, seen %v, verdict %s", r.Summary.DNSNames, r.dnsSeen, r.Verdict)
+	if r.Summary.DNSNames != 2 || !r.netSeen || r.Verdict != "suspicious" {
+		t.Errorf("dns_names %d, seen %v, verdict %s", r.Summary.DNSNames, r.netSeen, r.Verdict)
 	}
 	c := r.network("x")
 	var lines []string
 	for _, f := range c.items {
 		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
 	}
-	want := []string{"warn dns github.com x4 | A, not answered",
-		"high dns ab12cd.x.evil.example x1 | TXT; carries this run's decoy token: a secret sent out in a name",
-		"info ? 127.53.0.1:53 x5 | the sandbox's resolver: the names are above; by node; seen inside only"}
+	want := []string{"warn dns github.com x4 | A; not answered",
+		"high dns ab12cd.x.evil.example x1 | carries this run's decoy token: a secret sent out in a name; TXT"}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
 	}
-	if old := parseSandboxReport("user\tdev\n"); old.dnsSeen {
-		t.Error("an image without the section: dnsSeen")
+	if old := parseSandboxReport("user\tdev\n"); old.netSeen {
+		t.Error("an image without the section: netSeen")
 	}
 }
 
@@ -924,5 +923,46 @@ func TestHiddenTextFlags(t *testing.T) {
 	}
 	if (sandboxAgentText{Text: "(bidirectional controls in code: it reads otherwise than it runs)"}).severity() != sevWarn {
 		t.Error("bidi controls: want warn")
+	}
+}
+
+// What it sent the sinkhole comes first, high when it carries the decoy
+// token; a connection to the sinkhole's address is shown by its name.
+func TestSandboxSinkhole(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"section\tnet", "net\tsinkhole",
+		"addr\t198.18.0.1\tevil.example",
+		"addr\t198.18.0.2\tpypi.org",
+		"dns\t1\tA\tevil.example",
+		"dns\t1\tA\tpypi.org",
+		"http\t2\thttp\tPOST\thttp://evil.example/collect\t2048\t1\t80",
+		"tls\t1\tpypi.org",
+		"alert\tconnect\t2\t198.18.0.1:80\tpython3",
+		"alert\tconnect\t1\t198.18.0.1:4444\tbash",
+		"alert\tconnect\t1\t198.18.0.2:443\tpip",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	if r.Verdict != "suspicious" || r.Summary.SecretsSent != 1 || r.Summary.Requests != 2 || r.Net != "sinkhole" {
+		t.Errorf("verdict %s, summary %+v, net %q", r.Verdict, r.Summary, r.Net)
+	}
+	c := r.network("x")
+	var lines []string
+	for _, f := range c.items {
+		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
+	}
+	want := []string{
+		"high POST http://evil.example/collect x2 | carries this run's decoy token: a secret sent out; 2 KiB; by python3",
+		"warn https pypi.org x1 | refused the sinkhole's certificate (its own list of authorities): what it would send is unknown; by pip",
+		"warn dns evil.example x1 | A; answered into the sinkhole",
+		"warn dns pypi.org x1 | A; answered into the sinkhole",
+		"warn tcp evil.example:4444 x1 | a port reverse shells use; nothing listens there in the sinkhole; by bash",
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+	if c.phrase != "sent a decoy's secret to evil.example" || c.note != "the sandbox's own network answered: nothing left the VM" {
+		t.Errorf("phrase %q, note %q", c.phrase, c.note)
 	}
 }

@@ -44,9 +44,11 @@ https:// git URL; it lands in ~/work, where COMMAND — one shell line — runs 
 an unprivileged user. A file with no COMMAND is run itself.
 
 Anything fetched (--fetch, --apt, a URL) is fetched first, on a network of the
-sandbox's own, which is closed before the code runs: the code never runs with
-a network, and every connection it tries is refused and recorded. If closing
-it cannot be confirmed, nothing runs.
+sandbox's own, which is closed before the code runs: the code never reaches
+the internet. If closing it cannot be confirmed, nothing runs. What the code
+reaches for is answered inside the VM, and written down: every name it looks
+up points at a sinkhole that answers HTTP and HTTPS and records what was sent
+— a decoy's secret in it is high (--no-sinkhole: no name answered).
 
 The report: a verdict (SUSPICIOUS, REVIEW, NOTHING SUSPICIOUS SEEN), then one
 line per kind of finding, graded high, warn or info — decoy credentials read,
@@ -80,6 +82,8 @@ type sandboxOpts struct {
 	live    bool
 	output  bool
 	rules   []string
+	// noSinkhole: no name answered, as with no network (mh-sandbox-net)
+	noSinkhole bool
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -115,6 +119,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.boolVar(&o.verbose, "verbose", "v", "the report in full: every finding, every probe by every program, every command it ran")
 	fs.boolVar(&o.live, "live", "", "print each finding as it happens (every 2 s), while the code runs; the report follows")
 	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
+	fs.boolVar(&o.noSinkhole, "no-sinkhole", "", "answer no name the code looks up, as with no network: by default the sandbox's own network answers HTTP and HTTPS and writes down what was sent")
 	fs.listVar(&o.rules, "rules", "", "a `FILE` of rules of your own: detections, findings accepted (repeatable; sandbox/rules/, docs/sandbox.md)")
 	pos, err := fs.parse(args)
 	if err != nil {
@@ -325,11 +330,14 @@ func (s *sandbox) run() (err error) {
 	}
 
 	prepare := "mh-sandbox-prepare /root/code.tgz"
+	if s.o.noSinkhole {
+		prepare = "mh-sandbox-prepare --no-sinkhole /root/code.tgz"
+	}
 	if s.needsNetwork() {
 		if err := s.fetchPhase(tgz != ""); err != nil {
 			return err
 		}
-		prepare = "mh-sandbox-prepare"
+		prepare = strings.TrimSuffix(prepare, " /root/code.tgz")
 	}
 	if err := s.uploadRules(); err != nil {
 		return err
@@ -692,7 +700,7 @@ func (s *sandbox) report() *sandboxReport {
 		if rep.commands < 0 {
 			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the commands the code ran: rebuild it from sandbox/ (docs/sandbox.md)")
 		}
-		if !rep.dnsSeen {
+		if !rep.netSeen {
 			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the names the code looked up: rebuild it from sandbox/ (docs/sandbox.md)")
 		}
 		if s.rules.guest() != "" && rep.rulesApplied == 0 {
@@ -1166,8 +1174,17 @@ type sandboxReport struct {
 	Processes   []sandboxProc    `json:"processes"` // untrusted: args
 	Listening   []string         `json:"listening"`
 	Connections []sandboxConn    `json:"connections"`
-	// DNS: the names the code looked up, none answered (mh-sandbox-dns)
-	DNS              []sandboxDNS       `json:"dns"`                // untrusted: name
+	// Net: the code's network, the sandbox's own inside the VM
+	// (mh-sandbox-net): sinkhole (names answered with addresses the VM
+	// holds, HTTP and HTTPS answered and written down), servfail (no name
+	// answered: --no-sinkhole), off (an image without it: not recorded)
+	Net string `json:"net"`
+	// DNS: the names the code looked up
+	DNS []sandboxDNS `json:"dns"` // untrusted: name
+	// Requests: what it sent the sinkhole; TLSRefused: HTTPS clients that
+	// refused its certificate (their own list of authorities): the name only
+	Requests         []sandboxRequest   `json:"requests"`           // untrusted: method, url
+	TLSRefused       []sandboxTLS       `json:"tls_refused"`        // untrusted: name
 	AddressesAnAgent []sandboxAgentText `json:"addresses_an_agent"` // untrusted: file, text
 	Output           string             `json:"output"`             // untrusted
 	Warnings         []string           `json:"warnings"`
@@ -1182,9 +1199,10 @@ type sandboxReport struct {
 	Verdict string `json:"verdict"`
 
 	user     string
-	token    string // this run's, in every decoy: seen in a name, a secret went out
-	dnsSeen  bool   // the image reports names looked up (or says it cannot: dns off)
-	commands int    // distinct, as the image counted them; -1: not recorded
+	token    string            // this run's, in every decoy: seen in a name, a secret went out
+	netSeen  bool              // the image reports its network (or says it cannot: off)
+	sinkAddr map[string]string // the sinkhole's address → the name it was given to
+	commands int               // distinct, as the image counted them; -1: not recorded
 	decoyBy  map[string]map[string]int
 	readers  bool // the image names who opened a decoy (decoy has TOOLS, decoyby)
 	rules    *sandboxRules
@@ -1208,7 +1226,10 @@ type sandboxSummary struct {
 	Listening          int  `json:"listening"`
 	ConnectionsRefused int  `json:"connections_refused"`
 	DNSNames           int  `json:"dns_names"` // distinct names looked up
-	AddressesAnAgent   int  `json:"addresses_an_agent"`
+	Requests           int  `json:"requests"`  // to the sinkhole, and HTTPS refused
+	// SecretsSent: requests and names that carried this run's decoy token
+	SecretsSent      int `json:"secrets_sent"`
+	AddressesAnAgent int `json:"addresses_an_agent"`
 }
 
 type sandboxDecoy struct {
@@ -1282,6 +1303,23 @@ type sandboxDNS struct {
 	Name  string `json:"name"`
 }
 
+type sandboxRequest struct {
+	Count  int    `json:"count"`
+	Scheme string `json:"scheme"` // http, https (the sinkhole's certificate accepted)
+	Method string `json:"method"`
+	URL    string `json:"url"`
+	Port   int    `json:"port"`
+	Bytes  int    `json:"bytes"` // the bodies', summed
+	// CarriesToken: this run's decoy token was in it — as is, URL- or
+	// base64-encoded, gzipped: a secret sent out
+	CarriesToken bool `json:"carries_token"`
+}
+
+type sandboxTLS struct {
+	Count int    `json:"count"`
+	Name  string `json:"name"`
+}
+
 type sandboxAgentText struct {
 	Where string `json:"where"` // input, output
 	File  string `json:"file,omitempty"`
@@ -1312,7 +1350,7 @@ func (a sandboxAgentText) severity() severity {
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
 		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
-		Connections: []sandboxConn{}, DNS: []sandboxDNS{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
+		Connections: []sandboxConn{}, DNS: []sandboxDNS{}, Requests: []sandboxRequest{}, TLSRefused: []sandboxTLS{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
 		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
 		commands: -1,
 	}
@@ -1331,13 +1369,28 @@ func parseSandboxReport(tsv string) *sandboxReport {
 		case "token":
 			r.token = at(1)
 		case "section":
-			r.dnsSeen = r.dnsSeen || at(1) == "dns"
+			r.netSeen = r.netSeen || at(1) == "net" || at(1) == "dns"
+		case "net":
+			r.Net = at(1)
+			if r.Net == "off" {
+				r.Warnings = append(r.Warnings, "no network of the sandbox in this image: the names the code looked up are not recorded")
+			}
 		case "dns":
-			if at(1) == "off" {
+			if at(1) == "off" { // an image before the sinkhole
+				r.Net = "off"
 				r.Warnings = append(r.Warnings, "no resolver of the sandbox in this image: the names the code looked up are not recorded")
 			} else {
 				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3)})
 			}
+		case "addr":
+			if r.sinkAddr == nil {
+				r.sinkAddr = map[string]string{}
+			}
+			r.sinkAddr[at(1)] = at(2)
+		case "http":
+			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", Port: num(7)})
+		case "tls":
+			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2)})
 		case "rules":
 			r.rulesApplied = num(1)
 		case "decoy":
@@ -1389,6 +1442,11 @@ func parseSandboxReport(tsv string) *sandboxReport {
 	return r
 }
 
+// tokenIn says whether s carries this run's decoy token.
+func (r *sandboxReport) tokenIn(s string) bool {
+	return r.token != "" && strings.Contains(strings.ToLower(s), strings.ToLower(r.token))
+}
+
 // commonProbes are read by ordinary programs too — Node's os.cpus(), cgroup
 // limits read by Node, Go and the JVM — so they alone do not suggest evasion.
 var commonProbes = map[string]bool{"/proc/cpuinfo": true, "/proc/self/cgroup": true}
@@ -1423,6 +1481,17 @@ func (r *sandboxReport) summarize() {
 		names[d.Name] = true
 	}
 	s.DNSNames = len(names)
+	s.Requests = len(r.Requests) + len(r.TLSRefused)
+	for _, q := range r.Requests {
+		if q.CarriesToken {
+			s.SecretsSent++
+		}
+	}
+	for _, d := range r.DNS {
+		if r.tokenIn(d.Name) {
+			s.SecretsSent++
+		}
+	}
 	for i := range r.AddressesAnAgent {
 		r.AddressesAnAgent[i].Severity = r.AddressesAnAgent[i].severity().String()
 	}

@@ -2,6 +2,8 @@
 # to become them. /etc/mh-sandbox.conf, written by the image's build, may set
 # U, the user; the default is runner.
 S=/var/lib/mh-sandbox
+# N: the code's network's (mh-sandbox-net), its user's, not root's
+N=/var/lib/mh-sandbox-net
 U=runner
 [ ! -r /etc/mh-sandbox.conf ] || . /etc/mh-sandbox.conf
 H=/home/$U
@@ -17,12 +19,17 @@ if setpriv --help 2>&1 | grep -q -- --reuid; then
 	# nothing that the report would show — and a clean environment.
 	# UV_USE_IO_URING=0: Node (libuv ≥ 1.45) opens files through io_uring,
 	# which audit does not see — a decoy read by Node would have no reader.
+	# NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE: Node, and requests and pip,
+	# bring their own list of authorities; the system's has the sinkhole's
+	# (mh-sandbox-prepare).
 	asuser() {
 		_s=$1
 		shift
 		setpriv --reuid="$U" --regid="$U" --init-groups --no-new-privs \
 			env -i HOME="$H" USER="$U" LOGNAME="$U" SHELL="$SH" LANG=C.UTF-8 \
 			PATH=/usr/local/bin:/usr/bin:/bin UV_USE_IO_URING=0 \
+			NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+			REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
 			/bin/sh -c "$_s" "$@"
 	}
 else

@@ -3,12 +3,17 @@
 # Run it as root (mh exec), once, AFTER copying the code in and BEFORE
 # running it: everything changed after this moment is reported.
 #
-#   mh-sandbox-prepare [ARCHIVE]
+#   mh-sandbox-prepare [--no-sinkhole] [ARCHIVE]
 #
 # ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
 # unpacked into ~/work as the user and removed, before the clock starts.
 # Without it: the code was unpacked before (mh-sandbox-unpack), typically to
 # fetch its dependencies first (mh-sandbox-run --fetch).
+#
+# The code's network is the sandbox's own, inside the VM (mh-sandbox-net):
+# every name it looks up is answered with an address the VM holds, where a
+# sinkhole answers HTTP and HTTPS and writes down what was sent.
+# --no-sinkhole: no name is answered, as with no network at all.
 #
 # Root never writes inside the user's home: what is there may be the code's
 # (a symlink to a system file), and root writing through it would be the
@@ -19,6 +24,11 @@ set -eu
 
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-prepare: run as root (mh exec)" >&2; exit 1; }
 [ ! -e "$S/since" ] || { echo "mh-sandbox-prepare: already prepared" >&2; exit 1; }
+net=sinkhole
+if [ "${1:-}" = --no-sinkhole ]; then
+	net=servfail
+	shift
+fi
 
 # Every read updates atime (not just the first in a day, relatime; nor never,
 # noatime), whatever the image was mounted with.
@@ -100,13 +110,29 @@ printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xp
 
 echo "$tok" > "$S/token"
 
-# The names the code looks up (mh-sandbox-dns): root's resolver on a
-# loopback address of its own, answering none. resolv.conf is replaced, not
-# written through: it is a link to the kernel's /proc/net/pnp. Where there is
-# no python (the Alpine image), names are not recorded; the report says so.
-if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-dns ]; then
-	: > "$S/dns"
-	setsid /usr/sbin/mh-sandbox-dns 127.53.0.1 "$S/dns" </dev/null >/dev/null 2>&1 &
+# The code's network (mh-sandbox-net), in $N, owned by the user it runs as
+# (mhsink): not root, not the code. resolv.conf is replaced, not written
+# through: it is a link to the kernel's /proc/net/pnp. For the sinkhole:
+# 198.18.0.0/15, where the names point, is this VM's own (a local route: a
+# connection there never reaches the host), and a CA of this run's, which
+# the system trusts (mh-sandbox-lib points Node and pip at the system's
+# list), signs its certificates. Where there is no python (the Alpine
+# image) or no mhsink, nothing is answered and no name recorded; the report
+# says so.
+if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink >/dev/null 2>&1; then
+	rm -rf "$N"
+	install -d -o mhsink -g mhsink -m 700 "$N"
+	if [ $net = sinkhole ]; then
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+			-keyout "$N/ca.key" -out "$N/ca.crt" -subj "/O=Internal/CN=Internal Root CA" \
+			-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+		chown mhsink:mhsink "$N/ca.key" "$N/ca.crt"
+		cp "$N/ca.crt" /usr/local/share/ca-certificates/internal-root.crt
+		update-ca-certificates >/dev/null 2>&1
+		ip route add local 198.18.0.0/15 dev lo
+	fi
+	echo $net > "$S/net"
+	printf '%s' "$tok" | setsid /usr/sbin/mh-sandbox-net "$N" $net >/dev/null 2>&1 &
 	echo -1000 > "/proc/$!/oom_score_adj" 2>/dev/null || true
 	rm -f /etc/resolv.conf
 	printf 'nameserver 127.53.0.1\n' > /etc/resolv.conf

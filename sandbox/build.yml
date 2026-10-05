@@ -38,6 +38,7 @@ base: ubuntu:24.04
 packages:
   - ca-certificates
   - curl
+  - openssl
   - git
   - python3
   - python3-venv
@@ -53,13 +54,15 @@ files:
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
   /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
   /usr/sbin/mh-sandbox-watch: sbin/mh-sandbox-watch
-  /usr/sbin/mh-sandbox-dns: sbin/mh-sandbox-dns
+  /usr/sbin/mh-sandbox-net: sbin/mh-sandbox-net
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
 
 run:
   # The user the code runs as: a home from /etc/skel, bash, no password, no
   # sudo (not installed).
   - useradd -m -s /bin/bash dev
+  # mh-sandbox-net's: the sinkhole parses what the code sends, as neither root nor the code
+  - useradd -r -M -d /nonexistent -s /usr/sbin/nologin mhsink
   - echo U=dev > /etc/mh-sandbox.conf && chmod 0600 /etc/mh-sandbox.conf
   - passwd -l root
   # No setuid or setgid file anywhere (su, passwd, mount, chsh…): nothing
@@ -83,9 +86,9 @@ run:
   # (SYSCALL=, SADDR=), which mh-sandbox-lib reads.
   - sed -i 's/^log_format = .*/log_format = ENRICHED/' /etc/audit/auditd.conf
   - grep -q '^admin_space_left = 150$' /etc/audit/auditd.conf && grep -q '^log_format = ENRICHED$' /etc/audit/auditd.conf
-  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch /usr/sbin/mh-sandbox-dns
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch /usr/sbin/mh-sandbox-net
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
-  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && python3 -m py_compile /usr/sbin/mh-sandbox-dns && rm -rf /usr/sbin/__pycache__
+  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && python3 -m py_compile /usr/sbin/mh-sandbox-net && rm -rf /usr/sbin/__pycache__
 
 mem_mb: 512
 # Room for audit's log: every file the code opens is in it.

@@ -14,7 +14,7 @@ mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
 |---|---|
 | `build.yml` | the image: Ubuntu 24.04, the user `dev`, audit, no setuid file, a quiet systemd |
 | `alpine.yml` | a smaller one, without audit: `mh build -f sandbox/alpine.yml -t sandbox-alpine:1 sandbox` |
-| `sbin/` | the tools inside, root's only: prepare, unpack, scan, run, report, watch, dns (the resolver that writes down the names looked up) |
+| `sbin/` | the tools inside, root's only: prepare, unpack, scan, run, report, watch, net (the code's network: a resolver and a sinkhole, inside the VM) |
 | `agent-patterns` | the phrases that speak to an AI agent, for the input (grep) and the output (`mh sandbox`) |
 
 ## Fetching without running the code

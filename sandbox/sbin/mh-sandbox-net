@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# The sandbox's network, inside the VM: a resolver and a sinkhole. Nothing
+# leaves the VM; what the code meant to reach is written down.
+#
+#   mh-sandbox-net DIR sinkhole|servfail < TOKEN
+#
+# mh-sandbox-prepare starts it as root. It binds its ports, reads this run's
+# decoy token on stdin and DIR's CA, then becomes DIR's owner (mhsink): what
+# it parses is the code's to choose, and a mistake here must not hand the
+# code root.
+#
+# The resolver, on 127.53.0.1:53 (resolv.conf points at it), writes down
+# every name looked up. sinkhole: an A query is answered with an address of
+# its own for each name, in 198.18.0.0/15 — a range the VM holds locally
+# (mh-sandbox-prepare's route), so a connection to it never reaches the host;
+# any other type has no answer. servfail: no name is answered, as with no
+# network at all.
+#
+# The sinkhole, on ports 80 and 443 of those addresses: an HTTP request is
+# answered 200 and empty, and written down — method, URL, size, and whether
+# this run's decoy token is in it (as is, URL- or base64-encoded, gzipped):
+# a secret sent out. HTTPS is answered with a certificate for the name,
+# signed by DIR's CA, which the VM trusts (mh-sandbox-prepare); a client
+# with its own list of authorities refuses it, and only the name it asked
+# for (SNI) is written down.
+#
+# DIR gets, one record per line, tab-separated, every field the code's
+# choice made printable and cut:
+#   dns    TYPE NAME
+#   addr   ADDRESS NAME            (the address given to NAME)
+#   http   SCHEME METHOD URL BYTES TOKEN(0|1) PORT
+#   tls    NAME refused            (the client did not accept the certificate)
+# At most 50000 records: a loop says nothing new after that.
+import base64
+import binascii
+import ipaddress
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import urllib.parse
+import zlib
+
+RESOLVER = "127.53.0.1"
+SINK = ipaddress.ip_network("198.18.0.0/15")
+TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+         28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY"}
+MAXRECORDS = 50000
+MAXBODY = 1 << 20  # what is kept of a request, to look for the token in
+HOSTNAME = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,62}\.)*[a-z0-9_-]{1,63}\.?$")
+
+
+def printable(s, n):
+    return "".join(c if c.isprintable() and c != "\t" else "?" for c in s)[:n]
+
+
+class Log:
+    def __init__(self, path):
+        self.f = open(path, "a", buffering=1)
+        self.n = 0
+        self.lock = threading.Lock()
+
+    def write(self, *fields):
+        with self.lock:
+            if self.n < MAXRECORDS:
+                self.f.write("\t".join(str(f) for f in fields) + "\n")
+                self.n += 1
+
+
+class Names:
+    """Each name its own address in the sinkhole's range, in the order asked."""
+
+    def __init__(self, log):
+        self.log = log
+        self.by_name, self.by_addr = {}, {}
+        self.lock = threading.Lock()
+
+    def addr(self, name):
+        with self.lock:
+            a = self.by_name.get(name)
+            if a is None:
+                if len(self.by_name) >= SINK.num_addresses - 2:
+                    return None
+                a = SINK.network_address + 1 + len(self.by_name)
+                self.by_name[name], self.by_addr[a] = a, name
+                self.log.write("addr", a, name)
+            return a
+
+    def name(self, addr):
+        with self.lock:
+            return self.by_addr.get(ipaddress.ip_address(addr))
+
+
+# --- the resolver -----------------------------------------------------------
+
+def question(pkt):
+    """The first question's name and type, and where the question ends."""
+    if len(pkt) < 12 or int.from_bytes(pkt[4:6], "big") < 1:
+        return None
+    i, labels = 12, []
+    while True:
+        if i >= len(pkt):
+            return None
+        n = pkt[i]
+        i += 1
+        if n == 0:
+            break
+        if n & 0xC0 or i + n > len(pkt):  # no compression in a question
+            return None
+        labels.append(pkt[i:i + n])
+        i += n
+    if i + 4 > len(pkt):
+        return None
+    name = printable(b".".join(labels).decode("ascii", "replace").lower(), 253) or "."
+    return name, int.from_bytes(pkt[i:i + 2], "big"), i + 4
+
+
+def resolver(sock, log, names, sinkhole):
+    while True:
+        try:
+            pkt, peer = sock.recvfrom(4096)
+        except InterruptedError:
+            continue
+        q = question(pkt)
+        if q is None or pkt[2] & 0x80:  # not a query
+            continue
+        name, qtype, end = q
+        log.write("dns", TYPES.get(qtype, str(qtype)), name)
+        answer = b""
+        rcode = 0 if sinkhole else 2  # servfail: as with no network
+        if sinkhole and qtype == 1 and HOSTNAME.match(name):
+            a = names.addr(name)
+            if a is not None:
+                # the name by pointer to the question, A, IN, 60 s, the address
+                answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + a.packed
+        # the id, the opcode and RD as asked; QR, AA, RA set
+        flags = bytes([0x84 | (pkt[2] & 0x79), 0x80 | rcode])
+        counts = b"\x00\x01" + (b"\x00\x01" if answer else b"\x00\x00") + b"\x00\x00\x00\x00"
+        try:
+            sock.sendto(pkt[0:2] + flags + counts + pkt[12:end] + answer, peer)
+        except OSError:
+            pass
+
+
+# --- the sinkhole -----------------------------------------------------------
+
+def carries(data, token, depth=0):
+    """Whether data has the token in it: as is, or under up to three layers
+    of URL-encoding, base64 and gzip, in any order (gzip of base64 of a
+    file is a stealer's usual)."""
+    if not token:
+        return False
+    if token in data.lower():
+        return True
+    if depth == 3:
+        return False
+    layers = []
+    if b"%" in data:
+        try:
+            layers.append(urllib.parse.unquote_to_bytes(data))
+        except Exception:
+            pass
+    for run in re.findall(rb"[A-Za-z0-9+/_-]{24,}={0,2}", data)[:50]:
+        for dec in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                layers.append(dec(run + b"=" * (-len(run) % 4)))
+                break
+            except (binascii.Error, ValueError):
+                pass
+    i = data.find(b"\x1f\x8b")
+    if i >= 0:
+        try:
+            layers.append(zlib.decompressobj(31).decompress(data[i:], 4 * MAXBODY))
+        except zlib.error:
+            pass
+    return any(carries(d, token, depth + 1) for d in layers if d != data)
+
+
+def read_request(conn):
+    """The request's head and as much of its body as is kept, and its size."""
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < 65536:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    want = 0
+    m = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+    if m:
+        want = int(m.group(1))
+    elif re.search(rb"(?im)^transfer-encoding:\s*chunked", head):
+        want = MAXBODY  # until it stops, or the timeout
+    total = len(body)
+    while total < want:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if len(body) < MAXBODY:
+            body += chunk[:MAXBODY - len(body)]
+    return head, body, total
+
+
+def serve(conn, scheme, port, host, log, token):
+    try:
+        head, body, size = read_request(conn)
+        line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = line.split(" ")
+        method, target = (parts[0], parts[1]) if len(parts) >= 2 else ("?", "")
+        m = re.search(rb"(?im)^host:\s*([^\r\n]+)", head)
+        if m:
+            host = m.group(1).decode("latin-1").strip()
+        url = target if "://" in target else scheme + "://" + host + target
+        log.write("http", scheme, printable(method, 16), printable(url, 300), size,
+                  int(carries(head + b"\r\n\r\n" + body, token)), port)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    except (OSError, ssl.SSLError, UnicodeError):
+        pass
+
+
+class Certs:
+    """A certificate for each name, signed by DIR's CA."""
+
+    def __init__(self, d):
+        self.d = d
+        self.ctxs = {}
+        self.lock = threading.Lock()
+
+    def ctx(self, name):
+        with self.lock:
+            c = self.ctxs.get(name)
+            if c is not None:
+                return c
+            base = os.path.join(self.d, "certs", re.sub(r"[^a-z0-9.-]", "_", name))
+            ext = base + ".ext"
+            with open(ext, "w") as f:
+                f.write("subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n" % name)
+            subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                            "-nodes", "-keyout", base + ".key", "-subj", "/CN=" + name, "-out", base + ".csr"],
+                           check=True, capture_output=True, timeout=20)
+            subprocess.run(["openssl", "x509", "-req", "-in", base + ".csr", "-CA", os.path.join(self.d, "ca.crt"),
+                            "-CAkey", os.path.join(self.d, "ca.key"), "-set_serial", str(int.from_bytes(os.urandom(8), "big")),
+                            "-days", "30", "-extfile", ext, "-out", base + ".crt"],
+                           check=True, capture_output=True, timeout=20)
+            c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            c.load_cert_chain(base + ".crt", base + ".key")
+            self.ctxs[name] = c
+            return c
+
+
+def sinkhole(sock, port, tls, log, names, token, certs, slots):
+    while True:
+        try:
+            conn, _ = sock.accept()
+        except InterruptedError:
+            continue
+        local = conn.getsockname()[0]
+        if ipaddress.ip_address(local) not in SINK or not slots.acquire(blocking=False):
+            conn.close()
+            continue
+
+        def handle(conn=conn, local=local):
+            try:
+                conn.settimeout(5)
+                host = names.name(local) or local
+                if not tls:
+                    serve(conn, "http", port, host, log, token)
+                    return
+                asked = {"name": host}
+
+                def sni(sslobj, server_name, _ctx):
+                    if server_name and HOSTNAME.match(server_name.lower()):
+                        asked["name"] = server_name.lower()
+                    try:
+                        sslobj.context = certs.ctx(asked["name"])
+                    except Exception:
+                        return ssl.ALERT_DESCRIPTION_INTERNAL_ERROR
+                    return None
+
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.sni_callback = sni
+                ctx.load_cert_chain(*certs_default)
+                try:
+                    s = ctx.wrap_socket(conn, server_side=True)
+                except (ssl.SSLError, OSError):
+                    log.write("tls", printable(asked["name"], 253), "refused")
+                    return
+                serve(s, "https", port, asked["name"], log, token)
+            finally:
+                conn.close()
+                slots.release()
+
+        threading.Thread(target=handle, daemon=True).start()
+
+
+def main():
+    global certs_default
+    d, mode = sys.argv[1], sys.argv[2]
+    token = sys.stdin.read().strip().lower().encode()
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind((RESOLVER, 53))
+    tcp = []
+    if mode == "sinkhole":
+        for port in (80, 443):
+            t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            t.bind(("0.0.0.0", port))
+            t.listen(128)
+            tcp.append((t, port))
+    # root no longer: DIR's owner
+    st = os.stat(d)
+    if os.getuid() == 0:
+        os.setgroups([])
+        os.setgid(st.st_gid)
+        os.setuid(st.st_uid)
+    if os.getuid() == 0:
+        sys.exit("mh-sandbox-net: DIR must not be root's")
+
+    log = Log(os.path.join(d, "log"))
+    names = Names(log)
+    certs = Certs(d)
+    os.makedirs(os.path.join(d, "certs"), exist_ok=True)
+    slots = threading.BoundedSemaphore(64)
+    if mode == "sinkhole":
+        certs.ctx("sandbox.invalid")
+        certs_default = (os.path.join(d, "certs", "sandbox.invalid.crt"), os.path.join(d, "certs", "sandbox.invalid.key"))
+        for t, port in tcp:
+            threading.Thread(target=sinkhole, args=(t, port, port == 443, log, names, token, certs, slots), daemon=True).start()
+    resolver(udp, log, names, mode == "sinkhole")
+
+
+certs_default = None
+
+if __name__ == "__main__":
+    main()
