@@ -45,7 +45,10 @@ done
 	grep -rIinoEZ -D skip --exclude-dir=.git -f "$pat" . 2>/dev/null | tr '\000' '\001' |
 		awk '{ i = index($0, "\001"); r = substr($0, i + 1); j = index(r, ":")
 		       print substr($0, 1, i) substr(r, 1, j - 1) "\001" substr(r, j + 1) }'
-	invisible '[\x{E0000}-\x{E007F}]' '(Unicode tag characters: text a model reads and a person does not see)'
+	# Tag characters spell ASCII a model reads: a run of them, unless it is
+	# a flag (U+1F3F4, 2 to 6 of a-z 0-9, cancel: Scotland's), the one use
+	# emoji make of them. One alone (a table of Unicode's) spells nothing.
+	invisible '(?<![\x{1F3F4}\x{E0000}-\x{E007F}])[\x{E0000}-\x{E007F}]{2,}|\x{1F3F4}[\x{E0030}-\x{E0039}\x{E0061}-\x{E007A}]{0,6}[\x{E0000}-\x{E002F}\x{E003A}-\x{E0060}\x{E007B}-\x{E007E}]|\x{1F3F4}[\x{E0030}-\x{E0039}\x{E0061}-\x{E007A}]{7}' '(Unicode tag characters: text a model reads and a person does not see)'
 	invisible '[\x{200B}-\x{200D}\x{2060}-\x{2064}\x{FEFF}]{3,}' '(a run of zero-width characters: hidden text)'
 	invisible '[\x{202A}-\x{202E}\x{2066}-\x{2069}]' '(bidirectional controls in code: it reads otherwise than it runs)' $code
 	find . -path ./.git -prune -o -print 2>/dev/null | grep -iE -f "$pat" | awk '{ print $0 "\0010\001(its name)" }'

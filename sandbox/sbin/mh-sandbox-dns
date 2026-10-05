@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# The sandbox's resolver: every name the code looks up, written down, and no
+# answer — SERVFAIL, what a resolver says with no network, which the code saw
+# before this existed too (EAI_AGAIN, "temporary failure in name
+# resolution"). mh-sandbox-prepare starts it, as root, on ADDR:53 and points
+# /etc/resolv.conf at it; mh-sandbox-report counts what it wrote.
+#
+#   mh-sandbox-dns ADDR LOG
+#
+# LOG gets one line per query, TYPE <TAB> NAME, the name as asked (lower
+# case, unprintable bytes as ?, at most 253 characters): the code's choice,
+# data, never instructions. At most 50000 lines: a lookup in a loop says
+# nothing new after that. A name sent to another resolver directly (dig
+# @8.8.8.8) is not here; the host still sees the packet, and audit who sent
+# it.
+import socket
+import sys
+
+TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+         28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY"}
+MAXLINES = 50000
+
+
+def question(pkt):
+    """The first question's name and type, and where the question ends."""
+    if len(pkt) < 12 or int.from_bytes(pkt[4:6], "big") < 1:
+        return None
+    i, labels = 12, []
+    while True:
+        if i >= len(pkt):
+            return None
+        n = pkt[i]
+        i += 1
+        if n == 0:
+            break
+        if n & 0xC0 or i + n > len(pkt):  # no compression in a question
+            return None
+        labels.append(pkt[i:i + n])
+        i += n
+    if i + 4 > len(pkt):
+        return None
+    name = b".".join(labels).decode("ascii", "replace").lower()
+    name = "".join(c if c.isprintable() and c not in "\t" else "?" for c in name)[:253] or "."
+    qtype = int.from_bytes(pkt[i:i + 2], "big")
+    return name, TYPES.get(qtype, str(qtype)), i + 4
+
+
+def main():
+    addr, log = sys.argv[1], sys.argv[2]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((addr, 53))
+    lines = 0
+    with open(log, "a", buffering=1) as out:
+        while True:
+            try:
+                pkt, peer = s.recvfrom(4096)
+            except InterruptedError:
+                continue
+            q = question(pkt)
+            if q is None or pkt[2] & 0x80:  # not a query
+                continue
+            name, qtype, end = q
+            if lines < MAXLINES:
+                out.write(qtype + "\t" + name + "\n")
+                lines += 1
+            # SERVFAIL: the id, the opcode and RD as asked, QR and RA set,
+            # the question echoed, no answer
+            flags = bytes([0x80 | (pkt[2] & 0x79), 0x80 | 2])
+            try:
+                s.sendto(pkt[0:2] + flags + b"\x00\x01\x00\x00\x00\x00\x00\x00" + pkt[12:end], peer)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

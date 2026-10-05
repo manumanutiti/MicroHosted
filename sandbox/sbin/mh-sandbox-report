@@ -123,6 +123,16 @@ records() {
 		netstat -tuln 2>/dev/null | tail -n +3 | awk '{ printf "listen\t%s\t%s\n", $1, $4 }'
 	fi
 
+	# dns COUNT TYPE NAME — the names the code looked up (mh-sandbox-dns),
+	# in the order first asked, the first 500; dns off: not recorded here.
+	printf 'section\tdns\n'
+	if [ -e "$S/dns" ]; then
+		awk -F'\t' 'NF == 2 { k = $1 "\t" $2; if (!(k in n)) o[++m] = k; n[k]++ }
+			END { for (i = 1; i <= m && i <= 500; i++) printf "dns\t%d\t%s\n", n[o[i]], o[i] }' "$S/dns"
+	else
+		printf 'dns\toff\n'
+	fi
+
 	# agent input FILE LINE TEXT — text addressed to an AI agent in the input,
 	# found by mh-sandbox-scan before the code ran.
 	printf 'section\tagent\n'
@@ -228,6 +238,7 @@ human() {
 			if ($2 == "dirs")   print "== directories whose entries changed (a file created, renamed or deleted in them)"
 			if ($2 == "procs")  print "== processes left running as " u
 			if ($2 == "listen") print "== listening sockets"
+			if ($2 == "dns")    print "== names looked up (none answered)"
 			if ($2 == "agent")  print "== text addressed to an AI agent, in the input (a signal, not proof)"
 		}
 		$1 == "decoy" {
@@ -246,6 +257,8 @@ human() {
 		$1 == "work" && $3 !~ /\/$/ { print "  " w $3 }
 		$1 == "proc"   { printf "  %6s  %s\n", $2, $3 }
 		$1 == "listen" { printf "  %-5s %s\n", $2, $3 }
+		$1 == "dns" && $2 == "off" { print "  (no resolver of the sandbox in this image: not recorded)" }
+		$1 == "dns" && $2 != "off" { printf "  %4d× %-5s %s\n", $2, $3, $4 }
 		$1 == "agent"  { printf "  %s:%s: %s\n", $3, $4, $5 }'
 }
 

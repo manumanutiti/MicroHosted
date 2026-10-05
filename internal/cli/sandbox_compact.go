@@ -294,11 +294,59 @@ func groupCommands(as []sandboxAlert, x string) []finding {
 	return out
 }
 
+// groupAgentText is one line per phrase (case aside) or way of hiding text,
+// with how often and where: a repository of skills says "system prompt" in
+// forty files, which is one thing to read, not forty.
+func groupAgentText(as []sandboxAgentText, tilde func(string) string, x string) []finding {
+	type group struct {
+		text  string
+		sev   severity
+		n     int
+		where []string
+	}
+	var groups []*group
+	at := map[string]*group{}
+	for _, a := range as {
+		key := strings.ToLower(a.Text)
+		g := at[key]
+		if g == nil {
+			g = &group{text: a.Text, sev: a.severity()}
+			at[key] = g
+			groups = append(groups, g)
+		}
+		g.n++
+		w := a.Where
+		if a.File != "" {
+			w = tilde(a.File)
+		}
+		if !slices.Contains(g.where, w) {
+			g.where = append(g.where, w)
+		}
+	}
+	sort.SliceStable(groups, func(i, j int) bool { return groups[i].sev > groups[j].sev })
+	var out []finding
+	for _, g := range groups {
+		where := g.where
+		more := ""
+		if len(where) > 3 {
+			where, more = where[:3], fmt.Sprintf(" … %d files", len(g.where))
+		}
+		out = append(out, finding{sev: g.sev, cols: []string{x + strconv.Itoa(g.n), strconv.Quote(g.text)},
+			tail: "in " + strings.Join(where, ", ") + more, tailDim: true, short: strconv.Quote(g.text)})
+	}
+	return out
+}
+
+// sandboxResolver is mh-sandbox-dns's address in the guest (mh-sandbox-prepare).
+const sandboxResolver = "127.53.0.1"
+
 // dstNote says what a destination is, where it is known.
 func dstNote(dst string, port int) string {
 	switch {
 	case dst == "169.254.169.254" || dst == "[fd00:ec2::254]":
 		return "cloud metadata: an instance's credentials"
+	case dst == sandboxResolver && port == 53:
+		return "the sandbox's resolver: the names are above"
 	case port == 53:
 		return "DNS"
 	case port == 4444 || port == 1337 || port == 31337:
@@ -426,6 +474,16 @@ func (r *sandboxReport) network(x string) category {
 			inside = append(inside, dst)
 		}
 		who[dst][a.By] += a.Count
+	}
+	// the names first: what it meant to reach, where an address says little
+	for _, d := range r.DNS {
+		f := finding{sev: sevWarn, cols: []string{"dns", d.Name, x + strconv.Itoa(d.Count)}, tail: d.Type + ", not answered", tailDim: true, short: d.Name}
+		if r.token != "" && strings.Contains(d.Name, strings.ToLower(r.token)) {
+			f.sev, f.tailDim = sevHigh, false
+			f.tail = d.Type + "; carries this run's decoy token: a secret sent out in a name"
+			c.phrase = "sent a decoy's secret out in a DNS name"
+		}
+		c.items = append(c.items, f)
 	}
 	seen := map[string]bool{}
 	for _, n := range r.Connections {

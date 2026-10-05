@@ -26,6 +26,9 @@ else
 fi
 [ $# -gt 0 ] || { echo "usage: mh-sandbox-run [--fetch] COMMAND..." >&2; exit 2; }
 
+# The code is the first the kernel kills out of memory; set by root, the
+# floor it can lower it to is this (mh-sandbox-prepare protects the rest).
+echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 asuser 'mkdir -p "$HOME/work" && cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
 rc=$?
 # A fetch ends when its connections have closed (at most 10 s): cut while one

@@ -7,21 +7,25 @@
 #
 # A signal, never a defence: base64, another language or a split phrase evade
 # it. A match in an LLM application's own prompts is expected; read the line.
+# Agent tooling (skills, prompts, injection tests) is full of these, so a
+# phrase is graded warn; text hidden from a person (mh-sandbox-scan) is high.
+# Each pattern earns its place by being rare in such repositories: no bare
+# "system prompt", no "hey claude" (a skill's example request), no <system>.
 ignore (all |any )?(of )?(the |your |my )?(previous|prior|above|earlier|preceding|former) (instructions|prompts?|messages|rules|orders|directions|context)
 disregard (all |any )?(of )?(the |your )?(previous|prior|above|earlier|preceding|former|system)
 forget (all |everything )?(of )?(the |your )?(previous|prior|above|earlier) (instructions|prompts?|rules|context)
 override (the |your )?(system|safety) (prompt|instructions|rules)
 (new|updated|real|actual|hidden) (system )?instructions *:
-system prompt
+(new|updated|real|actual|hidden|secret) system prompt *:
 (do not|don't|never) (tell|inform|alert|show|mention (this|it) to) the user
 without (telling|informing|alerting|asking) the user
-(note|message|instructions?) (to|for) (the |any )?(ai|llm|assistant|agent|model|claude|chatgpt|copilot|cursor|gemini)
+(note|message|instructions?) (to|for) (the |any |all )?(ai|llm|assistant|agent|model|claude|chatgpt|copilot|cursor|gemini)( agents?| assistants?| models?)? *:
 if you are an? (ai|llm|assistant|agent|language model|coding agent)
-(dear|attention|hey) (ai|llm|assistant|agent|claude|chatgpt|copilot|cursor|gemini)
+(dear|attention) (ai|llm|assistant|agent|claude|chatgpt|copilot|cursor|gemini)
 as an ai (language model|assistant|agent)
 you are (now )?(an? )?(ai|llm|assistant|agent|language model) (that|who|with|and)
-(claude|chatgpt|copilot|cursor|gemini|assistant|agent), (please )?(ignore|run|execute|you must|immediately)
+(^|[^a-z_])(claude|chatgpt|copilot|cursor|gemini|assistant|agent), (please )?(ignore|run|execute|you must|immediately)( |$)
 <\|(im_start|im_end|system|user|assistant|endoftext)\|>
 \[/?INST\]
 <</?SYS>>
-</?(system|system-reminder|instructions)>
+</?system-reminder>

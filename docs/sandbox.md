@@ -38,6 +38,7 @@ COMMAND is one shell line, run as the sandbox's user in `~/work`.
 | `--image IMAGE` | default: the newest `sandbox:N` |
 | `--iface IFACE` | the fetch network's way out (default: the host's default route) |
 | `--timeout D` | for the fetch and the run each (default 5m, at most 10m) |
+| `--cpus N`, `--mem SIZE` | the VM's size (default 2 vCPUs, 2G): a build — `go build`, `cargo`, webpack — outgrows less. Out of memory, the kernel kills the code first, never the agent or audit: a run that outgrows the VM fails as itself, the report intact |
 | `--keep` | keep the VM (and its network) afterwards, to look inside |
 | `--json` | the report as JSON on stdout (schema below), everything in it |
 | `-o`, `--output` | print the code's own output too (its last 8 KiB, every line prefixed with `\|`); by default only what it did is reported |
@@ -59,7 +60,8 @@ and runs nothing.
    order, before any decoy exists, nothing reported.
 4. **The network's way out closed**, and the daemon asked to confirm it. If it
    cannot be confirmed, the VM is removed and nothing runs.
-5. Prepare: decoys planted, audit on, the clock started.
+5. Prepare: decoys planted, the sandbox's resolver started (every name the
+   code looks up written down, none answered), audit on, the clock started.
 6. The input scanned for text addressed to an AI agent (below).
 7. The command, as the sandbox's user, no way to gain privileges, no network.
 8. The report from inside, the refused connections from the host, the VM and
@@ -77,8 +79,9 @@ and runs nothing.
 | changed | files and directories created or changed: outside `~/work` one by one, inside it one line per entry with a count. The report groups them (`~/.cache/go-build/ (1515)`) and grades caches (`~/.cache`, `~/.npm`, `~/go`…), a tool's settings in `~/.config` and temporary files `info` |
 | processes | still running as the sandbox's user |
 | listening | sockets it opened |
+| dns | every name the code looked up, with its type and count — `github.com`, `pastebin.com`, `x7f3.evil.example` — none answered (SERVFAIL, as with no network). The sandbox's own resolver records them (`mh-sandbox-dns`); a name sent to another resolver directly shows only as a connection |
 | connections | what it tried that the network refused (the host's view); the report names the program that tried each (audit's `connect`, inside) |
-| addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "system prompt", chat-template tokens; Unicode that hides text — tag characters, a run of zero-width ones, bidirectional controls in code or a file's name (not one zero-width joiner, which emoji and names have, nor a right-to-left override in pip's `AUTHORS.txt`) |
+| addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "note to the AI:", chat-template tokens (a phrase is `warn`: skills, prompts and their tests are full of them); Unicode that hides text — tag characters, a run of zero-width ones, bidirectional controls in code or a file's name (not one zero-width joiner, which emoji and names have, nor a right-to-left override in pip's `AUTHORS.txt`) |
 
 ### Reading it
 
@@ -152,8 +155,8 @@ The verdict is in the JSON too (`verdict`: `suspicious`, `review`, `clean`,
 
 | Grade | |
 |---|---|
-| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text addressed to an AI agent; a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
-| warn | every other privesc probe (cron, root's home, the kernel's switches, `find -perm` for writable files); a VM probe; a connection refused; a file changed outside `~/work` that is not a cache, a tool's settings or a temporary file (`~/.local/bin`, `~/.ssh`, the system); a process left; a listening socket |
+| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text spelled in Unicode tag characters (a model reads it, a person sees nothing; not a flag's, 🏴 then a region's letters, which emoji use); a name looked up that carries the run's decoy token (a secret sent out in DNS); a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
+| warn | a phrase addressed to an AI agent; a run of zero-width characters, bidirectional controls in code (they deceive a person reading it; the tests of terminals and editors have them); a name looked up; every other privesc probe (cron, root's home, the kernel's switches, `find -perm` for writable files); a VM probe; a connection refused; a file changed outside `~/work` that is not a cache, a tool's settings or a temporary file (`~/.local/bin`, `~/.ssh`, the system); a process left; a listening socket |
 | info | a decoy read only by its own tool; `sudo`, `su`, `pkexec`… looked up by name (installers check for sudo); a VM probe ordinary programs make too (`/proc/cpuinfo`, `/proc/self/cgroup`); a cache, a temporary file, a directory whose entries changed |
 
 An alert (`alerts` in the JSON) is graded by its kind. The grades are a
@@ -281,6 +284,7 @@ and a warning: everything from inside is then unknown, not empty.
     "processes_left": 0,
     "listening": 0,
     "connections_refused": 8,
+    "dns_names": 2,                // distinct names looked up
     "addresses_an_agent": 0
   },
   "decoys":      [{"path": "/home/dev/.netrc", "state": "READ", "legitimately": "curl -n, …",
@@ -294,7 +298,8 @@ and a warning: everything from inside is then unknown, not empty.
   "processes":   [{"pid": 123, "args": "…"}],
   "listening":   ["tcp 0.0.0.0:8080"],
   "connections": [{"protocol": "udp", "dst": "1.1.1.1", "dst_port": 53, "count": 4, "reason": "egress"}],
-  "addresses_an_agent": [{"where": "input", "file": "README.md", "line": 12, "text": "ignore previous instructions"}],  // where: input, output, created (a file's name)
+  "dns":         [{"count": 4, "type": "A", "name": "github.com"}],
+  "addresses_an_agent": [{"where": "input", "file": "README.md", "line": 12, "text": "ignore previous instructions", "severity": "warn"}],  // where: input, output, created (a file's name)
   "output": "…",                   // the command's, last 8 KiB
   "warnings": ["audit lost 3 events: vm_probes may be incomplete"],
   "rules":    ["sandbox/rules/example.yml"],                // the --rules files read
@@ -306,7 +311,7 @@ and a warning: everything from inside is then unknown, not empty.
 A decoy an accept rule matched stays in `decoys`, graded `info`, with
 `"accepted": WHY`. A rule's alert has the kind `rule:NAME`.
 
-Untrusted (the code's choice): `decoys[].by`, `changed.*`, `vm_probes[].path` and `.by`,
+Untrusted (the code's choice): `decoys[].by`, `changed.*`, `dns[].name`, `vm_probes[].path` and `.by`,
 `privesc[].path` and `.by`, `commands[].args`, `alerts[].what` and `.by`,
 `processes[].args`, `addresses_an_agent[].file` and `.text`, `output`,
 `accepted[].what` and `.by`.

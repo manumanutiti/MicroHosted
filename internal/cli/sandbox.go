@@ -72,6 +72,8 @@ type sandboxOpts struct {
 	image   string
 	iface   string
 	timeout time.Duration
+	cpus    int64
+	memory  int64 // MiB, --mem
 	keep    bool
 	asJSON  bool
 	verbose bool
@@ -101,6 +103,13 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.DurationVar(&o.timeout, "timeout", 5*time.Minute, "for the fetch and the run each, a `DURATION` of at most 10m")
 	fs.alias("timeout", "t")
 	fs.defined = append(fs.defined, "timeout")
+	o.memory = 2048
+	fs.Int64Var(&o.cpus, "cpus", 2, "the VM's `N` vCPUs")
+	fs.alias("cpus", "c")
+	fs.defined = append(fs.defined, "cpus")
+	fs.Var((*mbValue)(&o.memory), "mem", "the VM's memory `SIZE` in MiB, or 4G (a build — go, cargo, webpack — needs 2G or more)")
+	fs.alias("mem", "m")
+	fs.defined = append(fs.defined, "mem")
 	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
 	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
 	fs.boolVar(&o.verbose, "verbose", "v", "the report in full: every finding, every probe by every program, every command it ran")
@@ -116,6 +125,9 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	}
 	if o.timeout < time.Second || o.timeout > 10*time.Minute {
 		return usagef(p, "--timeout must be between 1s and 10m")
+	}
+	if o.cpus < 1 || o.cpus > 32 || o.memory < 256 || o.memory > 32768 {
+		return usagef(p, "--cpus must be 1 to 32, --mem 256M to 32G")
 	}
 	for _, a := range apt {
 		for _, n := range strings.Split(a, ",") {
@@ -298,7 +310,7 @@ func (s *sandbox) run() (err error) {
 		s.say("VM (%s on %s: no way out)", s.image, netName)
 	}
 	var vm types.VMResponse
-	if err := s.c.Do("POST", "/v1/vms", types.CreateVMRequest{Image: s.image, Network: netName, Name: "sbx-" + id, Labels: labels}, &vm); err != nil {
+	if err := s.c.Do("POST", "/v1/vms", types.CreateVMRequest{Image: s.image, Network: netName, Name: "sbx-" + id, Labels: labels, VCPUs: s.o.cpus, MemMB: s.o.memory}, &vm); err != nil {
 		return err
 	}
 	s.vm = vm.ID
@@ -328,6 +340,9 @@ func (s *sandbox) run() (err error) {
 	if err := s.root("mh-sandbox-scan", 2*time.Minute); err != nil {
 		return err
 	}
+	// what the scan found, kept here before the code runs: a run that
+	// brings the VM down takes the report with it, not this
+	scanned := s.scanned()
 
 	if s.before, err = s.flowCounts(); err != nil {
 		return err
@@ -350,6 +365,9 @@ func (s *sandbox) run() (err error) {
 	}
 
 	rep := s.report()
+	if !rep.Complete {
+		rep.AddressesAnAgent = append(rep.AddressesAnAgent, scanned...)
+	}
 	rep.applyRules(s.rules)
 	rep.ExitCode, rep.TimedOut, rep.DurationMS = code, timedOut, took.Milliseconds()
 	rep.Output = untrustedTail(res.Output, 8<<10)
@@ -674,6 +692,9 @@ func (s *sandbox) report() *sandboxReport {
 		if rep.commands < 0 {
 			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the commands the code ran: rebuild it from sandbox/ (docs/sandbox.md)")
 		}
+		if !rep.dnsSeen {
+			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not record the names the code looked up: rebuild it from sandbox/ (docs/sandbox.md)")
+		}
 		if s.rules.guest() != "" && rep.rulesApplied == 0 {
 			rep.Warnings = append(rep.Warnings, "image "+s.image+" does not apply your path and command rules (only connect and accept ones were): rebuild it from sandbox/ (docs/sandbox.md)")
 		}
@@ -713,6 +734,17 @@ func (s *sandbox) flowCounts() (map[string]uint64, error) {
 		m[flowKey(f)] = f.Count
 	}
 	return m, nil
+}
+
+// scanned is what mh-sandbox-scan found in the input, as the report would
+// list it (agent input FILE LINE TEXT). Nothing when it cannot be read: the
+// report lists it too, when it can be had.
+func (s *sandbox) scanned() []sandboxAgentText {
+	r, _, err := s.exec("sed 's/^/agent\tinput\t/' /var/lib/mh-sandbox/scan 2>/dev/null", 30*time.Second)
+	if err != nil {
+		return nil
+	}
+	return parseSandboxReport(r.Output).AddressesAnAgent
 }
 
 // patterns are the image's: one list for the input (grep, in the guest) and
@@ -762,15 +794,27 @@ func scanText(where, text string, patterns []*regexp.Regexp) []sandboxAgentText 
 }
 
 // hiddenText says how line hides text from a person and not from a model,
-// as mh-sandbox-scan does for the input: Unicode tag characters, a run of
-// zero-width ones (one alone is in emoji and in Persian or Indic names), and
-// — where asked, in a file's name — bidirectional controls. "" if it does not.
+// as mh-sandbox-scan does for the input: Unicode tag characters (a run of
+// them that is not a flag, U+1F3F4 then 2 to 6 of a-z 0-9 then cancel:
+// Scotland's), a run of zero-width ones (one alone is in emoji and in Persian
+// or Indic names), and — where asked, in a file's name — bidirectional
+// controls. "" if it does not.
 func hiddenText(line string, bidi bool) string {
+	rs := []rune(line)
 	run := 0
-	for _, r := range line {
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
 		switch {
-		case r >= 0xE0000 && r <= 0xE007F:
-			return "(Unicode tag characters: text a model reads and a person does not see)"
+		case isTag(r):
+			j := i
+			for j < len(rs) && isTag(rs[j]) {
+				j++
+			}
+			if !(i > 0 && rs[i-1] == 0x1F3F4 && flagTags(rs[i:j])) && j-i >= 2 {
+				return "(Unicode tag characters: text a model reads and a person does not see)"
+			}
+			i, run = j-1, 0
+			continue
 		case r >= 0x200B && r <= 0x200D || r >= 0x2060 && r <= 0x2064 || r == 0xFEFF:
 			if run++; run >= 3 {
 				return "(a run of zero-width characters: hidden text)"
@@ -782,6 +826,21 @@ func hiddenText(line string, bidi bool) string {
 		run = 0
 	}
 	return ""
+}
+
+func isTag(r rune) bool { return r >= 0xE0000 && r <= 0xE007F }
+
+// flagTags: the tags of a subdivision's flag, 2 to 6 of a-z 0-9 then cancel.
+func flagTags(t []rune) bool {
+	if len(t) < 3 || len(t) > 7 || t[len(t)-1] != 0xE007F {
+		return false
+	}
+	for _, r := range t[:len(t)-1] {
+		if !(r >= 0xE0030 && r <= 0xE0039 || r >= 0xE0061 && r <= 0xE007A) {
+			return false
+		}
+	}
+	return true
 }
 
 func invisible(r rune) bool {
@@ -1098,15 +1157,17 @@ type sandboxReport struct {
 	Complete bool           `json:"complete"`
 	Summary  sandboxSummary `json:"summary"`
 
-	Decoys           []sandboxDecoy     `json:"decoys"`
-	VMProbes         []sandboxProbe     `json:"vm_probes"` // untrusted: path, by
-	Privesc          []sandboxProbe     `json:"privesc"`   // untrusted: path, by
-	Commands         []sandboxCommand   `json:"commands"`  // untrusted: args
-	Alerts           []sandboxAlert     `json:"alerts"`    // untrusted: what, by
-	Changed          sandboxChanged     `json:"changed"`   // untrusted
-	Processes        []sandboxProc      `json:"processes"` // untrusted: args
-	Listening        []string           `json:"listening"`
-	Connections      []sandboxConn      `json:"connections"`
+	Decoys      []sandboxDecoy   `json:"decoys"`
+	VMProbes    []sandboxProbe   `json:"vm_probes"` // untrusted: path, by
+	Privesc     []sandboxProbe   `json:"privesc"`   // untrusted: path, by
+	Commands    []sandboxCommand `json:"commands"`  // untrusted: args
+	Alerts      []sandboxAlert   `json:"alerts"`    // untrusted: what, by
+	Changed     sandboxChanged   `json:"changed"`   // untrusted
+	Processes   []sandboxProc    `json:"processes"` // untrusted: args
+	Listening   []string         `json:"listening"`
+	Connections []sandboxConn    `json:"connections"`
+	// DNS: the names the code looked up, none answered (mh-sandbox-dns)
+	DNS              []sandboxDNS       `json:"dns"`                // untrusted: name
 	AddressesAnAgent []sandboxAgentText `json:"addresses_an_agent"` // untrusted: file, text
 	Output           string             `json:"output"`             // untrusted
 	Warnings         []string           `json:"warnings"`
@@ -1121,7 +1182,9 @@ type sandboxReport struct {
 	Verdict string `json:"verdict"`
 
 	user     string
-	commands int // distinct, as the image counted them; -1: not recorded
+	token    string // this run's, in every decoy: seen in a name, a secret went out
+	dnsSeen  bool   // the image reports names looked up (or says it cannot: dns off)
+	commands int    // distinct, as the image counted them; -1: not recorded
 	decoyBy  map[string]map[string]int
 	readers  bool // the image names who opened a decoy (decoy has TOOLS, decoyby)
 	rules    *sandboxRules
@@ -1144,6 +1207,7 @@ type sandboxSummary struct {
 	ProcessesLeft      int  `json:"processes_left"`
 	Listening          int  `json:"listening"`
 	ConnectionsRefused int  `json:"connections_refused"`
+	DNSNames           int  `json:"dns_names"` // distinct names looked up
 	AddressesAnAgent   int  `json:"addresses_an_agent"`
 }
 
@@ -1212,11 +1276,35 @@ type sandboxConn struct {
 	Reason   string `json:"reason"`
 }
 
+type sandboxDNS struct {
+	Count int    `json:"count"`
+	Type  string `json:"type"` // A, AAAA, TXT…
+	Name  string `json:"name"`
+}
+
 type sandboxAgentText struct {
 	Where string `json:"where"` // input, output
 	File  string `json:"file,omitempty"`
 	Line  int    `json:"line"`
 	Text  string `json:"text"`
+	// Severity: high for text hidden from a person (hiddenLabels), warn for
+	// a phrase — agent tooling (skills, prompts, their tests) is full of them
+	Severity string `json:"severity"`
+}
+
+// tagLabel is what hiddenText and the image's mh-sandbox-scan say in place
+// of text spelled in Unicode tag characters: a model reads it as ASCII, a
+// person sees nothing, and nothing but a flag uses them — high. The rest is
+// warn: a phrase (skills, prompts and injection tests have them), a run of
+// zero-width characters or bidirectional controls (they deceive a person
+// reading code, and the tests of terminals, editors and i18n have them).
+const tagLabel = "(Unicode tag characters: text a model reads and a person does not see)"
+
+func (a sandboxAgentText) severity() severity {
+	if a.Text == tagLabel {
+		return sevHigh
+	}
+	return sevWarn
 }
 
 // parseSandboxReport reads mh-sandbox-report --tsv. Lines it does not know
@@ -1224,7 +1312,7 @@ type sandboxAgentText struct {
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
 		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
-		Connections: []sandboxConn{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
+		Connections: []sandboxConn{}, DNS: []sandboxDNS{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
 		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
 		commands: -1,
 	}
@@ -1240,6 +1328,16 @@ func parseSandboxReport(tsv string) *sandboxReport {
 		switch f[0] {
 		case "user":
 			r.user = at(1)
+		case "token":
+			r.token = at(1)
+		case "section":
+			r.dnsSeen = r.dnsSeen || at(1) == "dns"
+		case "dns":
+			if at(1) == "off" {
+				r.Warnings = append(r.Warnings, "no resolver of the sandbox in this image: the names the code looked up are not recorded")
+			} else {
+				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3)})
+			}
 		case "rules":
 			r.rulesApplied = num(1)
 		case "decoy":
@@ -1320,6 +1418,14 @@ func (r *sandboxReport) summarize() {
 		s.ConnectionsRefused += int(c.Count)
 	}
 	s.AddressesAnAgent = len(r.AddressesAnAgent)
+	names := map[string]bool{}
+	for _, d := range r.DNS {
+		names[d.Name] = true
+	}
+	s.DNSNames = len(names)
+	for i := range r.AddressesAnAgent {
+		r.AddressesAnAgent[i].Severity = r.AddressesAnAgent[i].severity().String()
+	}
 
 	counts := map[severity]int{}
 	for _, c := range r.categories(viewStyle{}, false) {

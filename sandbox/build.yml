@@ -53,6 +53,7 @@ files:
   /usr/sbin/mh-sandbox-report: sbin/mh-sandbox-report
   /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
   /usr/sbin/mh-sandbox-watch: sbin/mh-sandbox-watch
+  /usr/sbin/mh-sandbox-dns: sbin/mh-sandbox-dns
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
 
 run:
@@ -82,9 +83,9 @@ run:
   # (SYSCALL=, SADDR=), which mh-sandbox-lib reads.
   - sed -i 's/^log_format = .*/log_format = ENRICHED/' /etc/audit/auditd.conf
   - grep -q '^admin_space_left = 150$' /etc/audit/auditd.conf && grep -q '^log_format = ENRICHED$' /etc/audit/auditd.conf
-  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch
+  - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch /usr/sbin/mh-sandbox-dns
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
-  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch
+  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && python3 -m py_compile /usr/sbin/mh-sandbox-dns && rm -rf /usr/sbin/__pycache__
 
 mem_mb: 512
 # Room for audit's log: every file the code opens is in it.

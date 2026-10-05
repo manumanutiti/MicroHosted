@@ -28,6 +28,14 @@ mount -o remount,strictatime /
 # a privilege escalation.
 mount -o remount,hidepid=2 /proc 2>/dev/null || true
 sysctl -w kernel.kptr_restrict=2 kernel.dmesg_restrict=1 >/dev/null
+# Out of memory, the kernel kills the code, never what reports on it: the
+# agent mh talks to (and every command it starts from now on), audit, init.
+# mh-sandbox-run puts the code at the other end (1000), where it cannot climb
+# back from. A build that outgrows the VM (go build in 512 MB) then fails as
+# itself instead of taking the report with it.
+for _p in 1 $(pgrep -x socat) $(pgrep -x auditd) $(pgrep -x systemd-journald); do
+	echo -1000 > "/proc/$_p/oom_score_adj" 2>/dev/null || true
+done
 
 install -d -m 700 "$S"
 asuser 'mkdir -p "$HOME/work"'
@@ -91,6 +99,24 @@ printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xp
 	decoy .electrum/wallets/default_wallet "only the wallet reads it"
 
 echo "$tok" > "$S/token"
+
+# The names the code looks up (mh-sandbox-dns): root's resolver on a
+# loopback address of its own, answering none. resolv.conf is replaced, not
+# written through: it is a link to the kernel's /proc/net/pnp. Where there is
+# no python (the Alpine image), names are not recorded; the report says so.
+if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-dns ]; then
+	: > "$S/dns"
+	setsid /usr/sbin/mh-sandbox-dns 127.53.0.1 "$S/dns" </dev/null >/dev/null 2>&1 &
+	echo -1000 > "/proc/$!/oom_score_adj" 2>/dev/null || true
+	rm -f /etc/resolv.conf
+	printf 'nameserver 127.53.0.1\n' > /etc/resolv.conf
+	# up before the code can ask
+	i=0
+	while [ $i -lt 50 ] && ! ss -Hlun 'sport = :53' 2>/dev/null | grep -q 127.53.0.1; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+fi
 
 # Where there is audit (build.yml): every file the user opens, looks up or
 # runs, found or not — the report picks out the ones that tell a VM apart —

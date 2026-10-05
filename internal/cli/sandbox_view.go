@@ -25,13 +25,15 @@ import (
 // Severities (the alerts' come from their kind, sandbox_kinds.go):
 //
 //	high  a decoy TAMPERED or DELETED, or READ by anything but its own tool;
-//	      text addressed to an AI agent; privesc: find -perm for
-//	      setuid/setgid files, /etc/shadow, /etc/gshadow, /etc/sudoers*, a
-//	      container runtime's socket, /proc/PID/mem
-//	warn  every other privesc probe (cron, root's home, the kernel's switches,
-//	      find -perm for writable files); a VM probe; a connection refused; a
-//	      file changed outside ~/work that is not a cache or a temporary file;
-//	      a process left; a listening socket
+//	      text hidden from a person (Unicode tags, zero-width runs, bidi
+//	      controls); privesc: find -perm for setuid/setgid files,
+//	      /etc/shadow, /etc/gshadow, /etc/sudoers*, a container runtime's
+//	      socket, /proc/PID/mem
+//	warn  a phrase addressed to an AI agent; every other privesc probe (cron,
+//	      root's home, the kernel's switches, find -perm for writable files);
+//	      a VM probe; a connection refused; a file changed outside ~/work
+//	      that is not a cache or a temporary file; a process left; a
+//	      listening socket
 //	info  a decoy read only by its own tool (npm, ~/.npmrc); a lookup of sudo,
 //	      su… (installers check for sudo); a VM probe ordinary programs make
 //	      too (commonProbes); a cache, a temporary file, a directory whose
@@ -299,7 +301,13 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 		if a.Line > 0 {
 			where += ":" + strconv.Itoa(a.Line)
 		}
-		c.items = append(c.items, finding{sev: sevHigh, cols: []string{where}, tail: strconv.Quote(a.Text), short: strconv.Quote(a.Text)})
+		c.items = append(c.items, finding{sev: a.severity(), cols: []string{where}, tail: strconv.Quote(a.Text), short: strconv.Quote(a.Text)})
+	}
+	if !verbose {
+		c.compact = groupAgentText(r.AddressesAnAgent, tilde, x)
+	}
+	if c.sev() < sevHigh {
+		c.note = "phrases only: skills, prompts and their tests have them too; read the lines"
 	}
 	cs = append(cs, c)
 	if r.Complete {
