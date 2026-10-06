@@ -65,7 +65,8 @@ func TestSandboxPackageTargets(t *testing.T) {
 	if got := packageCommand(npm, ""); got != "mh-sandbox-try npm cowsay" {
 		t.Errorf("npm, no command: %s", got)
 	}
-	if got := packageCommand(npm, "cowsay hi"); !strings.Contains(got, "npm rebuild --foreground-scripts; cowsay hi") || !strings.Contains(got, "node_modules/.bin") {
+	// mh-sandbox-try runs it: an MCP server it starts is spoken to.
+	if got := packageCommand(npm, "cowsay 'hi there'"); got != `mh-sandbox-try npm cowsay 'cowsay '\''hi there'\'''` {
 		t.Errorf("npm, a command: %s", got)
 	}
 	if got := packageFetch(npm); !strings.Contains(got, "--ignore-scripts") {

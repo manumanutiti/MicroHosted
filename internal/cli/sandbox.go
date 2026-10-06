@@ -173,6 +173,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	if len(pos) == 2 {
 		command = pos[1]
 	}
+	given := command != ""
 	switch {
 	case t.kind == "npm" || t.kind == "pypi":
 		command = packageCommand(t, command)
@@ -204,7 +205,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	if err != nil {
 		return err
 	}
-	s := &sandbox{e: e, c: c, o: o, t: t, command: command, rules: rules}
+	s := &sandbox{e: e, c: c, o: o, t: t, command: command, given: given, rules: rules}
 	return s.run()
 }
 
@@ -260,15 +261,13 @@ func sandboxClassify(given string) (sandboxTarget, error) {
 // packageCommand is what runs for a package target: the package used the
 // ways it can act (mh-sandbox-try) with no COMMAND; with one, COMMAND, its
 // commands on the PATH — after npm's install scripts, which the fetch left
-// out.
+// out — and an MCP server it starts spoken to, not left waiting on stdin.
 func packageCommand(t sandboxTarget, command string) string {
-	if command == "" {
-		return "mh-sandbox-try " + t.kind + " " + shellQuote(t.name)
+	c := "mh-sandbox-try " + t.kind + " " + shellQuote(t.name)
+	if command != "" {
+		c += " " + shellQuote(command)
 	}
-	if t.kind == "npm" {
-		return `export PATH="$HOME/work/node_modules/.bin:$PATH"; npm rebuild --foreground-scripts; ` + command
-	}
-	return `export PATH="$HOME/work/.v/bin:$PATH"; ` + command
+	return c
 }
 
 // packageFetch brings a package and its dependencies into ~/work running
@@ -301,6 +300,7 @@ type sandbox struct {
 	o       sandboxOpts
 	t       sandboxTarget
 	command string
+	given   bool // the caller gave the COMMAND
 
 	rules *sandboxRules
 
@@ -635,6 +635,12 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 			return err
 		} else if r.ExitCode != 0 {
 			failed = fmt.Sprintf("image %s predates npm: and pypi: (no node or mh-sandbox-try): rebuild it from sandbox/ (docs/sandbox.md)", s.image)
+		} else if s.given {
+			if r, _, err := s.exec("mh-sandbox-try --can command", time.Minute); err != nil {
+				return err
+			} else if r.ExitCode != 0 {
+				failed = fmt.Sprintf("image %s predates a COMMAND for a package: rebuild it from sandbox/ (docs/sandbox.md)", s.image)
+			}
 		}
 	}
 	if failed == "" && (s.t.kind == "npm" || s.t.kind == "pypi") {

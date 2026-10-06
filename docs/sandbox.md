@@ -46,11 +46,14 @@ then `tools/list`, `prompts/list`, `resources/list` (given `~/work` as an
 argument if it answers nothing without one). Its tools' descriptions, what a
 model reads and where a poisoned server hides instructions for it, are then
 in the output, which is scanned for text addressed to an agent. With a COMMAND, its commands are on the PATH
-(`node_modules/.bin`, `.v/bin`), after npm's install scripts:
+(`node_modules/.bin`, `.v/bin`), after npm's install scripts; a COMMAND that
+starts an MCP server — `mcp-server-filesystem /tmp`, as the user's MCP config
+would — is spoken to the same way, with its arguments as given, instead of
+waiting on a stdin nobody writes to:
 
 ```bash
 mh sandbox npm:cowsay 'cowsay hi'
-mh sandbox npm:some-mcp-server 'timeout 20 some-mcp-server < /dev/null'
+mh sandbox npm:@modelcontextprotocol/server-filesystem@2025.8.21 'mcp-server-filesystem /tmp'
 ```
 
 | Flag | |

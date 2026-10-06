@@ -17,7 +17,7 @@ rely on (their distro, a pinned lockfile they maintain).
 ## Before the first run
 
 ```bash
-command -v mh && mh images | grep -E '^sandbox:'
+command -v mh && mh image ls | grep -E '^sandbox:'
 ```
 
 No `mh`, or no `sandbox:N` image: tell the user, and stop — do not run the
@@ -48,7 +48,9 @@ jq '{verdict, exit_code, timed_out, summary, warnings}' /tmp/sbx.json
   each of its commands with `--help`. An MCP server is also started and asked
   for its tools, prompts and resources, so text hidden in a tool's description
   for the model shows in `addresses_an_agent`. Give a COMMAND when you know
-  how it will be used (the arguments the user's MCP config passes it).
+  how it will be used: for an MCP server, the command and arguments the
+  user's MCP config starts it with (`'mcp-server-filesystem /tmp'`) — it is
+  started that way and asked for the same lists.
 - `--timeout 10m`, `--mem 4G` for builds. `--apt PKG` for Ubuntu packages
   (Go: `--apt golang-go`).
 - `--fetch` runs **with the network open, before the sandbox is armed**: it
