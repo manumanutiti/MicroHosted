@@ -29,8 +29,10 @@
 name: sandbox
 base: ubuntu:24.04
 
-# A developer's machine: git, curl, Python. Add the code's toolchain
-# (nodejs npm, golang, build-essential…). procps and iproute2 are the
+# A developer's machine: git, curl, Python with venv, a C toolchain (native
+# npm modules, sdists), Node (the LTS, below: Ubuntu's 18 is too old for most
+# of npm), unzip and xz (installers unpack with them). Add the rest with
+# --apt (golang…). procps and iproute2 are the
 # report's (ps, ss); auditd too: which paths the code asked for that tell a
 # VM apart (/sys/class/dmi, /proc/cpuinfo…), found or not, what it ran, and
 # the alerts (a setuid(0) refused, a write to ~/.ssh/authorized_keys, a
@@ -42,6 +44,9 @@ packages:
   - git
   - python3
   - python3-venv
+  - build-essential
+  - unzip
+  - xz-utils
   - procps
   - iproute2
   - auditd
@@ -55,9 +60,14 @@ files:
   /usr/sbin/mh-sandbox-scan: sbin/mh-sandbox-scan
   /usr/sbin/mh-sandbox-watch: sbin/mh-sandbox-watch
   /usr/sbin/mh-sandbox-net: sbin/mh-sandbox-net
+  /usr/local/bin/mh-sandbox-try: sbin/mh-sandbox-try
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
 
 run:
+  # Node, the 24 LTS line's newest, from nodejs.org, checked against its
+  # SHASUMS256.txt: node, npm, npx, corepack (pnpm, yarn) in /usr/local
+  # (not on the build's PATH; on the code's, mh-sandbox-lib).
+  - cd /tmp && b=https://nodejs.org/dist/latest-v24.x && curl -fsSL -o SHASUMS256.txt $b/SHASUMS256.txt && f=$(awk '/ node-v[0-9.]+-linux-x64[.]tar[.]xz$/ {print $2}' SHASUMS256.txt) && curl -fsSL -o "$f" "$b/$f" && grep " $f\$" SHASUMS256.txt | sha256sum -c - && tar -xJf "$f" -C /usr/local --strip-components=1 --no-same-owner --exclude=CHANGELOG.md --exclude=README.md --exclude=LICENSE && rm -f "$f" SHASUMS256.txt && PATH=/usr/local/bin:$PATH && node --version && npm --version
   # The user the code runs as: a home from /etc/skel, bash, no password, no
   # sudo (not installed).
   - useradd -m -s /bin/bash dev
@@ -88,8 +98,11 @@ run:
   - grep -q '^admin_space_left = 150$' /etc/audit/auditd.conf && grep -q '^log_format = ENRICHED$' /etc/audit/auditd.conf
   - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch /usr/sbin/mh-sandbox-net
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
-  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && python3 -m py_compile /usr/sbin/mh-sandbox-net && rm -rf /usr/sbin/__pycache__
+  # the code's user runs it: root's, readable
+  - chmod 0755 /usr/local/bin/mh-sandbox-try
+  - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && sh -n /usr/local/bin/mh-sandbox-try && python3 -m py_compile /usr/sbin/mh-sandbox-net && rm -rf /usr/sbin/__pycache__
 
 mem_mb: 512
-# Room for audit's log: every file the code opens is in it.
-disk_mb: 2048
+# Room for audit's log — every file the code opens is in it — and for a
+# build's dependencies.
+disk_mb: 4096

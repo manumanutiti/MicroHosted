@@ -35,10 +35,45 @@ func TestSandboxClassify(t *testing.T) {
 			t.Errorf("%s: kind %q, err %v; want %q", c.given, got.kind, err, c.kind)
 		}
 	}
-	for _, bad := range []string{"http://github.com/x/y", "git@github.com:x/y", "ssh://h/x", "https://h/x y", filepath.Join(dir, "missing")} {
+	for _, bad := range []string{"http://github.com/x/y", "git@github.com:x/y", "ssh://h/x", "https://h/x y", filepath.Join(dir, "missing"),
+		"npm:", "npm:Esbuild", "npm:x;rm -rf ~", "npm:-g", "npm:x@1 2", "pypi:", "pypi:-r", "pypi:x==1;id", "pypi:x>=1,<2", "pypi:x y"} {
 		if _, err := sandboxClassify(bad); err == nil {
 			t.Errorf("%s: accepted", bad)
 		}
+	}
+}
+
+// A package: its name for the import, the spec for the fetch; a URL: the
+// name its download is saved as, ours when its own is not a plain one.
+func TestSandboxPackageTargets(t *testing.T) {
+	for _, c := range []struct{ given, kind, pkg, name, file string }{
+		{"npm:esbuild@0.24.0", "npm", "esbuild@0.24.0", "esbuild", ""},
+		{"npm:@modelcontextprotocol/server-filesystem", "npm", "@modelcontextprotocol/server-filesystem", "@modelcontextprotocol/server-filesystem", ""},
+		{"npm:left-pad@^1.3", "npm", "left-pad@^1.3", "left-pad", ""},
+		{"pypi:httpie==3.2.4", "pypi", "httpie==3.2.4", "httpie", ""},
+		{"pypi:Requests[socks]>=2", "pypi", "Requests[socks]>=2", "Requests", ""},
+		{"https://astral.sh/uv/install.sh", "url", "", "", "install.sh"},
+		{"https://sh.rustup.rs", "url", "", "", "download"},
+		{"https://h/a/$(id)", "url", "", "", "download"},
+	} {
+		got, err := sandboxClassify(c.given)
+		if err != nil || got.kind != c.kind || got.pkg != c.pkg || got.name != c.name || got.file != c.file {
+			t.Errorf("%s: %+v, %v", c.given, got, err)
+		}
+	}
+	npm, _ := sandboxClassify("npm:cowsay")
+	if got := packageCommand(npm, ""); got != "mh-sandbox-try npm cowsay" {
+		t.Errorf("npm, no command: %s", got)
+	}
+	if got := packageCommand(npm, "cowsay hi"); !strings.Contains(got, "npm rebuild --foreground-scripts; cowsay hi") || !strings.Contains(got, "node_modules/.bin") {
+		t.Errorf("npm, a command: %s", got)
+	}
+	if got := packageFetch(npm); !strings.Contains(got, "--ignore-scripts") {
+		t.Errorf("npm's fetch runs its scripts: %s", got)
+	}
+	py, _ := sandboxClassify("pypi:httpie")
+	if got := packageFetch(py); !strings.Contains(got, "--only-binary=:all:") {
+		t.Errorf("pip's fetch could build an sdist: %s", got)
 	}
 }
 

@@ -18,7 +18,7 @@ override (the |your )?(system|safety) (prompt|instructions|rules)
 (new|updated|real|actual|hidden) (system )?instructions *:
 (new|updated|real|actual|hidden|secret) system prompt *:
 (do not|don't|never) (tell|inform|alert|show|mention (this|it) to) the user
-without (telling|informing|alerting|asking) the user
+without (telling|informing|alerting) the user
 (note|message|instructions?) (to|for) (the |any |all )?(ai|llm|assistant|agent|model|claude|chatgpt|copilot|cursor|gemini)( agents?| assistants?| models?)? *:
 if you are an? (ai|llm|assistant|agent|language model|coding agent)
 (dear|attention) (ai|llm|assistant|agent|claude|chatgpt|copilot|cursor|gemini)

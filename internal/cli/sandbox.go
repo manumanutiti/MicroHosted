@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -39,11 +40,16 @@ var sandboxCmd = &command{
 	name:    "sandbox",
 	args:    "TARGET [COMMAND]",
 	summary: "Run code you do not trust in a fresh VM, and report what it did",
-	help: `TARGET is a directory, a file, an archive (.tar.gz .tgz .tar .zip) or an
-https:// git URL; it lands in ~/work, where COMMAND — one shell line — runs as
-an unprivileged user. A file with no COMMAND is run itself.
+	help: `TARGET is a directory, a file, an archive (.tar.gz .tgz .tar .zip), an
+https:// URL (a git repository is cloned; anything else is downloaded, as
+curl | sh would), or a package: npm:NAME[@VERSION], pypi:NAME[==VERSION]. It
+lands in ~/work, where COMMAND — one shell line — runs as an unprivileged
+user. A file, or a URL that is not a repository, with no COMMAND is run
+itself. A package with no COMMAND is used the ways it can act: its install
+scripts, its import, each of its commands with --help; with one, its
+commands are on the PATH (npm:cowsay 'cowsay hi').
 
-Anything fetched (--fetch, --apt, a URL) is fetched first, on a network of the
+Anything fetched (--fetch, --apt, a URL, a package) is fetched first, on a network of the
 sandbox's own, which is closed before the code runs: the code never reaches
 the internet. If closing it cannot be confirmed, nothing runs. What the code
 reaches for is answered inside the VM, and written down: every name it looks
@@ -62,6 +68,9 @@ instructions.
 
 The image is built once: mh build -t sandbox:1 sandbox  (docs/sandbox.md)`,
 	examples: `  mh sandbox ./install.sh
+  mh sandbox https://astral.sh/uv/install.sh               # curl | sh, watched
+  mh sandbox npm:@modelcontextprotocol/server-filesystem
+  mh sandbox pypi:httpie 'http --version' --json
   mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
   mh sandbox https://github.com/x/y 'make test' --apt build-essential
   mh sandbox ./release.tgz 'bash setup.sh' --json`,
@@ -89,10 +98,21 @@ type sandboxOpts struct {
 // sandboxTarget is what goes into ~/work.
 type sandboxTarget struct {
 	given string // as on the command line
-	kind  string // dir, file, archive, url
+	kind  string // dir, file, archive, url, npm, pypi
 	path  string // dir, file, archive
 	url   string
+	file  string // url: the name a download is saved as, when it is not a git repository
+	pkg   string // npm, pypi: as given after the prefix (esbuild@0.24, httpie==3.2.4)
+	name  string // npm, pypi: the package's name alone
 }
+
+// The package targets' specs: a name and a version or range in one word,
+// no shell in it (they go in a command line quoted, but a word is a word).
+var (
+	npmSpec  = regexp.MustCompile(`^((?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*)(?:@[A-Za-z0-9._^~<>=*+-]+)?$`)
+	pypiSpec = regexp.MustCompile(`^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:\[[A-Za-z0-9._,-]+\])?(?:(?:==|>=|<=|~=|!=|<|>)[A-Za-z0-9.*!+_-]+)?$`)
+	urlFile  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$`)
+)
 
 var aptName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 
@@ -153,12 +173,15 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	if len(pos) == 2 {
 		command = pos[1]
 	}
-	if command == "" {
-		if t.kind != "file" {
-			return usagef(p, "a %s needs a COMMAND to run in it", t.kind)
-		}
-		name := filepath.Base(t.path)
-		command = "./" + shellQuote(name) // packed executable: a chmod here would show as a change
+	switch {
+	case t.kind == "npm" || t.kind == "pypi":
+		command = packageCommand(t, command)
+	case command != "", t.kind == "url":
+		// a URL's: once fetched, a repository or a file to run (fetchPhase)
+	case t.kind == "file":
+		command = "./" + shellQuote(filepath.Base(t.path)) // packed executable: a chmod here would show as a change
+	default:
+		return usagef(p, "a %s needs a COMMAND to run in it", t.kind)
 	}
 	// The guest's agent reads one line.
 	if strings.ContainsAny(command+o.fetch, "\n\r") {
@@ -189,15 +212,32 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 func sandboxClassify(given string) (sandboxTarget, error) {
 	t := sandboxTarget{given: given}
 	switch {
+	case strings.HasPrefix(given, "npm:"), strings.HasPrefix(given, "pypi:"):
+		kind, spec, _ := strings.Cut(given, ":")
+		re := npmSpec
+		if kind == "pypi" {
+			re = pypiSpec
+		}
+		m := re.FindStringSubmatch(spec)
+		if m == nil {
+			return t, fmt.Errorf("%s: not a %s package (NAME, NAME%s)", given, kind, map[string]string{"npm": "@VERSION", "pypi": "==VERSION"}[kind])
+		}
+		t.kind, t.pkg, t.name = kind, spec, m[1]
+		return t, nil
 	case strings.HasPrefix(given, "https://"):
 		u, err := url.Parse(given)
 		if err != nil || u.Host == "" || strings.ContainsAny(given, " \t'\"\\") {
-			return t, fmt.Errorf("%s: not a URL to clone", given)
+			return t, fmt.Errorf("%s: not a URL to fetch", given)
 		}
 		t.kind, t.url = "url", given
+		// saved under its own name when it is a file (install.sh), or one of ours
+		t.file = "download"
+		if b := path.Base(u.Path); urlFile.MatchString(b) {
+			t.file = b
+		}
 		return t, nil
 	case strings.Contains(given, "://") || strings.HasPrefix(given, "git@"):
-		return t, fmt.Errorf("%s: only https:// URLs are cloned", given)
+		return t, fmt.Errorf("%s: only https:// URLs are fetched", given)
 	}
 	fi, err := os.Stat(given)
 	if err != nil {
@@ -215,6 +255,30 @@ func sandboxClassify(given string) (sandboxTarget, error) {
 		t.kind = "file"
 	}
 	return t, nil
+}
+
+// packageCommand is what runs for a package target: the package used the
+// ways it can act (mh-sandbox-try) with no COMMAND; with one, COMMAND, its
+// commands on the PATH — after npm's install scripts, which the fetch left
+// out.
+func packageCommand(t sandboxTarget, command string) string {
+	if command == "" {
+		return "mh-sandbox-try " + t.kind + " " + shellQuote(t.name)
+	}
+	if t.kind == "npm" {
+		return `export PATH="$HOME/work/node_modules/.bin:$PATH"; npm rebuild --foreground-scripts; ` + command
+	}
+	return `export PATH="$HOME/work/.v/bin:$PATH"; ` + command
+}
+
+// packageFetch brings a package and its dependencies into ~/work running
+// nothing of them: npm without its scripts, pip wheels only (installing a
+// wheel unpacks it; building an sdist runs its setup.py).
+func packageFetch(t sandboxTarget) string {
+	if t.kind == "npm" {
+		return "npm init -y >/dev/null && npm install --ignore-scripts --no-audit --no-fund --loglevel=error " + shellQuote(t.pkg)
+	}
+	return "python3 -m venv .v && .v/bin/pip install -q --disable-pip-version-check --only-binary=:all: " + shellQuote(t.pkg)
 }
 
 func archiveKind(name string) string {
@@ -257,7 +321,20 @@ func (s *sandbox) say(format string, a ...any) {
 }
 
 func (s *sandbox) needsNetwork() bool {
-	return s.o.fetch != "" || len(s.o.apt) > 0 || s.t.kind == "url"
+	switch s.t.kind {
+	case "url", "npm", "pypi":
+		return true
+	}
+	return s.o.fetch != "" || len(s.o.apt) > 0
+}
+
+// packed: the target goes in as an archive from here, not fetched in the VM
+func (s *sandbox) packed() bool {
+	switch s.t.kind {
+	case "dir", "file", "archive":
+		return true
+	}
+	return false
 }
 
 func (s *sandbox) run() (err error) {
@@ -266,7 +343,7 @@ func (s *sandbox) run() (err error) {
 	}
 	// Packed before anything is created: a bad archive costs no VM.
 	var tgz string
-	if s.t.kind != "url" {
+	if s.packed() {
 		if tgz, err = packTarget(s.t); err != nil {
 			return err
 		}
@@ -529,12 +606,18 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 	}
 	failed := ""
 	if s.t.kind == "url" {
-		s.say("clone: %s", s.t.url)
-		if r, _, err := s.exec("mh-sandbox-run --fetch "+shellQuote("GIT_TERMINAL_PROMPT=0 git clone -q --depth 1 -- "+shellQuote(s.t.url)+" ."), s.o.timeout); err != nil {
+		// A git repository is cloned; anything else (sh.rustup.rs, an
+		// install.sh) is downloaded, as curl | sh would, and run.
+		u, f := shellQuote(s.t.url), shellQuote(s.t.file)
+		s.say("fetch: %s", s.t.url)
+		cmd := "export GIT_TERMINAL_PROMPT=0; if git ls-remote -q -- " + u + " >/dev/null 2>&1; then echo 'a git repository: cloned' && git clone -q --depth 1 -- " + u + " .; " +
+			"else curl -fsSL --proto =https --proto-redir =https --max-filesize 1G -o " + f + " -- " + u + " && chmod +x " + f + " && echo 'a file: saved as '" + f + "; fi"
+		if r, _, err := s.exec("mh-sandbox-run --fetch "+shellQuote(cmd), s.o.timeout); err != nil {
 			return err
-		} else if r.ExitCode != 0 {
-			fmt.Fprint(s.e.stderr, r.Output)
-			failed = fmt.Sprintf("the clone failed (exit %d)", r.ExitCode)
+		} else if fmt.Fprint(s.e.stderr, r.Output); r.ExitCode != 0 {
+			failed = fmt.Sprintf("the fetch of %s failed (exit %d)", s.t.url, r.ExitCode)
+		} else {
+			failed = s.urlCommand()
 		}
 	}
 	if failed == "" && len(s.o.apt) > 0 {
@@ -545,6 +628,30 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 		} else if r.ExitCode != 0 {
 			fmt.Fprint(s.e.stderr, r.Output)
 			failed = fmt.Sprintf("apt failed (exit %d)", r.ExitCode)
+		}
+	}
+	if failed == "" && (s.t.kind == "npm" || s.t.kind == "pypi") {
+		if r, _, err := s.exec("test -x /usr/local/bin/mh-sandbox-try && test -x /usr/local/bin/node", time.Minute); err != nil {
+			return err
+		} else if r.ExitCode != 0 {
+			failed = fmt.Sprintf("image %s predates npm: and pypi: (no node or mh-sandbox-try): rebuild it from sandbox/ (docs/sandbox.md)", s.image)
+		}
+	}
+	if failed == "" && (s.t.kind == "npm" || s.t.kind == "pypi") {
+		cmd := packageFetch(s.t)
+		s.say("fetch: %s", cmd)
+		r, timedOut, err := s.exec("mh-sandbox-run --fetch "+shellQuote(cmd), s.o.timeout)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(s.e.stderr, r.Output)
+		switch {
+		case timedOut:
+			failed = "the fetch timed out"
+		case r.ExitCode != 0 && s.t.kind == "pypi":
+			failed = fmt.Sprintf("the fetch failed (exit %d) — wheels only: building an sdist runs its code, with the network open; for one, a directory and --fetch 'pip download --no-binary=PKG …', built in the run", r.ExitCode)
+		case r.ExitCode != 0:
+			failed = fmt.Sprintf("the fetch failed (exit %d)", r.ExitCode)
 		}
 	}
 	if failed == "" && s.o.fetch != "" {
@@ -577,6 +684,31 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 		return fmt.Errorf("%s: not running the code", failed)
 	}
 	return nil
+}
+
+// urlCommand, once a URL is fetched: with no COMMAND, a file is run — by
+// itself when it says how (#!, a program), with sh otherwise, as curl | sh
+// would. A repository needs a COMMAND. Returns why it cannot run, or "".
+func (s *sandbox) urlCommand() string {
+	if s.command != "" {
+		return ""
+	}
+	f := shellQuote(s.t.file)
+	r, _, err := s.exec("mh-sandbox-run --fetch "+shellQuote(`if [ -d .git ]; then echo git; else case "$(head -c 4 `+f+` | tr -d '\0')" in '#!'*|?ELF) echo exec;; *) echo sh;; esac; fi`), time.Minute)
+	if err != nil {
+		return err.Error()
+	}
+	switch strings.TrimSpace(r.Output) {
+	case "exec":
+		s.command = "./" + f
+	case "sh":
+		s.command = "sh " + f
+	case "git":
+		return s.t.url + " is a git repository: it needs a COMMAND to run in it"
+	default:
+		return "could not tell what " + s.t.url + " is"
+	}
+	return ""
 }
 
 func (s *sandbox) cleanup() {

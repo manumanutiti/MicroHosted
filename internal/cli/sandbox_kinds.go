@@ -48,6 +48,8 @@ var alertKinds = map[string]alertKind{
 		"a write in /etc, as the sandbox's user (refused unless the file is writable by anyone)"},
 	"io_uring": {sevWarn, "used io_uring",
 		"files opened and read through io_uring are not recorded: what it did through it is missing here. Node turns it off here; little else uses it"},
+	"io_uring_epoll": {sevInfo, "set up Node's io_uring ring",
+		"libuv's ring of 256 for epoll_ctl, which Node sets up with io_uring off for files: what a native module did through it would not be recorded"},
 	"connect": {sevInfo, "tried to connect",
 		"which program tried to reach what, seen inside the VM (connections lists what the network refused); :53 (dns) is a name lookup"},
 	// From the command lines run (execve).

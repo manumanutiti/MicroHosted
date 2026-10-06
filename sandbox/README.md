@@ -12,12 +12,15 @@ mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
 
 | File | |
 |---|---|
-| `build.yml` | the image: Ubuntu 24.04, the user `dev`, audit, no setuid file, a quiet systemd |
+| `build.yml` | the image: Ubuntu 24.04, Node 24 LTS, a C toolchain, the user `dev`, audit, no setuid file, a quiet systemd |
 | `alpine.yml` | a smaller one, without audit: `mh build -f sandbox/alpine.yml -t sandbox-alpine:1 sandbox` |
 | `sbin/` | the tools inside, root's only: prepare, unpack, scan, run, report, watch, net (the code's network: a resolver and a sinkhole, inside the VM) |
+| `sbin/mh-sandbox-try` | the code's user's (`/usr/local/bin`): a package (`npm:`, `pypi:`) used the ways it can act — install scripts, import, `--help` |
 | `agent-patterns` | the phrases that speak to an AI agent, for the input (grep) and the output (`mh sandbox`) |
 
 ## Fetching without running the code
+
+`mh sandbox npm:NAME` and `pypi:NAME` do this themselves. For a directory:
 
 The fetch runs with a network, before the decoys and the clock: it must run
 nothing of the code. In npm and pip, *installing* already runs code

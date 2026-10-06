@@ -7,6 +7,9 @@ the host (every connection it tried).
 
 ```bash
 mh sandbox ./install.sh                                   # a file: runs it
+mh sandbox https://astral.sh/uv/install.sh                # curl | sh, watched
+mh sandbox npm:@modelcontextprotocol/server-filesystem    # a package: install, import, --help
+mh sandbox pypi:httpie 'http --version'
 mh sandbox ./repo 'npm test' --fetch 'npm ci --ignore-scripts'
 mh sandbox https://github.com/x/y 'make test' --apt build-essential
 mh sandbox ./release.tgz 'bash setup.sh' --json           # for an agent
@@ -27,13 +30,32 @@ mh build -t sandbox:1 sandbox
 | a directory | its contents, in `~/work` |
 | a file | `~/work/NAME`; with no COMMAND it is run: `./NAME` |
 | `.tar.gz`, `.tgz`, `.tar`, `.zip` | unpacked into `~/work` |
-| `https://…` | `git clone --depth 1` into `~/work`, inside the VM, with the fetch network |
+| `https://…` | a git repository: `git clone --depth 1` into `~/work`. Anything else — `sh.rustup.rs`, an `install.sh` — downloaded as `~/work/NAME` (its own name, or `download`), as `curl \| sh` would; with no COMMAND it is run: `./NAME` when it starts with `#!` or is a program, `sh NAME` otherwise. Inside the VM, with the fetch network |
+| `npm:NAME[@VERSION]` | `npm install --ignore-scripts` into `~/work` (Node 24 LTS in the image): nothing of it runs while the network is open |
+| `pypi:NAME[==VERSION]` | `pip install --only-binary=:all:` into the venv `~/work/.v`: wheels only, since building an sdist runs its `setup.py` — a package with one fails the fetch (then: a directory, and `--fetch` that downloads it, built in the run) |
 
 COMMAND is one shell line, run as the sandbox's user in `~/work`.
 
+A package with no COMMAND is used the ways it can act — `mh-sandbox-try`, in
+the image: npm's install scripts (`npm rebuild`), `import(NAME)`, each of its
+`bin` with `--help`; for pypi, each top-level module imported and each console
+script with `--help`, 30 s each. Code that does something on install, on
+import or on start does it there. An MCP server — `mcp` in its name, or the
+MCP SDK among its dependencies — is also spoken to over stdin: `initialize`,
+then `tools/list`, `prompts/list`, `resources/list` (given `~/work` as an
+argument if it answers nothing without one). Its tools' descriptions, what a
+model reads and where a poisoned server hides instructions for it, are then
+in the output, which is scanned for text addressed to an agent. With a COMMAND, its commands are on the PATH
+(`node_modules/.bin`, `.v/bin`), after npm's install scripts:
+
+```bash
+mh sandbox npm:cowsay 'cowsay hi'
+mh sandbox npm:some-mcp-server 'timeout 20 some-mcp-server < /dev/null'
+```
+
 | Flag | |
 |---|---|
-| `--fetch 'CMD'` | before the code runs, with a network: CMD must run nothing of the code (`npm ci --ignore-scripts`, `pip download --only-binary=:all: -d wheels -r requirements.txt`, `go mod download`) |
+| `--fetch 'CMD'` | before the code runs, with a network, after a package's or URL's own fetch: CMD must run nothing of the code (`npm ci --ignore-scripts`, `pip download --only-binary=:all: -d wheels -r requirements.txt`, `go mod download`) |
 | `--apt PKG` | Ubuntu packages, installed by root before the code runs (repeatable, or comma-separated) |
 | `--image IMAGE` | default: the newest `sandbox:N` |
 | `--iface IFACE` | the fetch network's way out (default: the host's default route) |
@@ -179,7 +201,10 @@ id/product_name` is `/sys/class/dmi/id/product_name`) and without a trailing
 from the sandbox's user (`/proc/1/cgroup`: other users' processes are hidden),
 or a file was asked for as a directory (`/proc/cmdline/`). The program is
 named by its file when its process name was cut at 15 characters
-(`systemd-detect-virt`, not `systemd-detect-`).
+(`systemd-detect-virt`, not `systemd-detect-`), and by what its process
+started as, not by the thread that did it: threads name themselves (Node's
+`libuv-worker`, `MainThread`), and so does code that wants to look like
+`kworker`.
 
 | Alert | Severity | When |
 |---|---|---|
@@ -200,6 +225,7 @@ named by its file when its process name was cut at 15 characters
 | `miner` | high | `xmrig`, `stratum+tcp://`, `--donate-level`, a mining pool's name |
 | `credential_search` | high | `grep -r`, `find -name`, `locate` for passwords, keys, tokens (`id_rsa`, `.pem`, `AKIA`…) outside `~/work` |
 | `io_uring` | warn | `io_uring_setup`: files opened and read through io_uring are not in audit's record. Node would use it (libuv ≥ 1.45); the sandbox turns it off for Node (`UV_USE_IO_URING=0`), so little else does |
+| `io_uring_epoll` | info | Node's own ring of 256, which libuv sets up for `epoll_ctl` with io_uring off for files: a native module could still use it unseen |
 | `connect` | info | which program tried to reach which address (`:53 (dns)`: a name lookup); loopback left out |
 | `audit_health` | warn | audit may have missed some: the disk nearly full (audit stops recording below `admin_space_left`, 150 MB), auditd stopped, the kernel holding the code back for audit to keep up |
 

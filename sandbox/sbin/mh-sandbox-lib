@@ -282,7 +282,7 @@ classify() {
 		function sf(k) { return match(sys, " " k "=(\"[^\"]*\"|[^ \035]+)") ? substr(sys, RSTART + length(k) + 2, RLENGTH - length(k) - 2) : "" }
 		# syscall E: reads the event'"'"'s SYSCALL record (the last one seen;
 		# an event whose records came apart is the program "?")
-		function syscall(e,  c, x, k, s, n, v) {
+		function syscall(e,  c, x, k, s, n, v, tg) {
 			if (e in by) return
 			if (e != sysid) { by[e] = "?"; return }
 			sc[e] = sf("SYSCALL")
@@ -291,7 +291,11 @@ classify() {
 			by[e] = c == "" ? "?" : length(c) >= 15 && index(x, c) == 1 ? x : c
 			exb[e] = x
 			ppid[e] = sf("ppid")
-			epid[e] = sf("pid")
+			epid[e] = tg = sf("pid")
+			# comm is the thread'"'"'s name, and threads rename themselves
+			# (Node'"'"'s libuv-worker, MainThread; prctl to look like kworker):
+			# the program is what its process started as, at its exec
+			if (sc[e] != "execve" && pcomm[tg] != "") by[e] = pcomm[tg]
 			ok[e] = sf("success") == "yes"
 			# what each process started as: the report reads only some
 			# events, every exec among them
@@ -303,7 +307,10 @@ classify() {
 				# io_uring opens and reads files without the syscalls
 				# audit records: what goes through it is not here
 				if (s == "io_uring_setup") {
-					alert("io_uring", s (ok[e] ? "" : " refused"), by[e])
+					# Node (libuv) sets up a ring of 256 (a0=100) to batch
+					# epoll_ctl, files or not (UV_USE_IO_URING=0 turns off
+					# the one for files: 64, SQPOLL)
+					alert(exb[e] == "node" && a0[e] == "100" ? "io_uring_epoll" : "io_uring", s (ok[e] ? "" : " refused"), by[e])
 					return
 				}
 				if (s == "personality") {
@@ -382,6 +389,12 @@ classify() {
 				s = substr(s, RSTART + RLENGTH)
 			}
 			pend[e] = args
+			# an interpreter running a script is named by the script, as
+			# the kernel names a #! one: #!/usr/bin/env node loses that
+			# (node /usr/local/bin/npm is npm; node -e is node)
+			if (sc[e] == "execve" && ok[e] && exb[e] ~ /^(node|nodejs|python[0-9.]*|perl|ruby|bash|dash|sh)$/ &&
+			    split(args, t2, "\001") > 1 && t2[2] !~ /^-/ && base(t2[2]) != "")
+				pcomm[epid[e]] = base(t2[2])
 			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
 			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0 }
 			nran[cmd]++

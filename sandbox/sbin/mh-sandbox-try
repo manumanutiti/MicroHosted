@@ -1,0 +1,107 @@
+#!/bin/sh
+# What mh sandbox runs for a package (npm:NAME, pypi:NAME) given no COMMAND:
+# the package used the ways it can act — its install scripts, its import,
+# each of its commands with --help — so that code which does something on
+# install, on import or on start does it here. Run as the sandbox's user, in
+# ~/work, after the fetch put the package there (node_modules/, .v/):
+#
+#   mh-sandbox-try npm NAME      # npm rebuild, import(NAME), each bin --help
+#   mh-sandbox-try pypi NAME     # import each top-level module, each console script --help
+#
+# An MCP server (its name says mcp, or it depends on the MCP SDK) is also
+# spoken to, over stdin: initialize, then the lists of its tools, prompts
+# and resources — the descriptions a model will read, where a poisoned
+# server hides its instructions (mh sandbox scans the output for them).
+#
+# Everything it prints is the package's or about it: the code's to write.
+# Each step has at most MH_TRY_TIMEOUT seconds (30); a step that fails is
+# said and the next one runs: the exit code is the install's.
+set -u
+[ $# -eq 2 ] || { echo "usage: mh-sandbox-try npm|pypi NAME" >&2; exit 2; }
+kind=$1 name=$2
+per=${MH_TRY_TIMEOUT:-30}
+
+# mcp CMD...: the handshake a client makes, then what it lists; stdin held
+# open a few seconds for the answers. A server that wants a directory
+# (filesystem) is given ~/work when it answered nothing without one.
+mcp() {
+	echo "== $* (MCP: initialize, tools/list, prompts/list, resources/list)"
+	for arg in "" "$HOME/work"; do
+		out=$({
+			printf '%s\n' \
+				'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mh-sandbox","version":"1"}}}' \
+				'{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+				'{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+				'{"jsonrpc":"2.0","id":3,"method":"prompts/list"}' \
+				'{"jsonrpc":"2.0","id":4,"method":"resources/list"}'
+			sleep 5
+		} | timeout 15 "$@" ${arg:+"$arg"} 2>&1)
+		case $out in *'"jsonrpc"'*) break ;; esac
+	done
+	printf '%s\n' "$out"
+}
+
+case $kind in
+npm)
+	echo "== npm rebuild: its install scripts, and its dependencies'"
+	npm rebuild --foreground-scripts
+	rc=$?
+	echo "== import $name"
+	timeout "$per" node -e '
+import(process.argv[1]).then(
+  m => console.log("imported:", Object.keys(m).slice(0, 20).join(" ")),
+  e => console.log("import failed:", e && e.message))' "$name"
+	bins=$(node -e '
+const p = require(require("path").resolve("node_modules", process.argv[1], "package.json"));
+const b = typeof p.bin === "string" ? { [p.name.split("/").pop()]: p.bin } : (p.bin || {});
+console.log(Object.keys(b).join("\n"))' "$name")
+	sdk=$(node -e '
+const p = require(require("path").resolve("node_modules", process.argv[1], "package.json"));
+console.log("@modelcontextprotocol/sdk" in { ...p.dependencies, ...p.peerDependencies } ? "mcp" : "")' "$name")
+	for b in $bins; do
+		echo "== $b --help"
+		timeout "$per" "./node_modules/.bin/$b" --help </dev/null
+		case "$sdk $name $b" in *[Mm][Cc][Pp]*) mcp "./node_modules/.bin/$b" ;; esac
+	done
+	exit $rc
+	;;
+pypi)
+	echo "== import $name's modules"
+	timeout "$per" .v/bin/python - "$name" <<'EOF'
+import importlib, importlib.metadata as md, sys
+d = md.distribution(sys.argv[1])
+tops = set((d.read_text("top_level.txt") or "").split())
+if not tops:
+    for f in d.files or []:
+        p = f.parts
+        if len(p) == 1 and p[0].endswith(".py"):
+            tops.add(p[0][:-3])
+        elif len(p) == 2 and p[1] == "__init__.py":
+            tops.add(p[0])
+for t in sorted(tops):
+    if not t.isidentifier():
+        continue
+    try:
+        importlib.import_module(t)
+        print("imported:", t)
+    except BaseException as e:
+        print("import", t, "failed:", type(e).__name__, e)
+EOF
+	scripts=$(.v/bin/python -c '
+import importlib.metadata as md, sys
+print("\n".join(e.name for e in md.distribution(sys.argv[1]).entry_points if e.group == "console_scripts"))' "$name")
+	sdk=$(.v/bin/python -c '
+import importlib.metadata as md, re, sys
+print("mcp" if any(re.match(r"mcp\b", r) for r in md.distribution(sys.argv[1]).requires or []) else "")' "$name")
+	for s in $scripts; do
+		echo "== $s --help"
+		timeout "$per" ".v/bin/$s" --help </dev/null
+		case "$sdk $name $s" in *[Mm][Cc][Pp]*) mcp ".v/bin/$s" ;; esac
+	done
+	exit 0
+	;;
+*)
+	echo "mh-sandbox-try: npm or pypi, not $kind" >&2
+	exit 2
+	;;
+esac
