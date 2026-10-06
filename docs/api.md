@@ -12,14 +12,16 @@ root — so "who may call it" is the same question as "who may open this file",
 which the host already knows how to express, audit with `ls`, and revoke. There
 is no token to distribute, rotate or leak into a shell history.
 
-The socket is root-only unless it was installed with an owning group
-(`sudo SOCKET_GROUP=microhosted ./scripts/install-service.sh`, mode 0660). To
-use it without `sudo`, join that group and **start a new login session** —
-`usermod` does not touch sessions that are already open:
+A first install gives the socket the group `microhosted` (mode 0660) and adds
+the installing user to it, as Docker does with `docker`; `SOCKET_GROUP=none`
+keeps it root-only (0600), `SOCKET_GROUP=NAME` names another group, and a
+reinstall keeps whatever the unit has. Membership is root-equivalent. Anyone
+else joins the same way — and a membership applies only to **new login
+sessions**: `usermod` does not touch the ones already open:
 
 ```bash
 sudo usermod -aG microhosted $USER
-# log out and back in, then confirm:
+newgrp microhosted          # this terminal; or log out and back in
 id -nG | tr ' ' '\n' | grep microhosted
 ```
 

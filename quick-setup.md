@@ -1,9 +1,16 @@
-# Quick setup — from clone to your first microVM
+# Quick setup — from clone to your first project
 
-Minimal guide to get MicroHosted running on a fresh machine. Everything heavy
-(`vmlinux` kernels, `.ext4` rootfs images, keys, database) is **not tracked in
-git**: every machine builds it locally with the scripts in this repo. That's
-why cloning is lightweight, and why you need to run the steps below.
+Two commands: install, then `mh up` in an example. Everything heavy (kernels,
+images, the database) is **not tracked in git**: every machine downloads or
+builds its own — pinned and checked — the first time it needs it.
+
+```bash
+git clone <repo-url> && cd MicroHosted
+make full-install                         # host, Firecracker, daemon, mh
+
+cd orchestrator/examples/hello
+mh up                                     # builds its image the first time, then runs it
+```
 
 ## Requirements
 
@@ -12,8 +19,11 @@ why cloning is lightweight, and why you need to run the steps below.
 - **KVM**: `/dev/kvm` must exist. On a PC, enable VT-x/AMD-V in the BIOS (or
   nested virtualization if you work inside a VM). On ARM64 boards it
   usually ships with the vendor's 64-bit kernel.
-- **Go 1.25+** (`go.mod` requires `go 1.25.0`).
-- `make`, `git`, `sudo`.
+- **Go 1.21+**: the build needs 1.25 (`go.mod`), and any Go from 1.21 fetches
+  it by itself. `sudo snap install go --classic` or <https://go.dev/dl/>.
+- `make`, `git`, `sudo`. The rest (nftables, iproute2, curl, e2fsprogs,
+  debootstrap, ubuntu-keyring, btrfs-progs) `make full-install` installs with
+  apt; on another distribution, install them first.
 
 Quick check of all of the above:
 
@@ -21,101 +31,91 @@ Quick check of all of the above:
 make check
 ```
 
-## 1. Full installation (one step)
+## 1. Install (one step)
 
 ```bash
 git clone <repo-url> && cd MicroHosted
 make full-install
 ```
 
-This does, in order: checks (architecture, KVM, Go), host configuration
-(cgroups, nftables, btrfs CoW store), installation of `firecracker` +
-`jailer` (pinned version `v1.16.1`, validated against this platform),
-building the daemon, registration as a systemd service (`enable --now`), and a
-health check through the API.
+In order: checks (architecture, KVM, Go), host packages and configuration
+(cgroups, nftables, a btrfs copy-on-write store), `firecracker` + `jailer`
+(pinned `v1.16.1`, checked against its hash), the three programs —
+`microhosted`, `mh`, `mh-orchestrator` — and the daemon as a systemd service,
+then a health check through the API. It asks for `sudo` once, at the start.
 
-Useful variables: `make full-install ADDR=127.0.0.1:9000` (API address,
-no `ADDR` means the API serves on a Unix socket, whose
-permissions are its authorization; `SOCKET_GROUP=microhosted` lets that group
-drive it without `sudo`) and `FC_VERSION=vX.Y.Z` (changing the Firecracker version is a
-conscious decision: snapshots are tied to the version that created them).
-
-It is **idempotent**: re-running it updates the binary/service without touching
-live VMs. It must run **on the target machine** (KVM, cgroups, and the store
-are local); to ship only the binary to another machine: `make build ARCH=aarch64`.
-
-## 2. Build your first image
-
-The `.ext4` images are not distributed via git — they are built:
+**Who may use it.** The API is a Unix socket whose permissions are its
+authorization. A first install gives it the group `microhosted` and adds you
+to it, as Docker does with `docker`: `mh` works without `sudo`. Membership is
+root-equivalent on this host (a member can exec as root in any VM and set any
+network's policy), so add only people you would give root. The group applies
+from your next login; in the terminal you installed from:
 
 ```bash
-make prepare-image
+newgrp microhosted
+mh health
 ```
 
-By default it builds the **ultra-minimal Alpine** (`base-alpine`, ~10 MB
-real, busybox init without systemd, access via vsock exec) — the one designed
-for density at the edge (it decides how many microVMs fit on a host). It ends
-with two things built from the same files:
+Variables: `SOCKET_GROUP=none` keeps the socket root-only (then `sudo mh …`),
+`SOCKET_GROUP=NAME` uses a group of your own, `ADDR=127.0.0.1:9000` serves the
+API on a TCP port instead — with no authentication in front of it — and
+`FC_VERSION=vX.Y.Z` changes Firecracker (a conscious decision: snapshots are
+tied to the version that created them).
 
-- a **template** `base-alpine` in the catalog
-  (`/var/lib/microhosted/catalog.json`, root-owned; `images/catalog.json` in the
-  repo is only the seed a fresh install starts from): a name for the two file
-  paths, with no digest — a rebuild changes what it boots;
-- an **image** `base-alpine:<version>` in the engine's image store: a hashed,
-  read-only copy under a tag that never moves. The last lines print its pinned
-  reference:
+It is **idempotent**: re-running it updates the binaries and the service
+without touching live VMs, and keeps the socket's group as it is. It must run
+**on the target machine** (KVM, cgroups and the store are local); to ship only
+the binaries elsewhere: `make build ARCH=aarch64`.
 
-```
-  For a project spec (the orchestrator needs the digest):
-    image: base-alpine:20260928-190412@sha256:59ddee22…
-```
-
-That line is what goes into an orchestrator spec's `image:`; `mh image ls -q`
-prints it again at any time. The version defaults to the build time; name it
-with `IMAGE_VERSION=1.0`. A tag names one build forever, so a rebuild needs a
-new version (the same version with different bytes is refused). `IMPORT=0`
-stops at the template. The difference is explained in
-[docs/engine.md](docs/engine.md#template-or-image).
-
-Variants:
+## 2. Your first project
 
 ```bash
-make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py IMAGE_VERSION=1.0   # Alpine + apk packages
-make prepare-image FLAVOR=ubuntu     # Ubuntu noble (~1 GiB, systemd + SSH): base-ubuntu-noble
-make prepare-image FLAVOR=ubuntu-docker  # noble + Docker Engine, dev workstation: dev-ubuntu
-make prepare-image ARCH=aarch64      # image for ARM (cross-compile with qemu-user-static)
-make prepare-image ARCH=x86_64       # the reverse, from an ARM machine
+cd orchestrator/examples/hello
+mh up              # Ctrl-C to stop; -d to run it in the background
 ```
 
-Both flavors support x86_64 and aarch64, native or cross. Watch out with
-cross-building: the resulting image is **neither registered in the local catalog
-nor imported** (it's for another CPU) — the script leaves the kernel and rootfs with an
-architecture suffix so you can copy them to the target machine's store. The
-usual approach is to run `make prepare-image` natively on each machine (x86_64
-and ARM64).
-
-The project SSH key is generated locally in `images/keys/` (git-ignored; never
-shared).
-
-## 3. Your first microVM
-
-`full-install` also installs `mh`, the docker-style CLI. Use `sudo mh …`
-until you are in the socket's group (see [docs/api.md](docs/api.md#calling-the-api-and-who-may)).
+The first `mh up` builds the project's image from its `build.yml`: it
+downloads the pinned kernel and the Alpine base, checks both, and asks for
+`sudo` (a build runs as root). Later runs reuse it — an unchanged build builds
+nothing. Then, in another terminal:
 
 ```bash
-mh health                          # daemon health
-mh template ls                     # templates (alias: mh images)
+mh status          # functions, VMs, health
+mh ps              # the VMs themselves
+mh down            # remove everything the project created
+```
+
+[orchestrator/examples/](orchestrator/examples/README.md) has the rest — a
+website, a three-tier stack, CI runners, labs — each a directory with its
+`microse.yml`. Ubuntu-based ones take a few minutes to build the first time.
+
+## 3. Single VMs, by hand
+
+`mh run` boots one VM from an image or a catalog template, as `docker run`:
+
+```bash
 mh image ls                        # images: tag, digest, defaults
-VM=$(mh run base-alpine)           # create a VM from the template
-VM=$(mh run base-alpine:<version>) # …or from the image (a ':' makes it one)
-mh ps                              # list
+VM=$(mh run hello:<version>)       # from an image (a ':' makes it one)
 mh exec $VM uname -a               # run a command inside it (vsock)
 mh rm $VM
 ```
 
-Every command is in [docs/cli.md](docs/cli.md) (networks, egress rules,
-volumes, snapshots/forks, quarantine). The raw HTTP API is in
-[docs/api.md](docs/api.md).
+**Catalog templates** (`mh run base-alpine`, no `:`) are built separately,
+with `make prepare-image` — a kernel and rootfs registered by name, with no
+digest, for quick experiments:
+
+```bash
+make prepare-image                                   # base-alpine: ~10 MB, busybox, vsock exec
+make prepare-image EXTRA_PKGS=python3 IMAGE_NAME=alpine-py
+make prepare-image FLAVOR=ubuntu                     # base-ubuntu-noble: systemd + SSH
+make prepare-image FLAVOR=ubuntu-docker              # dev-ubuntu: noble + Docker Engine
+make prepare-image ARCH=aarch64                      # for another CPU (qemu-user-static); copy it there
+```
+
+It also imports the result as an image and prints its pinned reference. The
+difference between the two is in
+[docs/engine.md](docs/engine.md#template-or-image). Every command is in
+[docs/cli.md](docs/cli.md); the raw HTTP API in [docs/api.md](docs/api.md).
 
 ## Day-to-day operation
 
@@ -130,8 +130,15 @@ make uninstall         # inverse of full-install (DRY_RUN=1 to simulate)
 - **`/dev/kvm` doesn't exist** — no KVM means no microVMs. PC: enable
   virtualization in the BIOS. ARM64 boards: you need a 64-bit OS
   with KVM in its kernel (`zgrep KVM /proc/config.gz` to check).
-- **Permissions on `/dev/kvm`** — `setup-host.sh` adds you to the `kvm` group;
-  you may need to re-login or run `newgrp kvm`.
+- **`permission denied` on `/run/microhosted.sock`** — your session is not in
+  the socket's group yet: `newgrp microhosted` (or log in again). `mh` says
+  which case it is: not in the group, or a root-only socket (`sudo mh …`).
+- **`mh up … mh-orchestrator, which is not installed`** — an install from
+  before it was built with the rest: `make full-install` again (or
+  `make install-cli`).
+- **`base ubuntu:… is built with debootstrap, which this host lacks`** —
+  `sudo apt-get install debootstrap ubuntu-keyring`, or re-run
+  `make full-install`, which installs them.
 - **`no pinned SHA-256 for …` / `… is not the pinned …`** — every download
   (Firecracker, the guest kernel, the Alpine base) is checked against
   `scripts/checksums.sha256`. The first means the version you asked for (e.g.

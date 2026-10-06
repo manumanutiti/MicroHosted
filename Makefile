@@ -20,8 +20,9 @@ FC_VERSION ?= v1.16.1
 # a conscious decision: make install-service ADDR=127.0.0.1:8080
 ADDR ?=
 SOCKET ?= /run/microhosted.sock
-# Group allowed to drive the daemon without sudo; empty keeps the socket
-# root-only: make install-service SOCKET_GROUP=microhosted
+# Group allowed to drive the daemon without sudo. Empty: a first install
+# creates microhosted and adds you to it (root-equivalent, as the docker
+# group); a reinstall keeps what the unit has. none: root-only.
 SOCKET_GROUP ?=
 # Interfaces whose whole nftables policy the daemon owns (comma-separated).
 # Declaring one denies it in both directions except for the egress and ingress
@@ -101,9 +102,10 @@ install-cli: build
 # One-step full installation (x86_64 or aarch64, auto-detected):
 #   make full-install                      # everything: host + firecracker + daemon
 #   make full-install FC_VERSION=v1.16.1   # pin the Firecracker version
-#   make full-install SOCKET_GROUP=microhosted  # let a group use the socket
+#   make full-install SOCKET_GROUP=none      # socket root-only (default: group microhosted, you in it)
 #   make full-install ADDR=127.0.0.1:8080      # serve on a port instead
-# Afterward, to get a template ready: make prepare-image
+# Afterward: cd orchestrator/examples/hello && mh up
+# (make prepare-image only for catalog templates: mh run base-alpine)
 # ---------------------------------------------------------------------------
 full-install:
 	chmod +x scripts/*.sh
@@ -188,5 +190,10 @@ check:
 	@command -v firecracker && firecracker --version || echo "  MISSING (make install-fc)"
 	@echo "==> jailer:"
 	@command -v jailer && jailer --version || echo "  MISSING (make install-fc)"
-	@echo "==> Go:"
-	@go version || echo "  MISSING"
+	@echo "==> Go (any from 1.21 fetches the $$(awk '$$1 == "go" { print $$2; exit }' go.mod) the build needs):"
+	@go version || echo "  MISSING (sudo snap install go --classic, or https://go.dev/dl/)"
+	@echo "==> Host tools (make full-install installs the missing ones with apt):"
+	@for c in ip nft curl mkfs.ext4 python3 debootstrap; do \
+	  if command -v $$c >/dev/null || [ -x /usr/sbin/$$c ] || [ -x /sbin/$$c ]; then echo "  $$c: OK"; else echo "  $$c: MISSING"; fi; \
+	done
+	@[ -e /usr/share/keyrings/ubuntu-archive-keyring.gpg ] && echo "  ubuntu-keyring: OK" || echo "  ubuntu-keyring: MISSING (only for Ubuntu-based images)"

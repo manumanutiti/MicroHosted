@@ -349,7 +349,9 @@ one-directional by construction:
 The API can do everything, so who can reach it is the question.
 
 - It serves on a **Unix socket** (`/run/microhosted.sock`), mode `0600` (root) or
-  `0660` with a named group. The file permissions *are* the authorization: no
+  `0660` with a named group — `microhosted` on a first install, with the
+  installing user in it, as Docker's `docker` group (`SOCKET_GROUP=none`:
+  root-only). The file permissions *are* the authorization: no
   secret to distribute, leak or rotate, and an access list the host already
   audits.
 - It never listens on a network by default. `--addr` opts into TCP, with a

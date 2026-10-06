@@ -78,14 +78,16 @@ mh down           # remove everything the project created
 
 ```bash
 git clone <repo-url> && cd MicroHosted
-make full-install                 # checks, host setup, Firecracker, daemon as a systemd service, mh
+make full-install                 # host packages, Firecracker, the daemon as a systemd service, mh
+newgrp microhosted                # once: the group the installer added you to (or log in again)
 
 cd orchestrator/examples/hello
 mh up                             # builds the image the first time (sudo), then runs; Ctrl-C to stop
 ```
 
 Requirements: Linux x86_64 or aarch64 with KVM (`/dev/kvm`), cgroups v2,
-Go 1.25+. `make check` verifies them. Images and kernels are not in git: every
+Go 1.21+ (it fetches the 1.25 the build needs). `make check` verifies them;
+`make full-install` installs the rest with apt. Images and kernels are not in git: every
 machine builds its own. **[quick-setup.md](quick-setup.md)** walks through it
 step by step, and **[orchestrator/examples/](orchestrator/examples/README.md)**
 lists every example with what it shows.

@@ -425,17 +425,26 @@ secure path is the easy one; no security property is traded for convenience.
 - `mh-orchestrator` (which `mh up`/`down`/`plan`… run) is installed with `mh`
   by `make install-cli` (2026-09-28) and by `make install-service`/`full-install`
   (2026-09-30), and `mh up -d` keeps a project running in the background — but
-  not across a reboot: there is no systemd unit yet.
-  `full-install` still installs `mh` only.
-- The API socket has no group by default (`SOCKET_GROUP` empty), so every `mh`
-  call needs `sudo` until the user reconfigures. `full-install` should offer
-  the group, add the user and say that a re-login is needed.
+  not across a reboot: there is no systemd unit yet. *Done 2026-10-06:*
+  `full-install` builds and installs it too (it built `mh` only, so the first
+  `mh up` on a fresh host failed).
+- *Done 2026-10-06:* a first install gives the socket the group `microhosted`
+  and adds the installing user, as Docker's `docker` group; the installer
+  ends with `newgrp microhosted` and `mh up` in an example. `SOCKET_GROUP=none`
+  keeps it root-only; a reinstall never widens access.
+- *Done 2026-10-06:* `setup-host` installs every host package in one apt run,
+  debootstrap and ubuntu-keyring included (an Ubuntu-based example failed
+  without them); `full-install` checks Go ≥ 1.21, which fetches the 1.25 the
+  build needs; `make check` lists the host tools.
 - `make prepare-image` ends with a template **and** an image (done 2026-09-28),
   but the catalog seed still lists templates that are never built on a fresh
   host (`base-ubuntu`, …), shown as `NOT BUILT`. List only what exists, or say
   in one line how to build each.
-- One command from clone to a running example: `full-install` + the example
-  images + a first `mh-orchestrator run`, checked by `make check`.
+- One command from clone to a running example. Now two — `make full-install`,
+  then `mh up` in `orchestrator/examples/hello`, which builds its image —
+  plus a `newgrp` on the first install. Still open: prebuilt binaries (no Go
+  on the host), an install that is not apt-only, and a first build without a
+  second `sudo` prompt.
 - Version bumps (Firecracker, kernel, Alpine) now stop at `no pinned SHA-256`
   (threat-model Layer 11). Right, but the steps to add a pin are in a file
   header: a `make pin` helper that fetches, verifies (signature where the

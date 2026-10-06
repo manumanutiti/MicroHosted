@@ -4,8 +4,9 @@
 #   1. checks (architecture, KVM, Go)
 #   2. host configuration (cgroups, nftables, btrfs CoW store)
 #   3. firecracker + jailer (same version, architecture binaries)
-#   4. building the daemon
-#   5. systemd service (enable --now)
+#   4. building the daemon and its clients (microhosted, mh, mh-orchestrator)
+#   5. systemd service (enable --now); the socket's group, microhosted, with
+#      you in it on a first install
 #   6. health check through the API
 #
 # Supports x86_64 and aarch64 (ARM64 boards with a 64-bit kernel, Jetson, ARM gateways).
@@ -14,6 +15,9 @@
 # Idempotent: re-running it updates the binary/service and doesn't touch live VMs
 # (KillMode=process + reconcile). NOTE: with FC_VERSION=latest it may upgrade
 # Firecracker — snapshots are tied to the version that created them.
+#
+# Afterwards nothing else is needed to run a project: mh up builds its images
+# (the pinned kernel included) the first time.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +38,7 @@ if [[ "$ARCH" != "$NATIVE" ]]; then
   exit 1
 fi
 
-FC_VERSION="${FC_VERSION:-latest}"
+FC_VERSION="${FC_VERSION:-v1.16.1}"   # the pinned one; the Makefile passes the same
 # No ADDR by default: the API serves on a Unix socket whose permissions are its
 # authorization. Set ADDR=host:port to put it on an unauthenticated port instead.
 ADDR="${ADDR:-}"
@@ -72,11 +76,21 @@ if [[ ! -e /dev/kvm ]]; then
 fi
 echo "  /dev/kvm: OK"
 
+# go.mod asks for 1.25; any go from 1.21 on fetches that toolchain by itself
+# (GOTOOLCHAIN=auto), so 1.21 is the floor here.
+GO_WANT="$(awk '$1 == "go" { print $2; exit }' go.mod)"
 if ! command -v go &>/dev/null; then
-  echo "ERROR: Go (1.22+) is missing. Install it: https://go.dev/dl/ or 'sudo snap install go --classic'" >&2
+  echo "ERROR: Go is missing (the build needs ${GO_WANT}; any Go from 1.21 fetches it by itself)." >&2
+  echo "  Install it: sudo snap install go --classic   or   https://go.dev/dl/" >&2
   exit 1
 fi
-echo "  $(go version): OK"
+GO_HAVE="$(go env GOVERSION 2>/dev/null | sed 's/^go//')"
+if [[ "$(printf '%s\n' 1.21 "$GO_HAVE" | sort -V | head -1)" != 1.21 ]]; then
+  echo "ERROR: Go ${GO_HAVE} is too old to fetch the ${GO_WANT} the build needs: install 1.21 or later." >&2
+  echo "  sudo snap install go --classic   or   https://go.dev/dl/" >&2
+  exit 1
+fi
+echo "  go ${GO_HAVE}: OK (builds with ${GO_WANT})"
 
 # Ask for sudo once at the start, not halfway through the installation.
 echo "  (sudo is needed to configure the host, binaries, and service)"
@@ -97,11 +111,13 @@ ARCH="$ARCH" ./scripts/install-fc.sh "$FC_VERSION"
 
 # --- [4/6] Build the daemon --------------------------------------------------
 echo ""
-echo "==> [4/6] Building microhosted..."
+echo "==> [4/6] Building microhosted, mh and mh-orchestrator..."
 mkdir -p build
 CGO_ENABLED=0 go build -o build/microhosted ./cmd/microhosted
 CGO_ENABLED=0 go build -o build/mh ./cmd/mh
-echo "  build/microhosted, build/mh: OK"
+# mh up, down, plan… run it: without it the first project fails.
+CGO_ENABLED=0 go build -o build/mh-orchestrator ./orchestrator/cmd/mh-orchestrator
+echo "  build/microhosted, build/mh, build/mh-orchestrator: OK"
 
 # --- [5/6] systemd service ---------------------------------------------------
 echo ""
@@ -159,18 +175,14 @@ for c in checks:
 esac
 echo ""
 
-# Is there any usable template? (a catalog with existing kernel+rootfs)
-MISSING="$(python3 - /var/lib/microhosted/catalog.json <<'PY' 2>/dev/null || true
-import json, os, sys
-try:
-    cat = json.load(open(sys.argv[1]))
-except Exception:
-    cat = []
-usable = [t for t in cat
-          if os.path.exists(t.get("kernel_path","")) and os.path.exists(t.get("rootfs_path",""))]
-print("ok" if usable else "none")
-PY
-)"
+# Can this user drive the daemon yet? A group just joined applies from the
+# next login; until then this terminal needs newgrp (or sudo mh).
+SOCK_GROUP=""
+if [[ -z "$ADDR" && -S "$SOCKET" ]]; then
+  SOCK_GROUP="$(stat -c %G "$SOCKET")"
+  [[ "$SOCK_GROUP" == root ]] && SOCK_GROUP=""
+fi
+in_group() { tr ' ' '\n' | grep -qx "$1"; }
 
 echo ""
 echo "=============================================="
@@ -178,10 +190,10 @@ echo " Installation complete (${ARCH})"
 echo "=============================================="
 if [[ -n "$ADDR" ]]; then
   echo "  API:      ${API_URL}  (tcp, UNAUTHENTICATED — root-equivalent)"
-  echo "  status:   curl -s ${API_URL}/v1/system | python3 -m json.tool"
+elif [[ -n "$SOCK_GROUP" ]]; then
+  echo "  API:      unix ${SOCKET}  (group ${SOCK_GROUP}: its members use mh without sudo)"
 else
-  echo "  API:      unix ${SOCKET}  (file permissions are the authorization)"
-  echo "  status:   sudo curl -s --unix-socket ${SOCKET} ${API_URL}/v1/system | python3 -m json.tool"
+  echo "  API:      unix ${SOCKET}  (root-only: sudo mh …)"
 fi
 echo "  logs:     journalctl -u microhosted -f"
 if [[ "$DEGRADED" -eq 1 ]]; then
@@ -189,11 +201,17 @@ if [[ "$DEGRADED" -eq 1 ]]; then
   echo "  ATTENTION: the daemon is running but health is DEGRADED (detail above)."
   echo "    mh health                 # re-check at any time"
 fi
-if [[ "$MISSING" != "ok" ]]; then
-  echo ""
-  echo "  NEXT STEP — there's no template ready yet:"
-  echo "    make prepare-image        # kernel + rootfs + preparation + catalog"
-fi
 echo ""
-echo "  Create the first VM:"
-echo "    mh vm create base-alpine"
+echo "  Try it — an example project, built and run:"
+if [[ -n "$SOCK_GROUP" ]] && ! id -nG | in_group "$SOCK_GROUP"; then
+  if id -nG "$USER" | in_group "$SOCK_GROUP"; then
+    echo "    newgrp ${SOCK_GROUP}            # once: your new group, in this terminal (or log in again)"
+  else
+    echo "    (you are not in ${SOCK_GROUP}: use sudo mh, or sudo usermod -aG ${SOCK_GROUP} \$USER)"
+  fi
+fi
+echo "    cd orchestrator/examples/hello"
+echo "    mh up                       # builds its image the first time (asks for sudo), then runs it"
+echo "    mh status                   # in another terminal; mh down removes it all"
+echo ""
+echo "  More examples: orchestrator/examples/README.md — every command: docs/cli.md"

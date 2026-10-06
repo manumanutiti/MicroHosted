@@ -8,13 +8,17 @@
 #
 # Usage:  sudo ./scripts/install-service.sh [ADDR]
 #         With no argument the API serves on a Unix socket (default
-#         /run/microhosted.sock), whose file permissions ARE its authorization —
-#         root-only unless SOCKET_GROUP names a group. Pass an ADDR
+#         /run/microhosted.sock), whose file permissions ARE its authorization.
+#         A first install gives it the group microhosted, created if missing,
+#         and adds the user who ran sudo to it — as Docker's docker group:
+#         membership is root-equivalent. SOCKET_GROUP=none keeps it root-only,
+#         SOCKET_GROUP=NAME names an existing group instead. Pass an ADDR
 #         (e.g. 127.0.0.1:8080) to serve on a TCP port instead: that API grants
 #         root-equivalent control and has no authentication in front of it.
 #
 #         Env:  SOCKET=/run/microhosted.sock   socket path
-#               SOCKET_GROUP=microhosted       group allowed to use it (0660)
+#               SOCKET_GROUP=microhosted       group allowed to use it (0660);
+#                                              the default on a first install
 #               MANAGED_IFACE=wlan0            interface(s) whose whole nftables
 #                                              policy the daemon owns, comma-
 #                                              separated: denied both ways
@@ -64,6 +68,14 @@ installed_flag() {
 }
 
 INHERITED=()
+# A first install (no unit yet) with no SOCKET_GROUP gets the default group,
+# created below, with the user who ran sudo in it. A reinstall keeps what the
+# unit has, root-only included: access is never widened behind an operator.
+DEFAULT_GROUP=0
+if [[ ! -f "$UNIT_DST" && -z "$SOCKET_GROUP" && -z "$ADDR" ]]; then
+  SOCKET_GROUP=microhosted
+  DEFAULT_GROUP=1
+fi
 if [[ -f "$UNIT_DST" ]]; then
   if [[ -z "$SOCKET_GROUP" ]] && old="$(installed_flag socket-group)" && [[ -n "$old" ]]; then
     SOCKET_GROUP="$old"
@@ -113,6 +125,19 @@ fi
 # it refuses to start on an unknown group (silently falling back to root-only
 # would read as "the daemon is broken" and get "fixed" with chmod), so rendering
 # a unit that names a nonexistent group just turns this into a crash loop.
+if [[ "$DEFAULT_GROUP" -eq 1 ]]; then
+  if ! getent group "$SOCKET_GROUP" >/dev/null; then
+    echo "==> Creating the group $SOCKET_GROUP (who may drive the daemon)..."
+    groupadd "$SOCKET_GROUP"
+  fi
+  # The user who ran sudo, as Docker's post-install adds them to docker. Root
+  # needs no group; a sudo from root's own shell has no one to add.
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]] && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx "$SOCKET_GROUP"; then
+    echo "==> Adding $SUDO_USER to $SOCKET_GROUP: mh without sudo (root-equivalent, like the docker group)..."
+    usermod -aG "$SOCKET_GROUP" "$SUDO_USER"
+    ADDED_USER="$SUDO_USER"
+  fi
+fi
 if [[ -n "$SOCKET_GROUP" ]] && ! getent group "$SOCKET_GROUP" >/dev/null; then
   echo "ERROR: group '$SOCKET_GROUP' does not exist, and the daemon refuses to" >&2
   echo "       start rather than quietly leave the socket root-only. Create it:" >&2
@@ -247,6 +272,14 @@ elif [[ -z "$SOCKET_GROUP" ]]; then
   echo "NOTE: ${SOCKET} will be root-only. To let a group drive it without sudo:"
   echo "      sudo groupadd -f microhosted && sudo usermod -aG microhosted \$USER"
   echo "      sudo SOCKET_GROUP=microhosted ./scripts/install-service.sh"
+else
+  echo ""
+  echo "NOTE: members of ${SOCKET_GROUP} drive the daemon without sudo — root-equivalent"
+  echo "      on this host, as the docker group is. SOCKET_GROUP=none makes it root-only."
+  if [[ -n "${ADDED_USER:-}" ]]; then
+    echo "      ${ADDED_USER} was added: it applies from the next login, or now in a"
+    echo "      shell started with: newgrp ${SOCKET_GROUP}"
+  fi
 fi
 
 echo ""

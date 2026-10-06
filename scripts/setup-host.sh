@@ -41,22 +41,44 @@ else
   echo "WARN: cgroup2 not mounted. Jailer may fail."
 fi
 
-echo "==> Checking iproute2 (ip tuntap)..."
-if ! command -v ip &>/dev/null; then
-  echo "  Installing iproute2..."
-  sudo apt-get install -y iproute2
+# What the daemon and mh build call on the host, installed in one apt run:
+#   ip (iproute2), nft (nftables: the daemon applies the segmented-network
+#   policy in its own table at startup — without it, it fails), curl
+#   (Firecracker, kernels, bases), mkfs.ext4 (e2fsprogs: every image),
+#   python3 (the installer's checks), debootstrap and ubuntu-keyring (an
+#   Ubuntu base: mh build fetches it with debootstrap and checks it with the
+#   archive's key — without them only Alpine images build).
+echo "==> Checking host packages..."
+declare -A PKG_FOR=(
+  [ip]=iproute2 [nft]=nftables [curl]=curl [mkfs.ext4]=e2fsprogs [python3]=python3
+  [debootstrap]=debootstrap [/usr/share/keyrings/ubuntu-archive-keyring.gpg]=ubuntu-keyring
+)
+MISSING_PKGS=()
+for what in "${!PKG_FOR[@]}"; do
+  if [[ "$what" == /* ]]; then [[ -e "$what" ]] && continue
+  else command -v "$what" &>/dev/null || [[ -x "/usr/sbin/$what" || -x "/sbin/$what" ]] && continue
+  fi
+  MISSING_PKGS+=("${PKG_FOR[$what]}")
+done
+if [[ ${#MISSING_PKGS[@]} -eq 0 ]]; then
+  echo "  iproute2, nftables, curl, e2fsprogs, python3, debootstrap, ubuntu-keyring: OK"
+elif command -v apt-get &>/dev/null; then
+  echo "  Installing: ${MISSING_PKGS[*]}"
+  sudo apt-get update -qq   # a fresh host may have no package lists yet
+  sudo apt-get install -y "${MISSING_PKGS[@]}"
+else
+  REQUIRED=()
+  for p in "${MISSING_PKGS[@]}"; do
+    [[ "$p" == debootstrap || "$p" == ubuntu-keyring ]] || REQUIRED+=("$p")
+  done
+  echo "  missing, and this host has no apt-get: ${MISSING_PKGS[*]}" >&2
+  echo "  Install them with your distribution's package manager." >&2
+  if [[ ${#REQUIRED[@]} -gt 0 ]]; then
+    echo "ERROR: ${REQUIRED[*]} cannot be done without; run this again once installed." >&2
+    exit 1
+  fi
+  echo "  WARN: without debootstrap and ubuntu-keyring only Alpine-based images build." >&2
 fi
-echo "  iproute2: OK"
-
-echo "==> Checking nftables (nft)..."
-if ! command -v nft &>/dev/null; then
-  echo "  Installing nftables..."
-  sudo apt-get install -y nftables
-fi
-# The daemon needs it at startup: it applies the segmented-network policy
-# (drop guest→host, isolation between networks, egress NAT) in its own table
-# 'inet microhosted'. Without nft, network reconciliation fails at startup.
-echo "  nftables: OK"
 
 # The Jailer working directory (the chroot) NO LONGER goes in /srv/jailer: it has
 # to be on the SAME filesystem as the rootfs clones, because Jailer hardlinks the
