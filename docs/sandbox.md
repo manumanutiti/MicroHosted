@@ -178,7 +178,7 @@ prints every finding under its kind, with what it means:
 [HIGH] decoy credentials read (1)  fake secrets planted for this run
   !  READ  ~/.aws/credentials  by cat ×1; legitimately, the AWS CLI and SDKs read it
 
-[INFO] decoys read by their own tool (1)  npm reading ~/.npmrc: expected
+[INFO] decoys read by their own tool (1)  each by the program it is for (npm ~/.npmrc, git ~/.netrc): expected
   -  READ  ~/.npmrc  by npm ×2
 ```
 

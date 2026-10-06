@@ -38,7 +38,7 @@ jq '{verdict, exit_code, timed_out, summary, warnings}' /tmp/sbx.json
 | `curl -fsSL https://x/install.sh \| sh` | `mh sandbox https://x/install.sh --json` |
 | `npm install foo` / `npx foo` | `mh sandbox npm:foo@1.2.3 --json`, or `mh sandbox npm:foo@1.2.3 'foo --the-flags-you-would-use' --json` |
 | `pip install foo` | `mh sandbox pypi:foo==1.2.3 --json`, or with `'foo …'` as above |
-| clone a repo and run its script | `mh sandbox https://github.com/x/y 'bash install.sh' --json` |
+| clone a repo and run its script | `mh sandbox https://github.com/x/y './install.sh' --json` — as its README runs it: a script that finds its files from `$0` breaks under `bash install.sh` |
 | run a file or archive you have | `mh sandbox ./thing --json` (a file with no COMMAND is run), `mh sandbox ./x.tgz 'sh setup.sh' --json` |
 | a local project with dependencies | `mh sandbox ./dir 'npm rebuild && npm test' --fetch 'npm ci --ignore-scripts' --json` |
 

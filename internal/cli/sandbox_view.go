@@ -243,7 +243,7 @@ func (r *sandboxReport) categories(st viewStyle, verbose bool) []category {
 	var cs []category
 	if r.Complete {
 		c := category{title: "decoy credentials read", note: "fake secrets planted for this run", phrase: "read the decoy credentials"}
-		own := category{title: "decoys read by their own tool", note: "npm reading ~/.npmrc: expected"}
+		own := category{title: "decoys read by their own tool", note: "each by the program it is for (npm ~/.npmrc, git ~/.netrc): expected"}
 		for _, d := range r.Decoys {
 			if d.State == "untouched" || d.Accepted != "" {
 				continue
