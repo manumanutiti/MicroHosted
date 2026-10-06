@@ -30,7 +30,7 @@ keeps a record per tag in $XDG_STATE_HOME/microhosted/builds), nothing is
 built: the existing reference is printed, without sudo. A tag this user did
 not build, or one that now names other bytes than it built, is refused
 rather than trusted: anyone who can import can bind a removed tag again.
-That is what lets a plant spec say build: instead of image: (mh-orchestrator
+That is what lets a project spec say build: instead of image: (mh-orchestrator
 builds on plan and apply, and only what changed).
 
 Each step (FROM, PACKAGES, every copy, every command) is a layer kept

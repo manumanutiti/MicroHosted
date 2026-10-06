@@ -59,7 +59,7 @@ run:
 
 # What the image's VMs run and how they are checked. mh run starts the
 # command (as docker run starts CMD; --no-command skips it); the orchestrator
-# uses both when a plant spec's function sets no command / health; the engine
+# uses both when a project spec's function sets no command / health; the engine
 # itself runs neither. Both are covered by the image's digest. nginx listens
 # on 8080 (nginx.conf): curl http://<VM IP>:8080/.
 command: nginx -g 'daemon off;'
@@ -69,7 +69,7 @@ health:
   timeout: 3s                   # default 2s; shorter than every
   failures: 3                   # checks failed in a row before the VM is replaced; default 3
 
-# Default resources of each VM; a plant spec's resources: overrides them.
+# Default resources of each VM; a project spec's resources: overrides them.
 vcpus: 1                        # default 1
 mem_mb: 128                     # default 128; the guest's TCP buffers scale with it (docs/uses.md)
 disk_mb: 0                      # grow each VM's disk to this many MB at creation; 0: the rootfs's size

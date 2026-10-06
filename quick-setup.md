@@ -66,7 +66,7 @@ with two things built from the same files:
   reference:
 
 ```
-  For a plant spec (the orchestrator needs the digest):
+  For a project spec (the orchestrator needs the digest):
     image: base-alpine:20260928-190412@sha256:59ddee22…
 ```
 

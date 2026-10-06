@@ -53,7 +53,7 @@ func TestLoadInterpolates(t *testing.T) {
 	spec := strings.Replace(valid, "image: alpine:1.0@"+digest+"\n    network: web\n    ip:", "image: ${SERVER_IMAGE}\n    network: web\n    ip:", 1)
 	spec = strings.Replace(spec, "command: whoami", "command: echo ${GREETING:-hi} $$ $HOME   # ${NOT_READ}", 1)
 	spec = "# built with: SERVER_IMAGE=$(mh build -q -t server .) — ${IGNORED}\n" + spec
-	p := filepath.Join(dir, "plant.yaml")
+	p := filepath.Join(dir, "microse.yml")
 	if err := os.WriteFile(p, []byte(spec), 0o644); err != nil {
 		t.Fatal(err)
 	}

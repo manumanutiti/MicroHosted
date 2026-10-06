@@ -1,4 +1,4 @@
-// mh-orchestrator keeps a MicroHosted host in the state a plant spec declares.
+// mh-orchestrator keeps a MicroHosted host in the state a project spec declares.
 // See docs/orchestrator.md and orchestrator/examples/.
 package main
 
@@ -46,14 +46,14 @@ Commands:
              project owns (quarantined VMs stay)
 
 Flags:
-  -f FILE    the plant spec (default ./microse.yml, or ./microse.yaml)
+  -f FILE    the project spec (default ./microse.yml, or ./microse.yaml)
   -H SOCKET  the engine's API socket (default $MICROHOSTED_HOST, $MICROHOSTED_SOCKET or /run/microhosted.sock)
   -y         apply / down without asking (required when stdin is not a terminal)
   -d         up: in the background (log in the project's state directory)
   -state DIR failure records and flags (default $XDG_STATE_HOME/mh-orchestrator
              or ~/.local/state/mh-orchestrator)
 
-Projects: each plant spec is a project — its name:, else its directory's
+Projects: each project spec is a project — its name:, else its directory's
 name, as docker compose names them. What the orchestrator creates carries the
 project; a spec sees and changes only its own project's objects, so several
 run side by side. VMs are named PROJECT-FUNCTION-N; network names are shared
@@ -89,7 +89,7 @@ func main() {
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
-	file := fs.String("f", "", "plant spec")
+	file := fs.String("f", "", "project spec")
 	host := fs.String("H", "", "engine socket")
 	yes := fs.Bool("y", false, "do not ask")
 	stateDir := fs.String("state", orch.DefaultStateDir(), "state directory")

@@ -51,7 +51,7 @@ run:
 
 # What the image's VMs run and how they are checked. mh run starts the
 # command (as docker run starts CMD; --no-command skips it); the orchestrator
-# uses both when a plant spec's function sets none; the engine runs neither.
+# uses both when a project spec's function sets none; the engine runs neither.
 # The command runs as root through the agent; setpriv drops to the app user.
 command: setpriv --reuid=app --regid=app --init-groups python3 /opt/app/server.py 8080
 health:
@@ -60,7 +60,7 @@ health:
   timeout: 3s
   failures: 3
 
-# Default resources of each VM; a plant spec's resources: overrides them.
+# Default resources of each VM; a project spec's resources: overrides them.
 # systemd and Python idle at ~100 MB: give Ubuntu images more than Alpine.
 vcpus: 1
 mem_mb: 256

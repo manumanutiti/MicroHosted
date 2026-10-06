@@ -10,7 +10,7 @@ import (
 	"syscall"
 )
 
-// projectVerbs are docker compose's verbs on a plant spec (./microse.yml):
+// projectVerbs are docker compose's verbs on a project spec (./microse.yml):
 // mh up, mh down… They run mh-orchestrator — a separate program by design
 // (docs/orchestrator.md §3), a client of the same API — with the same
 // arguments, as docker compose is a plugin of docker.

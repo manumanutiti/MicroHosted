@@ -12,8 +12,9 @@ at the end, not hidden in the middle.
 
 ## 1. In one paragraph
 
-MicroHosted runs code it does not trust — a protocol parser that talks to a
-sensor, a sample under analysis, an agent's tool call — inside microVMs. The
+MicroHosted runs code it does not trust — a service in a stack, a CI job, a
+package or installer under `mh sandbox`, an agent's tool call, a protocol
+parser that talks to a sensor at the edge — inside microVMs. The
 working assumption is that **any VM can be fully compromised at any moment**.
 The design goal is that such a compromise stays inside that VM: it cannot reach
 the host, cannot reach other VMs, cannot reach any network the operator did not
@@ -32,16 +33,17 @@ by more than one.
 |---|---|
 | **The host** (kernel, root, the daemon, its state DB) | owning it owns every VM and every network policy |
 | **Other VMs** and their data | one compromised workload must not become all of them |
-| **Trusted networks** behind the host (plant LAN, office, VPN, management) | an edge gateway usually sits between an untrusted device segment and a trusted one; being the pivot between them is the worst outcome |
-| **Devices** on the untrusted segment (sensors, PLCs) | a compromised VM must not be able to attack them beyond what its policy already allows |
-| **Integrity of what a function reports** | a compromised parser can lie; that must be detectable and recoverable |
+| **Trusted networks** behind the host (home or office LAN, VPN, management, a plant LAN) | the host sits between its VMs and the networks it is attached to; being the pivot from a VM into them is the worst outcome |
+| **Secrets on the host** (tokens, keys, the `.env` of a project) | a VM gets only the files and secrets its spec hands it, never the host's |
+| **Devices** on a managed segment (an edge gateway's sensors and PLCs) | a compromised VM must not be able to attack them beyond what its policy already allows |
+| **Integrity of what a function reports** | a compromised service can lie; that must be detectable and recoverable |
 | **Availability** of the other functions | one VM must not be able to starve the rest |
 
 ### Adversaries
 
 | Adversary | Starting position | Considered |
 |---|---|---|
-| **A compromised guest** | root inside one VM (e.g. a parser exploited by a malicious device) | **primary** — every layer below is designed against it |
+| **A compromised guest** | root inside one VM (e.g. a malicious dependency in a CI job or a sandboxed package, a service exploited over the network, a parser exploited by a malicious device) | **primary** — every layer below is designed against it |
 | **A malicious device** on a managed segment | can send any packet on that segment, spoof its source address | yes |
 | **A local unprivileged user** on the host | a shell without root, not in the API socket's group | yes |
 | **A network attacker** on the host's other networks | can reach the host's IPs | yes |
@@ -471,7 +473,24 @@ are for, and where they stop is listed in gaps 7 and 8.
 
 ---
 
-## 5. A worked attack
+## 5. Two worked attacks
+
+### A malicious dependency in a CI job
+
+A job on a runner VM (`orchestrator/examples/github-runner`) installs a package
+whose install script is malicious; it runs as root in the VM. The runner's
+network has internet egress, which the job needs. What next?
+
+| Attacker tries | Result | Stopped by |
+|---|---|---|
+| read the host's files, `.env`, SSH keys | no shared filesystem; the VM has its own disk and the files its spec ships | L1–L3, L6 |
+| reach the home or office router, other machines on the LAN, a cloud metadata service | dropped: `egress: true` excludes private and special destinations unless `egress_private` | L4b |
+| reach the host's API or SSH | dropped in `input` | L4b — guest → host |
+| persist for the next job | the VM is destroyed when the job ends; the next job boots a fresh one from the pinned image | the orchestrator (`on_exit: replace`), L11 |
+| reuse the runner's registration | single-use: it registers nothing else | the example's just-in-time config |
+| exfiltrate what the job itself holds (its checkout, its secrets) over the internet | **not stopped** — the network the job needs is the network it leaks through | — |
+
+### An exploited parser at the edge
 
 A sensor on the device segment sends a malformed frame; the Modbus parser in its
 VM has a memory-safety bug; the attacker now has root in that VM. What next?
@@ -488,9 +507,10 @@ VM has a memory-safety bug; the attacker now has root in that VM. What next?
 | escape the VM through a Firecracker device bug | lands as that VM's own uid in a chroot with its own files only, capped by its cgroup, inside a seccomp filter | L2, L3 |
 | send forged readings | **not stopped by the engine** — the orchestrator's validation must notice; then quarantine + replace within a VM boot time, suspect kept for forensics | L9 |
 
-The last row is the honest one: isolation contains the attacker, it does not make
-the data trustworthy. Detection is the orchestrator's responsibility, recovery is
-the engine's.
+In both, the last row is the honest one: isolation contains the attacker to
+what the VM was given — its data, its secrets, its network — and does not make
+any of that trustworthy. Give a VM only what its work needs; detection is the
+orchestrator's responsibility, recovery is the engine's.
 
 ---
 
@@ -601,7 +621,7 @@ Stated plainly, most important first.
 11. **Public DNS resolvers** are configured in guests; on networks without egress
    they are unreachable (DNS fails closed), with egress they are reached through
    the same NAT.
-12. **Projects are not a security boundary.** They keep plant specs from
+12. **Projects are not a security boundary.** They keep project specs from
     removing each other's objects by mistake; anyone with the engine's API
     can change any of them. A project's lock and failure records live in its
     state directory (0700, the user's), never in a shared directory: the lock

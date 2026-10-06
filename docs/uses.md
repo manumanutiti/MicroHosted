@@ -14,7 +14,7 @@ verbs, `mh`).
 A site generated to static files — Next.js with `output: "export"`, Astro,
 Hugo, Eleventy, plain HTML — served by nginx from a ~100 MB Alpine image, kept
 running by the orchestrator, reachable from the LAN. The site's files live
-**inside the image**: a site of any size goes in (`files:` in a plant spec is
+**inside the image**: a site of any size goes in (`files:` in a project spec is
 for small per-VM configuration, at most 64 files / 512 KiB), a deploy is a new
 image, and a rollback is the previous reference.
 
@@ -80,7 +80,7 @@ redirect. Serving `index.html` through `try_files` rather than `index` keeps the
 
 ### 3. The image spec: `build.yml`
 
-One directory holds everything — the build context and the plant spec:
+One directory holds everything — the build context and the project spec:
 
 ```
 site/
@@ -106,13 +106,13 @@ health: { command: "wget -qO- -T 2 http://127.0.0.1:8080/ >/dev/null", every: 10
 mem_mb: 128
 ```
 
-`command` and `health` travel with the image, so the plant spec does not repeat
+`command` and `health` travel with the image, so the project spec does not repeat
 them. `mh build` in that directory builds it (on the engine's host; it asks for
 `sudo` once) and prints `site:sha-<fingerprint>@sha256:…`; run again with
 nothing changed, it builds nothing and prints the same. The image comes out at
-~107 MB (Alpine, nginx, a 16 MB site). The plant spec below does this itself.
+~107 MB (Alpine, nginx, a 16 MB site). The project spec below does this itself.
 
-### 4. The plant spec: `microse.yml`
+### 4. The project spec: `microse.yml`
 
 ```yaml
 # microse.yml
@@ -205,7 +205,7 @@ behind the proxy.
 
 - `size_mb` in the image spec sizes the root filesystem (default: its content
   plus a quarter and 32 MB); `disk_mb` (image default) or `resources.disk_mb`
-  (plant spec, per function) grows each VM's copy at creation, for space to
+  (project spec, per function) grows each VM's copy at creation, for space to
   write at run time.
 - **Nothing written in the VM survives it**: a replacement (a failed check, a
   new version, `recycle`) boots a fresh copy of the image. A static site has
@@ -214,4 +214,4 @@ behind the proxy.
   test above — which is why the configuration turns it off (or send it to the
   host's proxy, which sees every request anyway).
 - Data that must outlive VMs goes in a volume (`docs/volumes.md`) — attached
-  with `mh`; plant specs do not declare volumes yet.
+  with `mh`; project specs do not declare volumes yet.

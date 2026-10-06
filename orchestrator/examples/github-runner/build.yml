@@ -84,7 +84,7 @@ command: JIT=$(cat /var/lib/mh-runner/jit) && rm -f /var/lib/mh-runner/jit && cd
 # runs a job it is alive; when it exits 0, the job is over (microse.yml's
 # on_exit: replace takes it from there).
 
-# Sized for builds with Docker; a plant spec's resources: overrides them.
+# Sized for builds with Docker; a project spec's resources: overrides them.
 # The disk is each VM's own copy, grown to disk_mb and sparse: what a VM does
 # not write costs nothing.
 vcpus: 2

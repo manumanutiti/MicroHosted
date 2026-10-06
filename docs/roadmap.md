@@ -244,7 +244,7 @@ holds for a real plant — that is no longer an estimate.
 The data half of this phase — how readings leave the VMs at 100–200 sensors
 without `/exec` in the data path (vsock DataPort stream, fd passing, journal,
 declarative registry) — is designed in `docs/ingestion.md`. The control half —
-plant spec, lifetimes, redundancy and the VM budget — is being designed in
+project spec, lifetimes, redundancy and the VM budget — is being designed in
 `docs/orchestrator.md`.
 
 Exit criterion: N sensors unattended for 72 h on the target hardware, zero orphans (VM,
@@ -252,7 +252,7 @@ network, tap, cgroup, chroot), and the loop survives killing the daemon
 mid-cycle — `Reconcile` exists, it has never been exercised under an
 orchestrator.
 
-### Open: a plant spec that works on another host (noted 2026-09-28)
+### Open: a project spec that works on another host (noted 2026-09-28)
 
 **The problem, as a newcomer meets it.** Someone clones the repo and tries
 `orchestrator/examples/website/microse.yml`. Its `image:` carries the digest of the
@@ -316,7 +316,7 @@ x86_64 and aarch64 with no edit to its YAML.
 Done on 2026-09-28, uncommitted at the end of the session: `mh build` (Alpine
 and Ubuntu bases, `build.yml`, fingerprint cache, `--no-cache`/`--no-build`),
 image defaults `command`/`health` (E8), `mh run` starting an image's command,
-`${VAR}`/`.env` and `build:` in plant specs, projects (`project=` label,
+`${VAR}`/`.env` and `build:` in project specs, projects (`project=` label,
 adoption of older objects) and the compose verbs `mh up [-d]`, `down`, `plan`,
 `apply`, `status`, `failures`, `validate`; examples moved to `build.yml` +
 `microse.yml`; `docs/uses.md` (a static website, with measured capacity).
@@ -341,7 +341,7 @@ Still open, in the order they matter:
    Today: two functions with the same `build:` do the same by hand.
 3. **`mh up -d` across reboots:** a systemd unit per project (or one that
    starts every project's `up`), so a background `up` survives a host restart.
-4. **Reproducible builds** (see "a plant spec that works on another host", 5):
+4. **Reproducible builds** (see "a project spec that works on another host", 5):
    the fingerprint already gives the same *tag* on every host; the same
    *digest* needs fixed ext4 inode times, readdir order and pinned packages.
 5. **Default nginx settings worth a build-time warning:** Alpine's nginx ships
@@ -447,7 +447,7 @@ secure path is the easy one; no security property is traded for convenience.
   names (`alpine-py` / `alpine-py:1.0`), and `mh images` is an alias for
   `mh template ls`. Documented (`docs/engine.md`, "Template or image?"); still
   to decide: rename or drop the alias, and whether templates stay user-facing.
-- **Examples that run on a fresh clone** — see "a plant spec that works on
+- **Examples that run on a fresh clone** — see "a project spec that works on
   another host" (Phase 2): today they fail with a bare `engine 409`.
 - **Errors that name the fix.** Engine refusals reach the user raw (`engine
   409: image conflict: …`). The orchestrator and `mh` should translate the

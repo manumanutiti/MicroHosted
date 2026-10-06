@@ -1,6 +1,6 @@
 # mh-orchestrator
 
-Keeps a MicroHosted host in the state a plant spec declares: the spec's
+Keeps a MicroHosted host in the state a project spec declares: the spec's
 networks and functions are created, kept in their lifecycle, and whatever the
 orchestrator owns that the spec no longer declares is removed. Design and
 decisions: [`docs/orchestrator.md`](../docs/orchestrator.md).
@@ -42,7 +42,7 @@ mh up -d -f ../hello/microse.yml  # any other file: -f
 `mh up` is `mh-orchestrator run`; every verb above is also `mh-orchestrator
 VERB`, the program `mh` hands them to (`make install-cli` installs both).
 
-**Projects.** Each plant spec is a project, named by its `name:` or else by its
+**Projects.** Each project spec is a project, named by its `name:` or else by its
 directory, as docker compose names them. Everything the orchestrator creates
 carries `project=<name>`, and a spec sees and changes only its own project's
 objects — `mh up` in two directories runs both, `mh down` in one leaves the

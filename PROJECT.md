@@ -1,5 +1,12 @@
 # MicroHosted — A self-hosted microVM orchestrator
 
+> **Where it stands (2026-10):** MicroHosted is a general-purpose microVM engine
+> with a Compose-like orchestrator on top — Docker and Docker Compose, but every
+> container is a microVM. See [Current direction](#current-direction-2026-10--compose-for-microvms)
+> at the end. The sections in between are the project's history, in order:
+> the first-stage plan, the security-sandbox positioning (2026-07-01/02) and the
+> IoT/OT pivot (2026-07-05), which is now one use case among several.
+
 ## Why it exists
 
 A real, unmet need: **strong, self-hosted isolation** for ephemeral workloads
@@ -345,6 +352,13 @@ Strategic keys:
 
 ## Niche pivot (2026-07-05) — IoT/OT isolation gateway
 
+> **Superseded (2026-10)** as the project's direction by
+> [Current direction](#current-direction-2026-10--compose-for-microvms). The
+> edge gateway remains a supported use case — `docs/iot-edge.md`,
+> `docs/ingestion.md`, `examples/modbus-pull/` — and much of what it asked for
+> (ARM64, fine-grained egress, the three lifecycle modes, the minimal Alpine
+> image, density) is what the general product is built on.
+
 Direction decision: **the project specializes in the IoT/OT edge niche.** The
 engine (Firecracker+Jailer microVMs, nftables segmented networks, btrfs CoW,
 snapshots/fork, vsock, volumes, cgroups, observability) stays as is — it's
@@ -424,6 +438,62 @@ The pending hardening (Phase 4: cgroups/seccomp validation, soak test) **remains
 in force and rises in importance** — in OT the selling point is the isolation
 guarantee, and that's demonstrated with the threat model + adversarial tests
 already planned.
+
+---
+
+## Current direction (2026-10) — Compose for microVMs
+
+Building the orchestrator for the OT gateway produced something more general
+than the gateway: a declarative file of networks and services, images built
+from a short spec, and a loop that keeps them running. Once it was driven with
+Docker's verbs, the same tool served workloads that have nothing to do with
+sensors. The direction since then: **Docker and Docker Compose, but every
+container is a microVM.**
+
+### The product
+
+| Piece | Role | Docker equivalent |
+|---|---|---|
+| `microhosted` | the engine: VMs, networks, volumes, images, snapshots, events, over an HTTP API on a Unix socket | `dockerd` |
+| `mh` | the command-line client, object-first like `docker` (`mh ps`, `mh run`, `mh exec`) | `docker` |
+| `mh build` + `build.yml` | an image from an Alpine or Ubuntu base, packages, files and commands, built in cached layers and pinned by digest | `docker build` + Dockerfile |
+| `mh up` + `microse.yml` | a project: networks and services kept in the declared state — health checks, replacement, back-off, rolling updates with rollback | `docker compose` |
+| `mh sandbox` | runs code you do not trust (an installer, a package, a repository, an MCP server) and reports what it did | — |
+
+The rule for user-facing design: when adding a command, a flag or a file
+format, look first at what Docker or Compose calls it and does, and follow it
+unless it would weaken a security property (pinned digests; the engine runs no
+command of its own accord).
+
+### Why microVMs and not containers
+
+The same moat as every earlier positioning: run something without trusting it,
+and keep it off the host. A container shares the host's kernel; a microVM has
+its own, behind KVM, a minimal VMM and Jailer's chroot, cgroups and seccomp.
+What MicroHosted adds over running Firecracker by hand is everything around the
+VM that Docker made ordinary — images, networks, names, projects, `up` and
+`down` — with the defaults of an isolation tool: no network unless declared, no
+channel from guest to host, images that boot only by digest.
+
+### Use cases
+
+None of them is the product; each is a project directory with a `microse.yml`
+(index: `orchestrator/examples/README.md`):
+
+- **Multi-service stacks** — database, API and front end, one VM each, on a
+  private network (`stack`, `intranet`, `website`).
+- **Labs and teaching environments** — an Ansible control node and its
+  machines, a school network with DNS, FTP, MQTT and NTP (`ansible`,
+  `classroom`).
+- **CI runners** — one GitHub Actions job per fresh VM (`github-runner`).
+- **Untrusted code** — `mh sandbox`, and an agent skill that calls it before
+  running anything unknown (`docs/sandbox.md`, `skills/mh-sandbox/`).
+- **Development environments** — disposable workstations with Docker inside
+  (`docs/development-environments.md`, exploratory).
+- **IoT/OT edge isolation** — the earlier niche: a parser per sensor in a
+  disposable VM (`docs/iot-edge.md`, `examples/modbus-pull/`).
+
+Where the work stands and what comes next: `docs/roadmap.md`.
 
 ---
 

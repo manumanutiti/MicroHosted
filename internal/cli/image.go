@@ -91,7 +91,7 @@ func imageImport(e *env, cmd *command, p string, args []string) error {
 func imageList(e *env, cmd *command, p string, args []string) error {
 	var quiet, noTrunc, asJSON bool
 	fs := newCmdFlags(e, p, cmd)
-	fs.boolVar(&quiet, "quiet", "q", "print pinned references only (NAME:VERSION@DIGEST), one per tag: what a plant spec's image: takes")
+	fs.boolVar(&quiet, "quiet", "q", "print pinned references only (NAME:VERSION@DIGEST), one per tag: what a project spec's image: takes")
 	fs.boolVar(&noTrunc, "no-trunc", "", "print the full digest")
 	fs.boolVar(&asJSON, "json", "", "print the API's JSON")
 	pos, err := fs.parse(args)
@@ -142,7 +142,7 @@ func imageList(e *env, cmd *command, p string, args []string) error {
 	table(e.stdout, []string{"IMAGE", "DIGEST", "VCPU", "MEM", "DISK", "SIZE", "STATUS", "IMPORTED"}, rows)
 	if len(imgs) > 0 {
 		// On stderr, like template ls's notes: the table stays parseable.
-		fmt.Fprintf(e.stderr, "\nFor a plant spec's image: (name:version@sha256:…, the digest in full): mh image ls -q\n")
+		fmt.Fprintf(e.stderr, "\nFor a project spec's image: (name:version@sha256:…, the digest in full): mh image ls -q\n")
 	}
 	return nil
 }

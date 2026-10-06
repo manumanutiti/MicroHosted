@@ -233,7 +233,7 @@ func (f *fakeEngine) count(sel map[string]string) int {
 	return len(vms)
 }
 
-const plant = `
+const testSpec = `
 version: 1
 budget: { max_vms: 5, max_mem_mb: 1024, workers: 2 }
 networks:
@@ -298,7 +298,7 @@ func applyOnce(t *testing.T, o *Orchestrator) *Plan {
 func TestApplyCreatesThenConverges(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	p := applyOnce(t, o)
 	if p.PeakVMs != 2 || p.PeakMemMB != 256 {
 		t.Errorf("worst case %d VMs %d MB, want 2 and 256 (1 persistent + 1 worker: one cycle function needs no second)", p.PeakVMs, p.PeakMemMB)
@@ -325,7 +325,7 @@ func TestForeignObjectsUntouched(t *testing.T) {
 	f := newFake()
 	f.vms["user0001"] = &types.VMResponse{ID: "user0001", Name: "dev", State: types.VMStateRunning, Labels: map[string]string{"function": "server"}}
 	f.nets["web"] = &types.NetworkResponse{Name: "web", Subnet: "172.16.2.0/24"}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	applyOnce(t, o)
 	if f.vms["user0001"] == nil || f.nets["web"] == nil {
 		t.Fatal("a VM or network without the orchestrator's mark was removed")
@@ -333,13 +333,13 @@ func TestForeignObjectsUntouched(t *testing.T) {
 
 	f2 := newFake()
 	f2.nets["demo"] = &types.NetworkResponse{Name: "demo", Subnet: "172.30.10.0/24"}
-	o2, _ := newOrch(t, f2, plant)
+	o2, _ := newOrch(t, f2, testSpec)
 	if _, err := o2.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "not the orchestrator's") {
 		t.Fatalf("plan over a foreign network of the same name: %v", err)
 	}
 	f3 := newFake()
 	f3.nets["other"] = &types.NetworkResponse{Name: "other", Subnet: "172.30.0.0/16"}
-	o3, _ := newOrch(t, f3, plant)
+	o3, _ := newOrch(t, f3, testSpec)
 	if _, err := o3.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "overlaps") {
 		t.Fatalf("plan over an overlapping subnet: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestForeignObjectsUntouched(t *testing.T) {
 func TestApplyPrunes(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	applyOnce(t, o)
 	f.vms["quar0001"] = &types.VMResponse{ID: "quar0001", Name: "server-0", Quarantine: true, State: types.VMStateRunning,
 		Labels: map[string]string{LabelManagedBy: Owner, LabelProject: "default", LabelFunction: "server"}}
@@ -382,12 +382,12 @@ functions:
 // stored digest, is refused before any change.
 func TestPlanRefuses(t *testing.T) {
 	f := newFake()
-	o, _ := newOrch(t, f, strings.Replace(plant, "max_mem_mb: 1024", "max_mem_mb: 200", 1))
+	o, _ := newOrch(t, f, strings.Replace(testSpec, "max_mem_mb: 1024", "max_mem_mb: 200", 1))
 	if _, err := o.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "max_mem_mb is 200") {
 		t.Errorf("over budget: %v", err)
 	}
 	other := "sha256:" + strings.Repeat("f", 64)
-	o, _ = newOrch(t, f, strings.Replace(plant, digest, other, 1))
+	o, _ = newOrch(t, f, strings.Replace(testSpec, digest, other, 1))
 	if _, err := o.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "no such image") {
 		t.Errorf("unknown image: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestStartPersistentFailureLeavesNothing(t *testing.T) {
 		}
 		return &types.ExecResponse{}, nil
 	}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	p, err := o.Plan(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +427,7 @@ func TestTransactionCycle(t *testing.T) {
 	f.exec = func(_ *types.VMResponse, cmd string) (*types.ExecResponse, error) {
 		return &types.ExecResponse{Output: "root\n"}, nil
 	}
-	o, out := newOrch(t, f, plant)
+	o, out := newOrch(t, f, testSpec)
 	fn := o.spec.Functions["whoami"]
 	r := o.cycle(context.Background(), "whoami", fn)
 	if !r.OK || r.Output != "root\n" || *r.Exit != 0 || r.VM != "default-whoami-1" {
@@ -468,7 +468,7 @@ func TestTransactionCycle(t *testing.T) {
 // it ends before.
 func TestWindowCycle(t *testing.T) {
 	fastTimers(t)
-	y := strings.Replace(plant, "lifecycle: { mode: transaction, every: 30s, timeout: 5s }", "lifecycle: { mode: window, every: 30s, duration: 1s }", 1)
+	y := strings.Replace(testSpec, "lifecycle: { mode: transaction, every: 30s, timeout: 5s }", "lifecycle: { mode: window, every: 30s, duration: 1s }", 1)
 	f := newFake()
 	o, _ := newOrch(t, f, y)
 	fn := o.spec.Functions["whoami"]
@@ -501,7 +501,7 @@ func TestWindowCycle(t *testing.T) {
 func TestRunReplacesDeadVM(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() { done <- o.Run(ctx, nil) }()
@@ -554,7 +554,7 @@ func TestLaunchRecordsExitCode(t *testing.T) {
 // replaced at once and nothing is recorded; any other code is a failure.
 func TestOnExitReplace(t *testing.T) {
 	fastTimers(t)
-	y := strings.Replace(plant, "    health: { command: check }\n    lifecycle: { mode: persistent }", "    lifecycle: { mode: persistent, on_exit: replace }", 1)
+	y := strings.Replace(testSpec, "    health: { command: check }\n    lifecycle: { mode: persistent }", "    lifecycle: { mode: persistent, on_exit: replace }", 1)
 	f := newFake()
 	o, _ := newOrch(t, f, y)
 	var mu sync.Mutex
@@ -651,7 +651,7 @@ func TestNoEngineInternals(t *testing.T) {
 // of the function.
 func TestInterruptedCycleIsSkipped(t *testing.T) {
 	fastTimers(t)
-	y := strings.Replace(plant, "lifecycle: { mode: transaction, every: 30s, timeout: 5s }", "lifecycle: { mode: window, every: 30s, duration: 10s }", 1)
+	y := strings.Replace(testSpec, "lifecycle: { mode: transaction, every: 30s, timeout: 5s }", "lifecycle: { mode: window, every: 30s, duration: 10s }", 1)
 	f := newFake()
 	o, _ := newOrch(t, f, y)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -676,7 +676,7 @@ func TestDegradedAfterFailedStarts(t *testing.T) {
 		}
 		return &types.ExecResponse{}, nil
 	}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() { done <- o.Run(ctx, nil) }()
@@ -713,7 +713,7 @@ func TestDegradedAfterFailedStarts(t *testing.T) {
 // the VM still existed; a successful one keeps nothing.
 func TestFailureRecords(t *testing.T) {
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	fn := o.spec.Functions["whoami"]
 	if r := o.cycle(context.Background(), "whoami", fn); !r.OK {
 		t.Fatalf("cycle %+v", r)
@@ -766,7 +766,7 @@ func TestFailureRecords(t *testing.T) {
 func TestDeathRecorded(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() { done <- o.Run(ctx, nil) }()
@@ -819,7 +819,7 @@ func TestPrintable(t *testing.T) {
 func TestFilesReachEngine(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	fn := o.spec.Functions["server"]
 	fn.Files = map[string]*spec.File{"/opt/app.py": {From: "app.py", Mode: "0755", Content: []byte("print(1)")}}
 	fn.Secrets = map[string]*spec.File{"/etc/token": {From: "token", Content: []byte("s3cret")}}
@@ -848,7 +848,7 @@ func TestFilesReachEngine(t *testing.T) {
 func TestSecretFromCommand(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	fn := o.spec.Functions["server"]
 	dir := t.TempDir()
 	fn.Secrets = map[string]*spec.File{"/etc/jit": {Command: `printf '%s' "jit-for-$MH_VM_NAME"; echo noise >&2`, Dir: dir}}
@@ -909,12 +909,12 @@ func servingVM(f *fakeEngine, fn string) *types.VMResponse {
 func TestRolloutUpdatesPersistent(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	reload, stop := startRun(t, o)
 	defer stop()
 	waitFor(t, func() bool { return servingVM(f, "server") != nil })
 
-	ns := mustSpec(t, strings.Replace(plant, "command: serve", "command: serve --v2", 1))
+	ns := mustSpec(t, strings.Replace(testSpec, "command: serve", "command: serve --v2", 1))
 	reload <- ns
 	want := SpecHash(ns.Functions["server"])
 	waitFor(t, func() bool { v := servingVM(f, "server"); return v != nil && v.Labels[LabelSpec] == want })
@@ -938,14 +938,14 @@ func TestRolloutRevertsAndHalts(t *testing.T) {
 		}
 		return &types.ExecResponse{Output: "root\n"}, nil
 	}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	reload, stop := startRun(t, o)
 	defer stop()
 	waitFor(t, func() bool { return servingVM(f, "server") != nil })
 	oldHash := SpecHash(o.spec.Functions["server"])
 	oldWhoami := o.fn("whoami")
 
-	y := strings.Replace(plant, "command: serve\n    health: { command: check }", "command: serve --v2\n    health: { command: check-v2 }", 1)
+	y := strings.Replace(testSpec, "command: serve\n    health: { command: check }", "command: serve --v2\n    health: { command: check-v2 }", 1)
 	y = strings.Replace(y, "command: whoami", "command: whoami --v2", 1)
 	reload <- mustSpec(t, y)
 	waitFor(t, func() bool { return o.state.Get("server").Held })
@@ -972,16 +972,16 @@ func TestRolloutCycleVerification(t *testing.T) {
 		}
 		return &types.ExecResponse{}, nil
 	}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	reload, stop := startRun(t, o)
 	defer stop()
 	waitFor(t, func() bool { return servingVM(f, "server") != nil })
 
-	good := mustSpec(t, strings.Replace(plant, "command: whoami", "command: whoami --v2", 1))
+	good := mustSpec(t, strings.Replace(testSpec, "command: whoami", "command: whoami --v2", 1))
 	reload <- good
 	waitFor(t, func() bool { return o.fn("whoami").Command == "whoami --v2" && o.desired() == good })
 
-	reload <- mustSpec(t, strings.Replace(plant, "command: whoami", "command: whoami --broken", 1))
+	reload <- mustSpec(t, strings.Replace(testSpec, "command: whoami", "command: whoami --broken", 1))
 	waitFor(t, func() bool { return o.state.Get("whoami").Held })
 	if c := o.fn("whoami").Command; c != "whoami --v2" {
 		t.Errorf("whoami runs %q after a failed update, want the previous whoami --v2", c)
@@ -993,13 +993,13 @@ func TestRolloutCycleVerification(t *testing.T) {
 func TestRolloutRefusesAndReshapes(t *testing.T) {
 	fastTimers(t)
 	f := newFake()
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	reload, stop := startRun(t, o)
 	defer stop()
 	waitFor(t, func() bool { return servingVM(f, "server") != nil })
 
 	before := o.desired()
-	reload <- mustSpec(t, strings.Replace(plant, "max_mem_mb: 1024", "max_mem_mb: 100", 1))
+	reload <- mustSpec(t, strings.Replace(testSpec, "max_mem_mb: 1024", "max_mem_mb: 100", 1))
 	time.Sleep(100 * time.Millisecond)
 	if o.desired() != before {
 		t.Fatal("an over-budget spec was adopted")
@@ -1040,7 +1040,7 @@ func TestStartFailsFastWhenCommandExits(t *testing.T) {
 		return &types.ExecResponse{}, nil
 	}
 	f.nets["demo"] = &types.NetworkResponse{Name: "demo", Subnet: "172.30.10.0/24"}
-	o, _ := newOrch(t, f, plant)
+	o, _ := newOrch(t, f, testSpec)
 	start := time.Now()
 	_, err := o.startPersistent(context.Background(), "server", o.spec.Functions["server"])
 	if err == nil || !strings.Contains(err.Error(), "SyntaxError") {

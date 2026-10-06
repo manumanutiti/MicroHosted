@@ -12,7 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// EnvFile is the file next to a plant spec whose variables it may use, as
+// EnvFile is the file next to a project spec whose variables it may use, as
 // docker compose reads .env: the process environment wins over it.
 const EnvFile = ".env"
 

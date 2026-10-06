@@ -347,7 +347,7 @@ source entries, with the same rules as `files:`) or `run:`, never both.
   xfs, btrfs do; an overlay itself, as in a container, does not), and its
   path must be letters, digits and `. _ - /`.
 
-**From a plant spec.** A function says `build: DIR` (the directory holding a
+**From a project spec.** A function says `build: DIR` (the directory holding a
 `build.yml`) or `build: path/to/build.yml` instead of `image:`, and
 `mh-orchestrator plan`/`apply`/`run` run `mh build` on it — building only what
 changed — and pin the reference it prints. `validate`, `status`, `down` and a
@@ -381,7 +381,7 @@ run:                         # RUN: shell commands in the image, after packages 
 #   - run: pip install -r /opt/app/requirements.txt   # kept while requirements.txt is unchanged
 #   - copy: {/opt/app/: app/}                         # a code change reruns only this and after
 # Defaults of its VMs. command and health are for whoever runs them — mh run
-# starts the command (docker run's CMD), the orchestrator uses both when a plant
+# starts the command (docker run's CMD), the orchestrator uses both when a project
 # spec leaves them out; the engine itself runs neither.
 command: nginx -g 'daemon off;'
 health: { command: "wget -qO- -T 2 http://127.0.0.1/", every: 10s, timeout: 2s, failures: 3 }
@@ -424,11 +424,11 @@ size_mb: 0                   # rootfs size; 0: its content plus a quarter and 32
   unpinned packages may differ, and ext4 timestamps and UUIDs do. Share the
   `build.yml` and its files — everyone builds the image with one command, or
   lets `build:` do it — rather than the digest, or share the image itself
-  (`docs/roadmap.md`, "a plant spec that works on another host").
+  (`docs/roadmap.md`, "a project spec that works on another host").
 
 ### Projects: `mh up`, `mh down`
 
-A plant spec (`microse.yml`, see `orchestrator/README.md`) is run with docker
+A project spec (`microse.yml`, see `orchestrator/README.md`) is run with docker
 compose's verbs, on `./microse.yml` unless `-f FILE` says otherwise. `mh` hands
 them to `mh-orchestrator` (installed with it by `make install-service` and
 `make install-cli`), a separate

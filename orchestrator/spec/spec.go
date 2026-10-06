@@ -1,4 +1,4 @@
-// Package spec reads and validates a plant spec: the one file that declares
+// Package spec reads and validates a project spec: the one file that declares
 // which networks and functions the orchestrator keeps running (see
 // docs/orchestrator.md §5).
 //
@@ -22,7 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Version is the only plant spec version this orchestrator reads.
+// Version is the only project spec version this orchestrator reads.
 const Version = 1
 
 // Lifecycle modes (docs/orchestrator.md §7).
@@ -38,7 +38,7 @@ const NoNetwork = "none"
 // Labels the orchestrator sets itself and a spec may not.
 var ReservedLabels = []string{"managed-by", "project", "function", "generation", "spec"}
 
-// Spec is a parsed, validated plant spec.
+// Spec is a parsed, validated project spec.
 type Spec struct {
 	Version int `yaml:"version"`
 	// Name is the project's name: what the orchestrator creates for this
@@ -126,7 +126,7 @@ type Function struct {
 	// Image is name:version@sha256:<digest>; the digest is mandatory.
 	Image string `yaml:"image"`
 	// Build is an image spec to build the image from instead: a build.yml,
-	// or a directory holding one (relative to the plant spec). The
+	// or a directory holding one (relative to the project spec). The
 	// orchestrator runs mh build on it and uses the reference it prints —
 	// built once per set of inputs (see ResolveBuilds).
 	Build string `yaml:"build"`
@@ -293,7 +293,7 @@ func Load(path string) (*Spec, error) {
 	return s, nil
 }
 
-// File names looked for when a path names a directory: the plant spec
+// File names looked for when a path names a directory: the project spec
 // mh-orchestrator reads without -f, and the image spec build: points at.
 var (
 	PlantFiles = []string{"microse.yml", "microse.yaml"}
@@ -413,7 +413,7 @@ func Parse(data []byte) (*Spec, error) {
 	}
 	var extra yaml.Node
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return nil, errors.New("more than one YAML document: a plant spec is exactly one")
+		return nil, errors.New("more than one YAML document: a project spec is exactly one")
 	}
 	order, err := functionOrder(data)
 	if err != nil {
@@ -433,7 +433,7 @@ func functionOrder(data []byte) ([]string, error) {
 		return nil, err
 	}
 	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
-		return nil, errors.New("a plant spec is a mapping")
+		return nil, errors.New("a project spec is a mapping")
 	}
 	top := root.Content[0]
 	for i := 0; i+1 < len(top.Content); i += 2 {

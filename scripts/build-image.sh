@@ -12,7 +12,7 @@
 #   5. catalog — registers/updates the template in /var/lib/microhosted/catalog.json
 #   6. import  — `mh image import IMAGE_NAME:IMAGE_VERSION`: copies both files
 #                into the engine's image store, hashes them and prints the
-#                pinned reference (name:version@sha256:…) a plant spec needs
+#                pinned reference (name:version@sha256:…) a project spec needs
 #
 # Template vs image: the template (step 5) is a name for two paths, rebuilt in
 # place, with no digest — `mh run IMAGE_NAME`. The image (step 6) is an
@@ -252,7 +252,7 @@ echo "=============================================="
 echo " Image ready"
 echo "=============================================="
 if [[ -n "$REF" ]]; then
-  echo "  For a plant spec (the orchestrator needs the digest):"
+  echo "  For a project spec (the orchestrator needs the digest):"
   echo "    image: $REF"
   echo "  Run a VM from it:"
   echo "    mh run ${IMAGE_NAME}:${IMAGE_VERSION}"

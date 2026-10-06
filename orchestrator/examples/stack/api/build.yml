@@ -25,7 +25,7 @@ steps:
   - copy: {/opt/api/: app/}
   - run: node --check /opt/api/server.js && node --check /opt/api/health.js   # a syntax error fails the build
 
-# The database's address is the plant spec's to give: ../microse.yml sets
+# The database's address is the project spec's to give: ../microse.yml sets
 # the command (this one is for mh run alone, against a local database).
 command: setpriv --reuid=api --regid=api --init-groups node /opt/api/server.js 8080 127.0.0.1
 health:

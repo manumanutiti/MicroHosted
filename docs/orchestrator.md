@@ -1,15 +1,31 @@
-# OT orchestrator — design
+# Orchestrator — design
 
-> Status: **design, nothing implemented.** Started 2026-09-24; final design
-> review 2026-09-25, second round of decisions 2026-09-28 (see "Review log" at
-> the end). Every decision is marked
-> **Decided** (agreed), **Proposed** (recommended, awaiting agreement) or
-> **Open**.
+> Status: **implemented in part** — what runs today, and how to use it, is in
+> [`orchestrator/README.md`](../orchestrator/README.md) and
+> [`docs/cli.md`](cli.md#projects-mh-up-mh-down); §16 tracks the milestones.
+> This document is the design record: started 2026-09-24, final review
+> 2026-09-25, second round of decisions 2026-09-28 (see "Review log" at the
+> end). Every decision is marked **Decided** (agreed), **Proposed**
+> (recommended, awaiting agreement) or **Open**.
+>
+> **Scope.** It was designed as the orchestrator of an IoT/OT isolation
+> gateway, and much of the text keeps that vocabulary and its examples
+> (sensors, readings, a plant). The orchestrator that came out of it is
+> general: Docker Compose for microVMs — `mh up`, `mh down`, a project per
+> directory. Read the terms accordingly:
+>
+> | Here | In the tool |
+> |---|---|
+> | `plant.yaml`, one file per host (§3) | `microse.yml`, one per project |
+> | the plant | the project, or the host's workloads |
+> | the gateway | the host running the engine |
+> | `mh orch …` | `mh up`, `mh status`, `mh failures`, … (`mh-orchestrator VERB`) |
+>
 > Vocabulary follows `docs/roadmap.md`: the **engine** is MicroHosted (VMs,
-> network, storage, host-initiated vsock, events); the **OT orchestrator** is its
-> first consumer and sits strictly above it. This document is the control half
-> of roadmap Phase 2; the data half (how readings leave the VMs) is
-> `docs/ingestion.md`.
+> network, storage, host-initiated vsock, events); the orchestrator is its first
+> consumer and sits strictly above it. This document is the control half of
+> roadmap Phase 2; the data half for the edge use case (how readings leave the
+> VMs) is `docs/ingestion.md`.
 
 ## Contents
 
@@ -17,7 +33,7 @@
 2. Three layers — build, deploy, operate
 3. Process model
 4. Images
-5. Plant spec
+5. Project spec (`microse.yml`)
 6. Objects, names and ownership
 7. Functions: lifetimes and the task contract
 8. Health and failure
@@ -36,11 +52,12 @@
 
 A configuration-management tool (Ansible, Salt, …) runs when an operator runs
 it, converges the host once and exits. That is the right shape for **installing
-and provisioning a gateway**, and it stays the recommended way to do that across
-a fleet: it installs the engine, ships images and places the plant spec on each
-gateway. A thin module wrapping `mh apply` is a natural later addition.
+and provisioning a host**, and it stays the recommended way to do that across
+a fleet: it installs the engine, ships images and places the project specs on
+each host. A thin module wrapping `mh apply` is a natural later addition.
 
-It is the wrong shape for what the plant needs at runtime:
+It is the wrong shape for what the workloads need at runtime (the table was
+written for an edge gateway; the first three rows hold for any project):
 
 | Requirement | One-shot convergence | Orchestrator |
 |---|---|---|
@@ -59,16 +76,21 @@ workflow engine (no task graphs) and **not** a scripting language (no steps).
 | Layer | Artefact | Tool | Nature |
 |---|---|---|---|
 | Build | image spec → image (rootfs + kernel, content-addressed) | `mh build` | reproducible, runs **outside the plant** |
-| Deploy | plant spec | orchestrator | declarative, reconcilable |
+| Deploy | project spec | orchestrator | declarative, reconcilable |
 | Operate | — | `mh cp`, `mh exec`, `mh events`, `mh quarantine` | imperative, for humans |
 
-Imperative operations never appear in the plant spec: a spec that says "copy
+Imperative operations never appear in the project spec: a spec that says "copy
 this, then run that" cannot be diffed, cannot be resumed after a crash and is
 not idempotent. `mh cp` and `mh exec` remain the diagnostic tools.
 
 ## 3. Process model
 
-**Decided (2026-09-28).**
+**Decided (2026-09-28).** *As built:* `mh-orchestrator` runs per project — in
+the foreground (`mh up`) or in the background (`mh up -d`) — on the
+`microse.yml` of the current directory, not as one systemd unit over
+`/etc/microhosted/plant.yaml`; `mh apply` hands changes to a running `up`.
+Locks and state are per project (`orchestrator/README.md`). The rest of this
+section is the original decision.
 
 - A separate binary, `cmd/mh-orchestrator`, run as its own systemd unit. It is a
   **client of the engine API** over the Unix socket and imports nothing from
@@ -87,14 +109,14 @@ not idempotent. `mh cp` and `mh exec` remain the diagnostic tools.
 - `mh orch status | plan | reset FUNCTION` for operators (names not final).
 - **Privilege.** The engine socket is root-equivalent (`/exec` is a root shell
   in every guest), so the orchestrator is as trusted as root. It runs on the
-  gateway only, has no listening port in v1, and its only inputs are the plant
+  gateway only, has no listening port in v1, and its only inputs are the project
   spec and the engine's events.
 
 ## 4. Images
 
-**Decided (2026-09-24):** images are built **outside the plant**; the plant spec
+**Decided (2026-09-24):** images are built **outside the plant**; the project spec
 references them as `name:version@sha256:<digest>` and the digest is
-**mandatory**; image spec and plant spec are **two separate files**. A
+**mandatory**; image spec and project spec are **two separate files**. A
 replacement must boot from exactly the image that was validated — never a newer
 build, never a post-incident snapshot.
 
@@ -140,8 +162,8 @@ kernel pinned by SHA-256. The build is **not bit-reproducible** yet (ext4
 timestamps and UUIDs; unpinned package versions): the O4 criterion "same spec →
 same digest" is still open — see `docs/roadmap.md`, reproducible builds.
 
-**How a plant spec gets the reference: compose's interpolation (2026-09-28).**
-`${NAME}` in a plant spec's values comes from the environment, else from the
+**How a project spec gets the reference: compose's interpolation (2026-09-28).**
+`${NAME}` in a project spec's values comes from the environment, else from the
 `.env` file next to the spec (`${NAME:-default}`, `${NAME:?message}`; a bare
 `$NAME` is left alone, so guest shell commands need no escaping). The digest
 stays mandatory — it is checked after interpolation — but it no longer has to
@@ -156,7 +178,7 @@ A running orchestrator reloads the file with its own environment, so `apply`
 refuses to hand it a spec whose variables only the caller's shell holds:
 they belong in `.env`.
 
-**Or the plant spec builds it (2026-09-28): `build:`, compose's `build:`.** A
+**Or the project spec builds it (2026-09-28): `build:`, compose's `build:`.** A
 function names a `build.yml` (or its directory) instead of an image;
 `plan`/`apply`/`run` run `mh build` on it and pin the reference printed. The
 build is cached by fingerprint — `mh build` versions an image
@@ -169,7 +191,7 @@ digest `mh build` printed. The orchestrator stays an API client: it runs the
 `mh-orchestrator` reads `./microse.yml` without `-f`.
 
 **Projects and `mh up` (2026-09-28), compose's model.** The desired state is no
-longer one file per host: each plant spec is a project (its `name:`, else its
+longer one file per host: each project spec is a project (its `name:`, else its
 directory), everything created carries `project=<name>`, and a spec sees and
 prunes only its own project — several run side by side, each with its own
 lock, state and background `run`. VMs are `<project>-<function>-<n>`; network
@@ -182,18 +204,18 @@ which stays a separate program (§3).
 
 **Decided (2026-09-28) — the command is configuration, like Docker's `CMD` and
 compose's `command:`.** An image *may* declare a default `command` and a default
-`health`; the plant spec may set or override either per function. There are no
+`health`; the project spec may set or override either per function. There are no
 named entry points: an operator must be able to use an image without knowing
-anything about it. Allowing a free command in the plant spec does not weaken the
+anything about it. Allowing a free command in the project spec does not weaken the
 host:
 
-- The plant spec is written by the operator, who already holds root-equivalent
+- The project spec is written by the operator, who already holds root-equivalent
   access (the engine socket; `/exec` is a root shell in every guest).
 - The guest is untrusted by design. What protects the host and the network is
   the Firecracker boundary (jailer, seccomp, per-VM uid) and the nftables rules,
   none of which depend on what runs inside.
 - The digest still pins the software exactly; the command is versioned with the
-  plant spec.
+  project spec.
 
 A command appears in plans and logs, so it must never carry a secret; secrets go
 through `secrets:` (§5).
@@ -201,11 +223,11 @@ through `secrets:` (§5).
 The image defaults live in the image manifest, covered by the digest (E8, §15).
 A function that sets no `command` takes the image's; a persistent function
 without `health` takes the image's check (a check's missing `every`, `timeout`
-or `failures` get the plant spec's defaults). `plan` says which functions run
+or `failures` get the project spec's defaults). `plan` says which functions run
 what the image declared. A cycle function with no command in either is refused
 at plan time.
 
-## 5. Plant spec
+## 5. Project spec (`microse.yml`)
 
 **Decided (2026-09-19):** YAML, parsed in **strict mode** (unknown field →
 error) and validated in full before anything is applied. A mistyped policy line
@@ -318,7 +340,7 @@ in its environment. Its standard output (at most 512 KiB, not empty) is the
 secret; a failure fails that create — a start failure like any other, with
 back-off — and reports the command's last line of stderr, so a command must
 not print the secret there. It runs with the orchestrator's user and
-environment, as code the operator wrote: plant specs are trusted like image
+environment, as code the operator wrote: project specs are trusted like image
 specs. Because every VM gets different content, the spec hash covers the
 command, not its output: a fresh credential is not a spec change. The use is a
 credential that must not outlive the VM — a GitHub runner's just-in-time
@@ -414,7 +436,7 @@ reconnected.
 
 **Decided (2026-09-28) — failure is a process signal, never a judgement on
 data.** The orchestrator is generic: it does not know what a function's output
-means, and the plant spec holds no data schemas. A function that wants to fail
+means, and the project spec holds no data schemas. A function that wants to fail
 on bad data exits non-zero.
 
 **Proposed — health is checked over vsock only.** The host cannot reach guest
@@ -570,7 +592,7 @@ silently: every removal is logged.
 ### No residue
 
 **Decided (2026-09-28).** Everything the orchestrator creates carries its
-ownership label, is accounted for by the plant spec, and has a bound. Whatever
+ownership label, is accounted for by the project spec, and has a bound. Whatever
 does not fit is removed on the next pass.
 
 | Possible residue | What removes or bounds it |
@@ -625,7 +647,7 @@ criterion.
 
 **Decided (2026-09-28).**
 
-What a change in the plant spec does:
+What a change in the project spec does:
 
 | Change | Effect |
 |---|---|
@@ -752,7 +774,7 @@ address; the guest network never reached the office segment. What it does not do
 | O1 | `mh apply` + one reconcile pass: strict parse, validation, budget, plan, apply networks and `persistent` functions, prune owned objects | apply twice → empty plan; remove a function → fully cleaned; over-budget or destructive spec refused before any change |
 | O2 | `mh-orchestrator` loop: events, health, replace, back-off, *degraded*, persisted failure state and failure records (E3, E7) | kill a VM, kill the orchestrator, reboot the host: every function back, zero orphans, back-off preserved; `mh orch status` shows why each failure happened |
 | O3 | Scheduler + work queue: `transaction`, `window`, jitter, coalescing, `max_age`, workers, journal (E5) | 200 functions at 30 s for 72 h unattended: flat boot rate, peak VMs ≤ computed peak — roadmap Phase 2 exit |
-| O4 | `mh build` + image spec + `files`/`secrets` (E4) — **in progress**: `mh build` (fingerprint cache), `build:` in plant specs, image defaults (E8), `${VAR}`/`.env`, `files`/`secrets` done; not yet validated on hardware, builds not reproducible | same spec → same digest; a replacement boots configured |
+| O4 | `mh build` + image spec + `files`/`secrets` (E4) — **in progress**: `mh build` (fingerprint cache), `build:` in project specs, image defaults (E8), `${VAR}`/`.env`, `files`/`secrets` done; not yet validated on hardware, builds not reproducible | same spec → same digest; a replacement boots configured |
 | O5 | `standby`, quarantine retention limits, rolling updates | failover without a gap; a failing function never exceeds its peak |
 | O6 | Triggers: local socket, then outbound MQTT | a flood of triggers changes neither the peak nor the budget |
 
@@ -760,7 +782,7 @@ address; the guest network never reached the office segment. What it does not do
 
 Decided: YAML + strict parsing; ownership by label; three layers; build outside
 the plant; digest mandatory; two files; intervals only. 2026-09-28: separate
-binary (§3); `command:` in the plant spec, optional image defaults, no named
+binary (§3); `command:` in the project spec, optional image defaults, no named
 entry points (§4); engine field names for networks (§5); the three modes, with
 `recycle: never` (§7); failure is a process signal, no data schemas; `old:
 destroy` by default, quarantine opt-in (§8); no `depends_on` in v1 (§9);
@@ -773,7 +795,7 @@ Proposed in the review, awaiting agreement:
 
 1. ~~Separate `mh-orchestrator` binary, engine API client (§3).~~ **Decided 2026-09-28.**
 2. Engine-enforced digests via an image store (§4, E2) — **decided 2026-09-25**, implemented.
-3. ~~Image declares `task` / `service` / `health`~~ — replaced 2026-09-28: `command:` in the plant spec, optional image defaults (§4).
+3. ~~Image declares `task` / `service` / `health`~~ — replaced 2026-09-28: `command:` in the project spec, optional image defaults (§4).
 4. ~~Network blocks reuse the engine's field names (§5).~~ **Decided 2026-09-28.**
 5. Cold boot in v1, snapshots later (§7).
 6. Task contract + local JSON-lines journal as the v1 sink (§7).
@@ -821,10 +843,10 @@ code. Changes from the first draft:
 **2026-09-28 — second round, from a generic workload's point of view.**
 
 - Named entry points declared by the image were too indirect for an operator
-  who does not know the image: replaced by `command:` in the plant spec with
+  who does not know the image: replaced by `command:` in the project spec with
   optional image defaults. The host's isolation does not depend on the guest's
   command (§4).
-- Data schemas removed from the plant spec: the orchestrator is generic, so
+- Data schemas removed from the project spec: the orchestrator is generic, so
   failure is an exit code, a timeout, a failed health check or a death (§8).
 - The default `old: quarantine` would have turned every ordinary failure into a
   suspect and filled the host: the default is now `destroy`, quarantine is

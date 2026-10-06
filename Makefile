@@ -126,7 +126,7 @@ uninstall:
 # Complete image pipeline: kernel + rootfs (correct arch, cross with qemu) +
 # preparation (vsock/SSH/DNS) + installation into the CoW store + registration
 # in the catalog + import into the image store, which prints the pinned
-# reference (name:version@sha256:…) a plant spec needs. Requires the host already configured (make full-install or
+# reference (name:version@sha256:…) a project spec needs. Requires the host already configured (make full-install or
 # setup-host). By default it builds the ultra-minimal Alpine (base-alpine,
 # ~10 MB, vsock exec, no systemd); FLAVOR=ubuntu for the classic noble.
 #   make prepare-image

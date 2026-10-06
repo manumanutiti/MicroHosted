@@ -143,7 +143,7 @@ digest. A VM created from an image boots exactly the bytes that were hashed.
 | `vcpus`       | int    | yes      | default vCPUs of its VMs, 1–32 |
 | `mem_mb`      | int    | yes      | default memory, at least 32 |
 | `disk_mb`     | int    | no       | default disk size its VMs are grown to |
-| `command`     | string | no       | default command of its VMs, one line of at most 4096 characters. The engine runs no command: this is for whoever starts the VMs (the orchestrator runs it when a plant spec sets none) |
+| `command`     | string | no       | default command of its VMs, one line of at most 4096 characters. The engine runs no command: this is for whoever starts the VMs (the orchestrator runs it when a project spec sets none) |
 | `health`      | object | no       | default health check `{command, every?, timeout?, failures?}`: `command` required, durations such as `"10s"` (timeout shorter than every), stored in canonical form (`"1m0s"`) |
 
 The digest covers the defaults: the same files with another command are another

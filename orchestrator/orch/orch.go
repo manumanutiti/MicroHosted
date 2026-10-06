@@ -1,4 +1,4 @@
-// Package orch reconciles the engine toward a plant spec: it creates the
+// Package orch reconciles the engine toward a project spec: it creates the
 // spec's networks and functions, keeps them in their declared state and
 // removes whatever it owns that the spec no longer declares.
 //
@@ -56,7 +56,7 @@ type Engine interface {
 	Console(ctx context.Context, id string, tail int) ([]byte, error)
 }
 
-// Orchestrator holds one plant spec and the engine it is applied to.
+// Orchestrator holds one project spec and the engine it is applied to.
 type Orchestrator struct {
 	eng  Engine
 	spec *spec.Spec

@@ -106,11 +106,11 @@ func TestParseRejects(t *testing.T) {
 // The examples shipped with the orchestrator stay valid, and every build:
 // names an image spec that exists.
 func TestExamplesValid(t *testing.T) {
-	plants, _ := filepath.Glob("../examples/*/microse.yml")
-	if len(plants) == 0 {
+	files, _ := filepath.Glob("../examples/*/microse.yml")
+	if len(files) == 0 {
 		t.Fatal("no examples found")
 	}
-	for _, f := range plants {
+	for _, f := range files {
 		// An example that needs variables ships them in env.example, the
 		// .env its user copies and fills in.
 		vars, err := ReadEnvFile(filepath.Dir(f))
@@ -147,12 +147,12 @@ func TestBuildField(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "web"), 0o755)
 	os.WriteFile(filepath.Join(dir, "web", "build.yml"), []byte("base: alpine:3.22\n"), 0o644)
 	os.WriteFile(filepath.Join(dir, "other.yml"), []byte("base: alpine:3.22\n"), 0o644)
-	plant := func(fn string) string {
+	specWith := func(fn string) string {
 		return "version: 1\nbudget: { max_vms: 2, max_mem_mb: 256 }\nfunctions:\n  a:\n    network: none\n    lifecycle: { mode: persistent }\n" + fn
 	}
 	for build, want := range map[string]string{"web": "web/build.yml", "web/": "web/build.yml", "other.yml": "other.yml"} {
 		p := filepath.Join(dir, "microse.yml")
-		os.WriteFile(p, []byte(plant("    build: "+build+"\n")), 0o644)
+		os.WriteFile(p, []byte(specWith("    build: "+build+"\n")), 0o644)
 		s, err := Load(p)
 		if err != nil {
 			t.Fatalf("build: %s: %v", build, err)
@@ -167,7 +167,7 @@ func TestBuildField(t *testing.T) {
 		"neither": "",
 	} {
 		p := filepath.Join(dir, "microse.yml")
-		os.WriteFile(p, []byte(plant(fn)), 0o644)
+		os.WriteFile(p, []byte(specWith(fn)), 0o644)
 		if _, err := Load(p); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
@@ -187,7 +187,7 @@ func TestLoadFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "open-token"), []byte("s3cret"), 0o644)
 	write := func(files string) string {
 		y := strings.Replace(valid, "    command: whoami\n", "    command: whoami\n"+files, 1)
-		p := filepath.Join(dir, "plant.yaml")
+		p := filepath.Join(dir, "microse.yml")
 		os.WriteFile(p, []byte(y), 0o644)
 		return p
 	}
