@@ -390,6 +390,9 @@ func (s *sandbox) run() (err error) {
 			rep.AddressesAnAgent = append(rep.AddressesAnAgent, a)
 		}
 	}
+	if w := rep.failed(); w != "" {
+		rep.Warnings = append(rep.Warnings, w)
+	}
 	rep.summarize()
 
 	if s.o.asJSON {
@@ -1195,7 +1198,8 @@ type sandboxReport struct {
 
 	// Verdict, for a program: suspicious (a high finding), review (warn),
 	// clean (nothing high or warn: not proof it is safe), incomplete (the
-	// VM's side could not be read).
+	// VM's side could not be read), did_not_run (exit 126 or 127: the shell
+	// could not find or run the command — fix the call, it proves nothing).
 	Verdict string `json:"verdict"`
 
 	user     string
@@ -1508,11 +1512,30 @@ func (r *sandboxReport) summarize() {
 		r.Verdict = "incomplete"
 	case s.High > 0:
 		r.Verdict = "suspicious"
+	case r.notRun():
+		// the shell's 127 (not found), 126 (not executable): what the code
+		// does was not seen, and nothing here may read as clean
+		r.Verdict = "did_not_run"
 	case s.Warn > 0:
 		r.Verdict = "review"
 	default:
 		r.Verdict = "clean"
 	}
+}
+
+// notRun: the command never started — the shell could not find it (127)
+// or run it (126). A missing tool (npm, go) or a path that is not there.
+func (r *sandboxReport) notRun() bool {
+	return !r.TimedOut && (r.ExitCode == 126 || r.ExitCode == 127)
+}
+
+// failed says why a run that started ended early, for the warnings: what
+// the code would have done past the failure is not in the report.
+func (r *sandboxReport) failed() string {
+	if r.TimedOut || r.ExitCode == 0 || r.notRun() {
+		return ""
+	}
+	return fmt.Sprintf("the command failed (exit %d): what it would have done past the failure is not in this report (-o: its output)", r.ExitCode)
 }
 
 // grade names who opened the decoy and how serious that is: info when it

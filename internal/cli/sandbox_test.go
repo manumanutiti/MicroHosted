@@ -733,6 +733,39 @@ func TestSandboxRenderFindings(t *testing.T) {
 	}
 }
 
+// A command the shell could not find ran nothing: never clean. A high
+// finding still wins; a failure past the start is a warning.
+func TestSandboxDidNotRun(t *testing.T) {
+	r := parseSandboxReport("user\tdev\ndecoy\tuntouched\t/home/dev/.netrc\tcurl\ncommands\t2\n")
+	r.Complete, r.Target, r.Image, r.ExitCode = true, "./t", "sandbox:16", 127
+	r.Output = "bash: line 1: npm: command not found\n"
+	r.summarize()
+	out := renderReport(r, false, false)
+	if r.Verdict != "did_not_run" || !strings.HasPrefix(out, "?? DID NOT RUN -- the shell found no such command (npm): nothing here says what the code does\n") {
+		t.Errorf("verdict %s:\n%s", r.Verdict, out)
+	}
+	if strings.Contains(out, "clean") {
+		t.Errorf("nothing ran, nothing is clean:\n%s", out)
+	}
+
+	r = parseSandboxReport("user\tdev\ndecoy\tREAD\t/home/dev/.aws/credentials\taws\ndecoyby\t/home/dev/.aws/credentials\tcat\t1\n")
+	r.Complete, r.ExitCode = true, 127
+	r.summarize()
+	if r.Verdict != "suspicious" {
+		t.Errorf("a decoy read, then 127: verdict %s", r.Verdict)
+	}
+
+	r = parseSandboxReport("user\tdev\n")
+	r.Complete, r.ExitCode = true, 1
+	if w := r.failed(); !strings.Contains(w, "exit 1") {
+		t.Errorf("exit 1: %q", w)
+	}
+	r.ExitCode, r.TimedOut = 124, true
+	if r.failed() != "" || r.notRun() {
+		t.Error("a timeout is neither a failure nor a run that did not start")
+	}
+}
+
 // Nothing found must not read as safe; looking for a VM makes it prove less.
 func TestSandboxRenderEmpty(t *testing.T) {
 	r := parseSandboxReport("user\tdev\ndecoy\tuntouched\t/home/dev/.netrc\tcurl\ncommands\t2\n")

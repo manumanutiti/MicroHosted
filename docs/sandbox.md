@@ -89,7 +89,7 @@ and runs nothing.
 ### Reading it
 
 A verdict first — `SUSPICIOUS` (something high), `REVIEW` (something warn),
-`NOTHING SUSPICIOUS SEEN` — then one block per kind of finding, the most
+`NOTHING SUSPICIOUS SEEN`, `DID NOT RUN` (the command never started) — then one block per kind of finding, the most
 serious first, each line what the findings amount to: the privesc probes by
 what they go for, the VM probes by what they tell apart, the same command run
 on fifteen directories as one line, every connection with the program that
@@ -141,7 +141,12 @@ ok clean: no sockets, no text addressed to an agent
 
 That is the plain form, for a pipe or a file (or `NO_COLOR`); on a terminal
 the same in color, with symbols. When the report from inside the VM failed,
-the verdict is `INCOMPLETE`, and what is inside is unknown, not clean. `-v`
+the verdict is `INCOMPLETE`, and what is inside is unknown, not clean. When
+the shell could not find the command or run it (exit 127, 126: `npm` not in
+the image, a path that is not there), it is `DID NOT RUN`: the code was not
+seen, so nothing in the report says what it does — fix the call. Any other
+failure is a warning: what the code would have done past it is not there.
+`-v`
 prints every finding under its kind, with what it means:
 
 ```
@@ -153,7 +158,7 @@ prints every finding under its kind, with what it means:
 ```
 
 The verdict is in the JSON too (`verdict`: `suspicious`, `review`, `clean`,
-`incomplete`), with the summary lines counted by grade (`summary.high`,
+`incomplete`, `did_not_run`), with the summary lines counted by grade (`summary.high`,
 `.warn`, `.info`).
 
 | Grade | |
@@ -299,7 +304,7 @@ no name, as before, and the names are still written down.
   "timed_out": false,
   "duration_ms": 4810,             // the command's start to its end
   "complete": true,                // false: the VM's side could not be read
-  "verdict": "suspicious",         // suspicious, review, clean, incomplete
+  "verdict": "suspicious",         // suspicious, review, clean, incomplete, did_not_run
   "summary": {
     "high": 2, "warn": 3, "info": 1, // the report's lines, by grade
     "decoys_read": 1,                // touched, by any program

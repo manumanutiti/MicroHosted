@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -584,6 +585,10 @@ func (r *sandboxReport) cleanChecks() []string {
 	return out
 }
 
+// notFound is the shell's "npm: not found" (dash) or "npm: command not
+// found" (bash).
+var notFound = regexp.MustCompile(`(?m)([^\s:]+): (?:command )?not found`)
+
 // render prints the report for a person: a verdict, then one line per kind
 // of finding (renderSummary), or with verbose every finding under its kind.
 func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) {
@@ -624,6 +629,16 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 	case counts[sevHigh] > 0:
 		head := st.paint(sevColor[sevHigh], st.pick("✗ SUSPICIOUS", "XX SUSPICIOUS"))
 		fmt.Fprintln(w, wrap(head+dash+st.bold(it(phrases[sevHigh])), 3, viewWidth))
+	case r.notRun():
+		head := st.paint("1;35", st.pick("✗ DID NOT RUN", "?? DID NOT RUN"))
+		why := "the shell could not run the command"
+		if r.ExitCode == 127 {
+			why = "the shell found no such command"
+			if m := notFound.FindStringSubmatch(r.Output); m != nil {
+				why += " (" + untrusted(m[1], 60) + ")"
+			}
+		}
+		fmt.Fprintln(w, wrap(head+dash+why+": nothing here says what the code does", 3, viewWidth))
 	case counts[sevWarn] > 0:
 		head := st.paint("1;"+sevColor[sevWarn], st.pick("⚠ REVIEW", "!! REVIEW"))
 		fmt.Fprintln(w, wrap(head+dash+st.bold(it(phrases[sevWarn])), 3, viewWidth))
@@ -658,7 +673,8 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 	if !r.Complete {
 		fmt.Fprintln(w, st.paint("1;35", "inside the VM: unknown, not none")+" (decoys, probes, commands, files, processes)")
 	}
-	if clean := r.cleanChecks(); len(clean) > 0 {
+	// nothing ran: nothing was checked clean
+	if clean := r.cleanChecks(); len(clean) > 0 && !r.notRun() {
 		fmt.Fprintln(w, wrap(st.paint("32", st.pick("✓", "ok"))+" "+st.dim("clean:")+" "+strings.Join(clean, ", "), 3, viewWidth))
 	}
 	if !verbose {
