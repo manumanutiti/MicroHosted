@@ -76,6 +76,10 @@ func TestSandboxPackageTargets(t *testing.T) {
 	if got := packageFetch(py); !strings.Contains(got, "--only-binary=:all:") {
 		t.Errorf("pip's fetch could build an sdist: %s", got)
 	}
+	// no wheel: the sdist downloaded, not built (pip download would build it)
+	if got := packageFetch(py); !strings.Contains(got, "|| { ") || !strings.Contains(got, "mh-sandbox-sdist httpie") || strings.Contains(got, "pip download") {
+		t.Errorf("pip's fetch, an sdist: %s", got)
+	}
 }
 
 func TestSafeName(t *testing.T) {

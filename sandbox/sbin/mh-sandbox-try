@@ -6,7 +6,7 @@
 # ~/work, after the fetch put the package there (node_modules/, .v/):
 #
 #   mh-sandbox-try npm NAME      # npm rebuild, import(NAME), each bin --help
-#   mh-sandbox-try pypi NAME     # import each top-level module, each console script --help
+#   mh-sandbox-try pypi NAME     # the sdist built (no wheel), import each top-level module, each console script --help
 #   mh-sandbox-try KIND NAME COMMAND   # COMMAND, its commands on the PATH
 #
 # An MCP server (its name says mcp, or it depends on the MCP SDK) is also
@@ -100,6 +100,18 @@ import(process.argv[1]).then(
 	exit $rc
 	;;
 pypi)
+	rc=0
+	if [ -d .sdist ]; then
+		# no wheel: the fetch left the sdist unbuilt (mh-sandbox-sdist);
+		# building and installing it runs its setup.py, here
+		echo "== pip install the sdist: its build, its setup.py"
+		set -- .sdist/*.tar.gz .sdist/*.zip
+		for a; do [ -f "$a" ] && sdist=$a; done
+		set -- .sdist/wheels/*.whl
+		[ -f "$1" ] && .v/bin/pip install -q --disable-pip-version-check --no-index --find-links .sdist/wheels "$@"
+		.v/bin/pip install --disable-pip-version-check --no-index --find-links .sdist/wheels --no-build-isolation "$sdist" 2>&1
+		rc=$?
+	fi
 	scripts=$(.v/bin/python -c '
 import importlib.metadata as md, sys
 print("\n".join(e.name for e in md.distribution(sys.argv[1]).entry_points if e.group == "console_scripts"))' "$name")
@@ -136,7 +148,7 @@ EOF
 		timeout "$per" ".v/bin/$s" --help </dev/null
 		case "$sdk $name $s" in *[Mm][Cc][Pp]*) mcp ".v/bin/$s" ;; esac
 	done
-	exit 0
+	exit $rc
 	;;
 *)
 	echo "mh-sandbox-try: npm or pypi, not $kind" >&2

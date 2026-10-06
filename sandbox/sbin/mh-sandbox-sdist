@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+# What mh sandbox's fetch does for pypi:NAME when the package has no wheel:
+# the sdist itself, downloaded and not built — building it (even for pip
+# download's metadata) runs its setup.py, and the fetch has the network.
+# Run as the sandbox's user, in ~/work, after the venv (.v):
+#
+#   mh-sandbox-sdist NAME[==VERSION]
+#
+# Into .sdist/: the archive, checked against PyPI's sha256, and into
+# .sdist/wheels/ — wheels only — what building it needs (pyproject.toml's
+# build-system.requires, setuptools and wheel without one) and what it says
+# it depends on (PKG-INFO's Requires-Dist). Both are read from the archive
+# as text: nothing of it runs. mh-sandbox-try installs it in the run, where
+# its code runs with no network.
+#
+# The archive's contents are the code's to write: read as data, at most
+# 1 MiB of each file, and only those two.
+import hashlib, io, json, os, re, subprocess, sys, tarfile, tomllib, urllib.request, zipfile
+
+if len(sys.argv) != 2:
+    sys.exit("usage: mh-sandbox-sdist NAME[==VERSION]")
+name, _, version = sys.argv[1].partition("==")
+api = "https://pypi.org/pypi/%s/%sjson" % (name, version + "/" if version else "")
+with urllib.request.urlopen(api, timeout=60) as r:
+    meta = json.load(r)
+sdists = [u for u in meta["urls"] if u["packagetype"] == "sdist"]
+if not sdists:
+    sys.exit("%s %s: no wheel for this machine and no sdist" % (name, meta["info"]["version"]))
+u = sdists[0]
+os.makedirs(".sdist/wheels", exist_ok=True)
+path = os.path.join(".sdist", os.path.basename(u["filename"]))
+with urllib.request.urlopen(u["url"], timeout=300) as r:
+    data = r.read(1 << 30)
+if hashlib.sha256(data).hexdigest() != u["digests"]["sha256"]:
+    sys.exit("%s: its sha256 is not PyPI's" % u["filename"])
+with open(path, "wb") as f:
+    f.write(data)
+print("sdist:", path, "(not built: that runs its code, in the run)")
+
+# the two files, from the archive's top directory, as text
+def member(want):
+    if path.endswith(".zip"):
+        z = zipfile.ZipFile(io.BytesIO(data))
+        for n in z.namelist():
+            if n.count("/") == 1 and n.endswith("/" + want):
+                return z.open(n).read(1 << 20).decode("utf-8", "replace")
+        return None
+    t = tarfile.open(fileobj=io.BytesIO(data))
+    for m in t:
+        if m.isfile() and m.name.count("/") == 1 and m.name.endswith("/" + want):
+            return t.extractfile(m).read(1 << 20).decode("utf-8", "replace")
+    return None
+
+build = ["setuptools>=40.8.0", "wheel"]
+pyproject = member("pyproject.toml")
+if pyproject:
+    try:
+        build = tomllib.loads(pyproject).get("build-system", {}).get("requires", build)
+    except tomllib.TOMLDecodeError as e:
+        print("pyproject.toml unreadable (%s): building with setuptools" % e)
+deps = []
+for line in (member("PKG-INFO") or "").splitlines():
+    if line.startswith("Requires-Dist:"):
+        d = line.split(":", 1)[1].strip()
+        if not re.search(r"\bextra\s*==", d):
+            deps.append(d)
+reqs = [r for r in build + deps if isinstance(r, str) and r.strip()]
+print("wheels for building it and its dependencies:", " ".join(reqs) or "none")
+if reqs:
+    sys.exit(subprocess.call([".v/bin/pip", "download", "-q", "--disable-pip-version-check",
+                              "--only-binary=:all:", "-d", ".sdist/wheels", *reqs]))

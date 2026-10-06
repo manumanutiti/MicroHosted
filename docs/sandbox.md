@@ -32,7 +32,7 @@ mh build -t sandbox:1 sandbox
 | `.tar.gz`, `.tgz`, `.tar`, `.zip` | unpacked into `~/work` |
 | `https://…` | a git repository: `git clone --depth 1` into `~/work`. Anything else — `sh.rustup.rs`, an `install.sh` — downloaded as `~/work/NAME` (its own name, or `download`), as `curl \| sh` would; with no COMMAND it is run: `./NAME` when it starts with `#!` or is a program, `sh NAME` otherwise. Inside the VM, with the fetch network |
 | `npm:NAME[@VERSION]` | `npm install --ignore-scripts` into `~/work` (Node 24 LTS in the image): nothing of it runs while the network is open |
-| `pypi:NAME[==VERSION]` | `pip install --only-binary=:all:` into the venv `~/work/.v`: wheels only, since building an sdist runs its `setup.py` — a package with one fails the fetch (then: a directory, and `--fetch` that downloads it, built in the run) |
+| `pypi:NAME[==VERSION]` | `pip install --only-binary=:all:` into the venv `~/work/.v`. With no wheel, the sdist is downloaded and not built (building it, even for `pip download`'s metadata, runs its `setup.py`): checked against PyPI's sha256 into `~/work/.sdist`, with wheels of what its `pyproject.toml` says building it needs and its `PKG-INFO` says it depends on — read as text (`mh-sandbox-sdist`). It is built and installed in the run, with no network |
 
 COMMAND is one shell line, run as the sandbox's user in `~/work`.
 

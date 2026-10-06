@@ -277,7 +277,12 @@ func packageFetch(t sandboxTarget) string {
 	if t.kind == "npm" {
 		return "npm init -y >/dev/null && npm install --ignore-scripts --no-audit --no-fund --loglevel=error " + shellQuote(t.pkg)
 	}
-	return "python3 -m venv .v && .v/bin/pip install -q --disable-pip-version-check --only-binary=:all: " + shellQuote(t.pkg)
+	// No wheel: the sdist, downloaded unbuilt, with the wheels its build
+	// and its dependencies need (mh-sandbox-sdist); mh-sandbox-try builds
+	// it in the run.
+	return "python3 -m venv .v && { .v/bin/pip install -q --disable-pip-version-check --only-binary=:all: " + shellQuote(t.pkg) +
+		" || { command -v mh-sandbox-sdist >/dev/null || { echo 'no wheel, and this image predates sdists: rebuild it from sandbox/'; exit 1; }; " +
+		"echo 'no wheel: the sdist, not built'; mh-sandbox-sdist " + shellQuote(t.pkg) + "; }; }"
 }
 
 func archiveKind(name string) string {
@@ -301,6 +306,8 @@ type sandbox struct {
 	t       sandboxTarget
 	command string
 	given   bool // the caller gave the COMMAND
+
+	fetchOut strings.Builder // what the steps before the run printed
 
 	rules *sandboxRules
 
@@ -412,6 +419,14 @@ func (s *sandbox) run() (err error) {
 	}
 	if s.needsNetwork() {
 		if err := s.fetchPhase(tgz != ""); err != nil {
+			var nr *sandboxNotRun
+			if s.o.asJSON && errors.As(err, &nr) {
+				rep := &sandboxReport{Target: s.t.given, Image: s.image, VM: s.vm, Verdict: "did_not_run",
+					Warnings: []string{nr.why}, Output: untrustedTail(nr.output, 8<<10)}
+				if perr := printJSON(s.e.stdout, rep); perr != nil {
+					return perr
+				}
+			}
 			return err
 		}
 		prepare = strings.TrimSuffix(prepare, " /root/code.tgz")
@@ -614,7 +629,7 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 			"else curl -fsSL --proto =https --proto-redir =https --max-filesize 1G -o " + f + " -- " + u + " && chmod +x " + f + " && echo 'a file: saved as '" + f + "; fi"
 		if r, _, err := s.exec("mh-sandbox-run --fetch "+shellQuote(cmd), s.o.timeout); err != nil {
 			return err
-		} else if fmt.Fprint(s.e.stderr, r.Output); r.ExitCode != 0 {
+		} else if s.fetched(r.Output); r.ExitCode != 0 {
 			failed = fmt.Sprintf("the fetch of %s failed (exit %d)", s.t.url, r.ExitCode)
 		} else {
 			failed = s.urlCommand()
@@ -626,7 +641,7 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 		if r, _, err := s.exec(cmd, s.o.timeout); err != nil {
 			return err
 		} else if r.ExitCode != 0 {
-			fmt.Fprint(s.e.stderr, r.Output)
+			s.fetched(r.Output)
 			failed = fmt.Sprintf("apt failed (exit %d)", r.ExitCode)
 		}
 	}
@@ -650,12 +665,10 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprint(s.e.stderr, r.Output)
+		s.fetched(r.Output)
 		switch {
 		case timedOut:
 			failed = "the fetch timed out"
-		case r.ExitCode != 0 && s.t.kind == "pypi":
-			failed = fmt.Sprintf("the fetch failed (exit %d) — wheels only: building an sdist runs its code, with the network open; for one, a directory and --fetch 'pip download --no-binary=PKG …', built in the run", r.ExitCode)
 		case r.ExitCode != 0:
 			failed = fmt.Sprintf("the fetch failed (exit %d)", r.ExitCode)
 		}
@@ -666,7 +679,7 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprint(s.e.stderr, r.Output)
+		s.fetched(r.Output)
 		if timedOut {
 			failed = "the fetch timed out"
 		} else if r.ExitCode != 0 {
@@ -687,10 +700,24 @@ func (s *sandbox) fetchPhase(unpack bool) error {
 	}
 	fmt.Fprintf(s.e.stderr, "%s: no way out\n", s.network)
 	if failed != "" {
-		return fmt.Errorf("%s: not running the code", failed)
+		return &sandboxNotRun{why: failed + ": not running the code", output: s.fetchOut.String()}
 	}
 	return nil
 }
+
+// fetched shows the output of a step before the run, and keeps it for a
+// report of why the code did not run.
+func (s *sandbox) fetched(out string) {
+	fmt.Fprint(s.e.stderr, out)
+	s.fetchOut.WriteString(out)
+}
+
+// sandboxNotRun: a step before the run failed (the fetch, apt, an image
+// too old for the target): nothing of the code ran. With --json it is still
+// a report, did_not_run, so a program reading it has a verdict.
+type sandboxNotRun struct{ why, output string }
+
+func (e *sandboxNotRun) Error() string { return e.why }
 
 // urlCommand, once a URL is fetched: with no COMMAND, a file is run — by
 // itself when it says how (#!, a program), with sh otherwise, as curl | sh
@@ -1337,7 +1364,8 @@ type sandboxReport struct {
 	// Verdict, for a program: suspicious (a high finding), review (warn),
 	// clean (nothing high or warn: not proof it is safe), incomplete (the
 	// VM's side could not be read), did_not_run (exit 126 or 127: the shell
-	// could not find or run the command — fix the call, it proves nothing).
+	// could not find or run the command; or a step before the run failed,
+	// in warnings — fix the call, it proves nothing).
 	Verdict string `json:"verdict"`
 
 	user     string
