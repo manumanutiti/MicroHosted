@@ -207,7 +207,16 @@ var haveDebootstrap = func() bool {
 
 var debArch = map[string]string{"x86_64": "amd64", "aarch64": "arm64"}
 
+// mirror is where Ubuntu's packages come from: MH_UBUNTU_MIRROR when set
+// (a country's, http://es.archive.ubuntu.com/ubuntu, when the main archive
+// is slow or unreachable; ports' mirrors for aarch64), else Canonical's.
+// Any mirror will do: what it serves is checked against the archive's
+// signature (ubuntuKeyring), and it is part of the base's inputs, so a
+// change builds the base again.
 func (b Base) mirror(arch string) string {
+	if m := strings.TrimRight(os.Getenv("MH_UBUNTU_MIRROR"), "/"); m != "" {
+		return m
+	}
 	switch arch {
 	case "x86_64":
 		return "http://archive.ubuntu.com/ubuntu"

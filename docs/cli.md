@@ -407,7 +407,10 @@ size_mb: 0                   # rootfs size; 0: its content plus a quarter and 32
   cron and the like: `packages:` adds what the image needs. No SSH in either:
   access is `mh exec` (add `openssh-server` to `packages` if you want it).
   Ubuntu's packages are verified by the archive's signature, not pinned by
-  hash.
+  hash — so any mirror will do: `MH_UBUNTU_MIRROR=http://es.archive.ubuntu.com/ubuntu
+  mh build …` when `archive.ubuntu.com` is slow or unreachable (the mirror is
+  part of the base's inputs: changing it builds the base again, and the
+  image's apt uses it too).
 - **What goes in.** The Alpine base and the kernel are downloaded once to
   `~/.cache/microhosted` and refused unless their SHA-256 matches the pins in
   `scripts/checksums.sha256` (kept equal to `internal/build/pins.go` by a test).
