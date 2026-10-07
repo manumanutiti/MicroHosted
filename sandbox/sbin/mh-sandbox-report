@@ -93,6 +93,7 @@ records() {
 		grep "^alert$tab" "$S/audited" | sort -t "$tab" -k2,2 -k4,4
 		pthhooks
 		traced
+		rclines
 		health
 		rm -f "$S/audited"
 	else
@@ -103,6 +104,7 @@ records() {
 		printf 'section\talerts\n'
 		pthhooks
 		traced
+		rclines
 	fi
 
 	# file PATH, dir PATH — outside ~/work, one by one; work file|dir ENTRY

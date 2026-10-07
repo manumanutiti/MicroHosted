@@ -216,6 +216,8 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `ptrace` | warn | `ptrace` — debuggers do it too |
 | `persistence` | high | a write (refused ones too) to `~/.ssh/authorized_keys` (there with one key, as on any machine reached by ssh: code that adds to the one it finds acts), a systemd user unit, `~/.config/autostart`, cron, `/etc`'s startup files; `crontab`, `at`, `systemctl --user enable` run |
 | `shell_rc` | warn | a write to `~/.bashrc`, `~/.profile`… — installers (nvm, rustup) do it too |
+| `shell_rc_hostile` | high | a line added to a shell startup file that shuts down or wipes the machine (`shutdown`, `reboot`, `rm -rf ~`, `mkfs`, `dd of=/dev/…`, a fork bomb), runs a download or decoded text, joins a shell to `/dev/tcp` or `nc -e`, sets `LD_PRELOAD`, or replaces `sudo`, `su`, `ssh` by an alias or a function |
+| `shell_rc_line` | info | any other line added to a shell startup file (the first 30 of each): what every new shell will now run. The files are read before and after the run, as the sandbox's user |
 | `system_write` | warn | any other write to `/etc` |
 | `reverse_shell` | high | a shell joined to a connection: `bash -i >& /dev/tcp/…`, `nc -e`, `socat … exec:`, `mkfifo … \| sh -i \| nc`, a Python/Perl socket with a shell, `pty.spawn` |
 | `dev_tcp` | warn | bash's `/dev/tcp` or `/dev/udp` otherwise (a connectivity check, a hand-made request); in a script, where no command line shows it, bash itself connecting |

@@ -69,6 +69,10 @@ vmtools='dmidecode|lspci|lscpu|lsmod|lshw|systemd-detect-virt|virt-what|hostname
 pedirs='etc/(sudoers|shadow|gshadow|crontab|cron[.]|anacrontab|doas[.]conf|polkit-1|exports)|var/spool/cron|root(/|"|$)|(var/)?run/(docker|containerd|podman|lxd|snapd)|var/lib/(lxd|docker)|proc/sys/kernel/(yama|unprivileged|kptr_restrict|randomize_va_space|modprobe)|proc/[0-9]+/mem'
 petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 
+# The shell's startup files, in the home: run by every new shell (or
+# session), where code makes itself start again (auditrules, rcsnap).
+rcfiles='.bashrc .profile .bash_profile .bash_login .bash_logout .zshrc .zprofile .zshenv .zlogin .xprofile .xinitrc .pam_environment'
+
 # auditrules: what mh-sandbox-prepare asks audit to record, for U. The first
 # rule an event matches names it (key=), so the narrow ones come first.
 #   mh-persist  writes (and chmod, rename, delete) where code makes itself
@@ -84,7 +88,7 @@ petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 #   mh-sandbox  every file opened, looked up or run, found or not
 auditrules() {
 	_r="-a always,exit -F arch=b64 -F uid=$(id -u "$U")"
-	for _f in .bashrc .profile .bash_profile .bash_login .bash_logout .zshrc .zprofile .zshenv .zlogin .xprofile .xinitrc .pam_environment; do
+	for _f in $rcfiles; do
 		auditctl $_r -F path="$H/$_f" -F perm=wa -k mh-persist >/dev/null
 	done
 	for _d in "$H/.ssh" "$H/.config" /etc /var/spool/cron; do
@@ -326,6 +330,13 @@ classify() {
 			# what each process started as: the report reads only some
 			# events, every exec among them
 			if (sc[e] == "execve" && ok[e]) pcomm[sf("pid")] = by[e]
+			# /bin/sh is sh.c, which execs bash (or dash) in the same
+			# process: one command the code ran, two execs — the second
+			# is not counted again (EXECVE, below)
+			if (sc[e] == "execve" && ok[e]) {
+				if (lastx[tg] == "/usr/bin/sh" && exe[e] ~ /^\/usr\/bin\/(bash|dash)$/) viash[e] = 1
+				lastx[tg] = exe[e]
+			}
 			# a system program just started: the loader has not looked
 			# in its cache yet (below, a library loaded before it)
 			if (sc[e] == "execve" && ok[e] && exe[e] ~ /^\/(usr\/)?(local\/)?s?bin\//) fresh[tg] = exe[e]
@@ -425,6 +436,7 @@ classify() {
 			if (sc[e] == "execve" && ok[e] && exb[e] ~ /^(node|nodejs|python[0-9.]*|perl|ruby|bash|dash|sh)$/ &&
 			    split(args, t2, "\001") > 1 && t2[2] !~ /^-/ && base(t2[2]) != "")
 				pcomm[epid[e]] = base(t2[2])
+			if (e in viash) { delete pend[e]; next }
 			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
 			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0 }
 			nran[cmd]++
@@ -684,4 +696,52 @@ traced() {
 				printf "alert\t%s\t%d\t%s\t%s\n", a[1], alerts[k], a[2], a[3]
 			}
 		}' "$T/trace"
+}
+
+# rcsnap DIR: the shell's startup files as they are now, into DIR (root's),
+# one file each, the first 64 KB — read as U, who hands them over: root
+# reads nothing in the home itself (a link there could point anywhere).
+# mh-sandbox-prepare takes one before the code runs; rclines, another after.
+rcsnap() {
+	rm -rf "$1"
+	install -d -m 700 "$1"
+	for _f in $rcfiles; do
+		asuser '[ ! -f "$HOME/$0" ] || head -c 65536 "$HOME/$0"' "$_f" > "$1/$_f" 2>/dev/null
+	done
+}
+
+# rclines: alert records for the lines the code added to the shell's
+# startup files (rcsnap before, now after) — what audit's shell_rc does not
+# say: what every new shell will now run. The line is the code's text: data.
+#   shell_rc_line     a line added, the first 30 of each file
+#   shell_rc_hostile  one that harms the machine or hands it over: shutdown,
+#                     reboot, rm -rf of the home or /, mkfs, dd onto a disk,
+#                     a fork bomb, kill -1; a download or decoded text run, a
+#                     shell joined to a connection; LD_PRELOAD; sudo, ssh or
+#                     su replaced by an alias or a function
+rclines() {
+	[ -d "$S/rc" ] || return 0
+	rcsnap "$S/rc.after"
+	for _f in $rcfiles; do
+		[ -s "$S/rc.after/$_f" ] || continue
+		cmp -s "$S/rc/$_f" "$S/rc.after/$_f" && continue
+		awk -v f="~/$_f" '
+			FILENAME == ARGV[1] { had[$0] = 1; next }
+			$0 in had || $0 ~ /^[[:space:]]*(#|$)/ { next }
+			{
+				l = $0; gsub(/[^[:print:]]/, "?", l); sub(/^[[:space:]]+/, "", l)
+				if (length(l) > 200) l = substr(l, 1, 200) "..."
+				lc = tolower(l)
+				if (lc ~ /(^|[^a-z_-])(shutdown|reboot|halt|poweroff)([^a-z_-]|$)|(^|[ ;&|])init +[06]( |$)|systemctl +(poweroff|reboot|halt)|rm +-[a-z]*r[a-z]* +(-[a-z]+ +)*(\/|~|\$home|\/home)( |\/? *$|\/\*)|mkfs|dd +[^|;&]*of=\/dev\/|:\(\) *\{|kill +-9 +-1/ ||
+				    lc ~ /(curl|wget)[^|;&]*\| *(ba|da|z)?sh|base64 +(-[a-z]*d|--decode)|\/dev\/(tcp|udp)\/|(nc|ncat|netcat)( [^|;&]*)? -[a-z]*e |ld_preload=/ ||
+				    lc ~ /^(alias +(sudo|su|ssh|scp|git|passwd)=|(function +)?(sudo|su|ssh|passwd) *\( *\))/)
+					hostile[++nh] = l
+				else if (++n <= 30) added[n] = l
+			}
+			END {
+				for (i = 1; i <= nh; i++) printf "alert\tshell_rc_hostile\t1\t%s: %s\t?\n", f, hostile[i]
+				for (i = 1; i <= n && i <= 30; i++) printf "alert\tshell_rc_line\t1\t%s: %s\t?\n", f, added[i]
+				if (n > 30) printf "alert\tshell_rc_line\t1\t%s: (%d more lines)\t?\n", f, n - 30
+			}' "$S/rc/$_f" "$S/rc.after/$_f"
+	done
 }

@@ -44,6 +44,12 @@ var alertKinds = map[string]alertKind{
 		"wrote (or tried to) where code is run later without being asked: ~/.ssh/authorized_keys, a systemd user unit, autostart, cron, /etc's startup files"},
 	"shell_rc": {sevWarn, "changed the shell's startup files",
 		"~/.bashrc, ~/.profile…: run by every new shell. Installers (nvm, rustup) add a line too; malware hides a command there"},
+	// From the startup files themselves (rclines, mh-sandbox-lib): what
+	// was added to them, which every new shell will run.
+	"shell_rc_hostile": {sevHigh, "left a harmful command for every new shell",
+		"a line added to ~/.bashrc, ~/.zshrc… that shuts down or wipes the machine, runs a download or decoded text, joins a shell to a connection, preloads a library, or replaces sudo, su or ssh"},
+	"shell_rc_line": {sevInfo, "added a line to the shell's startup files",
+		"what every new shell will now run: installers add their PATH (nvm, rustup, cargo)"},
 	"system_write": {sevWarn, "tried to write a system file",
 		"a write in /etc, as the sandbox's user (refused unless the file is writable by anyone)"},
 	"io_uring": {sevWarn, "used io_uring",
