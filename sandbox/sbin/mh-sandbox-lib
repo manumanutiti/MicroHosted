@@ -713,6 +713,8 @@ rcsnap() {
 # rclines: alert records for the lines the code added to the shell's
 # startup files (rcsnap before, now after) — what audit's shell_rc does not
 # say: what every new shell will now run. The line is the code's text: data.
+# BY: the programs audit saw write the file (its shell_rc alerts, in
+# $S/audited while mh-sandbox-report runs), else ?.
 #   shell_rc_line     a line added, the first 30 of each file
 #   shell_rc_hostile  one that harms the machine or hands it over: shutdown,
 #                     reboot, rm -rf of the home or /, mkfs, dd onto a disk,
@@ -725,7 +727,17 @@ rclines() {
 	for _f in $rcfiles; do
 		[ -s "$S/rc.after/$_f" ] || continue
 		cmp -s "$S/rc/$_f" "$S/rc.after/$_f" && continue
-		awk -v f="~/$_f" '
+		awk -v f="~/$_f" -v path="$H/$_f" -v aud="$S/audited" '
+			BEGIN {
+				while ((getline l < aud) > 0) {
+					split(l, a, "\t")
+					w = a[4]; sub(/ \(refused\)$/, "", w)
+					if (a[1] == "alert" && a[2] == "shell_rc" && w == path && index(", " by ", ", ", " a[5] ", ") == 0)
+						by = by (by == "" ? "" : ", ") a[5]
+				}
+				close(aud)
+				if (by == "") by = "?"
+			}
 			FILENAME == ARGV[1] { had[$0] = 1; next }
 			$0 in had || $0 ~ /^[[:space:]]*(#|$)/ { next }
 			{
@@ -739,9 +751,9 @@ rclines() {
 				else if (++n <= 30) added[n] = l
 			}
 			END {
-				for (i = 1; i <= nh; i++) printf "alert\tshell_rc_hostile\t1\t%s: %s\t?\n", f, hostile[i]
-				for (i = 1; i <= n && i <= 30; i++) printf "alert\tshell_rc_line\t1\t%s: %s\t?\n", f, added[i]
-				if (n > 30) printf "alert\tshell_rc_line\t1\t%s: (%d more lines)\t?\n", f, n - 30
+				for (i = 1; i <= nh; i++) printf "alert\tshell_rc_hostile\t1\t%s: %s\t%s\n", f, hostile[i], by
+				for (i = 1; i <= n && i <= 30; i++) printf "alert\tshell_rc_line\t1\t%s: %s\t%s\n", f, added[i], by
+				if (n > 30) printf "alert\tshell_rc_line\t1\t%s: (%d more lines)\t%s\n", f, n - 30, by
 			}' "$S/rc/$_f" "$S/rc.after/$_f"
 	done
 }
