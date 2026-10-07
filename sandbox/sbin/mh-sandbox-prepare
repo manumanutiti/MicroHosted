@@ -106,6 +106,8 @@ printf '{"nextId":2,"logins":[{"hostname":"https://github.com","encryptedUsernam
 	decoy .mozilla/firefox/k3x9q2pd.default-release/logins.json "only the browser reads it"
 printf 'SQLite format 3\0003%s' "$tok" |
 	decoy .mozilla/firefox/k3x9q2pd.default-release/key4.db "only the browser reads it"
+printf 'Created: 20250101T000000\nKey: (private-key (ecc (curve Ed25519)(flags eddsa)(q #40%s%s#)(d #%s%s#)))\n' "$TOK" "$TOK" "$TOK" "$TOK" |
+	decoy .gnupg/private-keys-v1.d/7F3A9C2E41B85D6A0E19C4F27B3D8A51E6C09F42.key "gpg's agent reads it to sign or decrypt" "gpg gpg2 gpg-agent gpgsm"
 printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xprv%s%s"}}\n' "$tok" "$tok" |
 	decoy .electrum/wallets/default_wallet "only the wallet reads it"
 

@@ -76,6 +76,8 @@ petools='sudo|su|pkexec|doas|getcap|setcap|capsh'
 #               and io_uring_setup, file access audit does not see
 #   mh-net      connect: which program tried to reach what (the host sees
 #               what was sent, not who sent it)
+#   mh-bind     bind: an address and port it took, to listen on (a server
+#               gone by the end is in no ss)
 #   mh-sandbox  every file opened, looked up or run, found or not
 auditrules() {
 	_r="-a always,exit -F arch=b64 -F uid=$(id -u "$U")"
@@ -88,6 +90,7 @@ auditrules() {
 	auditctl $_r -S setuid,setgid,setreuid,setregid,setresuid,setresgid,setgroups,setfsuid,setfsgid,capset,ptrace,personality,mount,umount2,pivot_root,chroot,unshare,setns,bpf,init_module,finit_module,delete_module,kexec_load,iopl,ioperm,keyctl,add_key,request_key,userfaultfd,perf_event_open,io_uring_setup \
 		-k mh-privesc >/dev/null
 	auditctl $_r -S connect -k mh-net >/dev/null
+	auditctl $_r -S bind -k mh-bind >/dev/null
 	auditctl $_r -S open,openat,openat2,stat,lstat,newfstatat,statx,access,faccessat,faccessat2,readlink,readlinkat,execve,creat \
 		-k mh-sandbox >/dev/null
 }
@@ -190,6 +193,9 @@ classify() {
 				if (sx != "" && sx in made && !(sx in ran) && !built(made[sx]) && (sx ~ /^\/(tmp|var\/tmp|dev\/shm)\// || masq(sx))) {
 					if (sx ~ /^\/(tmp|var\/tmp|dev\/shm)\//) alert("dropped_script", sx " (written by " made[sx] ")", who)
 					if (masq(sx)) alert("masquerade", sx " (written by " made[sx] ")", who)
+					# a #! script run itself has this command line too (the
+					# kernel'"'"'s): said here, not again for its PATH record
+					said[e] = sx
 					ran[sx] = 1
 					if (state != "") print "x\t" sx > (state ".new")
 				}
@@ -242,7 +248,7 @@ classify() {
 			# looking for credentials beyond the code'"'"'s own tree: what
 			# it looks for (find'"'"'s -name, -path…; grep'"'"'s pattern; any
 			# word of locate'"'"'s), where (a directory not its own)
-			sens = "passw|secret|api[_-]?key|apikey|private[_ -]?key|id_(rsa|dsa|ecdsa|ed25519)|\\.pem|akia|aws_(access|secret)|credential|\\.kdbx|wallet|\\.ovpn|\\.p12|\\.pfx|\\.ppk|authorized_keys|netrc|git-credentials|pgpass|htpasswd|token|shadow"
+			sens = "passw|secret|api[_-]?key|apikey|private[_ -]?key|id_(rsa|dsa|ecdsa|ed25519)|\\.pem|akia|aws_(access|secret)|credential|\\.kdbx|wallet|\\.ovpn|\\.p12|\\.pfx|\\.ppk|authorized_keys|netrc|git-credentials|pgpass|htpasswd|token|shadow|gnupg|secring|private-keys-v1"
 			if (a0 ~ /^(locate|plocate|mlocate)$/ && lc ~ sens)
 				alert("credential_search", cmd, who)
 			else if (a0 == "find") {
@@ -317,6 +323,10 @@ classify() {
 			# what each process started as: the report reads only some
 			# events, every exec among them
 			if (sc[e] == "execve" && ok[e]) pcomm[sf("pid")] = by[e]
+			# a system program just started: the loader has not looked
+			# in its cache yet (below, a library loaded before it)
+			if (sc[e] == "execve" && ok[e] && exe[e] ~ /^\/(usr\/)?(local\/)?s?bin\//) fresh[tg] = exe[e]
+			else if (sc[e] == "execve") delete fresh[tg]
 			a0[e] = sf("a0")
 			k = arg(sf("key")); key[e] = k
 			if (k == "mh-privesc") {
@@ -386,7 +396,7 @@ classify() {
 			sys = $0; sysid = id()
 			# read now if it is one of the narrow rules'"'"' or an exec, else
 			# when a record of the event needs it (most never do)
-			if (/ key="mh-(privesc|persist|net)"| SYSCALL=execve /) syscall(sysid)
+			if (/ key="mh-(privesc|persist|net|bind)"| SYSCALL=execve /) syscall(sysid)
 			next
 		}
 		/^type=CWD/ {
@@ -426,7 +436,7 @@ classify() {
 		}
 		/^type=SOCKADDR/ {
 			e = id()
-			if (key[e] != "mh-net") next
+			if (key[e] != "mh-net" && key[e] != "mh-bind") next
 			if (match($0, /saddr_fam=inet6? laddr=[^ ]+ lport=[0-9]+/)) {
 				split(substr($0, RSTART, RLENGTH), sw, /[ =]/)
 				ad = sw[4]; pt = sw[6]
@@ -436,6 +446,14 @@ classify() {
 				pt = num(substr(s, 5, 4))
 				ad = num(substr(s, 9, 2)) "." num(substr(s, 11, 2)) "." num(substr(s, 13, 2)) "." num(substr(s, 15, 2))
 			} else next
+			# a port taken on an address others reach (0.0.0.0, ::, its
+			# own): a server for whoever finds it. Loopback is a test
+			# server; port 0, the kernel picking one for a client
+			if (key[e] == "mh-bind") {
+				if (ok[e] && pt != 0 && ad !~ /^127\.|^\[::1\]$|^\[::ffff:127\./)
+					alert("listen", ad ":" pt, by[e])
+				next
+			}
 			# loopback is the code talking to itself (a test server), but
 			# for a resolver
 			if (ad ~ /^127\.|^\[::1\]$|^\[::ffff:127\./ && pt != 53) next
@@ -461,9 +479,18 @@ classify() {
 			pe = !vm && (f ~ pet || f ~ ped)
 			dk = f in decoy
 			ur = nur && f ~ urall
-			if (!vm && !pe && !dk && !ur && nt != "CREATE" && !(e in key)) next
+			lib = f == "/etc/ld.so.cache" || f ~ /^\/(tmp|var\/tmp|dev\/shm|home)\/.*\.so(\.[0-9]+)*$/
+			if (!vm && !pe && !dk && !ur && !lib && nt != "CREATE" && !(e in key)) next
 			syscall(e)
 			s = sc[e]
+			# the loader opens what LD_PRELOAD names (and what
+			# LD_LIBRARY_PATH finds) before its cache: a library of the
+			# code'"'"'s, from a temporary directory or a home, inside a system
+			# program — its functions in place of libc'"'"'s
+			if (lib && s ~ /^open/ && ok[e] && (epid[e] in fresh)) {
+				if (f != "/etc/ld.so.cache") alert("preload", f " into " fresh[epid[e]], by[e])
+				delete fresh[epid[e]]
+			}
 			# relative to the working directory, or to a directory the
 			# program holds open (unknown here: left out)
 			if (rel && (s ~ /at2?$/ && s != "creat" || s == "statx") && a0[e] != "ffffff9c") next
@@ -490,7 +517,7 @@ classify() {
 					if (x != "" && !built(made[x])) {
 						tmp = x ~ /^\/(tmp|var\/tmp|dev\/shm)\//
 						bin = x == exe[e]
-						if (bin || tmp) {
+						if ((bin || tmp) && said[e] != x) {
 							# a script: what it runs is recorded command by
 							# command (a test suite helper, a git hook)
 							dw = pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c

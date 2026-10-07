@@ -50,6 +50,8 @@ var alertKinds = map[string]alertKind{
 		"files opened and read through io_uring are not recorded: what it did through it is missing here. Node turns it off here; little else uses it"},
 	"io_uring_epoll": {sevInfo, "set up Node's io_uring ring",
 		"libuv's ring of 256 for epoll_ctl, which Node sets up with io_uring off for files: what a native module did through it would not be recorded"},
+	"listen": {sevWarn, "opened a port to the network",
+		"bind on an address others reach (0.0.0.0, ::), not loopback: a server for whoever finds it. Dev servers do it; so do backdoors and exfiltration over HTTP"},
 	"connect": {sevInfo, "tried to connect",
 		"which program tried to reach what, seen inside the VM (connections lists what the network refused); :53 (dns) is a name lookup"},
 	// From the command lines run (execve).
@@ -67,6 +69,8 @@ var alertKinds = map[string]alertKind{
 		"a binary written (not by a compiler or linker) after the sandbox was prepared, then run: unpacked releases do it; so do payloads"},
 	"dropped_script": {sevInfo, "ran a script it wrote in /tmp",
 		"test suites (pytest's tmp_path) and git hooks do it; what the script ran is recorded, command by command"},
+	"preload": {sevWarn, "loaded its own library into a system program",
+		"a library from a temporary directory or a home, loaded before the loader's cache (LD_PRELOAD, LD_LIBRARY_PATH) into a program of /usr/bin: its functions replace libc's in it"},
 	"masquerade": {sevWarn, "ran a program dressed as a document",
 		"a file it wrote, named as a document, a picture or an archive (report.pdf.sh, image.png), then run or handed to an interpreter: made for a person to open without a second look"},
 	// From the files left, read at the end (mh-sandbox-report).

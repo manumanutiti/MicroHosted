@@ -65,6 +65,7 @@ var privescThemes = []theme{
 
 var decoyThemes = []theme{
 	{label: "SSH", dirs: []string{"~/.ssh/"}},
+	{label: "GnuPG", dirs: []string{"~/.gnupg/"}},
 	{label: "cloud: AWS, k8s", dirs: []string{"~/.aws/", "~/.kube/", "~/.config/gcloud/", "~/.azure/"}},
 	{label: "npm, PyPI, Docker", dirs: []string{"~/.docker/", "~/.npmrc", "~/.pypirc"}},
 	{label: "GitHub, git, .netrc", dirs: []string{"~/.config/gh/", "~/.git-credentials", "~/.netrc"}},

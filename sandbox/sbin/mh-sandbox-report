@@ -166,14 +166,15 @@ records() {
 # of MB of it, which ausearch takes minutes over. One pass, oldest first —
 # reading the log is most of the time — keeps the events worth classifying:
 # a path that tells a VM apart or that a privilege escalation looks for
-# (and /etc/passwd: what perl reads before /etc/shadow, classify), a
+# (and /etc/passwd: what perl reads before /etc/shadow, classify; the
+# loader's cache and a library in a temporary directory: preload), a
 # file created, a path relative to somewhere else than ~/work, one in the
 # home outside ~/work (the decoys), a path of the user's rules, a command
 # run, a syscall of auditrules' narrow rules; each with its SYSCALL and CWD
 # records, which come first.
 audited() {
 	cat $(auditlogs) 2>/dev/null |
-		awk -v pi="name=\"(/($vmdirs|$pedirs|etc/passwd\")|[^\"]*/($vmtools|$petools)\")|nametype=CREATE| name=[0-9A-F]" -v work="cwd=\"$H/work" \
+		awk -v pi="name=\"(/($vmdirs|$pedirs|etc/passwd\"|etc/ld[.]so[.]cache\"|(tmp|var/tmp|dev/shm)/[^\"]*[.]so([.][0-9]+)*\")|[^\"]*/($vmtools|$petools)\")|nametype=CREATE| name=[0-9A-F]" -v work="cwd=\"$H/work" \
 			-v hn=" name=\"$H/" -v hw=" name=\"$H/work" -v home="$H" -v rules="$S/rules" '
 			# the rules'"'"' paths, as a PATH record names them
 			BEGIN {
@@ -189,7 +190,7 @@ audited() {
 					up = up (up == "" ? "" : "|") "name=\"" x
 				}
 			}
-			/^type=SYSCALL/ { sys = $0; cwd = ""; keep = / key="mh-(privesc|persist|net)"| SYSCALL=execve /; if (keep) print; next }
+			/^type=SYSCALL/ { sys = $0; cwd = ""; keep = / key="mh-(privesc|persist|net|bind)"| SYSCALL=execve /; if (keep) print; next }
 			/^type=CWD/ { cwd = $0; if (keep) print; next }
 			/^type=PATH/ {
 				if (!keep && ($0 ~ pi || up != "" && $0 ~ up || index($0, hn) && !index($0, hw) || / name="[^\/]/ && (index(cwd, work) != 1 || / name="[^"]*\.\./))) {

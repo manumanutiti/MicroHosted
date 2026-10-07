@@ -98,7 +98,7 @@ and runs nothing.
 
 | | Means |
 |---|---|
-| decoys | a fake credential read (`READ`) or written (`TAMPERED`), and the programs that opened it (`by`). Each says who reads that file legitimately; read only by that tool (npm reading `~/.npmrc`), it is `info`, not `high` |
+| decoys | a fake credential (SSH, GnuPG, cloud, registries, git, a project's `.env`, history, browsers, a wallet) read (`READ`) or written (`TAMPERED`), and the programs that opened it (`by`). Each says who reads that file legitimately; read only by that tool (npm reading `~/.npmrc`), it is `info`, not `high` |
 | vm_probes | paths that tell a VM apart the code asked for — DMI, `/proc/cpuinfo`, PCI, modules, `/.dockerenv`, `systemd-detect-virt` — `absent` ones included: asking is the tell |
 | privesc | what a privilege escalation looks for — `/etc/shadow`, `/etc/sudoers`, cron, root's home, container sockets (docker, lxd), the kernel's hardening switches, `/proc/PID/mem`; `sudo`, `su`, `pkexec`, `doas`, `getcap` looked up or run (by name); `find -perm` searching for setuid (`-4000`) or writable (`-o=w`) files — `absent` ones included. Not perl's `getpw*`, which reads `/etc/shadow` right after `/etc/passwd` for the shadow password (glibc's `getspnam`) |
 | commands | every command line the code ran (from audit's `execve`), in the order it first ran it, with a count; the first 2000. The first lines are `mh-sandbox-run` starting it. `-v` prints them |
@@ -231,6 +231,8 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `credential_search` | high | `grep -r`, `find -name`, `locate` for passwords, keys, tokens (`id_rsa`, `.pem`, `AKIA`…) outside `~/work` |
 | `io_uring` | warn | `io_uring_setup`: files opened and read through io_uring are not in audit's record. Node would use it (libuv ≥ 1.45); the sandbox turns it off for Node (`UV_USE_IO_URING=0`), so little else does |
 | `io_uring_epoll` | info | Node's own ring of 256, which libuv sets up for `epoll_ctl` with io_uring off for files: a native module could still use it unseen |
+| `preload` | warn | a library from a temporary directory or a home loaded into a program of `/usr/bin` before the loader's cache: `LD_PRELOAD` (or `LD_LIBRARY_PATH`), seen by its effect, since audit does not record the environment |
+| `listen` | warn | `bind` on an address others reach (`0.0.0.0`, `::`): a server, even one gone by the end (`listening` shows only those still there); loopback left out |
 | `connect` | info | which program tried to reach which address (`:53 (dns)`: a name lookup); loopback left out |
 | `audit_health` | warn | audit may have missed some: the disk nearly full (audit stops recording below `admin_space_left`, 150 MB), auditd stopped, the kernel holding the code back for audit to keep up |
 
