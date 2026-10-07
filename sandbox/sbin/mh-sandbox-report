@@ -92,6 +92,7 @@ records() {
 		printf 'section\talerts\n'
 		grep "^alert$tab" "$S/audited" | sort -t "$tab" -k2,2 -k4,4
 		pthhooks
+		traced
 		health
 		rm -f "$S/audited"
 	else
@@ -101,6 +102,7 @@ records() {
 		printf 'section\texec\n'
 		printf 'section\talerts\n'
 		pthhooks
+		traced
 	fi
 
 	# file PATH, dir PATH — outside ~/work, one by one; work file|dir ENTRY
@@ -228,7 +230,7 @@ health() {
 # import a module and call it, none of these. Read with the code stopped
 # (records), never followed through a link (-type f).
 pthhooks() {
-	find / -xdev -type f -name '*.pth' -cnewer "$M" ! -path "$S/*" ! -path "$N/*" \
+	find / -xdev -type f -name '*.pth' -cnewer "$M" ! -path "$S/*" ! -path "$N/*" ! -path "$T/*" \
 		-exec grep -lE '^import[[:space:]].*(os\.system|os\.popen|os\.exec|subprocess|pty\.|socket|urllib|urlopen|http\.client|requests\.|exec\(|eval\(|compile\(|b64decode|base64|marshal|zlib|codecs\.decode|bytes\.fromhex)' {} + 2>/dev/null |
 		awk '{ gsub(/[^[:print:]]/, "?"); printf "alert\tpth_hook\t1\t%s\t?\n", $0 }'
 }
@@ -236,7 +238,7 @@ pthhooks() {
 changed() {
 	kind=$1
 	shift
-	find / -xdev "$@" ! -path "$S" ! -path "$S/*" ! -path "$N" ! -path "$N/*" ! -path /var/log/audit ! -path "/var/log/audit/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
+	find / -xdev "$@" ! -path "$S" ! -path "$S/*" ! -path "$N" ! -path "$N/*" ! -path "$T" ! -path "$T/*" ! -path /var/log/audit ! -path "/var/log/audit/*" -exec stat -c '%z|%n' {} + 2>/dev/null |
 		awk -F'|' -v m="$since" -v w="$H/work/" -v kind="$kind" '
 			$1 ~ /^[0-9][0-9][0-9][0-9]-/ && $1 > m {
 				sub(/^[^|]*\|/, ""); gsub(/[^[:print:]]/, "?")

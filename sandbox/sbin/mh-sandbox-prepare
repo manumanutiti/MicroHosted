@@ -153,6 +153,10 @@ if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink
 	done
 fi
 
+# The shells' trace (tracer, mh-sandbox-lib): what scripts do that runs no
+# program — builtins, eval's decoded text — which audit does not see.
+tracer
+
 # Where there is audit (build.yml): every file the user opens, looks up or
 # runs, found or not — the report picks out the ones that tell a VM apart —
 # and what changes who it is, makes it start again, or reaches out

@@ -63,6 +63,8 @@ files:
   /usr/local/bin/mh-sandbox-try: sbin/mh-sandbox-try
   /usr/local/bin/mh-sandbox-sdist: sbin/mh-sandbox-sdist
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
+  /usr/share/mh-sandbox/trace.bash: trace.bash
+  /usr/share/mh-sandbox/sh.c: sh.c
 
 run:
   # Node, the 24 LTS line's newest, from nodejs.org, checked against its
@@ -97,6 +99,11 @@ run:
   # (SYSCALL=, SADDR=), which mh-sandbox-lib reads.
   - sed -i 's/^log_format = .*/log_format = ENRICHED/' /etc/audit/auditd.conf
   - grep -q '^admin_space_left = 150$' /etc/audit/auditd.conf && grep -q '^log_format = ENRICHED$' /etc/audit/auditd.conf
+  # /bin/sh: bash, traced, for the code (MH_TRACE, mh-sandbox-run); dash
+  # for everything else (sh.c). trace.bash is read by the code's shells.
+  # Diverted: an apt install (--apt) does not put dash back.
+  - cc -O2 -Wall -Werror -o /usr/bin/sh.mh /usr/share/mh-sandbox/sh.c && dpkg-divert --local --rename --add /usr/bin/sh && mv -f /usr/bin/sh.mh /usr/bin/sh && rm -f /usr/share/mh-sandbox/sh.c && chmod 0644 /usr/share/mh-sandbox/trace.bash
+  - test "$(/bin/sh -c 'echo -n a; echo "b\tc"')" = "$(printf 'ab\tc')" && test "$(MH_TRACE=1 BASH_ENV=/usr/share/mh-sandbox/trace.bash /bin/sh -c 'echo -n a; echo "b\tc"')" = "$(printf 'ab\tc')"
   - chmod 0700 /usr/sbin/mh-sandbox-prepare /usr/sbin/mh-sandbox-unpack /usr/sbin/mh-sandbox-run /usr/sbin/mh-sandbox-report /usr/sbin/mh-sandbox-scan /usr/sbin/mh-sandbox-watch /usr/sbin/mh-sandbox-net
   - chmod 0600 /usr/sbin/mh-sandbox-lib /usr/share/mh-sandbox/agent-patterns
   # the code's user runs it: root's, readable

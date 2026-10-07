@@ -234,13 +234,24 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `preload` | warn | a library from a temporary directory or a home loaded into a program of `/usr/bin` before the loader's cache: `LD_PRELOAD` (or `LD_LIBRARY_PATH`), seen by its effect, since audit does not record the environment |
 | `listen` | warn | `bind` on an address others reach (`0.0.0.0`, `::`): a server, even one gone by the end (`listening` shows only those still there); loopback left out |
 | `connect` | info | which program tried to reach which address (`:53 (dns)`: a name lookup); loopback left out |
+| `trace_off` | info | `set +x` in a script: what that shell did after is not traced (CI scripts do it to keep secrets out of logs) |
+| `trace_full` | warn | the shells' trace reached 32 MB: what scripts did after is only in audit |
 | `audit_health` | warn | audit may have missed some: the disk nearly full (audit stops recording below `admin_space_left`, 150 MB), auditd stopped, the kernel holding the code back for audit to keep up |
 
-Shell builtins (`history -c`, `export HISTFILE=…`) and pipes (`curl … | sh`,
-`base64 -d | sh`) show only when they are in a command line run (`bash -c
-'…'`), not inside a script file: audit sees programs started, not what a
-shell does within. A `/dev/tcp` redirection in a script shows by its effect:
-bash connecting. The commands that make alerts are matched on their arguments: code
+Audit sees programs started, not what a shell does within; for that, every
+shell the code starts is traced (`set -x`, to a FIFO only the sandbox reads):
+`/bin/sh` is bash for the code, in POSIX mode with dash's `echo`, and each
+shell reads `trace.bash` (`BASH_ENV`) first. From the trace: history turned
+off or cleared by a builtin (`antiforensics`); `eval` or `source` of text a
+command substitution just decoded, shown decoded (`obfuscated_exec`); `eval`
+or `trap` text that pipes a download or decoded data into a shell
+(`pipe_to_shell`, `obfuscated_exec`) or joins one to `/dev/tcp`
+(`reverse_shell`); `LD_PRELOAD` set to a library outside `/usr` and `/lib`
+(`preload`). A pipeline in a script file is traced command by command, not as
+a pipe: `curl … | sh` there shows as the two programs run. Code that looks can
+tell it is traced (`$-` has `x`, `/bin/sh` is bash), and a program that
+clears its environment (`env -i`) starts untraced shells. A `/dev/tcp`
+redirection in a script shows by its effect: bash connecting. The commands that make alerts are matched on their arguments: code
 that means to hide can split, encode or rename; an alert is evidence, its
 absence is not.
 

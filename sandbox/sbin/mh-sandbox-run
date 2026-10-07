@@ -29,6 +29,11 @@ fi
 # The code is the first the kernel kills out of memory; set by root, the
 # floor it can lower it to is this (mh-sandbox-prepare protects the rest).
 echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
+# Its shells traced (tracer, mh-sandbox-lib): /bin/sh is bash for it (sh.c),
+# and each reads trace.bash first. Not a fetch's: nothing is reported then.
+# SHLVL=1: bash at level 1 with a socket for stdin (mh exec's) takes itself
+# for rshd's, reads ~/.bashrc and skips BASH_ENV.
+[ -n "$fetch" ] || [ ! -e "$S/traced" ] || ASENV="MH_TRACE=1 BASH_ENV=/usr/share/mh-sandbox/trace.bash SHLVL=1"
 asuser 'mkdir -p "$HOME/work" && cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
 rc=$?
 # A fetch ends when its connections have closed (at most 10 s): cut while one

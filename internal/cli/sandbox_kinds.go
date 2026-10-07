@@ -82,6 +82,12 @@ var alertKinds = map[string]alertKind{
 		"a miner by name or by its arguments (xmrig, stratum+tcp://, --donate-level, a mining pool)"},
 	"credential_search": {sevHigh, "searched for credentials",
 		"grep, find or locate for passwords, keys, tokens (id_rsa, .pem, AKIA…) outside ~/work: across home, /etc or the whole disk"},
+	// From the shells' trace (traced, mh-sandbox-lib): set -x of every
+	// shell the code started.
+	"trace_off": {sevInfo, "turned off its shell's trace",
+		"set +x in a script: CI scripts do it to keep secrets out of logs; what that shell did after is only in audit (programs run, not builtins)"},
+	"trace_full": {sevWarn, "flooded the shell trace",
+		"the trace of its shells reached its cap: what scripts did after (builtins, eval) is only in audit"},
 	// Audit's own state, at the end.
 	"audit_health": {sevWarn, "audit may have missed some",
 		"the disk filled up (audit stops recording), auditd stopped, or the kernel held the code back for audit to keep up: what is missing is unknown"},

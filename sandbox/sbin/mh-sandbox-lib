@@ -4,6 +4,8 @@
 S=/var/lib/mh-sandbox
 # N: the code's network's (mh-sandbox-net), its user's, not root's
 N=/var/lib/mh-sandbox-net
+# T: the shells' trace (tracer), mhsink's too
+T=/var/lib/mh-sandbox-trace
 U=runner
 [ ! -r /etc/mh-sandbox.conf ] || . /etc/mh-sandbox.conf
 H=/home/$U
@@ -21,7 +23,8 @@ if setpriv --help 2>&1 | grep -q -- --reuid; then
 	# which audit does not see — a decoy read by Node would have no reader.
 	# NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE: Node, and requests and pip,
 	# bring their own list of authorities; the system's has the sinkhole's
-	# (mh-sandbox-prepare).
+	# (mh-sandbox-prepare). ASENV: more of it, words without spaces
+	# (mh-sandbox-run: the trace's).
 	asuser() {
 		_s=$1
 		shift
@@ -29,7 +32,7 @@ if setpriv --help 2>&1 | grep -q -- --reuid; then
 			env -i HOME="$H" USER="$U" LOGNAME="$U" SHELL="$SH" LANG=C.UTF-8 \
 			PATH=/usr/local/bin:/usr/bin:/bin UV_USE_IO_URING=0 \
 			NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
-			REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+			REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt ${ASENV:-} \
 			/bin/sh -c "$_s" "$@"
 	}
 else
@@ -571,3 +574,114 @@ classify() {
 	[ -z "${1:-}" ] || [ ! -e "$1.new" ] || { cat "$1.new" >> "$1"; rm -f "$1.new"; }
 }
 
+
+# tracer: where the code's shells send their trace (trace.bash, through
+# /bin/sh: sh.c), for mh-sandbox-prepare to start. A FIFO the code may write
+# to and not read (0622, mhsink's, in a directory of root's: not removed nor
+# replaced), and its reader, mhsink, holding it open both ways (head, its
+# output unbuffered: each read written as it comes; dd counts a pipe's
+# partial reads as blocks, and stops long before its count) — a writer
+# never waits for one, nor gets SIGPIPE — into $T/trace, the first
+# $tracecap bytes; the rest is read and dropped ($T/full: code that floods
+# the trace to drown what follows). Where there is no bash, no trace.bash or
+# no mhsink, none: mh-sandbox-run sets no BASH_ENV.
+tracecap=33554432
+tracer() {
+	[ -x /usr/bin/bash ] && [ -r /usr/share/mh-sandbox/trace.bash ] && id mhsink >/dev/null 2>&1 || return 0
+	rm -rf "$T" /run/mh-sandbox
+	install -d -o mhsink -g mhsink -m 700 "$T"
+	install -d -m 711 /run/mh-sandbox
+	mkfifo -m 622 /run/mh-sandbox/trace
+	chown mhsink:mhsink /run/mh-sandbox/trace
+	setsid setpriv --reuid=mhsink --regid=mhsink --clear-groups --no-new-privs \
+		/bin/sh -c 'exec 3<>/run/mh-sandbox/trace; stdbuf -o0 head -c "$0" <&3 > "$1/trace"; touch "$1/full"; exec cat <&3 > /dev/null' \
+		"$tracecap" "$T" < /dev/null > /dev/null 2>&1 &
+	echo -1000 > "/proc/$!/oom_score_adj" 2>/dev/null || true
+	touch "$S/traced"
+}
+
+# traced: alert records from the shells' trace (tracer) — what a script does
+# that runs no program, so audit has no command line of it: builtins, and
+# what eval was given, decoded. Each line is "+SCRIPT<tab>COMMAND", one +
+# per level (a command substitution is one deeper), the words quoted as
+# bash quotes them. The trace is the code's own writing: data; a forged line
+# can add to the report, not take from it.
+#   antiforensics  history off or cleared (HISTFILE=/dev/null, unset
+#                  HISTFILE, history -c, set +o history, HISTSIZE=0)
+#   obfuscated_exec  eval (or source) of what a command substitution just
+#                  decoded (base64 -d, xxd -r, openssl -d, rev, gunzip):
+#                  the decoded text itself; and eval or trap text that
+#                  pipes decoded data into an interpreter
+#   pipe_to_shell, reverse_shell  the same, in eval or trap text: a trap's
+#                  is run later, when the script exits or is signalled
+#   preload        LD_PRELOAD set to a library outside /usr and /lib
+#   trace_off      set +x: the script stopped its own trace
+#   trace_full     the trace reached $tracecap bytes
+traced() {
+	[ -e "$S/traced" ] || return 0
+	[ ! -e "$T/full" ] || printf 'alert\ttrace_full\t1\tthe shells'"'"' trace reached %d MB: what scripts did after is only in audit\t?\n' $((tracecap / 1048576))
+	[ -s "$T/trace" ] || return 0
+	awk '
+		function alert(kind, what, who) {
+			if (length(what) > 200) what = substr(what, 1, 200) "..."
+			alerts[kind "\t" what "\t" who]++
+		}
+		# the words as bash quoted them, unquoted enough to read
+		function unq(s) {
+			gsub(/'"'"'\\'"'"''"'"'/, "\001", s)
+			gsub(/\$'"'"'/, "'"'"'", s)
+			gsub(/\\n/, "; ", s)
+			gsub(/'"'"'/, "", s)
+			gsub(/\001/, "'"'"'", s)
+			return s
+		}
+		function texts(kind, x, who,  lc) {
+			lc = tolower(x)
+			if (lc ~ /(base64 +(-[a-z]*d|--decode)|xxd +-r|openssl +(enc +|base64 +)?-[a-z]*d|\| *rev *\|)[^;&]*\| *(\/usr)?(\/bin\/)?((ba|da|z)?sh|python[0-9.]*|perl|ruby|php)( |$|;)/)
+				alert("obfuscated_exec", kind " " x, who)
+			if (lc ~ /(curl|wget)[^|;&]*\| *(sudo +)?(\/usr)?(\/bin\/)?(ba|da|z|k)?sh( |$|;)/)
+				alert("pipe_to_shell", kind " " x, who)
+			if (lc ~ /\/dev\/(tcp|udp)\/[^ \/]+\/[0-9]/ && lc ~ /(sh +-i|0>&1|>& *0|<&0|0<&)/ ||
+			    lc ~ /(nc|ncat|netcat)( [^|;&]*)? -[a-z]*e /)
+				alert("reverse_shell", kind " " x, who)
+		}
+		{
+			if (!match($0, /^\++[^\t]*\t/)) next
+			lv = 0
+			while (substr($0, lv + 1, 1) == "+") lv++
+			who = substr($0, lv + 1, RLENGTH - lv - 1)
+			s = substr($0, RLENGTH + 1)
+			gsub(/[^[:print:]]/, "?", s); gsub(/[^[:print:]]/, "?", who)
+			if (who == "") who = "?"
+			w = s; sub(/ .*/, "", w)
+			rest = index(s, " ") ? substr(s, index(s, " ") + 1) : ""
+			# a decoder in a command substitution: for the eval one level up
+			if (lv > 1 && w ~ /^(base64|basenc|xxd|openssl|rev|gunzip|zcat|uudecode)$/ && (w ~ /^(rev|gunzip|zcat|uudecode)$/ || rest ~ /(^| )(-[a-z]*d|--decode|-r)( |$)/))
+				dec[lv - 1] = 1
+			if (s ~ /^(export +)?HISTFILE=["'"'"']?\/dev\/null|^unset( [^ ]+)* HISTFILE( |$)|^history +-[a-z]*[cd]|^set +\+o +history|^(export +)?HIST(FILE)?SIZE=["'"'"']?0["'"'"']?( |$)/)
+				alert("antiforensics", s, who)
+			if (w ~ /^(eval|source|\.)$/) {
+				x = unq(rest)
+				if (dec[lv]) alert("obfuscated_exec", w " " x, who)
+				texts(w, x, who)
+			} else if (w == "trap" && rest != "" && rest !~ /^-/)
+				texts(w, unq(rest), who)
+			# not an assignment: a command, after which an earlier decode
+			# is no longer what eval runs
+			if (w !~ /^[A-Za-z_][A-Za-z0-9_]*=/ && w !~ /^(local|export|readonly|declare|typeset)$/) dec[lv] = 0
+			x = s
+			while (match(x, /(^| )LD_PRELOAD=[^ ]+/)) {
+				v = substr(x, RSTART, RLENGTH); sub(/^ ?LD_PRELOAD=/, "", v); v = unq(v)
+				n = split(v, ps, /[: ]/)
+				for (i = 1; i <= n; i++) if (ps[i] != "" && ps[i] !~ /^\/(usr\/)?lib(32|64|x32)?\//) { alert("preload", "LD_PRELOAD=" v " (set by a script)", who); break }
+				x = substr(x, RSTART + RLENGTH)
+			}
+			if (s ~ /^set( +-[a-zA-Z]+)* +(\+[a-zA-Z]*x|\+o +xtrace)/) alert("trace_off", s, who)
+		}
+		END {
+			for (k in alerts) {
+				split(k, a, "\t")
+				printf "alert\t%s\t%d\t%s\t%s\n", a[1], alerts[k], a[2], a[3]
+			}
+		}' "$T/trace"
+}
