@@ -91,6 +91,7 @@ records() {
 		# (mh-sandbox-lib). Then audit's own health: what it may have missed.
 		printf 'section\talerts\n'
 		grep "^alert$tab" "$S/audited" | sort -t "$tab" -k2,2 -k4,4
+		pthhooks
 		health
 		rm -f "$S/audited"
 	else
@@ -99,6 +100,7 @@ records() {
 		printf 'section\tprivesc\n'
 		printf 'section\texec\n'
 		printf 'section\talerts\n'
+		pthhooks
 	fi
 
 	# file PATH, dir PATH — outside ~/work, one by one; work file|dir ENTRY
@@ -215,6 +217,19 @@ health() {
 			else if (adm != "" && free != "" && free <= 2 * adm)
 				printf "alert\taudit_health\t1\tthe disk is nearly full: %d MB free, audit stops recording below %d MB\tauditd\n", free, adm
 		}'
+}
+
+# pthhooks: alert pth_hook … — a .pth file written since prepare (any
+# site-packages: the system's, ~/.local, a venv's) whose import line runs
+# code at every start of Python: a shell, a subprocess, a connection,
+# decoded code. Python runs a .pth's lines that start with "import";
+# setuptools' own (distutils-precedence.pth, an editable install's finder)
+# import a module and call it, none of these. Read with the code stopped
+# (records), never followed through a link (-type f).
+pthhooks() {
+	find / -xdev -type f -name '*.pth' -cnewer "$M" ! -path "$S/*" ! -path "$N/*" \
+		-exec grep -lE '^import[[:space:]].*(os\.system|os\.popen|os\.exec|subprocess|pty\.|socket|urllib|urlopen|http\.client|requests\.|exec\(|eval\(|compile\(|b64decode|base64|marshal|zlib|codecs\.decode|bytes\.fromhex)' {} + 2>/dev/null |
+		awk '{ gsub(/[^[:print:]]/, "?"); printf "alert\tpth_hook\t1\t%s\t?\n", $0 }'
 }
 
 changed() {

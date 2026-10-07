@@ -214,7 +214,7 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `privesc_attempt` | high | a syscall that changes who the process is refused (`setuid(0)`, `setresgid`, `capset`, `setgroups`), or one an ordinary program never makes as a user: `mount`, `chroot`, `pivot_root`, `bpf`, a kernel module, `keyctl`, `userfaultfd`, `perf_event_open`, `personality` turning ASLR off |
 | `namespace` | warn | `unshare`, `setns` — browsers' sandboxes (Playwright) do it too |
 | `ptrace` | warn | `ptrace` — debuggers do it too |
-| `persistence` | high | a write (refused ones too) to `~/.ssh/authorized_keys`, a systemd user unit, `~/.config/autostart`, cron, `/etc`'s startup files; `crontab`, `at`, `systemctl --user enable` run |
+| `persistence` | high | a write (refused ones too) to `~/.ssh/authorized_keys` (there with one key, as on any machine reached by ssh: code that adds to the one it finds acts), a systemd user unit, `~/.config/autostart`, cron, `/etc`'s startup files; `crontab`, `at`, `systemctl --user enable` run |
 | `shell_rc` | warn | a write to `~/.bashrc`, `~/.profile`… — installers (nvm, rustup) do it too |
 | `system_write` | warn | any other write to `/etc` |
 | `reverse_shell` | high | a shell joined to a connection: `bash -i >& /dev/tcp/…`, `nc -e`, `socat … exec:`, `mkfifo … \| sh -i \| nc`, a Python/Perl socket with a shell, `pty.spawn` |
@@ -223,7 +223,9 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `obfuscated_exec` | high | decoded and run at once: `base64 -d \| sh`, `xxd -r \| sh`, `exec(base64.b64decode(…))` |
 | `dropper` | high | a binary written after the sandbox was prepared, by anything but a compiler or linker, in `/tmp`, `/var/tmp` or `/dev/shm`, then run |
 | `dropped_exec` | warn | the same elsewhere (`~/work`) |
-| `dropped_script` | info | a script written in a temporary directory and run: test suites (pytest's `tmp_path`) and git hooks do it, and what it runs is recorded command by command |
+| `dropped_script` | info | a script written in a temporary directory and run, itself or by an interpreter (`sh /tmp/x`): test suites (pytest's `tmp_path`) and git hooks do it, and what it runs is recorded command by command |
+| `masquerade` | warn | a file it wrote named as a document, a picture or an archive (`report.pdf.sh`, `image.png`), then run or handed to an interpreter |
+| `pth_hook` | high | a `.pth` file written in any site-packages whose `import` line runs a shell, a subprocess, a connection or decoded code (`os.system`, `subprocess`, `socket`, `exec(`, `b64decode`…): Python runs it at every start. setuptools' own `.pth` files do none of these |
 | `antiforensics` | high | history off or cleared (`HISTFILE=/dev/null`, `history -c`), `touch -d/-r` outside `~/work`, `shred`, logs or a dropped program removed |
 | `miner` | high | `xmrig`, `stratum+tcp://`, `--donate-level`, a mining pool's name |
 | `credential_search` | high | `grep -r`, `find -name`, `locate` for passwords, keys, tokens (`id_rsa`, `.pem`, `AKIA`…) outside `~/work` |

@@ -111,6 +111,12 @@ printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xp
 
 echo "$tok" > "$S/token"
 
+# Not a decoy (a list of public keys, no secret in it): there for code that
+# adds its key to the one it finds, as on any machine reached by ssh. A
+# write to it is persistence (auditrules watch ~/.ssh).
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0wmN/Cr3JXqmLW7u+g9pTh+wSN4RhCTTZaWyQx7Kp2 %s@laptop\n' "$U" |
+	asuser 'cd "$HOME" && rm -rf .ssh/authorized_keys && (umask 077 && cat > .ssh/authorized_keys) && touch -d "2025-01-01 00:00:00" .ssh/authorized_keys'
+
 # The code's network (mh-sandbox-net), in $N, owned by the user it runs as
 # (mhsink): not root, not the code. resolv.conf is replaced, not written
 # through: it is a link to the kernel's /proc/net/pnp. For the sinkhole:

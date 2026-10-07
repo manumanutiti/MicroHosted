@@ -67,6 +67,11 @@ var alertKinds = map[string]alertKind{
 		"a binary written (not by a compiler or linker) after the sandbox was prepared, then run: unpacked releases do it; so do payloads"},
 	"dropped_script": {sevInfo, "ran a script it wrote in /tmp",
 		"test suites (pytest's tmp_path) and git hooks do it; what the script ran is recorded, command by command"},
+	"masquerade": {sevWarn, "ran a program dressed as a document",
+		"a file it wrote, named as a document, a picture or an archive (report.pdf.sh, image.png), then run or handed to an interpreter: made for a person to open without a second look"},
+	// From the files left, read at the end (mh-sandbox-report).
+	"pth_hook": {sevHigh, "hooked every start of Python",
+		"a .pth file in a site-packages whose import line runs a shell, a subprocess, a connection or decoded code: Python runs it at every start, of every program"},
 	"antiforensics": {sevHigh, "covered its tracks",
 		"history turned off or cleared, a file's times reset outside ~/work (touch -d/-r), shred, logs or the program it dropped removed"},
 	"miner": {sevHigh, "cryptocurrency miner",

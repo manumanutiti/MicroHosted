@@ -167,9 +167,14 @@ classify() {
 		# the certificate authorities'"'"' directories: a search there for
 		# .pem is finding a CA bundle, not a key
 		function certs(p) { return p ~ /^\/(etc\/(ssl|pki|ca-certificates)|usr\/(local\/)?share\/ca-certificates)(\/|$)/ }
+		# named as a document, a picture or an archive (report.pdf.sh,
+		# image.png): what a program run is dressed as for a person to open it
+		function masq(p) { return tolower(base(p)) ~ /\.(pdf|docx?|xlsx?|pptx?|od[tsp]|rtf|txt|csv|jpe?g|png|gif|bmp|svg|webp|mp[34]|avi|mov|mkv|zip|rar|7z|iso)(\.[a-z0-9]+)?$/ }
+		# what a compiler or a linker wrote: not dropped, built
+		function built(w) { return w ~ /(^|-)(ld(\.(bfd|gold|lld))?|lld|mold|collect2|cc1(plus)?|gcc[-0-9.]*|g\+\+[-0-9.]*|cc|c\+\+|clang(\+\+)?[-0-9.]*|rustc|go|link|compile|tcc|zig|ghc|javac|nim|as|strip|objcopy)$/ }
 		# what a command line says, by its words: ARGS, its arguments
 		# joined by \001; CWD, where it ran
-		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat) {
+		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat, sx) {
 			n = split(args, t, "\001")
 			cmd = t[1]
 			for (i = 2; i <= n; i++) cmd = cmd " " t[i]
@@ -177,6 +182,18 @@ classify() {
 			a0 = base(t[1])
 			# by: the program that ran it, where known
 			who = pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : by[e]
+			# a script it wrote, handed to an interpreter (sh /tmp/x.png):
+			# the kernel runs the interpreter, not the file, so the PATH
+			# record names the interpreter (below, a script run itself)
+			if (n > 1 && a0 ~ /^((ba|da|z|k)?sh|python[0-9.]*|perl|ruby|node|php[0-9.]*)$/ && t[2] !~ /^-/) {
+				sx = abs(t[2], cwd)
+				if (sx != "" && sx in made && !(sx in ran) && !built(made[sx]) && (sx ~ /^\/(tmp|var\/tmp|dev\/shm)\// || masq(sx))) {
+					if (sx ~ /^\/(tmp|var\/tmp|dev\/shm)\//) alert("dropped_script", sx " (written by " made[sx] ")", who)
+					if (masq(sx)) alert("masquerade", sx " (written by " made[sx] ")", who)
+					ran[sx] = 1
+					if (state != "") print "x\t" sx > (state ".new")
+				}
+			}
 			# bash'"'"'s /dev/tcp: a connection without a network tool —
 			# a shell when its input or output is joined to it
 			dt = lc ~ /\/dev\/(tcp|udp)\/[^ \/]+\/[0-9]/
@@ -470,13 +487,15 @@ classify() {
 				# directory. Not what a compiler or a linker wrote.
 				if (s == "execve" && field("item") == "0" && ok[e]) {
 					x = f in made ? f : exe[e] in made ? exe[e] : ""
-					if (x != "" && made[x] !~ /(^|-)(ld(\.(bfd|gold|lld))?|lld|mold|collect2|cc1(plus)?|gcc[-0-9.]*|g\+\+[-0-9.]*|cc|c\+\+|clang(\+\+)?[-0-9.]*|rustc|go|link|compile|tcc|zig|ghc|javac|nim|as|strip|objcopy)$/) {
+					if (x != "" && !built(made[x])) {
 						tmp = x ~ /^\/(tmp|var\/tmp|dev\/shm)\//
 						bin = x == exe[e]
 						if (bin || tmp) {
 							# a script: what it runs is recorded command by
 							# command (a test suite helper, a git hook)
-							alert(!bin ? "dropped_script" : tmp ? "dropper" : "dropped_exec", x " (written by " made[x] ")", pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c)
+							dw = pcomm[ppid[e]] != "" ? pcomm[ppid[e]] : c
+							alert(!bin ? "dropped_script" : tmp ? "dropper" : "dropped_exec", x " (written by " made[x] ")", dw)
+							if (masq(x)) alert("masquerade", x " (written by " made[x] ")", dw)
 							ran[x] = 1
 							if (state != "") print "x\t" x > (state ".new")
 						}
