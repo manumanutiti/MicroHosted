@@ -98,7 +98,7 @@ and runs nothing.
 
 | | Means |
 |---|---|
-| decoys | a fake credential (SSH, GnuPG, cloud, registries, git, a project's `.env`, history, browsers, a wallet) read (`READ`) or written (`TAMPERED`), and the programs that opened it (`by`). Each says who reads that file legitimately; read only by that tool (npm reading `~/.npmrc`), it is `info`, not `high` |
+| decoys | a fake credential (SSH, GnuPG, cloud, registries, git, the AI coding agents' logins — Claude Code, Gemini CLI, Codex, Copilot —, a project's `.env`, history, browsers, a wallet) read (`READ`) or written (`TAMPERED`), and the programs that opened it (`by`). Each says who reads that file legitimately; read only by that tool (npm reading `~/.npmrc`), it is `info`, not `high` |
 | vm_probes | paths that tell a VM apart the code asked for — DMI, `/proc/cpuinfo`, PCI, modules, `/.dockerenv`, `systemd-detect-virt` — `absent` ones included: asking is the tell |
 | privesc | what a privilege escalation looks for — `/etc/shadow`, `/etc/sudoers`, cron, root's home, container sockets (docker, lxd), the kernel's hardening switches, `/proc/PID/mem`; `sudo`, `su`, `pkexec`, `doas`, `getcap` looked up or run (by name); `find -perm` searching for setuid (`-4000`) or writable (`-o=w`) files — `absent` ones included. Not perl's `getpw*`, which reads `/etc/shadow` right after `/etc/passwd` for the shadow password (glibc's `getspnam`) |
 | commands | every command line the code ran (from audit's `execve`), in the order it first ran it, with a count; the first 2000. The first lines are `mh-sandbox-run` starting it. `-v` prints them |

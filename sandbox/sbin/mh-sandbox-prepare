@@ -111,6 +111,19 @@ printf 'Created: 20250101T000000\nKey: (private-key (ecc (curve Ed25519)(flags e
 printf '{"seed_version": 51, "wallet_type": "standard", "keystore": {"xprv": "xprv%s%s"}}\n' "$tok" "$tok" |
 	decoy .electrum/wallets/default_wallet "only the wallet reads it"
 
+# The AI coding agents' logins: what malware aimed at developers' machines
+# reaches for (s1ngularity, @nx 2025, looked for claude, gemini and q).
+# Files only, never the environment: code whose tests call an AI's API
+# would send a key found there, and be graded for it.
+printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-%s%s%s","refreshToken":"sk-ant-ort01-%s%s%s","expiresAt":1893456000000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}\n' "$tok" "$TOK" "$tok" "$TOK" "$tok" "$TOK" |
+	decoy .claude/.credentials.json "Claude Code reads it to sign in" "claude"
+printf '{\n  "access_token": "ya29.a0%s%s",\n  "refresh_token": "1//0g%s%s",\n  "scope": "https://www.googleapis.com/auth/cloud-platform openid",\n  "token_type": "Bearer",\n  "expiry_date": 1893456000000\n}\n' "$tok" "$TOK" "$TOK" "$tok" |
+	decoy .gemini/oauth_creds.json "the Gemini CLI reads it to sign in" "gemini"
+printf '{\n  "OPENAI_API_KEY": "sk-proj-%s%s%s",\n  "tokens": null,\n  "last_refresh": "2025-01-01T00:00:00Z"\n}\n' "$tok" "$TOK" "$tok" |
+	decoy .codex/auth.json "the Codex CLI reads it to sign in" "codex"
+printf '{"github.com:Iv1.b507a08c87ecfe98":{"user":"%s","oauth_token":"gho_%s%s","githubAppId":"Iv1.b507a08c87ecfe98"}}\n' "$U" "$tok" "$TOK" |
+	decoy .config/github-copilot/apps.json "Copilot's editor plugins read it" "copilot-language-server copilot-agent"
+
 echo "$tok" > "$S/token"
 
 # Not a decoy (a list of public keys, no secret in it): there for code that

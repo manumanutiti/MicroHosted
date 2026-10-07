@@ -69,6 +69,7 @@ var decoyThemes = []theme{
 	{label: "cloud: AWS, k8s", dirs: []string{"~/.aws/", "~/.kube/", "~/.config/gcloud/", "~/.azure/"}},
 	{label: "npm, PyPI, Docker", dirs: []string{"~/.docker/", "~/.npmrc", "~/.pypirc"}},
 	{label: "GitHub, git, .netrc", dirs: []string{"~/.config/gh/", "~/.git-credentials", "~/.netrc"}},
+	{label: "AI agents: Claude, Gemini, Codex, Copilot", dirs: []string{"~/.claude/", "~/.gemini/", "~/.codex/", "~/.config/github-copilot/"}},
 	{label: "a project's .env", dirs: []string{"~/projects/"}},
 	{label: "shell history", dirs: []string{"~/.bash_history", "~/.zsh_history"}},
 	{label: "browsers", dirs: []string{"~/.config/google-chrome/", "~/.config/chromium/", "~/.mozilla/"}},
