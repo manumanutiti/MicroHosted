@@ -3,7 +3,7 @@
 # Run it as root (mh exec), once, AFTER copying the code in and BEFORE
 # running it: everything changed after this moment is reported.
 #
-#   mh-sandbox-prepare [--no-sinkhole] [ARCHIVE]
+#   mh-sandbox-prepare [--no-sinkhole] [--ci] [ARCHIVE]
 #
 # ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
 # unpacked into ~/work as the user and removed, before the clock starts.
@@ -15,6 +15,12 @@
 # sinkhole answers HTTP and HTTPS and writes down what was sent.
 # --no-sinkhole: no name is answered, as with no network at all.
 #
+# --ci: the code runs as a CI job does (mh-sandbox-run): GitHub Actions'
+# variables in its environment, and its secrets — GITHUB_TOKEN, NPM_TOKEN,
+# AWS keys, PyPI's, the OIDC token's request — as decoys with this run's
+# token in them. Code that steals from CI looks in the environment, not in
+# ~/.npmrc: without them it finds nothing, and does nothing more.
+#
 # Root never writes inside the user's home: what is there may be the code's
 # (a symlink to a system file), and root writing through it would be the
 # escalation the sandbox exists to prevent. Root hands files over on stdin;
@@ -25,10 +31,19 @@ set -eu
 [ "$(id -u)" = 0 ] || { echo "mh-sandbox-prepare: run as root (mh exec)" >&2; exit 1; }
 [ ! -e "$S/since" ] || { echo "mh-sandbox-prepare: already prepared" >&2; exit 1; }
 net=sinkhole
-if [ "${1:-}" = --no-sinkhole ]; then
-	net=servfail
+ci=
+while [ $# -gt 0 ]; do
+	case $1 in
+	--no-sinkhole) net=servfail ;;
+	--ci) ci=1 ;;
+	*) break ;;
+	esac
 	shift
-fi
+done
+# The environment reaches the code through setpriv's env -i (mh-sandbox-lib);
+# busybox's su starts a clean one
+[ -z "$ci" ] || setpriv --help 2>&1 | grep -q -- --reuid ||
+	{ echo "mh-sandbox-prepare: --ci needs util-linux's setpriv (this image has busybox's)" >&2; exit 1; }
 
 # Every read updates atime (not just the first in a day, relatime; nor never,
 # noatime), whatever the image was mounted with.
@@ -125,6 +140,46 @@ printf '{"github.com:Iv1.b507a08c87ecfe98":{"user":"%s","oauth_token":"gho_%s%s"
 	decoy .config/github-copilot/apps.json "Copilot's editor plugins read it" "copilot-language-server copilot-agent"
 
 echo "$tok" > "$S/token"
+
+# --ci: a GitHub-hosted runner's environment, one VAR=value a line, words
+# without spaces (mh-sandbox-run adds them to the code's). Root's: the code
+# sees them in its environment, not in a file.
+if [ -n "$ci" ]; then
+	cat > "$S/ci" <<CI
+CI=true
+GITHUB_ACTIONS=true
+RUNNER_OS=Linux
+RUNNER_ARCH=X64
+RUNNER_ENVIRONMENT=github-hosted
+RUNNER_TEMP=/tmp
+GITHUB_REPOSITORY=acme/billing-api
+GITHUB_REPOSITORY_OWNER=acme
+GITHUB_ACTOR=$U
+GITHUB_WORKFLOW=release
+GITHUB_EVENT_NAME=push
+GITHUB_REF=refs/heads/main
+GITHUB_REF_NAME=main
+GITHUB_SHA=$tok$tok
+GITHUB_RUN_ID=1$(printf '%d' "0x${tok%"${tok#????????}"}")
+GITHUB_WORKSPACE=$H/work
+GITHUB_SERVER_URL=https://github.com
+GITHUB_API_URL=https://api.github.com
+GITHUB_TOKEN=ghs_$tok$TOK
+GH_TOKEN=ghp_$TOK$tok
+NPM_TOKEN=npm_$tok$tok
+NODE_AUTH_TOKEN=npm_$tok$tok
+AWS_ACCESS_KEY_ID=AKIA$TOK
+AWS_SECRET_ACCESS_KEY=$tok$TOK
+AWS_REGION=us-east-1
+AWS_DEFAULT_REGION=us-east-1
+TWINE_USERNAME=__token__
+TWINE_PASSWORD=pypi-$tok$tok
+ACTIONS_ID_TOKEN_REQUEST_URL=https://pipelines.actions.githubusercontent.com/$tok/idtoken
+ACTIONS_ID_TOKEN_REQUEST_TOKEN=$tok$TOK
+ACTIONS_RUNTIME_TOKEN=$TOK$tok
+CI
+	chmod 600 "$S/ci"
+fi
 
 # Not a decoy (a list of public keys, no secret in it): there for code that
 # adds its key to the one it finds, as on any machine reached by ssh. A

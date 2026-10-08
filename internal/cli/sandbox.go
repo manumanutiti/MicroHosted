@@ -94,6 +94,9 @@ type sandboxOpts struct {
 	rules   []string
 	// noSinkhole: no name answered, as with no network (mh-sandbox-net)
 	noSinkhole bool
+	// ci: the code's environment a CI runner's, with decoy tokens in it
+	// (mh-sandbox-prepare --ci)
+	ci bool
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -141,6 +144,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.boolVar(&o.live, "live", "", "print each finding as it happens (every 2 s), while the code runs; the report follows")
 	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
 	fs.boolVar(&o.noSinkhole, "no-sinkhole", "", "answer no name the code looks up, as with no network: by default the sandbox's own network answers HTTP and HTTPS and writes down what was sent")
+	fs.boolVar(&o.ci, "ci", "", "run it as in CI: GitHub Actions' variables, and decoy tokens in its environment (GITHUB_TOKEN, NPM_TOKEN, AWS keys…), as a CI job has them")
 	fs.listVar(&o.rules, "rules", "", "a `FILE` of rules of your own: detections, findings accepted (repeatable; sandbox/rules/, docs/sandbox.md)")
 	pos, err := fs.parse(args)
 	if err != nil {
@@ -415,11 +419,23 @@ func (s *sandbox) run() (err error) {
 			return err
 		}
 	}
-
-	prepare := "mh-sandbox-prepare /root/code.tgz"
-	if s.o.noSinkhole {
-		prepare = "mh-sandbox-prepare --no-sinkhole /root/code.tgz"
+	if s.o.ci {
+		// before the fetch: an image without it costs no download
+		if r, _, err := s.exec("grep -q -e --ci /usr/sbin/mh-sandbox-prepare", time.Minute); err != nil {
+			return err
+		} else if r.ExitCode != 0 {
+			return fmt.Errorf("image %s predates --ci: rebuild it from sandbox/ (docs/sandbox.md)", s.image)
+		}
 	}
+
+	prepare := "mh-sandbox-prepare"
+	if s.o.noSinkhole {
+		prepare += " --no-sinkhole"
+	}
+	if s.o.ci {
+		prepare += " --ci"
+	}
+	prepare += " /root/code.tgz"
 	if s.needsNetwork() {
 		if err := s.fetchPhase(tgz != ""); err != nil {
 			var nr *sandboxNotRun
@@ -879,6 +895,7 @@ func (s *sandbox) report() *sandboxReport {
 		}
 	}
 	rep.Target, rep.Image, rep.VM, rep.Kept = s.t.given, s.image, s.vm, s.o.keep
+	rep.CI = s.o.ci
 	var flows types.FlowList
 	if err := s.c.Do("GET", "/v1/vms/"+s.vm+"/flows", nil, &flows); err != nil {
 		rep.Warnings = append(rep.Warnings, "the host's flows could not be read: "+err.Error())
@@ -1334,12 +1351,15 @@ func repackZip(tw *tar.Writer, p string) error {
 // sandboxReport is what --json prints (docs/sandbox.md). Fields marked
 // untrusted hold strings the code chose.
 type sandboxReport struct {
-	Target   string `json:"target"`
-	Image    string `json:"image"`
-	VM       string `json:"vm"`
-	Kept     bool   `json:"kept"`
-	ExitCode int    `json:"exit_code"`
-	TimedOut bool   `json:"timed_out"`
+	Target string `json:"target"`
+	Image  string `json:"image"`
+	VM     string `json:"vm"`
+	Kept   bool   `json:"kept"`
+	// CI: run as in CI (--ci): a runner's variables and decoy tokens in
+	// the code's environment
+	CI       bool `json:"ci"`
+	ExitCode int  `json:"exit_code"`
+	TimedOut bool `json:"timed_out"`
 	// DurationMS: from the command's start to its end (or the timeout).
 	DurationMS int64 `json:"duration_ms"`
 	// Complete: the VM's side of the report was read. When false, every

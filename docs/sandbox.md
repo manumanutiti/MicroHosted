@@ -70,6 +70,7 @@ mh sandbox npm:@modelcontextprotocol/server-filesystem@2025.8.21 'mcp-server-fil
 | `-v`, `--verbose` | the report in full — every finding under its kind, every probe by every program, every command the code ran, what changed in `~/work`. Without it, what the findings amount to: probes by what they go for, the same command on many directories as one line, at most 8 lines a kind |
 | `--live` | each finding as it happens, every 2 seconds, while the code runs (below); the report follows |
 | `--no-sinkhole` | answer no name the code looks up, as with no network at all (below, "Its network"); by default the sinkhole answers |
+| `--ci` | run it as a CI job: GitHub Actions' variables in its environment (`CI=true`, `GITHUB_ACTIONS`, the repository, the ref) and its secrets as decoys, with this run's token in them — `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`, the AWS keys, PyPI's (`TWINE_PASSWORD`), the OIDC token's request. Code that steals from CI looks there, not in `~/.npmrc`: without them it finds nothing and goes no further. One sent out is a secret sent (`high`). Never in the fetch |
 | `--rules FILE` | rules of your own (below), from any file, in order (repeatable); none is read without it |
 
 The exit code is the command's. A sandbox that could not be set up exits 1
@@ -347,6 +348,7 @@ no name, as before, and the names are still written down.
   "image": "sandbox:3@sha256:…",
   "vm": "3878e944",
   "kept": false,
+  "ci": false,                     // --ci: a CI runner's environment, decoy tokens in it
   "exit_code": 0,                  // the command's; 124 if it timed out
   "timed_out": false,
   "duration_ms": 4810,             // the command's start to its end

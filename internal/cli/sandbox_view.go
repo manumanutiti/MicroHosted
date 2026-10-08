@@ -649,6 +649,9 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 	if r.TimedOut {
 		meta[2] = st.paint(sevColor[sevWarn], "timed out") + " (stopped, then looked at): exit 124"
 	}
+	if r.CI {
+		meta = append(meta, "as in CI (decoy tokens in its environment)")
+	}
 	if r.DurationMS > 0 {
 		meta = append(meta, runDuration(time.Duration(r.DurationMS)*time.Millisecond))
 	}
