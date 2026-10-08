@@ -66,6 +66,7 @@ mh sandbox npm:@modelcontextprotocol/server-filesystem@2025.8.21 'mcp-server-fil
 | `--cpus N`, `--mem SIZE` | the VM's size (default 2 vCPUs, 2G): a build — `go build`, `cargo`, webpack — outgrows less. Out of memory, the kernel kills the code first, never the agent or audit: a run that outgrows the VM fails as itself, the report intact |
 | `--keep` | keep the VM (and its network) afterwards, to look inside |
 | `--json` | the report as JSON on stdout (schema below), everything in it |
+| `--json-out FILE` | the same JSON to FILE too, and the report printed as without it: for a program that keeps the record while a person reads the view |
 | `-o`, `--output` | print the code's own output too (its last 8 KiB, every line prefixed with `\|`); by default only what it did is reported |
 | `-v`, `--verbose` | the report in full — every finding under its kind, every probe by every program, every command the code ran, what changed in `~/work`. Without it, what the findings amount to: probes by what they go for, the same command on many directories as one line, at most 8 lines a kind |
 | `--live` | each finding as it happens, every 2 seconds, while the code runs (below); the report follows |

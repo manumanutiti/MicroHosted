@@ -88,6 +88,8 @@ type sandboxOpts struct {
 	memory  int64 // MiB, --mem
 	keep    bool
 	asJSON  bool
+	// jsonOut: the report as JSON to this file too, the view still printed
+	jsonOut string
 	verbose bool
 	live    bool
 	output  bool
@@ -140,6 +142,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.defined = append(fs.defined, "mem")
 	fs.boolVar(&o.keep, "keep", "k", "keep the VM and its network afterwards, to look inside")
 	fs.boolVar(&o.asJSON, "json", "", "the report as JSON on stdout (docs/sandbox.md)")
+	fs.stringVar(&o.jsonOut, "json-out", "", "", "the report as JSON to `FILE` too, the view still printed: for a program that keeps it while a person reads it")
 	fs.boolVar(&o.verbose, "verbose", "v", "the report in full: every finding, every probe by every program, every command it ran")
 	fs.boolVar(&o.live, "live", "", "print each finding as it happens (every 2 s), while the code runs; the report follows")
 	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
@@ -439,11 +442,16 @@ func (s *sandbox) run() (err error) {
 	if s.needsNetwork() {
 		if err := s.fetchPhase(tgz != ""); err != nil {
 			var nr *sandboxNotRun
-			if s.o.asJSON && errors.As(err, &nr) {
-				rep := &sandboxReport{Target: s.t.given, Image: s.image, VM: s.vm, Verdict: "did_not_run",
+			if (s.o.asJSON || s.o.jsonOut != "") && errors.As(err, &nr) {
+				rep := &sandboxReport{Target: s.t.given, Image: s.image, VM: s.vm, CI: s.o.ci, Verdict: "did_not_run",
 					Warnings: []string{nr.why}, Output: untrustedTail(nr.output, 8<<10)}
-				if perr := printJSON(s.e.stdout, rep); perr != nil {
+				if perr := s.writeJSON(rep); perr != nil {
 					return perr
+				}
+				if s.o.asJSON {
+					if perr := printJSON(s.e.stdout, rep); perr != nil {
+						return perr
+					}
 				}
 			}
 			return err
@@ -506,6 +514,9 @@ func (s *sandbox) run() (err error) {
 	}
 	rep.summarize()
 
+	if err := s.writeJSON(rep); err != nil {
+		return err
+	}
 	if s.o.asJSON {
 		if err := printJSON(s.e.stdout, rep); err != nil {
 			return err
@@ -517,6 +528,22 @@ func (s *sandbox) run() (err error) {
 		return exitError{code: code}
 	}
 	return nil
+}
+
+// writeJSON writes the report to --json-out's file, if any.
+func (s *sandbox) writeJSON(rep *sandboxReport) error {
+	if s.o.jsonOut == "" {
+		return nil
+	}
+	f, err := os.Create(s.o.jsonOut)
+	if err != nil {
+		return fmt.Errorf("--json-out: %w", err)
+	}
+	if err := printJSON(f, rep); err != nil {
+		f.Close()
+		return fmt.Errorf("--json-out: %w", err)
+	}
+	return f.Close()
 }
 
 // watchEvery is how often --live looks at what the code has done while it runs.
