@@ -6,7 +6,7 @@
 # ~/work, after the fetch put the package there (node_modules/, .v/):
 #
 #   mh-sandbox-try npm NAME      # npm rebuild, import(NAME), each bin --help
-#   mh-sandbox-try pypi NAME     # the sdist built (no wheel), import each top-level module, each console script --help
+#   mh-sandbox-try pypi NAME     # the sdist built (no wheel), import each top-level module and the packages right under it, each console script --help
 #   mh-sandbox-try KIND NAME COMMAND   # COMMAND, its commands on the PATH
 #
 # An MCP server (its name says mcp, or it depends on the MCP SDK) is also
@@ -126,16 +126,24 @@ print("mcp" if any(re.match(r"mcp\b", r) for r in md.distribution(sys.argv[1]).r
 	timeout "$per" .v/bin/python - "$name" <<'EOF'
 import importlib, importlib.metadata as md, sys
 d = md.distribution(sys.argv[1])
-tops = set((d.read_text("top_level.txt") or "").split())
-if not tops:
-    for f in d.files or []:
-        p = f.parts
-        if len(p) == 1 and p[0].endswith(".py"):
-            tops.add(p[0][:-3])
-        elif len(p) == 2 and p[1] == "__init__.py":
-            tops.add(p[0])
-for t in sorted(tops):
-    if not t.isidentifier():
+# Its modules, from the files it installed: top_level.txt is setuptools'
+# alone (hatchling, flit write none), and a namespace package has no
+# __init__.py at the top (mistralai). Then each package right under a top
+# one: code in mistralai/client/__init__.py runs on import mistralai.client,
+# not on import mistralai.
+mods = set((d.read_text("top_level.txt") or "").split())
+for f in d.files or []:
+    p = f.parts
+    if p[0].endswith((".dist-info", ".data")) or p[0] in ("..", "__pycache__"):
+        continue
+    if len(p) == 1 and p[0].endswith(".py"):
+        mods.add(p[0][:-3])
+    elif len(p) >= 2 and p[-1].endswith(".py"):
+        mods.add(p[0])
+        if len(p) == 3 and p[2] == "__init__.py":
+            mods.add(p[0] + "." + p[1])
+for t in sorted(mods):
+    if not all(w.isidentifier() for w in t.split(".")):
         continue
     try:
         importlib.import_module(t)
