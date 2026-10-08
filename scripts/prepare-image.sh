@@ -128,6 +128,10 @@ Description=MicroHosted vsock exec listener
 [Service]
 ExecStart=/usr/bin/socat VSOCK-LISTEN:${AGENT_PORT},fork,reuseaddr EXEC:/usr/local/bin/microhosted-exec
 Restart=always
+# What mh exec runs is in this unit's cgroup: with systemd's default (stop),
+# the kernel killing one process of it out of memory stops the whole unit —
+# the agent, the connection, everything the command started.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

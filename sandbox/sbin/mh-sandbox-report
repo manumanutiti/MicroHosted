@@ -217,8 +217,15 @@ audited() {
 # health: alert audit_health … — what audit may have missed: auditd
 # stopped, the disk (nearly) full, the kernel holding the code back a second
 # or more for audit's backlog (a slowdown code can notice). Events lost are
-# in the audit record.
+# in the audit record. And alert oom_kill: processes the kernel killed out of
+# memory since prepare (/proc/vmstat counts them; the kernel's log, which
+# audit floods, may have lost their names): a fork bomb, or a build bigger
+# than the VM.
 health() {
+	if [ -r "$S/oom" ]; then
+		awk -v was="$(cat "$S/oom")" '$1 == "oom_kill" && $2 > was {
+			printf "alert\toom_kill\t%d\tthe kernel killed %d of its processes out of memory\tkernel\n", $2 - was, $2 - was }' /proc/vmstat
+	fi
 	auditctl -s | awk -v free="$(df -Pm / | awk 'NR == 2 { print $4 }')" \
 		-v adm="$(awk -F' *= *' '$1 == "admin_space_left" { print $2 + 0 }' /etc/audit/auditd.conf 2>/dev/null)" '
 		$1 == "pid" && $2 == 0 { print "alert\taudit_health\t1\tauditd is not running: nothing was recorded after it stopped\tauditd" }

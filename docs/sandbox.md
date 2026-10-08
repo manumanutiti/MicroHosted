@@ -238,6 +238,7 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `connect` | info | which program tried to reach which address (`:53 (dns)`: a name lookup); loopback left out |
 | `trace_off` | info | `set +x` in a script: what that shell did after is not traced (CI scripts do it to keep secrets out of logs) |
 | `trace_full` | warn | the shells' trace reached 32 MB: what scripts did after is only in audit |
+| `oom_kill` | warn | the kernel killed its processes out of memory (counted since prepare): a fork bomb — a `.pth` that starts Python, which reads the `.pth` again — or a build bigger than the VM (`--mem`). The run goes on, and the report with it; what the killed ones would have done next is not in it |
 | `audit_health` | warn | audit may have missed some: the disk nearly full (audit stops recording below `admin_space_left`, 150 MB), auditd stopped, the kernel holding the code back for audit to keep up |
 
 Audit sees programs started, not what a shell does within; for that, every

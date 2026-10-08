@@ -94,6 +94,9 @@ var alertKinds = map[string]alertKind{
 		"set +x in a script: CI scripts do it to keep secrets out of logs; what that shell did after is only in audit (programs run, not builtins)"},
 	"trace_full": {sevWarn, "flooded the shell trace",
 		"the trace of its shells reached its cap: what scripts did after (builtins, eval) is only in audit"},
+	// The kernel's, at the end.
+	"oom_kill": {sevWarn, "ran the VM out of memory",
+		"the kernel killed its processes out of memory: a fork bomb (a .pth that starts Python, which reads the .pth…) or a build bigger than the VM (--mem). What the killed ones would have done next is not here"},
 	// Audit's own state, at the end.
 	"audit_health": {sevWarn, "audit may have missed some",
 		"the disk filled up (audit stops recording), auditd stopped, or the kernel held the code back for audit to keep up: what is missing is unknown"},

@@ -185,5 +185,8 @@ if command -v auditctl >/dev/null; then
 fi
 
 # The clock: last, so that everything above is before it.
+# the kernel's out-of-memory kills so far (the fetch's): the report counts
+# the code's from here
+awk '$1 == "oom_kill" { print $2 }' /proc/vmstat > "$S/oom" 2>/dev/null || true
 touch "$S/since"
 echo "prepared: $(wc -l < "$S/decoys") decoys in $H, token $tok"
