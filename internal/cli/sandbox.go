@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
+	"cmp"
 	"compress/gzip"
 	"crypto/rand"
 	"encoding/hex"
@@ -321,6 +322,8 @@ type sandbox struct {
 	// --fetch); a server that still resends its FIN later gets an ACK that
 	// shows here, under the fetch's own destination.
 	before map[string]uint64
+	// began: when the command was started, by this host's clock
+	began time.Time
 }
 
 func (s *sandbox) say(format string, a ...any) {
@@ -452,9 +455,9 @@ func (s *sandbox) run() (err error) {
 	if s.o.live {
 		stopWatch = s.watch()
 	}
-	began := time.Now()
+	s.began = time.Now()
 	res, timedOut, err := s.exec("mh-sandbox-run "+shellQuote(s.command), s.o.timeout)
-	took := time.Since(began)
+	took := time.Since(s.began)
 	stopWatch()
 	if err != nil {
 		return err
@@ -888,7 +891,18 @@ func (s *sandbox) report() *sandboxReport {
 		}
 		for _, f := range flows.Flows {
 			if n := f.Count - s.before[flowKey(f)]; n > 0 {
-				rep.Connections = append(rep.Connections, sandboxConn{Protocol: f.Protocol, Dst: f.Dst, DstPort: f.DstPort, Count: n, Reason: f.Reason})
+				c := sandboxConn{Protocol: f.Protocol, Dst: f.Dst, DstPort: f.DstPort, Count: n, Reason: f.Reason}
+				// the host's clock: refused before this run too, its
+				// first time is not this run's
+				if !s.began.IsZero() {
+					last := f.Last.Sub(s.began).Milliseconds()
+					c.LastMS = &last
+					if s.before[flowKey(f)] == 0 {
+						first := f.First.Sub(s.began).Milliseconds()
+						c.FirstMS = &first
+					}
+				}
+				rep.Connections = append(rep.Connections, c)
 			}
 		}
 	}
@@ -1374,8 +1388,14 @@ type sandboxReport struct {
 	sinkAddr map[string]string // the sinkhole's address → the name it was given to
 	commands int               // distinct, as the image counted them; -1: not recorded
 	decoyBy  map[string]map[string]int
-	readers  bool // the image names who opened a decoy (decoy has TOOLS, decoyby)
-	rules    *sandboxRules
+	// decoyOpens: decoyBy with when, by decoy
+	decoyOpens map[string][]sandboxOpen
+	readers    bool // the image names who opened a decoy (decoy has TOOLS, decoyby)
+	// start: when the command started, in ms since the epoch by the VM's
+	// clock (the image's start record); started: the image said
+	start   int64
+	started bool
+	rules   *sandboxRules
 	// rulesApplied: the user's path and command rules the image read
 	rulesApplied int
 }
@@ -1409,6 +1429,9 @@ type sandboxDecoy struct {
 	// By: the programs that opened it (audit), "name ×N"; untrusted. Empty
 	// for a decoy READ: who read it is unknown, not no one.
 	By []string `json:"by"`
+	// Opens: the same, one entry per program with when it opened it,
+	// first opened first
+	Opens []sandboxOpen `json:"opens"`
 	// ByItsTool: only READ, and only by the program that reads it
 	// legitimately (npm, ~/.npmrc): graded info, not high.
 	ByItsTool bool   `json:"by_its_tool"`
@@ -1420,11 +1443,29 @@ type sandboxDecoy struct {
 	counts map[string]int
 }
 
+// sandboxOpen is a program that opened a decoy (audit): its name, untrusted.
+type sandboxOpen struct {
+	By    string `json:"by"`
+	Count int    `json:"count"`
+	sandboxWhen
+}
+
+// sandboxWhen is when a finding was first and last seen, in milliseconds
+// from the command's start (by the VM's clock; connections by the host's).
+// Absent where it is not known: an older image, a finding made after the
+// run (files left, a .pth hook, lines added to a shell's startup file), or
+// a connection that had been refused before this run too (first_ms).
+type sandboxWhen struct {
+	FirstMS *int64 `json:"first_ms,omitempty"`
+	LastMS  *int64 `json:"last_ms,omitempty"`
+}
+
 type sandboxProbe struct {
 	Path  string `json:"path"`
 	Found bool   `json:"found"`
 	Count int    `json:"count"`
 	By    string `json:"by"`
+	sandboxWhen
 }
 
 type sandboxWorkEntry struct {
@@ -1447,11 +1488,17 @@ type sandboxAlert struct {
 	Count    int    `json:"count"`
 	What     string `json:"what"`
 	By       string `json:"by"`
+	sandboxWhen
 }
 
+// sandboxCommand is a command line the code ran, every run of it counted;
+// PID and PPID are its first run's (0: not known).
 type sandboxCommand struct {
 	Count int    `json:"count"`
 	Args  string `json:"args"`
+	PID   int    `json:"pid,omitempty"`
+	PPID  int    `json:"ppid,omitempty"`
+	sandboxWhen
 }
 
 type sandboxProc struct {
@@ -1465,12 +1512,14 @@ type sandboxConn struct {
 	DstPort  int    `json:"dst_port,omitempty"`
 	Count    uint64 `json:"count"`
 	Reason   string `json:"reason"`
+	sandboxWhen
 }
 
 type sandboxDNS struct {
 	Count int    `json:"count"`
 	Type  string `json:"type"` // A, AAAA, TXT…
 	Name  string `json:"name"`
+	sandboxWhen
 }
 
 type sandboxRequest struct {
@@ -1483,11 +1532,13 @@ type sandboxRequest struct {
 	// CarriesToken: this run's decoy token was in it — as is, URL- or
 	// base64-encoded, gzipped: a secret sent out
 	CarriesToken bool `json:"carries_token"`
+	sandboxWhen
 }
 
 type sandboxTLS struct {
 	Count int    `json:"count"`
 	Name  string `json:"name"`
+	sandboxWhen
 }
 
 type sandboxAgentText struct {
@@ -1533,7 +1584,11 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			return ""
 		}
 		num := func(i int) int { n, _ := strconv.Atoi(at(i)); return n }
+		// fields i and i+1: when first and last seen, against start
+		when := func(i int) sandboxWhen { return r.when(at(i), at(i+1)) }
 		switch f[0] {
+		case "start":
+			r.start, r.started = epochMS(at(1))
 		case "user":
 			r.user = at(1)
 		case "token":
@@ -1550,7 +1605,7 @@ func parseSandboxReport(tsv string) *sandboxReport {
 				r.Net = "off"
 				r.Warnings = append(r.Warnings, "no resolver of the sandbox in this image: the names the code looked up are not recorded")
 			} else {
-				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3)})
+				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3), sandboxWhen: when(4)})
 			}
 		case "addr":
 			if r.sinkAddr == nil {
@@ -1558,14 +1613,14 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			}
 			r.sinkAddr[at(1)] = at(2)
 		case "http":
-			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", Port: num(7)})
+			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", Port: num(7), sandboxWhen: when(8)})
 		case "tls":
-			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2)})
+			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2), sandboxWhen: when(3)})
 		case "rules":
 			r.rulesApplied = num(1)
 		case "decoy":
 			r.readers = r.readers || len(f) > 4
-			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3), By: []string{}, tools: strings.Fields(at(4))})
+			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3), By: []string{}, Opens: []sandboxOpen{}, tools: strings.Fields(at(4))})
 		case "decoyby":
 			if r.decoyBy == nil {
 				r.decoyBy = map[string]map[string]int{}
@@ -1574,6 +1629,10 @@ func parseSandboxReport(tsv string) *sandboxReport {
 				r.decoyBy[at(3)] = map[string]int{}
 			}
 			r.decoyBy[at(3)][at(4)] += num(2)
+			if r.decoyOpens == nil {
+				r.decoyOpens = map[string][]sandboxOpen{}
+			}
+			r.decoyOpens[at(3)] = append(r.decoyOpens[at(3)], sandboxOpen{By: at(4), Count: num(2), sandboxWhen: when(5)})
 		case "audit":
 			if at(1) == "off" {
 				r.Warnings = append(r.Warnings, "no audit in this image: how the code looked for a VM is not recorded")
@@ -1581,15 +1640,15 @@ func parseSandboxReport(tsv string) *sandboxReport {
 				r.Warnings = append(r.Warnings, fmt.Sprintf("audit lost %d events: vm_probes may be incomplete", n))
 			}
 		case "probe":
-			r.VMProbes = append(r.VMProbes, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
+			r.VMProbes = append(r.VMProbes, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4), sandboxWhen: when(5)})
 		case "privesc":
-			r.Privesc = append(r.Privesc, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4)})
+			r.Privesc = append(r.Privesc, sandboxProbe{Found: at(1) == "found", Count: num(2), Path: at(3), By: at(4), sandboxWhen: when(5)})
 		case "commands":
 			r.commands = num(1)
 		case "alert":
-			r.Alerts = append(r.Alerts, sandboxAlert{Kind: at(1), Severity: kindOf(at(1)).Severity.String(), Count: num(2), What: at(3), By: at(4)})
+			r.Alerts = append(r.Alerts, sandboxAlert{Kind: at(1), Severity: kindOf(at(1)).Severity.String(), Count: num(2), What: at(3), By: at(4), sandboxWhen: when(5)})
 		case "exec":
-			r.Commands = append(r.Commands, sandboxCommand{Count: num(1), Args: at(2)})
+			r.Commands = append(r.Commands, sandboxCommand{Count: num(1), Args: at(2), PID: num(5), PPID: num(6), sandboxWhen: when(3)})
 		case "file":
 			r.Changed.Files = append(r.Changed.Files, at(1))
 		case "dir":
@@ -1612,6 +1671,53 @@ func parseSandboxReport(tsv string) *sandboxReport {
 	return r
 }
 
+// epochMS reads a time as the VM's tools write it, seconds since the epoch
+// with a fraction (date +%s.%N, audit's, $EPOCHREALTIME), in milliseconds.
+func epochMS(s string) (int64, bool) {
+	sec, frac, _ := strings.Cut(s, ".")
+	n, err := strconv.ParseInt(sec, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	frac = (frac + "000")[:3]
+	ms, err := strconv.Atoi(frac)
+	if err != nil {
+		return 0, false
+	}
+	return n*1000 + int64(ms), true
+}
+
+// when is a finding's first and last time (epoch seconds, as the VM wrote
+// them) in milliseconds from the command's start; unknown ones, none.
+func (r *sandboxReport) when(first, last string) sandboxWhen {
+	var w sandboxWhen
+	if !r.started {
+		return w
+	}
+	if t, ok := epochMS(first); ok {
+		d := t - r.start
+		w.FirstMS = &d
+	}
+	if t, ok := epochMS(last); ok {
+		d := t - r.start
+		w.LastMS = &d
+	}
+	return w
+}
+
+// cmpWhen orders two first times, the unknown last.
+func cmpWhen(a, b *int64) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return 1
+	case b == nil:
+		return -1
+	}
+	return cmp.Compare(*a, *b)
+}
+
 // tokenIn says whether s carries this run's decoy token.
 func (r *sandboxReport) tokenIn(s string) bool {
 	return r.token != "" && strings.Contains(strings.ToLower(s), strings.ToLower(r.token))
@@ -1626,6 +1732,8 @@ func (r *sandboxReport) summarize() {
 	for i := range r.Decoys {
 		d := &r.Decoys[i]
 		d.grade(r.decoyBy[d.Path])
+		d.Opens = append(d.Opens, r.decoyOpens[d.Path]...)
+		slices.SortStableFunc(d.Opens, func(a, b sandboxOpen) int { return cmpWhen(a.FirstMS, b.FirstMS) })
 		if d.State != "untouched" {
 			s.DecoysRead++
 		}

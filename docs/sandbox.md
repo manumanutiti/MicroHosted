@@ -369,21 +369,26 @@ no name, as before, and the names are still written down.
     "addresses_an_agent": 0
   },
   "decoys":      [{"path": "/home/dev/.netrc", "state": "READ", "legitimately": "curl -n, …",
-                   "by": ["cat ×1"], "by_its_tool": false, "severity": "high"}],
-  "vm_probes":   [{"path": "/sys/class/dmi/id/product_name", "found": false, "count": 1, "by": "python"}],
-  "privesc":     [{"path": "find -perm -4000", "found": true, "count": 1, "by": "find"}],
-  "commands":    [{"count": 3, "args": "find / -perm -4000"}],
-  "alerts":      [{"kind": "shell_rc", "severity": "warn", "count": 1, "what": "/home/dev/.bashrc", "by": "bash"}],
+                   "by": ["cat ×1"], "by_its_tool": false, "severity": "high",
+                   "opens": [{"by": "cat", "count": 1, "first_ms": 2210, "last_ms": 2210}]}],
+  "vm_probes":   [{"path": "/sys/class/dmi/id/product_name", "found": false, "count": 1, "by": "python",
+                   "first_ms": 340, "last_ms": 340}],
+  "privesc":     [{"path": "find -perm -4000", "found": true, "count": 1, "by": "find", "first_ms": 1800, "last_ms": 1800}],
+  "commands":    [{"count": 3, "args": "find / -perm -4000", "pid": 812, "ppid": 790,
+                   "first_ms": 1800, "last_ms": 3020}],
+  "alerts":      [{"kind": "shell_rc", "severity": "warn", "count": 1, "what": "/home/dev/.bashrc", "by": "bash",
+                   "first_ms": 4100, "last_ms": 4100}],
   "changed":     {"files": ["/home/dev/.bashrc"], "dirs": ["/tmp"],
                   "work_files": [{"entry": ".v/", "count": 203}], "work_dirs": [{"entry": ".v/", "count": 33}]},
   "processes":   [{"pid": 123, "args": "…"}],
   "listening":   ["tcp 0.0.0.0:8080"],
-  "connections": [{"protocol": "udp", "dst": "1.1.1.1", "dst_port": 53, "count": 4, "reason": "egress"}],
+  "connections": [{"protocol": "udp", "dst": "1.1.1.1", "dst_port": 53, "count": 4, "reason": "egress",
+                   "first_ms": 2400, "last_ms": 2950}],
   "net":         "sinkhole",       // sinkhole, servfail (--no-sinkhole), off (an image without it)
-  "dns":         [{"count": 4, "type": "A", "name": "evil.example"}],
+  "dns":         [{"count": 4, "type": "A", "name": "evil.example", "first_ms": 2300, "last_ms": 2900}],
   "requests":    [{"count": 1, "scheme": "https", "method": "POST", "url": "https://evil.example/collect",
-                   "port": 443, "bytes": 2048, "carries_token": true}],
-  "tls_refused": [{"count": 1, "name": "pypi.org"}],
+                   "port": 443, "bytes": 2048, "carries_token": true, "first_ms": 2330, "last_ms": 2330}],
+  "tls_refused": [{"count": 1, "name": "pypi.org", "first_ms": 900, "last_ms": 900}],
   "addresses_an_agent": [{"where": "input", "file": "README.md", "line": 12, "text": "ignore previous instructions", "severity": "warn"}],  // where: input, output, created (a file's name)
   "output": "…",                   // the command's, last 8 KiB
   "warnings": ["audit lost 3 events: vm_probes may be incomplete"],
@@ -395,6 +400,20 @@ no name, as before, and the names are still written down.
 
 A decoy an accept rule matched stays in `decoys`, graded `info`, with
 `"accepted": WHY`. A rule's alert has the kind `rule:NAME`.
+
+`first_ms` and `last_ms` say when a finding was first and last seen, in
+milliseconds from the command's start — so what the code did can be put in
+order across lists (a decoy opened, then a request carrying its token).
+They come from the VM's clock (audit, the shells' trace, the sinkhole); a
+connection's from the host's, which can be off from it by a few
+milliseconds. Audit's are to the kernel's tick (a few milliseconds, so the
+sandbox's own first commands can show at -2): findings from different
+sources that close together may be listed out of order. They are absent where unknown: an image from before them, a
+finding read after the run (a `.pth` hook, a line added to a shell's
+startup file, audit's health), a connection refused before this run too
+(`first_ms`). A time from the shells' trace is bash's `$EPOCHREALTIME`, a
+variable the code can set: untrusted, like the text beside it. A command's
+`pid` and `ppid` are its first run's: the tree of who started what.
 
 Untrusted (the code's choice): `decoys[].by`, `changed.*`, `dns[].name`, `requests[].method` and `.url`, `tls_refused[].name`, `vm_probes[].path` and `.by`,
 `privesc[].path` and `.by`, `commands[].args`, `alerts[].what` and `.by`,

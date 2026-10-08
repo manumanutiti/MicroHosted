@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -196,6 +197,61 @@ func TestRepackTarRefusesHardLinksAndAbsolute(t *testing.T) {
 	}
 }
 
+// The records' times, from the image's start record: milliseconds from the
+// command's start; an image without it, none.
+func TestParseSandboxReportTimes(t *testing.T) {
+	tsv := strings.Join([]string{
+		"start\t1760000000.050123456", "token\tabc",
+		"decoy\tREAD\t/home/dev/.npmrc\tnpm reads it\tnpm",
+		"decoyby\topen\t2\t/home/dev/.npmrc\tcurl\t1760000001.000\t1760000001.200",
+		"decoyby\topen\t1\t/home/dev/.npmrc\tnpm\t1760000000.300\t1760000000.300",
+		"exec\t2\tnpm whoami\t1760000000.100\t1760000001.500\t101\t100",
+		"alert\tshell_rc_line\t1\t~/.bashrc: x\t?",
+		"dns\t1\tA\tx.example\t1760000002.5\t1760000002.5",
+		"http\t1\thttps\tPOST\thttps://x.example/\t10\t1\t443\t1760000002.600\t1760000003.000",
+		"",
+	}, "\n")
+	r := parseSandboxReport(tsv)
+	r.summarize()
+	ms := func(w sandboxWhen) string {
+		s := func(p *int64) string {
+			if p == nil {
+				return "-"
+			}
+			return strconv.FormatInt(*p, 10)
+		}
+		return s(w.FirstMS) + "," + s(w.LastMS)
+	}
+	c := r.Commands[0]
+	if got := ms(c.sandboxWhen); got != "50,1450" || c.PID != 101 || c.PPID != 100 {
+		t.Errorf("command = %s pid %d ppid %d, want 50,1450 pid 101 ppid 100", got, c.PID, c.PPID)
+	}
+	if got := ms(r.Alerts[0].sandboxWhen); got != "-,-" {
+		t.Errorf("alert with no time = %s", got)
+	}
+	if got := ms(r.DNS[0].sandboxWhen); got != "2450,2450" {
+		t.Errorf("dns = %s", got)
+	}
+	if got := ms(r.Requests[0].sandboxWhen); got != "2550,2950" {
+		t.Errorf("request = %s", got)
+	}
+	o := r.Decoys[0].Opens
+	if len(o) != 2 || o[0].By != "npm" || ms(o[0].sandboxWhen) != "250,250" || o[1].By != "curl" || o[1].Count != 2 || ms(o[1].sandboxWhen) != "950,1150" {
+		t.Errorf("opens = %+v", o)
+	}
+	j, err := json.Marshal(r.Commands[0])
+	must(t, err)
+	if want := `{"count":2,"args":"npm whoami","pid":101,"ppid":100,"first_ms":50,"last_ms":1450}`; string(j) != want {
+		t.Errorf("json = %s\nwant   %s", j, want)
+	}
+
+	// an image before the start record: times unknown, not 0
+	old := parseSandboxReport("exec\t1\tid\t1760000000.100\t1760000000.100\t5\t1\n")
+	if j, _ := json.Marshal(old.Commands[0]); string(j) != `{"count":1,"args":"id","pid":5,"ppid":1}` {
+		t.Errorf("old image: %s", j)
+	}
+}
+
 func TestParseSandboxReport(t *testing.T) {
 	tsv := strings.Join([]string{
 		"since\t2026-10-01 22:40:15.7 +0000", "user\tdev", "token\tabc",
@@ -232,7 +288,7 @@ func TestParseSandboxReport(t *testing.T) {
 	if len(r.Changed.WorkFiles) != 2 || r.Changed.WorkFiles[0] != (sandboxWorkEntry{".v/", 203}) || len(r.Changed.WorkDirs) != 1 {
 		t.Errorf("work = %+v / %+v", r.Changed.WorkFiles, r.Changed.WorkDirs)
 	}
-	if len(r.Commands) != 2 || r.Commands[1] != (sandboxCommand{3, "find / -perm -4000"}) {
+	if len(r.Commands) != 2 || r.Commands[1] != (sandboxCommand{Count: 3, Args: "find / -perm -4000"}) {
 		t.Errorf("commands = %+v", r.Commands)
 	}
 	wantAlerts := []sandboxAlert{

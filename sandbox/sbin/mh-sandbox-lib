@@ -111,13 +111,19 @@ auditlogs() {
 
 # classify [STATE]: raw audit records on stdin, as auditd writes them (an
 # event's SYSCALL, then EXECVE, CWD, PATH, SOCKADDR) — out:
-#   probe|privesc STATE COUNT PATH BY
-#   exec FIRST COUNT ARGS     (FIRST: the event's serial, to order by)
-#   alert KIND COUNT WHAT BY  (KIND: internal/cli/sandbox_kinds.go, or
+#   probe|privesc STATE COUNT PATH BY T1 T2
+#   exec FIRST COUNT ARGS T1 T2 PID PPID
+#                             (FIRST: the event's serial, to order by; PID,
+#                             PPID: the first run's)
+#   alert KIND COUNT WHAT BY T1 T2
+#                             (KIND: internal/cli/sandbox_kinds.go, or
 #                             rule:NAME, the user's: internal/cli/sandbox_rules.go)
-#   decoyby open COUNT PATH BY  (a decoy opened, and by which program: the
-#                               report's READ comes from its atime, which
-#                               does not say who)
+#   decoyby open COUNT PATH BY T1 T2
+#                             (a decoy opened, and by which program: the
+#                             report's READ comes from its atime, which
+#                             does not say who)
+# T1, T2: when it was first and last seen, audit's clock (seconds since the
+# epoch, to the millisecond).
 # STATE, a file, carries what one call learnt to the next (mh-sandbox-watch
 # reads the log in pieces): the files the code created, the dropped ones it
 # ran, the program each process started. Paths are made absolute (relative
@@ -131,6 +137,11 @@ classify() {
 	awk -v vmd="^/($vmdirs)" -v vmt="/($vmtools)\$" -v ped="^/($pedirs)" -v pet="/($petools)\$" \
 		-v home="$H" -v state="${1:-}" -v decoys="$S/decoys" -v rules="$S/rules" '
 		function id() { return match($0, /msg=audit\([0-9.:]+\)/) ? substr($0, RSTART, RLENGTH) : "" }
+		# when event E happened: msg=audit(TIME:SERIAL)
+		function tm(e) { return substr(e, 11, index(e, ":") - 11) }
+		# K seen once more, now (ev: the event being read): its count and
+		# when it was first and last seen
+		function mark(arr, k) { if (!(k in tfirst)) tfirst[k] = tm(ev); tlast[k] = tm(ev); arr[k]++ }
 		# an argument is "quoted", or hex when it has a space, a quote or a
 		# control character in it
 		function arg(v,  i, out) {
@@ -170,7 +181,7 @@ classify() {
 		function alert(kind, what, who) {
 			gsub(/[^[:print:]]/, "?", what); gsub(/[^[:print:]]/, "?", who)
 			if (length(what) > 200) what = substr(what, 1, 200) "..."
-			alerts[kind "\t" what "\t" who]++
+			mark(alerts, kind "\t" what "\t" who)
 		}
 		# in ~/work or a temporary directory: the code'"'"'s own
 		function own(p) { return p == work || index(p, work "/") == 1 || p ~ /^\/(tmp|var\/tmp|dev\/shm)(\/|$)/ }
@@ -185,6 +196,7 @@ classify() {
 		# what a command line says, by its words: ARGS, its arguments
 		# joined by \001; CWD, where it ran
 		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat, sx) {
+			ev = e
 			n = split(args, t, "\001")
 			cmd = t[1]
 			for (i = 2; i <= n; i++) cmd = cmd " " t[i]
@@ -294,6 +306,7 @@ classify() {
 		}
 		# a write where code makes itself start again: F, the path; E, the event
 		function persist(f, e,  w) {
+			ev = e
 			w = f (ok[e] ? "" : " (refused)")
 			if (f ~ "^" home "/\\.ssh/(authorized_keys2?|rc|environment)$" ||
 			    f ~ "^" home "/\\.config/(systemd/user|autostart|environment\\.d)(/|$)" ||
@@ -407,20 +420,20 @@ classify() {
 		}
 		/^type=SYSCALL/ {
 			parents()
-			sys = $0; sysid = id()
+			sys = $0; sysid = ev = id()
 			# read now if it is one of the narrow rules'"'"' or an exec, else
 			# when a record of the event needs it (most never do)
 			if (/ key="mh-(privesc|persist|net|bind)"| SYSCALL=execve /) syscall(sysid)
 			next
 		}
 		/^type=CWD/ {
-			e = id()
+			e = ev = id()
 			cwd[e] = arg(field("cwd"))
 			if (e in pend) { command(e, pend[e], cwd[e]); delete pend[e] }
 			next
 		}
 		/^type=EXECVE/ {
-			e = id()
+			e = ev = id()
 			s = $0; cmd = ""; args = ""
 			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 4000) {
 				v = substr(s, RSTART + 1, RLENGTH - 1); sub(/^[^=]*=/, "", v)
@@ -438,19 +451,19 @@ classify() {
 				pcomm[epid[e]] = base(t2[2])
 			if (e in viash) { delete pend[e]; next }
 			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
-			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0 }
-			nran[cmd]++
+			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0; xpid[cmd] = epid[e]; xppid[cmd] = ppid[e] }
+			mark(nran, cmd)
 			# every -perm VALUE of one find: -4000 setuid, -2000 setgid, -o=w writable
 			s = $0
 			while (match(s, /"-perm" a[0-9]+="[^"]*"/)) {
 				v = substr(s, RSTART, RLENGTH); sub(/.*="/, "", v); sub(/"$/, "", v)
-				seen["privesc\tfound\tfind -perm " v "\t" by[e]]++
+				mark(seen, "privesc\tfound\tfind -perm " v "\t" by[e])
 				s = substr(s, RSTART + RLENGTH)
 			}
 			next
 		}
 		/^type=SOCKADDR/ {
-			e = id()
+			e = ev = id()
 			if (key[e] != "mh-net" && key[e] != "mh-bind") next
 			if (match($0, /saddr_fam=inet6? laddr=[^ ]+ lport=[0-9]+/)) {
 				split(substr($0, RSTART, RLENGTH), sw, /[ =]/)
@@ -481,7 +494,7 @@ classify() {
 		}
 		/^type=PATH/ && match($0, / name=("[^"]*"|[0-9A-F]+)/) {
 			n = arg(substr($0, RSTART + 6, RLENGTH - 6))
-			e = id()
+			e = ev = id()
 			nt = field("nametype")
 			rel = n !~ /^\//
 			if (rel && cwd[e] == "") next
@@ -546,12 +559,12 @@ classify() {
 			}
 			st = nt == "UNKNOWN" ? "absent" : "found"
 			# who opened a decoy (a stat does not read it)
-			if (dk && s ~ /^(open|openat|openat2|creat)$/) seen["decoyby\topen\t" f "\t" c]++
+			if (dk && s ~ /^(open|openat|openat2|creat)$/) mark(seen, "decoyby\topen\t" f "\t" c)
 			if (vm) {
-				seen["probe\t" st "\t" f "\t" c]++
+				mark(seen, "probe\t" st "\t" f "\t" c)
 			} else if (!pe) {
 			} else if (f ~ pet) {
-				seen["privesc\t" st "\t" base(f) "\t" c]++
+				mark(seen, "privesc\t" st "\t" base(f) "\t" c)
 			} else if (f ~ ped) {
 				# A stat alone is what listing a directory does (ls -l /etc,
 				# find, os.walk in Python stat every entry): an escalation
@@ -559,21 +572,21 @@ classify() {
 				if (s ~ /^(stat|lstat|newfstatat|fstatat64|statx)$/) next
 				if (f == "/etc/shadow" && pw[epid[e]] && exb[e] ~ /^perl/) next
 				sub(/^\/proc\/[0-9]+\//, "/proc/PID/", f)
-				seen["privesc\t" st "\t" f "\t" c]++
+				mark(seen, "privesc\t" st "\t" f "\t" c)
 			}
 		}
 		END {
 			parents()
 			for (e in pend) command(e, pend[e], "")
-			for (k in nran) printf "exec\t%d\t%d\t%s\n", first[k], nran[k], k
+			for (k in nran) printf "exec\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", first[k], nran[k], k, tfirst[k], tlast[k], xpid[k], xppid[k]
 			for (k in seen) {
 				split(k, a, "\t")
 				gsub(/[^[:print:]]/, "?", a[3]); gsub(/[^[:print:]]/, "?", a[4])
-				printf "%s\t%s\t%d\t%s\t%s\n", a[1], a[2], seen[k], a[3], a[4]
+				printf "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", a[1], a[2], seen[k], a[3], a[4], tfirst[k], tlast[k]
 			}
 			for (k in alerts) {
 				split(k, a, "\t")
-				printf "alert\t%s\t%d\t%s\t%s\n", a[1], alerts[k], a[2], a[3]
+				printf "alert\t%s\t%d\t%s\t%s\t%s\t%s\n", a[1], alerts[k], a[2], a[3], tfirst[k], tlast[k]
 			}
 			if (state != "") {
 				# the program each process started, to name who ran a
@@ -614,7 +627,8 @@ tracer() {
 
 # traced: alert records from the shells' trace (tracer) — what a script does
 # that runs no program, so audit has no command line of it: builtins, and
-# what eval was given, decoded. Each line is "+SCRIPT<tab>COMMAND", one +
+# what eval was given, decoded. Each line is "+TIME<tab>SCRIPT<tab>COMMAND"
+# (TIME: bash's $EPOCHREALTIME, the code's to change), one +
 # per level (a command substitution is one deeper), the words quoted as
 # bash quotes them. The trace is the code's own writing: data; a forged line
 # can add to the report, not take from it.
@@ -631,12 +645,16 @@ tracer() {
 #   trace_full     the trace reached $tracecap bytes
 traced() {
 	[ -e "$S/traced" ] || return 0
-	[ ! -e "$T/full" ] || printf 'alert\ttrace_full\t1\tthe shells'"'"' trace reached %d MB: what scripts did after is only in audit\t?\n' $((tracecap / 1048576))
+	# when: as the trace says it (a tracer's file is created when it fills)
+	[ ! -e "$T/full" ] || { _t=$(stat -c %Y "$T/full"); printf 'alert\ttrace_full\t1\tthe shells'"'"' trace reached %d MB: what scripts did after is only in audit\t?\t%s\t%s\n' $((tracecap / 1048576)) "$_t" "$_t"; }
 	[ -s "$T/trace" ] || return 0
 	awk '
-		function alert(kind, what, who) {
+		function alert(kind, what, who,  k) {
 			if (length(what) > 200) what = substr(what, 1, 200) "..."
-			alerts[kind "\t" what "\t" who]++
+			k = kind "\t" what "\t" who
+			if (!(k in tfirst)) tfirst[k] = now
+			tlast[k] = now
+			alerts[k]++
 		}
 		# the words as bash quoted them, unquoted enough to read
 		function unq(s) {
@@ -658,10 +676,14 @@ traced() {
 				alert("reverse_shell", kind " " x, who)
 		}
 		{
-			if (!match($0, /^\++[^\t]*\t/)) next
+			if (!match($0, /^\++[^\t]*\t[^\t]*\t/)) next
 			lv = 0
 			while (substr($0, lv + 1, 1) == "+") lv++
-			who = substr($0, lv + 1, RLENGTH - lv - 1)
+			now = who = substr($0, lv + 1, RLENGTH - lv - 1)
+			sub(/\t.*/, "", now); sub(/^[^\t]*\t/, "", who)
+			# a locale with a decimal comma; not a time, none
+			sub(/,/, ".", now)
+			if (now !~ /^[0-9]+\.[0-9]+$/) now = ""
 			s = substr($0, RLENGTH + 1)
 			gsub(/[^[:print:]]/, "?", s); gsub(/[^[:print:]]/, "?", who)
 			if (who == "") who = "?"
@@ -693,7 +715,7 @@ traced() {
 		END {
 			for (k in alerts) {
 				split(k, a, "\t")
-				printf "alert\t%s\t%d\t%s\t%s\n", a[1], alerts[k], a[2], a[3]
+				printf "alert\t%s\t%d\t%s\t%s\t%s\t%s\n", a[1], alerts[k], a[2], a[3], tfirst[k], tlast[k]
 			}
 		}' "$T/trace"
 }

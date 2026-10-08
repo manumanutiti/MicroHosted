@@ -34,6 +34,9 @@ echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
 # SHLVL=1: bash at level 1 with a socket for stdin (mh exec's) takes itself
 # for rshd's, reads ~/.bashrc and skips BASH_ENV.
 [ -n "$fetch" ] || [ ! -e "$S/traced" ] || ASENV="MH_TRACE=1 BASH_ENV=/usr/share/mh-sandbox/trace.bash SHLVL=1"
+# When the code started, by the clock audit, the trace and mh-sandbox-net
+# stamp their records with (mh-sandbox-report: start): the first run's.
+[ -n "$fetch" ] || [ -e "$S/start" ] || date +%s.%N > "$S/start"
 asuser 'mkdir -p "$HOME/work" && cd "$HOME/work" && exec "$0" -c "$1"' "$SH" "$*"
 rc=$?
 # A fetch ends when its connections have closed (at most 10 s): cut while one

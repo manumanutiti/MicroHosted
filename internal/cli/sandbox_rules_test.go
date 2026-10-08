@@ -287,13 +287,13 @@ func TestGuestClassify(t *testing.T) {
 	must(t, err)
 
 	want := []string{
-		"privesc\tfound\t1\t/etc/shadow\tperl",
-		"privesc\tfound\t1\t/etc/shadow\tcat",
-		"alert\tdropped_script\t1\t/tmp/t/helper.sh (written by python3.12)\thelper.sh",
-		"alert\tdropper\t1\t/tmp/.x (written by cp)\t.x",
-		"alert\trule:brave\t1\t/home/dev/.config/BraveSoftware/Default/Login Data\tpython3",
-		"alert\trule:wallet\t1\t/opt/wallet.dat\tcat",
-		"alert\trule:solana\t1\tsolana transfer ADDR 1\tsolana",
+		"privesc\tfound\t1\t/etc/shadow\tperl\t1.000\t1.000",
+		"privesc\tfound\t1\t/etc/shadow\tcat\t1.000\t1.000",
+		"alert\tdropped_script\t1\t/tmp/t/helper.sh (written by python3.12)\thelper.sh\t1.000\t1.000",
+		"alert\tdropper\t1\t/tmp/.x (written by cp)\t.x\t1.000\t1.000",
+		"alert\trule:brave\t1\t/home/dev/.config/BraveSoftware/Default/Login Data\tpython3\t1.000\t1.000",
+		"alert\trule:wallet\t1\t/opt/wallet.dat\tcat\t1.000\t1.000",
+		"alert\trule:solana\t1\tsolana transfer ADDR 1\tsolana\t1.000\t1.000",
 	}
 	for _, awk := range []string{"mawk", "gawk", "busybox"} {
 		bin, err := exec.LookPath(awk)
@@ -326,6 +326,51 @@ func TestGuestClassify(t *testing.T) {
 		}
 		if len(got) != len(want) {
 			t.Errorf("%s: %d lines, want %d:\n%s", awk, len(got), len(want), strings.Join(got, "\n"))
+		}
+	}
+}
+
+// classify says when each thing was first and last seen (audit's time) and
+// which process first ran a command, and its parent.
+func TestGuestClassifyTimes(t *testing.T) {
+	ev := func(time string, serial, pid, ppid int, call, comm string, rest ...string) []string {
+		h := fmt.Sprintf("msg=audit(%s:%d):", time, serial)
+		l := []string{fmt.Sprintf(`type=SYSCALL %s arch=c000003e syscall=0 success=yes exit=0 a0=ffffff9c a1=0 a2=0 a3=0 items=1 ppid=%d pid=%d auid=4294967295 uid=1000 comm="%s" exe="/usr/bin/%s" key="mh-sandbox"`+"\035"+`ARCH=x86_64 SYSCALL=%s UID="dev"`, h, ppid, pid, comm, comm, call)}
+		// as auditd writes them: EXECVE, then CWD, then PATH
+		for _, r := range rest {
+			if strings.HasPrefix(r, "type=PATH") {
+				l = append(l, `type=CWD `+h+` cwd="/home/dev/work"`)
+			}
+			l = append(l, strings.Replace(r, "{H}", h, 1))
+		}
+		if !strings.HasPrefix(rest[len(rest)-1], "type=PATH") {
+			l = append(l, `type=CWD `+h+` cwd="/home/dev/work"`)
+		}
+		return l
+	}
+	var log []string
+	log = append(log, ev("1760000000.100", 10, 101, 100, "execve", "npm", `type=EXECVE {H} argc=2 a0="npm" a1="whoami"`)...)
+	log = append(log, ev("1760000000.350", 11, 104, 101, "openat", "cat", `type=PATH {H} item=0 name="/home/dev/.npmrc" nametype=NORMAL`)...)
+	log = append(log, ev("1760000001.500", 12, 102, 101, "execve", "npm", `type=EXECVE {H} argc=2 a0="npm" a1="whoami"`)...)
+	log = append(log, ev("1760000002.000", 13, 103, 101, "execve", "crontab", `type=EXECVE {H} argc=2 a0="crontab" a1="x"`)...)
+	dir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(dir, "decoys"), []byte("/home/dev/.npmrc\tnpm reads it\tnpm\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "rules"), nil, 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "audit.log"), []byte(strings.Join(log, "\n")+"\n"), 0o600))
+	lib, err := filepath.Abs("../../sandbox/sbin/mh-sandbox-lib")
+	must(t, err)
+	out, err := exec.Command("/bin/sh", "-c", `. "$1"; S=$2; H=/home/dev; classify < "$2/audit.log"`, "sh", lib, dir).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	for _, w := range []string{
+		"exec\t10\t2\tnpm whoami\t1760000000.100\t1760000001.500\t101\t100",
+		"exec\t13\t1\tcrontab x\t1760000002.000\t1760000002.000\t103\t101",
+		"decoyby\topen\t1\t/home/dev/.npmrc\tcat\t1760000000.350\t1760000000.350",
+		"alert\tpersistence\t1\tcrontab x\tnpm\t1760000002.000\t1760000002.000",
+	} {
+		if !strings.Contains(string(out)+"\n", w+"\n") {
+			t.Errorf("no %q in:\n%s", w, out)
 		}
 	}
 }

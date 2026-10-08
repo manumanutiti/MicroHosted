@@ -31,6 +31,10 @@ records() {
 	pkill -STOP -u "$U" 2>/dev/null
 
 	printf 'since\t%s\nuser\t%s\ntoken\t%s\n' "$since" "$U" "$(cat "$S/token")"
+	# start TIME: when mh-sandbox-run started the code, seconds since the
+	# epoch; the T1 T2 of the records below (first and last seen) are on
+	# the same clock, empty where unknown
+	[ ! -s "$S/start" ] || printf 'start\t%s\n' "$(cat "$S/start")"
 	# rules N: the user's rules this image applied (classify)
 	[ ! -s "$S/rules" ] || printf 'rules\t%s\n' "$(grep -c . "$S/rules")"
 	audit=
@@ -44,7 +48,7 @@ records() {
 	printf 'section\tdecoys\n'
 	# decoy STATE PATH NOTE TOOLS — STATE: untouched, READ, TAMPERED,
 	# READ+TAMPERED, DELETED; TOOLS: the programs that read it legitimately,
-	# by name. decoyby open COUNT PATH BY: which program opened it (audit).
+	# by name. decoyby open COUNT PATH BY T1 T2: which program opened it (audit).
 	while IFS="$tab" read -r f note tools; do
 		if ! a=$(stat -c %x "$f" 2>/dev/null); then
 			printf 'decoy\tDELETED\t%s\t%s\t%s\n' "$f" "$note" "$tools"
@@ -58,7 +62,7 @@ records() {
 	done < "$S/decoys"
 	[ -z "$audit" ] || grep "^decoyby$tab" "$S/audited"
 
-	# probe found|absent COUNT PATH COMM — what tells a VM (or a container)
+	# probe found|absent COUNT PATH COMM T1 T2 — what tells a VM (or a container)
 	# apart: DMI, CPU flags, modules, PCI, a hypervisor's files, disk and MAC
 	# vendors, battery and sensors, and the tools that read them. Most do not
 	# exist here: asking is the tell. absent: the lookup failed — not there,
@@ -68,7 +72,7 @@ records() {
 	# through a symlink, or relative to a directory it holds open, it shows
 	# under another name or not at all; the CPUID instruction never does.
 	#
-	# privesc found|absent COUNT PATH COMM — what a privilege escalation looks
+	# privesc found|absent COUNT PATH COMM T1 T2 — what a privilege escalation looks
 	# for: sudo's and the passwords' files, cron, the container runtimes'
 	# sockets, root's home, the kernel's hardening switches, the tools that
 	# change user (by name: a lookup walks every directory of PATH), and
@@ -79,13 +83,14 @@ records() {
 		grep "^probe$tab" "$S/audited" | sort -t "$tab" -k4,4 -k2,2
 		printf 'section\tprivesc\n'
 		grep "^privesc$tab" "$S/audited" | sort -t "$tab" -k4,4 -k2,2
-		# exec COUNT ARGS — every command line the code ran, in the order it
-		# first ran it, the first $maxexec; commands DISTINCT says how many
-		# there were. The first are mh-sandbox-run starting the command.
+		# exec COUNT ARGS T1 T2 PID PPID — every command line the code ran,
+		# in the order it first ran it, the first $maxexec; commands DISTINCT
+		# says how many there were. The first are mh-sandbox-run starting the
+		# command. PID, PPID: of its first run.
 		printf 'section\texec\n'
 		printf 'commands\t%s\n' "$(grep -c "^exec$tab" "$S/audited")"
 		grep "^exec$tab" "$S/audited" | sort -t "$tab" -k2,2n | awk -v n="$maxexec" 'NR <= n' | cut -f 1,3-
-		# alert KIND COUNT WHAT BY — what code does when it means harm:
+		# alert KIND COUNT WHAT BY T1 T2 — what code does when it means harm:
 		# each KIND's severity and meaning are in
 		# internal/cli/sandbox_kinds.go, how it is found in classify
 		# (mh-sandbox-lib). Then audit's own health: what it may have missed.
@@ -134,26 +139,28 @@ records() {
 	# 500 of each:
 	#   net sinkhole|servfail|off   names answered into the sinkhole, none,
 	#                               or not recorded (no resolver here)
-	#   dns COUNT TYPE NAME         a name looked up
+	#   dns COUNT TYPE NAME T1 T2   a name looked up
 	#   addr ADDRESS NAME           the sinkhole's address given to NAME
-	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT
+	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT T1 T2
 	#                               a request to the sinkhole; TOKEN 1: this
 	#                               run's decoy token was in it; BYTES summed
-	#   tls COUNT NAME              an HTTPS client that refused the
+	#   tls COUNT NAME T1 T2        an HTTPS client that refused the
 	#                               sinkhole's certificate: only the name
+	# Each record of $N/log ends in the time it was written.
 	printf 'section\tnet\n'
 	if [ -s "$S/net" ] && [ -e "$N/log" ]; then
 		printf 'net\t%s\n' "$(cat "$S/net")"
 		awk -F'\t' '
-			function add(kind, k, extra) { if (!((kind, k) in n)) { o[kind, ++m[kind]] = k; x[kind, k] = extra } n[kind, k]++ }
-			$1 == "dns" && NF == 3 { add("dns", $2 "\t" $3) }
-			$1 == "addr" && NF == 3 { if (++a <= 500) print }
-			$1 == "http" && NF == 7 { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; t[k] = t[k] || $6; p[k] = $7 }
-			$1 == "tls" && NF == 3 { add("tls", $2) }
+			function add(kind, k) { if (!((kind, k) in n)) { o[kind, ++m[kind]] = k; t1[kind, k] = $NF } t2[kind, k] = $NF; n[kind, k]++ }
+			function when(kind, k) { return t1[kind, k] "\t" t2[kind, k] }
+			$1 == "dns" && NF == 4 { add("dns", $2 "\t" $3) }
+			$1 == "addr" && NF == 4 { if (++a <= 500) print $1 "\t" $2 "\t" $3 }
+			$1 == "http" && NF == 8 { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; t[k] = t[k] || $6; p[k] = $7 }
+			$1 == "tls" && NF == 4 { add("tls", $2) }
 			END {
-				for (i = 1; i <= m["dns"] && i <= 500; i++) { k = o["dns", i]; printf "dns\t%d\t%s\n", n["dns", k], k }
-				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\n", n["http", k], k, b[k], t[k], p[k] }
-				for (i = 1; i <= m["tls"] && i <= 500; i++) { k = o["tls", i]; printf "tls\t%d\t%s\n", n["tls", k], k }
+				for (i = 1; i <= m["dns"] && i <= 500; i++) { k = o["dns", i]; printf "dns\t%d\t%s\t%s\n", n["dns", k], k, when("dns", k) }
+				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\t%s\n", n["http", k], k, b[k], t[k], p[k], when("http", k) }
+				for (i = 1; i <= m["tls"] && i <= 500; i++) { k = o["tls", i]; printf "tls\t%d\t%s\t%s\n", n["tls", k], k, when("tls", k) }
 			}' "$N/log"
 	else
 		printf 'net\toff\n'

@@ -37,6 +37,6 @@ fi
 if [ -n "$__mh_t" ]; then
 	unset __mh_t
 	BASH_XTRACEFD=1022
-	PS4=$'+${0##*/}\t'
+	PS4=$'+${EPOCHREALTIME}\t${0##*/}\t'
 	set -x
 fi

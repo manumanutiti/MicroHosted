@@ -10,10 +10,10 @@
 # separated, as mh-sandbox-report --tsv:
 #   decoy READ|TAMPERED|… PATH TOOLS  every decoy touched so far, and
 #                                     the programs that read it legitimately
-#   decoyby open COUNT PATH BY        which program opened one
-#   probe|privesc STATE COUNT PATH BY
-#   exec FIRST COUNT ARGS
-#   alert KIND COUNT WHAT BY
+#   decoyby open COUNT PATH BY T1 T2  which program opened one
+#   probe|privesc STATE COUNT PATH BY T1 T2
+#   exec FIRST COUNT ARGS T1 T2 PID PPID
+#   alert KIND COUNT WHAT BY T1 T2
 #   at INODE OFFSET
 # Counts are of this look. What one look learnt that the next needs (the
 # files the code created, to tell a dropped program when it runs) is kept in
