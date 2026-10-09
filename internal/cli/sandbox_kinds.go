@@ -1,5 +1,12 @@
 package cli
 
+import (
+	"path"
+	"regexp"
+	"slices"
+	"strings"
+)
+
 // The kinds of alert the image's tools report (mh-sandbox-report --tsv,
 // mh-sandbox-watch: "alert KIND COUNT WHAT BY"). The guest names the kind;
 // this table is what the CLI knows about it: how serious, under which
@@ -67,6 +74,10 @@ var alertKinds = map[string]alertKind{
 		"a connection without a network tool: connectivity checks do it, and hand-made requests that avoid curl"},
 	"pipe_to_shell": {sevWarn, "ran what it downloaded",
 		"curl … | sh: installers (rustup, nvm) do it; so does malware's first stage"},
+	// pipe_to_shell, regraded by the CLI (hookAlerts): the process tree
+	// says who ran it
+	"hook_pipe_to_shell": {sevHigh, "an install script ran what it downloaded",
+		"curl … | sh run by a package's install script (npm's preinstall, install, postinstall; pip's setup.py, a build backend), not by the command given: a dependency fetching and running code of its own on install, as Shai-Hulud 2.0 brought in Bun"},
 	"obfuscated_exec": {sevHigh, "ran hidden code",
 		"decoded and ran at once (base64 -d | sh, exec(b64decode(…))): code that hides what it runs from whoever reads it"},
 	"dropper": {sevHigh, "ran a binary it dropped in /tmp",
@@ -109,4 +120,136 @@ func kindOf(kind string) alertKind {
 		return k
 	}
 	return alertKind{Severity: sevWarn, Title: kind, Means: "reported by the image (unknown to this mh: update it)"}
+}
+
+// hookAlerts regrades each pipe_to_shell alert whose command ran under a
+// package manager installing (npm install, pip install…: its install
+// scripts, a build) as hook_pipe_to_shell. A person types curl … | sh; a
+// dependency doing it on install fetches code nobody chose. The tree is the
+// commands' pid and ppid (an image before them: none, nothing regraded),
+// their first run's: a command line run by the command given first and by
+// an install script after is the first's. Up from the alert's process,
+// never its own: sh -c "npm i x; curl … | sh" is the command given.
+func (r *sandboxReport) hookAlerts() {
+	args := map[int][]string{} // pid: the command lines it ran
+	parent := map[int]int{}
+	for _, c := range r.Commands {
+		if c.PID == 0 {
+			continue
+		}
+		args[c.PID] = append(args[c.PID], c.Args)
+		if _, ok := parent[c.PID]; !ok {
+			parent[c.PID] = c.PPID
+		}
+	}
+	if len(args) == 0 {
+		return
+	}
+	// a package manager installing above pid
+	underInstall := func(pid int) bool {
+		seen := map[int]bool{pid: true}
+		for p := parent[pid]; p > 1 && !seen[p]; p = parent[p] {
+			seen[p] = true
+			if slices.ContainsFunc(args[p], installing) {
+				return true
+			}
+		}
+		return false
+	}
+	for i := range r.Alerts {
+		a := &r.Alerts[i]
+		if a.Kind != "pipe_to_shell" {
+			continue
+		}
+		// WHAT is the command line, cut at 200 (…...); its exec record's
+		// at 300
+		cut, long := strings.CutSuffix(a.What, "...")
+		for _, c := range r.Commands {
+			if c.PID == 0 || !(c.Args == a.What || long && strings.HasPrefix(c.Args, cut)) {
+				continue
+			}
+			if underInstall(c.PID) {
+				a.Kind = "hook_pipe_to_shell"
+				a.Severity = kindOf(a.Kind).Severity.String()
+				break
+			}
+		}
+	}
+}
+
+// installVerbs: each package manager's commands that run its packages'
+// install scripts or build them, by their first words; "" is the command
+// with none (yarn).
+var installVerbs = map[string][]string{
+	"npm":    {"install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal", "isntall", "add", "ci", "clean-install", "ic", "install-clean", "isntall-clean", "install-test", "it", "install-ci-test", "cit", "rebuild", "rb", "update", "up", "upgrade", "udpate"},
+	"yarn":   {"", "install", "add", "upgrade", "up"},
+	"pnpm":   {"install", "i", "add", "update", "up", "upgrade", "rebuild", "rb"},
+	"bun":    {"install", "i", "add", "update"},
+	"pip":    {"install", "download", "wheel"},
+	"uv":     {"sync", "add", "pip install", "pip sync", "tool install"},
+	"poetry": {"install", "add", "update", "lock"},
+	"pdm":    {"install", "add", "sync", "update"},
+	"pipx":   {"install", "inject", "upgrade"},
+}
+
+// a script the program is named by: npm-cli.js, yarn.cjs, pip3.12
+var installerName = regexp.MustCompile(`^(npm|yarn|pnpm|bun|pip|uv|poetry|pdm|pipx)(-cli)?(\.c?js|\.mjs|[0-9.]*)$`)
+
+// installing says whether a command line is a package manager installing,
+// or a package's build run by one: setup.py, pip's and build's backend
+// (pyproject_hooks' _in_process.py). By the program it runs, not by its
+// words: bash -c "npm install" is a shell, its npm a process of its own.
+func installing(cmd string) bool {
+	t := strings.Fields(cmd)
+	i := 0
+	// env [-i] [VAR=…]: what it runs
+	if i < len(t) && path.Base(t[i]) == "env" {
+		for i++; i < len(t) && (strings.HasPrefix(t[i], "-") || strings.Contains(t[i], "=")); i++ {
+		}
+	}
+	if i >= len(t) {
+		return false
+	}
+	prog := path.Base(t[i])
+	// an interpreter is named by its script, or python's -m module
+	if prog == "node" || prog == "nodejs" || strings.HasPrefix(prog, "python") {
+		for i++; i < len(t); i++ {
+			if t[i] == "-m" && i+1 < len(t) {
+				i++
+				break
+			}
+			if t[i] == "-c" {
+				// pip's legacy setup.py install: python -c "…setup.py…"
+				return strings.Contains(cmd, "setup.py")
+			}
+			if !strings.HasPrefix(t[i], "-") {
+				break
+			}
+		}
+		if i >= len(t) {
+			return false
+		}
+		prog = path.Base(t[i])
+	}
+	if prog == "setup.py" || prog == "_in_process.py" {
+		return true
+	}
+	m := installerName.FindStringSubmatch(prog)
+	if m == nil {
+		return false
+	}
+	// its first two words not an option: uv's verbs are two
+	var words []string
+	for _, w := range t[i+1:] {
+		if !strings.HasPrefix(w, "-") && len(words) < 2 {
+			words = append(words, w)
+		}
+	}
+	for _, v := range installVerbs[m[1]] {
+		n := len(strings.Fields(v))
+		if n == 0 && len(words) == 0 || n > 0 && n <= len(words) && v == strings.Join(words[:n], " ") {
+			return true
+		}
+	}
+	return false
 }

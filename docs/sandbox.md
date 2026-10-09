@@ -224,6 +224,7 @@ started as, not by the thread that did it: threads name themselves (Node's
 | `reverse_shell` | high | a shell joined to a connection: `bash -i >& /dev/tcp/…`, `nc -e`, `socat … exec:`, `mkfifo … \| sh -i \| nc`, a Python/Perl socket with a shell, `pty.spawn` |
 | `dev_tcp` | warn | bash's `/dev/tcp` or `/dev/udp` otherwise (a connectivity check, a hand-made request); in a script, where no command line shows it, bash itself connecting |
 | `pipe_to_shell` | warn | `curl … \| sh`, `sh -c "$(curl …)"` — installers do it too |
+| `hook_pipe_to_shell` | high | the same run by a package's install script: a process under a package manager installing (`npm install`, `ci`, `rebuild`; `yarn`, `pnpm`, `bun` `install`/`add`; `pip install`, `download`, `wheel`; `uv sync`, `uv pip install`; `poetry`, `pdm`, `pipx` `install`), or under `setup.py` or a build backend (`_in_process.py`). Graded by mh from the commands' `pid` and `ppid` (an image before them: `pipe_to_shell`); the command given running `curl … \| sh` itself stays `pipe_to_shell`, and so does one in `eval` or `trap` text (the shells' trace: no process). A dependency that fetches and runs code on install is how Shai-Hulud 2.0 brought in Bun |
 | `obfuscated_exec` | high | decoded and run at once: `base64 -d \| sh`, `xxd -r \| sh`, `exec(base64.b64decode(…))` |
 | `dropper` | high | a binary written after the sandbox was prepared, by anything but a compiler or linker, in `/tmp`, `/var/tmp` or `/dev/shm`, then run |
 | `dropped_exec` | warn | the same elsewhere (`~/work`) |

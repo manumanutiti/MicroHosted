@@ -1715,6 +1715,7 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			r.AddressesAnAgent = append(r.AddressesAnAgent, sandboxAgentText{Where: at(1), File: at(2), Line: num(3), Text: at(4)})
 		}
 	}
+	r.hookAlerts()
 	return r
 }
 

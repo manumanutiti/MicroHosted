@@ -238,7 +238,7 @@ func topNames(by map[string]int, n int) string {
 }
 
 // commandKinds are the alerts whose WHAT is a command line.
-var commandKinds = map[string]bool{"credential_search": true, "dev_tcp": true, "reverse_shell": true, "pipe_to_shell": true,
+var commandKinds = map[string]bool{"credential_search": true, "dev_tcp": true, "reverse_shell": true, "pipe_to_shell": true, "hook_pipe_to_shell": true,
 	"obfuscated_exec": true, "antiforensics": true, "miner": true}
 
 // groupCommands is the same command run on several directories as one line:
