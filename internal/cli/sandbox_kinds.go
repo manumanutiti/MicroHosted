@@ -76,6 +76,9 @@ var alertKinds = map[string]alertKind{
 		"curl … | sh: installers (rustup, nvm) do it; so does malware's first stage"},
 	// pipe_to_shell, regraded by the CLI (hookAlerts): the process tree
 	// says who ran it
+	// a downloader under the package's install or its use (hookAlerts)
+	"hook_download": {sevHigh, "the package ran a downloader",
+		"curl, wget, nc… run by a package's install script or by using it (its import, its command's --help, as mh-sandbox-try does): a library has no reason to, a dropper's second stage comes that way (mistralai 2.4.6: curl -k of a .pyz from a bare IP on import)"},
 	"hook_pipe_to_shell": {sevHigh, "an install script ran what it downloaded",
 		"curl … | sh run by a package's install script (npm's preinstall, install, postinstall; pip's setup.py, a build backend), not by the command given: a dependency fetching and running code of its own on install, as Shai-Hulud 2.0 brought in Bun"},
 	"obfuscated_exec": {sevHigh, "ran hidden code",
@@ -84,6 +87,11 @@ var alertKinds = map[string]alertKind{
 		"a program written (not compiled) after the sandbox was prepared, in /tmp, /var/tmp or /dev/shm, then run: a downloaded payload"},
 	"dropped_exec": {sevWarn, "ran a program it wrote",
 		"a binary written (not by a compiler or linker) after the sandbox was prepared, then run: unpacked releases do it; so do payloads"},
+	// dropped_script whose writer was a downloader, regraded (hookAlerts)
+	"ran_download": {sevWarn, "ran a script it downloaded",
+		"curl -o /tmp/x.sh, then sh /tmp/x.sh: curl | sh in two steps; installers do it, so does a dropper"},
+	"hook_ran_download": {sevHigh, "the package ran a script it downloaded",
+		"a script written by curl, wget… and run, under a package's install script or its use (its import, its --help): mistralai 2.4.6's import fetched transformers.pyz and ran it"},
 	"dropped_script": {sevInfo, "ran a script it wrote in /tmp",
 		"test suites (pytest's tmp_path) and git hooks do it; what the script ran is recorded, command by command"},
 	"preload": {sevWarn, "loaded its own library into a system program",
@@ -145,17 +153,20 @@ func (r *sandboxReport) hookAlerts() {
 	if len(args) == 0 {
 		return
 	}
-	// a package manager installing above pid
-	underInstall := func(pid int) bool {
+	// a package manager installing above pid, or (using) the sandbox
+	// using the package: mh-sandbox-try's import, its commands' --help
+	under := func(pid int, using bool) bool {
 		seen := map[int]bool{pid: true}
 		for p := parent[pid]; p > 1 && !seen[p]; p = parent[p] {
 			seen[p] = true
-			if slices.ContainsFunc(args[p], installing) {
+			if slices.ContainsFunc(args[p], installing) || using && slices.ContainsFunc(args[p], tryingPackage) {
 				return true
 			}
 		}
 		return false
 	}
+	underInstall := func(pid int) bool { return under(pid, false) }
+	hooked := map[int]bool{} // the commands of the pipe_to_shell regraded
 	for i := range r.Alerts {
 		a := &r.Alerts[i]
 		if a.Kind != "pipe_to_shell" {
@@ -171,10 +182,64 @@ func (r *sandboxReport) hookAlerts() {
 			if underInstall(c.PID) {
 				a.Kind = "hook_pipe_to_shell"
 				a.Severity = kindOf(a.Kind).Severity.String()
+				hooked[c.PID] = true
 				break
 			}
 		}
 	}
+	// a script a downloader wrote, run: warn; under the install or the
+	// package's use, high. WHAT is "PATH (written by PROGRAM)".
+	for i := range r.Alerts {
+		a := &r.Alerts[i]
+		file, writer, ok := strings.Cut(a.What, " (written by ")
+		if a.Kind != "dropped_script" || !ok || downloader(strings.TrimSuffix(writer, ")")) == "" {
+			continue
+		}
+		a.Kind = "ran_download"
+		for _, c := range r.Commands {
+			if c.PID != 0 && slices.Contains(strings.Fields(c.Args), file) && under(c.PID, true) {
+				a.Kind = "hook_ran_download"
+				break
+			}
+		}
+		a.Severity = kindOf(a.Kind).Severity.String()
+	}
+	// a downloader under the install or the package's use; not the curl
+	// of a curl | sh already said
+	for _, c := range r.Commands {
+		prog := downloader(c.Args)
+		if c.PID == 0 || prog == "" || hooked[parent[c.PID]] || !under(c.PID, true) {
+			continue
+		}
+		r.Alerts = append(r.Alerts, sandboxAlert{Kind: "hook_download", Severity: kindOf("hook_download").Severity.String(),
+			Count: c.Count, What: c.Args, By: prog, sandboxWhen: c.sandboxWhen})
+	}
+}
+
+// tryingPackage: mh-sandbox-try, the sandbox using a package (npm:, pypi:,
+// the maldata harness): what runs under it is the package's doing.
+func tryingPackage(cmd string) bool {
+	t := strings.Fields(cmd)
+	for i := 0; i < len(t) && i < 2; i++ {
+		if path.Base(t[i]) == "mh-sandbox-try" {
+			return true
+		}
+	}
+	return false
+}
+
+// downloader is the program a command line runs when it is one that fetches
+// or opens a connection by itself, else "".
+func downloader(cmd string) string {
+	t := strings.Fields(cmd)
+	if len(t) == 0 {
+		return ""
+	}
+	switch p := path.Base(t[0]); p {
+	case "curl", "wget", "wget2", "aria2c", "nc", "ncat", "netcat", "socat", "ftp", "tftp", "telnet":
+		return p
+	}
+	return ""
 }
 
 // installVerbs: each package manager's commands that run its packages'
