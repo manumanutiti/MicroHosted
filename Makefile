@@ -178,6 +178,8 @@ lint:
 
 test:
 	go test -v ./...
+	# the sandbox's network (sandbox/net), the image's Python
+	python3 -m unittest discover -s sandbox/tests/net
 
 # Verify the environment before installing
 check:

@@ -64,6 +64,7 @@ files:
   /usr/sbin/mh-sandbox-watch: sbin/mh-sandbox-watch
   /usr/sbin/mh-sandbox-linger: sbin/mh-sandbox-linger
   /usr/sbin/mh-sandbox-net: sbin/mh-sandbox-net
+  /usr/lib/mh-sandbox/net/: net/
   /usr/local/bin/mh-sandbox-try: sbin/mh-sandbox-try
   /usr/local/bin/mh-sandbox-sdist: sbin/mh-sandbox-sdist
   /usr/share/mh-sandbox/agent-patterns: agent-patterns
@@ -113,6 +114,9 @@ run:
   # the code's user runs it: root's, readable
   - chmod 0755 /usr/local/bin/mh-sandbox-try /usr/local/bin/mh-sandbox-sdist
   - sh -n /usr/sbin/mh-sandbox-lib && sh -n /usr/sbin/mh-sandbox-prepare && sh -n /usr/sbin/mh-sandbox-unpack && sh -n /usr/sbin/mh-sandbox-run && sh -n /usr/sbin/mh-sandbox-report && sh -n /usr/sbin/mh-sandbox-scan && sh -n /usr/sbin/mh-sandbox-watch && sh -n /usr/sbin/mh-sandbox-linger && sh -n /usr/local/bin/mh-sandbox-try && python3 -m py_compile /usr/sbin/mh-sandbox-net /usr/local/bin/mh-sandbox-sdist && rm -rf /usr/sbin/__pycache__ /usr/local/bin/__pycache__
+  # mh-sandbox-net's package: root's, read by mhsink, compiled now (mhsink
+  # writes no __pycache__ there)
+  - chown -R root:root /usr/lib/mh-sandbox && chmod -R u=rwX,go=rX /usr/lib/mh-sandbox && python3 -m compileall -q /usr/lib/mh-sandbox/net && python3 -I -c 'import sys; sys.path.insert(0, "/usr/lib/mh-sandbox/net"); import mhnet.main'
 
 mem_mb: 512
 # Room for audit's log — every file the code opens is in it — and for a

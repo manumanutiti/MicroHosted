@@ -1,0 +1,127 @@
+"""mh-sandbox-net DIR sinkhole|answers USER|servfail < TOKEN
+
+mh-sandbox-prepare starts it as root. It binds its ports, reads this run's
+decoy token on stdin and DIR's CA, then becomes DIR's owner (mhsink): what
+it parses is the code's to choose, and a mistake here must not hand the
+code root.
+
+The resolver, on 127.53.0.1:53 (resolv.conf points at it), writes down
+every name looked up. sinkhole: an A query is answered with an address of
+its own for each name, in 198.18.0.0/15 — a range the VM holds locally
+(mh-sandbox-prepare's route), so a connection to it never reaches the
+host; any other type has no answer. servfail: no name is answered, as with
+no network at all.
+
+The sinkhole, on ports 80 and 443 of those addresses, and of any bare
+address the code connects to (mh-sandbox-prepare redirects them here; the
+address it meant is read back, SO_ORIGINAL_DST): an HTTP request is
+answered (services) and written down (log.py). answers: the services worms
+go for are answered as for USER, logged in (services/identity.py). HTTPS
+is answered with a certificate for the name, signed by DIR's CA (tls.py).
+"""
+import ipaddress
+import os
+import socket
+import sys
+import threading
+
+from . import dns, http, services
+from .log import Log
+from .names import SINK, Names
+from .tls import Certs
+
+RESOLVER = "127.53.0.1"
+SLOTS = 64            # connections served at once; the rest are closed
+HARD_DEADLINE = 30    # seconds a connection may last, whatever it does
+SO_ORIGINAL_DST = 80  # linux/netfilter_ipv4.h
+
+
+def original_dst(conn):
+    """Where a connection mh-sandbox-prepare's REDIRECT sent here was going:
+    a bare address the code connected to, or None (not redirected)."""
+    try:
+        raw = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    except OSError:
+        return None
+    a = ipaddress.ip_address(raw[4:8])
+    return None if a.is_loopback or a in SINK else a
+
+
+def cut(conn):
+    try:
+        conn.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class Sinkhole:
+    def __init__(self, log, names, token, certs, answer):
+        self.log, self.names, self.token, self.certs, self.answer = log, names, token, certs, answer
+        self.slots = threading.BoundedSemaphore(SLOTS)
+
+    def accept(self, sock, port):
+        while True:
+            try:
+                conn, _ = sock.accept()
+            except InterruptedError:
+                continue
+            local = ipaddress.ip_address(conn.getsockname()[0])
+            # a name's address, by its name; a bare address, as itself
+            host = (self.names.name(local) or local) if local in SINK else original_dst(conn)
+            if host is None or not self.slots.acquire(blocking=False):
+                conn.close()
+                continue
+            threading.Thread(target=self.handle, args=(conn, port, str(host)), daemon=True).start()
+
+    def handle(self, conn, port, host):
+        # a hard end to whatever the code makes of it: a handshake dripped a
+        # byte at a time cannot hold a slot for the run
+        timer = threading.Timer(HARD_DEADLINE, cut, (conn,))
+        timer.daemon = True
+        timer.start()
+        try:
+            conn.settimeout(5)
+            if port != 443:
+                http.serve(conn, "http", port, host, self.log, self.token, self.answer)
+                return
+            w = self.certs.wrap(conn, host, self.log)
+            if w is not None:
+                http.serve(w[0], "https", port, w[1], self.log, self.token, self.answer)
+        finally:
+            timer.cancel()
+            conn.close()
+            self.slots.release()
+
+
+def main(argv):
+    d, mode = argv[1], argv[2]
+    token = sys.stdin.read().strip().lower().encode()
+    user = argv[3] if mode == "answers" else None
+    if user:
+        mode = "sinkhole"
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind((RESOLVER, 53))
+    tcp = []
+    if mode == "sinkhole":
+        for port in (80, 443):
+            t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            t.bind(("0.0.0.0", port))
+            t.listen(128)
+            tcp.append((t, port))
+    # root no longer: DIR's owner
+    st = os.stat(d)
+    if os.getuid() == 0:
+        os.setgroups([])
+        os.setgid(st.st_gid)
+        os.setuid(st.st_uid)
+    if os.getuid() == 0:
+        sys.exit("mh-sandbox-net: DIR must not be root's")
+
+    log = Log(os.path.join(d, "log"))
+    names = Names(log)
+    if mode == "sinkhole":
+        sink = Sinkhole(log, names, token, Certs(d), services.Dispatcher(user, token))
+        for t, port in tcp:
+            threading.Thread(target=sink.accept, args=(t, port), daemon=True).start()
+    dns.serve_udp(udp, log, names, mode == "sinkhole")

@@ -50,3 +50,4 @@ docs/*.pdf
 
 # Keys the examples generate locally (orchestrator/examples/ansible)
 orchestrator/examples/*/keys/
+__pycache__/
