@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 	"io"
+	"net/url"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -502,6 +504,7 @@ func (r *sandboxReport) network(x string) category {
 	}
 	seen := map[string]bool{}
 	secretSent := false // the phrase names the first request that carried one
+	pubPhrase := ""     // and the first that published
 	// what it sent first: a secret going out is what matters most
 	for _, q := range r.Requests {
 		host := urlHost(q.URL)
@@ -523,7 +526,22 @@ func (r *sandboxReport) network(x string) category {
 			}
 			secretSent = true
 		}
+		// publishing goes first: what it did with the credential
+		if pub := published(q.Method, q.URL); pub != "" {
+			f.sev, f.tailDim = sevHigh, false
+			f.tail = pub + "; " + f.tail
+			if pubPhrase == "" {
+				pubPhrase = pub
+			}
+		}
 		c.items = append(c.items, f)
+	}
+	if pubPhrase != "" {
+		if secretSent {
+			c.phrase = pubPhrase + " and " + c.phrase
+		} else {
+			c.phrase = pubPhrase
+		}
 	}
 	for _, t := range r.TLSRefused {
 		dst := t.Name + ":443"
@@ -631,6 +649,54 @@ func (r *sandboxReport) isSinkName(host string) bool {
 	}
 	return false
 }
+
+// published says what a request to the sinkhole published, in the
+// registries' and GitHub's own APIs: a package (npm publish, twine upload),
+// a repository created, a file or a branch written, a self-hosted runner
+// registered. A worm spreads that way, with the credentials it found; a
+// test, a build, an install has no reason to. "" for anything else.
+func published(method, rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host, p := strings.ToLower(u.Hostname()), u.EscapedPath()
+	switch {
+	case (host == "registry.npmjs.org" || host == "registry.yarnpkg.com") && method == "PUT" && len(p) > 1 && !strings.HasPrefix(p, "/-/"):
+		name, err := url.PathUnescape(strings.TrimPrefix(p, "/"))
+		if err != nil || strings.Contains(name, "/-rev/") {
+			name = "a package"
+		}
+		return "published " + name + " to npm"
+	case (host == "upload.pypi.org" || host == "test.pypi.org") && method == "POST" && strings.HasPrefix(p, "/legacy"):
+		return "uploaded a package to PyPI"
+	case host != "api.github.com" && host != "uploads.github.com":
+		return ""
+	case method == "POST" && (p == "/user/repos" || ghOrgRepos.MatchString(p)):
+		return "created a GitHub repository"
+	}
+	m := ghRepoPath.FindStringSubmatch(p)
+	if m == nil {
+		return ""
+	}
+	repo, rest := m[1], m[2]
+	switch {
+	case (method == "PUT" || method == "POST") && strings.HasPrefix(rest, "/contents/"):
+		return "wrote " + strings.TrimPrefix(rest, "/contents/") + " to GitHub's " + repo
+	case method == "POST" && (rest == "/git/refs" || rest == "/git/commits" || rest == "/forks"):
+		return "wrote to GitHub's " + repo
+	case method == "POST" && rest == "/actions/runners/registration-token":
+		return "registered a self-hosted runner in GitHub's " + repo
+	case method == "POST" && strings.HasPrefix(rest, "/releases"):
+		return "made a release in GitHub's " + repo
+	}
+	return ""
+}
+
+var (
+	ghOrgRepos = regexp.MustCompile(`^/orgs/[^/]+/repos$`)
+	ghRepoPath = regexp.MustCompile(`^/repos/([^/]+/[^/]+)(/.*)?$`)
+)
 
 // urlHost is the host of a URL the sinkhole wrote down, without its port.
 func urlHost(u string) string {

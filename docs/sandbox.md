@@ -191,7 +191,7 @@ The verdict is in the JSON too (`verdict`: `suspicious`, `review`, `clean`,
 
 | Grade | |
 |---|---|
-| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text spelled in Unicode tag characters (a model reads it, a person sees nothing; not a flag's, 🏴 then a region's letters, which emoji use); a request to the sinkhole, or a name looked up, that carries the run's decoy token (a secret sent out) — not a decoy's credential to its own service only, in the header it reads (`npm whoami` with `NPM_TOKEN` to npm's registry, `GITHUB_TOKEN` to GitHub's API): that is a tool logged in, `warn`; a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
+| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text spelled in Unicode tag characters (a model reads it, a person sees nothing; not a flag's, 🏴 then a region's letters, which emoji use); a request to the sinkhole, or a name looked up, that carries the run's decoy token (a secret sent out) — not a decoy's credential to its own service only, in the header it reads (`npm whoami` with `NPM_TOKEN` to npm's registry, `GITHUB_TOKEN` to GitHub's API): that is a tool logged in, `warn`; a request that publishes, whoever's credential it used — a package to npm (`PUT` of a package) or PyPI (`/legacy/`), a GitHub repository created, a file, a branch, a release written, a self-hosted runner registered: how a worm spreads; a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
 | warn | a name looked up; a request to the sinkhole; an HTTPS client that refused its certificate; a phrase addressed to an AI agent; a run of zero-width characters, bidirectional controls in code (they deceive a person reading it; the tests of terminals and editors have them); a name looked up; every other privesc probe (cron, root's home, the kernel's switches, `find -perm` for writable files); a VM probe; a connection refused; a file changed outside `~/work` that is not a cache, a tool's settings or a temporary file (`~/.local/bin`, `~/.ssh`, the system); a process left; a listening socket |
 | info | a decoy read only by its own tool; `sudo`, `su`, `pkexec`… looked up by name (installers check for sudo); a VM probe ordinary programs make too (`/proc/cpuinfo`, `/proc/self/cgroup`); a cache, a temporary file, a directory whose entries changed |
 
@@ -390,6 +390,7 @@ by default: an answer makes code go further, and only where you asked.
     "dns_names": 2,                // distinct names looked up
     "requests": 1,                 // to the sinkhole, and HTTPS refused
     "secrets_sent": 1,             // requests and names that carried the decoy token
+    "published": 0,                // requests that published: npm, PyPI, a GitHub repository or file
     "addresses_an_agent": 0
   },
   "decoys":      [{"path": "/home/dev/.netrc", "state": "READ", "legitimately": "curl -n, …",

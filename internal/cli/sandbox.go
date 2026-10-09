@@ -1485,7 +1485,10 @@ type sandboxSummary struct {
 	DNSNames           int  `json:"dns_names"` // distinct names looked up
 	Requests           int  `json:"requests"`  // to the sinkhole, and HTTPS refused
 	// SecretsSent: requests and names that carried this run's decoy token
-	SecretsSent      int `json:"secrets_sent"`
+	SecretsSent int `json:"secrets_sent"`
+	// Published: requests that published — a package to npm or PyPI, a
+	// repository or a file to GitHub (published)
+	Published        int `json:"published"`
 	AddressesAnAgent int `json:"addresses_an_agent"`
 }
 
@@ -1839,6 +1842,9 @@ func (r *sandboxReport) summarize() {
 	for _, q := range r.Requests {
 		if q.CarriesToken {
 			s.SecretsSent++
+		}
+		if published(q.Method, q.URL) != "" {
+			s.Published++
 		}
 	}
 	for _, d := range r.DNS {

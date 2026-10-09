@@ -1214,7 +1214,7 @@ func TestSandboxAnswers(t *testing.T) {
 	}
 	want := []string{
 		"warn GET https://registry.npmjs.org/-/whoami x1 | a decoy's credential, to its own service: used, not sent out; answered: npm whoami",
-		"high POST https://api.github.com/user/repos x1 | carries this run's decoy token: a secret sent out; 300 bytes; answered: github repository created",
+		"high POST https://api.github.com/user/repos x1 | created a GitHub repository; carries this run's decoy token: a secret sent out; 300 bytes; answered: github repository created",
 		"warn GET https://example.com/ x1 | ",
 	}
 	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
@@ -1222,5 +1222,43 @@ func TestSandboxAnswers(t *testing.T) {
 	}
 	if !strings.Contains(c.note, "as GitHub, npm and AWS would a logged-in user") {
 		t.Errorf("note %q", c.note)
+	}
+}
+
+// What a worm does with the credentials it finds: publish. High whoever's
+// credential it used, and first in the phrase.
+func TestSandboxPublished(t *testing.T) {
+	for _, c := range []struct{ method, url, want string }{
+		{"PUT", "https://registry.npmjs.org/acme-billing-utils", "published acme-billing-utils to npm"},
+		{"PUT", "https://registry.npmjs.org/@acme%2futils", "published @acme/utils to npm"},
+		{"GET", "https://registry.npmjs.org/acme-billing-utils", ""},
+		{"PUT", "https://registry.npmjs.org/-/user/org.couchdb.user:dev", ""},
+		{"POST", "https://upload.pypi.org/legacy/", "uploaded a package to PyPI"},
+		{"POST", "https://api.github.com/user/repos", "created a GitHub repository"},
+		{"POST", "https://api.github.com/orgs/acme/repos", "created a GitHub repository"},
+		{"GET", "https://api.github.com/user/repos", ""},
+		{"PUT", "https://api.github.com/repos/dev/Shai-Hulud/contents/data.json", "wrote data.json to GitHub's dev/Shai-Hulud"},
+		{"POST", "https://api.github.com/repos/acme/billing-api/git/refs", "wrote to GitHub's acme/billing-api"},
+		{"POST", "https://api.github.com/repos/acme/billing-api/actions/runners/registration-token", "registered a self-hosted runner in GitHub's acme/billing-api"},
+		{"GET", "https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest", ""},
+		{"PUT", "https://evil.example/repos/a/b/contents/x", ""},
+	} {
+		if got := published(c.method, c.url); got != c.want {
+			t.Errorf("published(%s %s) = %q, want %q", c.method, c.url, got, c.want)
+		}
+	}
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"section\tnet", "net\tsinkhole\tanswers",
+		"http\t1\thttps\tPUT\thttps://registry.npmjs.org/acme-billing-utils\t1090000\t2\t443\t1760000002.600\t1760000002.600\tnpm published",
+		"http\t1\thttps\tPUT\thttps://api.github.com/repos/dev/Shai-Hulud/contents/data.json\t21000\t1\t443\t1760000003.000\t1760000003.000\tgithub file written",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	if r.Verdict != "suspicious" || r.Summary.Published != 2 || r.Summary.SecretsSent != 1 {
+		t.Errorf("verdict %s, summary %+v", r.Verdict, r.Summary)
+	}
+	if c := r.network("x"); c.phrase != "published acme-billing-utils to npm and sent a decoy's secret to api.github.com" {
+		t.Errorf("phrase %q", c.phrase)
 	}
 }
