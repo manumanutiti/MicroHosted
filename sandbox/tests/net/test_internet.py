@@ -1,5 +1,6 @@
 """What any machine online gets: the generic answer and services/INTERNET."""
 import base64
+import ipaddress
 import json
 import unittest
 
@@ -66,17 +67,26 @@ class IPTest(unittest.TestCase):
 
 class DoHTest(unittest.TestCase):
     def test_json(self):
-        out, rows = get(b"/resolve?name=evil.example&type=A", b"dns.google")
+        out, rows = get(b"/resolve?name=evil.com&type=A", b"dns.google")
         a = json.loads(body(out))
-        self.assertEqual(a["Answer"][0]["data"], "198.18.0.1")
-        self.assertIn(("dns", "A", "evil.example"), [r[:3] for r in rows])
+        self.assertTrue(ipaddress.ip_address(a["Answer"][0]["data"]).is_global)
+        self.assertIn(("dns", "A", "evil.com"), [r[:3] for r in rows])
+        self.assertIn(("addr", a["Answer"][0]["data"], "evil.com"), [r[:3] for r in rows])
+
+    def test_json_nxdomain(self):
+        out, _ = get(b"/resolve?name=evil.example", b"dns.google")
+        a = json.loads(body(out))
+        self.assertEqual(a["Status"], 3)
+        self.assertNotIn("Answer", a)
+        self.assertEqual(a["Authority"][0]["type"], 6)
 
     def test_wire(self):
-        q = base64.urlsafe_b64encode(query("evil.example")).rstrip(b"=")
+        q = base64.urlsafe_b64encode(query("evil.com")).rstrip(b"=")
         out, rows = get(b"/dns-query?dns=" + q, b"cloudflare-dns.com")
         self.assertIn(b"application/dns-message", out)
-        self.assertEqual(body(out)[-4:], bytes([198, 18, 0, 1]))
-        self.assertIn(("dns", "A", "evil.example"), [r[:3] for r in rows])
+        addr = str(ipaddress.ip_address(body(out)[-4:]))
+        self.assertIn(("addr", addr, "evil.com"), [r[:3] for r in rows])
+        self.assertIn(("dns", "A", "evil.com"), [r[:3] for r in rows])
 
     def test_garbage(self):
         out, _ = get(b"/dns-query?dns=%%%", b"dns.google")

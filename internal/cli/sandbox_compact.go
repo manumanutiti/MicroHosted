@@ -570,7 +570,9 @@ func (r *sandboxReport) network(x string) category {
 		answer := "not answered"
 		if r.Net == "sinkhole" {
 			answer = "no answer"
-			if slices.Contains(types[name], "A") {
+			if r.nx[name] {
+				answer = "no such name (NXDOMAIN): its TLD does not exist"
+			} else if slices.Contains(types[name], "A") {
 				answer = "answered into the sinkhole"
 			}
 		}
@@ -623,6 +625,11 @@ func (r *sandboxReport) network(x string) category {
 		if r.isSinkName(host) {
 			// a name the sinkhole answered, on a port it does not serve
 			c.items = append(c.items, finding{sev: sevWarn, cols: []string{"tcp", dst, x + strconv.Itoa(n)}, tail: join(dstNote("", port), "nothing listens there in the sinkhole", by(dst)), tailDim: true, short: dst})
+			continue
+		}
+		if port == 53 && r.Net == "sinkhole" {
+			// mh-sandbox-prepare sends it to the sandbox's resolver
+			c.items = append(c.items, finding{sev: sevWarn, cols: []string{"dns", dst, x + strconv.Itoa(n)}, tail: join("a resolver of its own, not the system's: the sandbox's answered, the names are above", by(dst)), tailDim: true, short: dst})
 			continue
 		}
 		tail := []string{by(dst), "seen inside only"}

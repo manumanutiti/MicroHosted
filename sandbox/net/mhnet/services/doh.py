@@ -3,6 +3,7 @@ resolver, and written down as a name (dns), not only as a request."""
 import base64
 import binascii
 import json
+import time
 import urllib.parse
 
 from .. import dns
@@ -45,9 +46,15 @@ def as_json(ctx, q):
     t = q.get("type", ["A"])[0].upper()
     qtype = int(t) if t.isdigit() and int(t) < 65536 else CODES.get(t, 1)
     ctx.log.write("dns", dns.TYPES.get(qtype, str(qtype)), name or ".")
-    out = {"Status": 0, "TC": False, "RD": True, "RA": True, "AD": False, "CD": False,
+    ok = dns.exists(name)
+    out = {"Status": 0 if ok else dns.NXDOMAIN, "TC": False, "RD": True, "RA": True, "AD": False, "CD": False,
            "Question": [{"name": name + ".", "type": qtype}]}
-    if qtype == 1 and dns.HOSTNAME.match(name):
+    if not ok:
+        ctx.log.write("nx", name or ".")
+        out["Authority"] = [{"name": ".", "type": 6, "TTL": 86400,
+                             "data": "a.root-servers.net. nstld.verisign-grs.com. %s 1800 900 604800 86400"
+                             % time.strftime("%Y%m%d00", time.gmtime())}]
+    elif qtype == 1 and name:
         a = ctx.names.addr(name)
         if a is not None:
             out["Answer"] = [{"name": name + ".", "type": 1, "TTL": 60, "data": str(a)}]

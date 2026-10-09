@@ -1212,6 +1212,37 @@ func TestSandboxSinkhole(t *testing.T) {
 	}
 }
 
+// A name under a TLD that does not exist was NXDOMAIN, not answered; a
+// resolver of the code's own was the sandbox's.
+func TestSandboxNXDomain(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"section\tnet", "net\tsinkhole",
+		"nx\twpad",
+		"addr\t203.0.113.7\tevil.com",
+		"dns\t1\tA\twpad",
+		"dns\t1\tA\tevil.com",
+		"alert\tconnect\t1\t1.1.1.1:53\tprobe.py",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	if len(r.DNS) != 2 || !r.DNS[0].NoSuchName || r.DNS[1].NoSuchName {
+		t.Errorf("dns %+v", r.DNS)
+	}
+	var lines []string
+	for _, f := range r.network("x").items {
+		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
+	}
+	want := []string{
+		"warn dns wpad x1 | A; no such name (NXDOMAIN): its TLD does not exist",
+		"warn dns evil.com x1 | A; answered into the sinkhole",
+		"warn dns 1.1.1.1:53 x1 | a resolver of its own, not the system's: the sandbox's answered, the names are above; by probe.py",
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 // --answers: what the sinkhole answered as shows with each request; the
 // empty 200's ("-") shows nothing.
 func TestSandboxAnswers(t *testing.T) {

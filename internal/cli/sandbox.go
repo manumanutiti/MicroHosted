@@ -1494,6 +1494,7 @@ type sandboxReport struct {
 	token    string            // this run's, in every decoy: seen in a name, a secret went out
 	netSeen  bool              // the image reports its network (or says it cannot: off)
 	sinkAddr map[string]string // the sinkhole's address → the name it was given to
+	nx       map[string]bool   // names answered NXDOMAIN
 	commands int               // distinct, as the image counted them; -1: not recorded
 	decoyBy  map[string]map[string]int
 	// decoyOpens: decoyBy with when, by decoy
@@ -1630,6 +1631,8 @@ type sandboxDNS struct {
 	Count int    `json:"count"`
 	Type  string `json:"type"` // A, AAAA, TXT…
 	Name  string `json:"name"`
+	// NXDOMAIN: under a TLD that does not exist, as the internet answers
+	NoSuchName bool `json:"nxdomain,omitempty"`
 	sandboxWhen
 }
 
@@ -1724,8 +1727,13 @@ func parseSandboxReport(tsv string) *sandboxReport {
 				r.Net = "off"
 				r.Warnings = append(r.Warnings, "no resolver of the sandbox in this image: the names the code looked up are not recorded")
 			} else {
-				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3), sandboxWhen: when(4)})
+				r.DNS = append(r.DNS, sandboxDNS{Count: num(1), Type: at(2), Name: at(3), NoSuchName: r.nx[at(3)], sandboxWhen: when(4)})
 			}
+		case "nx": // before the names' dns records
+			if r.nx == nil {
+				r.nx = map[string]bool{}
+			}
+			r.nx[at(1)] = true
 		case "addr":
 			if r.sinkAddr == nil {
 				r.sinkAddr = map[string]string{}

@@ -145,6 +145,7 @@ records() {
 	#                               or not recorded (no resolver here);
 	#                               answers: as to a logged-in user (--answers)
 	#   dns COUNT TYPE NAME T1 T2   a name looked up
+	#   nx NAME                     NAME is NXDOMAIN: its TLD does not exist
 	#   addr ADDRESS NAME           the sinkhole's address given to NAME
 	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT T1 T2 ANSWER
 	#                               a request to the sinkhole; TOKEN 1: this
@@ -163,6 +164,7 @@ records() {
 			function when(kind, k) { return t1[kind, k] "\t" t2[kind, k] }
 			$1 == "dns" && NF == 4 { add("dns", $2 "\t" $3) }
 			$1 == "addr" && NF == 4 { if (++a <= 500) print $1 "\t" $2 "\t" $3 }
+			$1 == "nx" && NF == 3 && !($2 in nx) { nx[$2]; if (++x <= 500) print $1 "\t" $2 }
 			$1 == "http" && (NF == 8 || NF == 9) { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; if ($6 == 1 || t[k] != 1 && $6 > t[k]) t[k] = $6; p[k] = $7; if (NF == 9) ans[k] = $8 }
 			$1 == "tls" && NF == 4 { add("tls", $2) }
 			END {

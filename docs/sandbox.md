@@ -338,9 +338,15 @@ The code never reaches the internet; what it reaches for is answered inside
 the VM, by the image's `mh-sandbox-net`, and written down:
 
 - **The resolver** (`/etc/resolv.conf` points at it) writes down every name
-  looked up and answers an `A` query with an address of its own for each
-  name, in `198.18.0.0/15` — a range the VM holds itself (a local route): a
-  connection there never reaches the host. Any other type has no answer.
+  looked up and answers as the internet's would. An `A` query gets an
+  address of its own for each name. The address looks public: it falls in
+  one of 96 `/24`s picked at random for the run, not in a range only a
+  sandbox hands out (`198.18.0.0/15`). The VM holds those blocks itself (a
+  local route each), so a connection there never reaches the host. Any
+  other type has no answer. A name under a TLD that does not exist (IANA's
+  list: `.example`, `.local`, `wpad`) is `NXDOMAIN`, with the root's SOA.
+  A resolver of the code's own (`dig @8.8.8.8`, UDP or TCP) is answered by
+  this one, as from the address it asked.
 - **The sinkhole**, on ports 80 and 443 of those addresses, answers as a
   web server would — `Date`, `Server`, a `Content-Type` — and writes down
   the method, the URL, the size and whether this run's decoy token is in
