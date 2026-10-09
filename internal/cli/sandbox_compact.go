@@ -466,6 +466,9 @@ func (r *sandboxReport) network(x string) category {
 	c := category{title: "tried to reach the network", note: "refused by the host: nothing got out", phrase: "tried to reach the network"}
 	if r.Net == "sinkhole" {
 		c.note = "the sandbox's own network answered: nothing left the VM"
+		if r.Answers {
+			c.note = "the sandbox's own network answered, as GitHub, npm and AWS would a logged-in user: nothing left the VM"
+		}
 	}
 	// who: the programs that connected to each destination (audit, inside),
 	// the sinkhole's addresses by the name they were given to
@@ -504,10 +507,17 @@ func (r *sandboxReport) network(x string) category {
 		host := urlHost(q.URL)
 		dst := host + ":" + strconv.Itoa(defaultPort(q.Scheme, q.Port))
 		seen[dst] = true
-		f := finding{sev: sevWarn, cols: []string{q.Method, q.URL, x + strconv.Itoa(q.Count)}, tail: join(sizeOf(q.Bytes), by(dst)), tailDim: true, short: q.Method + " " + host}
+		answered := ""
+		if q.Answer != "" {
+			answered = "answered: " + q.Answer
+		}
+		f := finding{sev: sevWarn, cols: []string{q.Method, q.URL, x + strconv.Itoa(q.Count)}, tail: join(sizeOf(q.Bytes), answered, by(dst)), tailDim: true, short: q.Method + " " + host}
+		if q.TokenToItsService {
+			f.tail = join("a decoy's credential, to its own service: used, not sent out", sizeOf(q.Bytes), answered, by(dst))
+		}
 		if q.CarriesToken {
 			f.sev, f.tailDim = sevHigh, false
-			f.tail = join("carries this run's decoy token: a secret sent out", sizeOf(q.Bytes), by(dst))
+			f.tail = join("carries this run's decoy token: a secret sent out", sizeOf(q.Bytes), answered, by(dst))
 			if !secretSent {
 				c.phrase = "sent a decoy's secret to " + host
 			}

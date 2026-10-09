@@ -1190,3 +1190,37 @@ func TestSandboxSinkhole(t *testing.T) {
 		t.Errorf("phrase %q, note %q", c.phrase, c.note)
 	}
 }
+
+// --answers: what the sinkhole answered as shows with each request; the
+// empty 200's ("-") shows nothing.
+func TestSandboxAnswers(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"section\tnet", "net\tsinkhole\tanswers",
+		"http\t1\thttps\tGET\thttps://registry.npmjs.org/-/whoami\t0\t2\t443\t1760000002.600\t1760000002.600\tnpm whoami",
+		"http\t1\thttps\tPOST\thttps://api.github.com/user/repos\t300\t1\t443\t1760000003.000\t1760000003.000\tgithub repository created",
+		"http\t1\thttps\tGET\thttps://example.com/\t0\t0\t443\t1760000004.000\t1760000004.000\t-",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	// its own service's credential (2) is no secret sent; the token elsewhere (1) is
+	if !r.Answers || r.Net != "sinkhole" || r.Requests[2].Answer != "" || r.Summary.SecretsSent != 1 || !r.Requests[0].TokenToItsService {
+		t.Errorf("answers %v, net %q, requests %+v", r.Answers, r.Net, r.Requests)
+	}
+	c := r.network("x")
+	var lines []string
+	for _, f := range c.items {
+		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
+	}
+	want := []string{
+		"warn GET https://registry.npmjs.org/-/whoami x1 | a decoy's credential, to its own service: used, not sent out; answered: npm whoami",
+		"high POST https://api.github.com/user/repos x1 | carries this run's decoy token: a secret sent out; 300 bytes; answered: github repository created",
+		"warn GET https://example.com/ x1 | ",
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+	if !strings.Contains(c.note, "as GitHub, npm and AWS would a logged-in user") {
+		t.Errorf("note %q", c.note)
+	}
+}

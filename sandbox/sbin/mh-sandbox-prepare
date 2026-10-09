@@ -3,7 +3,7 @@
 # Run it as root (mh exec), once, AFTER copying the code in and BEFORE
 # running it: everything changed after this moment is reported.
 #
-#   mh-sandbox-prepare [--no-sinkhole] [--ci] [ARCHIVE]
+#   mh-sandbox-prepare [--no-sinkhole|--answers] [--ci] [ARCHIVE]
 #
 # ARCHIVE, a .tar.gz copied in with mh cp (which copies single files), is
 # unpacked into ~/work as the user and removed, before the clock starts.
@@ -14,6 +14,9 @@
 # every name it looks up is answered with an address the VM holds, where a
 # sinkhole answers HTTP and HTTPS and writes down what was sent.
 # --no-sinkhole: no name is answered, as with no network at all.
+# --answers: GitHub, npm's registry, AWS and Actions' OIDC answer as they
+# would a logged-in user (mh-sandbox-net's Answers), not with an empty 200,
+# on which a worm stops.
 #
 # --ci: the code runs as a CI job does (mh-sandbox-run): GitHub Actions'
 # variables in its environment, and its secrets — GITHUB_TOKEN, NPM_TOKEN,
@@ -35,6 +38,7 @@ ci=
 while [ $# -gt 0 ]; do
 	case $1 in
 	--no-sinkhole) net=servfail ;;
+	--answers) net=answers ;;
 	--ci) ci=1 ;;
 	*) break ;;
 	esac
@@ -199,7 +203,7 @@ printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0wmN/Cr3JXqmLW7u+g9pTh+wSN4RhCTTZa
 if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink >/dev/null 2>&1; then
 	rm -rf "$N"
 	install -d -o mhsink -g mhsink -m 700 "$N"
-	if [ $net = sinkhole ]; then
+	if [ $net != servfail ]; then
 		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
 			-keyout "$N/ca.key" -out "$N/ca.crt" -subj "/O=Internal/CN=Internal Root CA" \
 			-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
@@ -208,8 +212,13 @@ if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink
 		update-ca-certificates >/dev/null 2>&1
 		ip route add local 198.18.0.0/15 dev lo
 	fi
-	echo $net > "$S/net"
-	printf '%s' "$tok" | setsid /usr/sbin/mh-sandbox-net "$N" $net >/dev/null 2>&1 &
+	# net: sinkhole or servfail, and answers after a tab (mh-sandbox-report)
+	if [ $net = answers ]; then
+		printf 'sinkhole\tanswers\n' > "$S/net"
+	else
+		echo $net > "$S/net"
+	fi
+	printf '%s' "$tok" | setsid /usr/sbin/mh-sandbox-net "$N" $net $U >/dev/null 2>&1 &
 	echo -1000 > "/proc/$!/oom_score_adj" 2>/dev/null || true
 	rm -f /etc/resolv.conf
 	printf 'nameserver 127.53.0.1\n' > /etc/resolv.conf

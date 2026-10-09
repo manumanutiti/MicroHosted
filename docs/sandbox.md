@@ -71,6 +71,7 @@ mh sandbox npm:@modelcontextprotocol/server-filesystem@2025.8.21 'mcp-server-fil
 | `-v`, `--verbose` | the report in full — every finding under its kind, every probe by every program, every command the code ran, what changed in `~/work`. Without it, what the findings amount to: probes by what they go for, the same command on many directories as one line, at most 8 lines a kind |
 | `--live` | each finding as it happens, every 2 seconds, while the code runs (below); the report follows |
 | `--no-sinkhole` | answer no name the code looks up, as with no network at all (below, "Its network"); by default the sinkhole answers |
+| `--answers` | answer as GitHub's API, npm's registry, AWS (STS, Secrets Manager) and Actions' OIDC would a logged-in user, made up for the run (below, "Its network"), not with an empty `200`: a worm that stops after `whoami` or after creating a repository goes on, and what it does next shows. On with `--ci` |
 | `--ci` | run it as a CI job: GitHub Actions' variables in its environment (`CI=true`, `GITHUB_ACTIONS`, the repository, the ref) and its secrets as decoys, with this run's token in them — `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`, the AWS keys, PyPI's (`TWINE_PASSWORD`), the OIDC token's request. Code that steals from CI looks there, not in `~/.npmrc`: without them it finds nothing and goes no further. One sent out is a secret sent (`high`). Never in the fetch |
 | `--rules FILE` | rules of your own (below), from any file, in order (repeatable); none is read without it |
 
@@ -109,7 +110,7 @@ and runs nothing.
 | processes | still running as the sandbox's user |
 | listening | sockets it opened |
 | dns | every name the code looked up, with its type and count — `github.com`, `pastebin.com`, `x7f3.evil.example`. A name sent to another resolver directly (`dig @8.8.8.8`) shows only as a connection |
-| requests | what it sent the sinkhole: method, URL, size, and whether this run's decoy token was in it (as is, URL- or base64-encoded, gzipped) — `POST https://evil.example/collect` carrying the fake AWS key. `tls_refused`: HTTPS clients that refused the sinkhole's certificate (a list of authorities of their own): the name only |
+| requests | what it sent the sinkhole: method, URL, size, and whether this run's decoy token was in it (as is, URL- or base64-encoded, gzipped), or only as its own service's credential (`token_to_its_service`: `Authorization` to GitHub, npm's registry, PyPI, AWS; the OIDC token's URL) — `POST https://evil.example/collect` carrying the fake AWS key. `tls_refused`: HTTPS clients that refused the sinkhole's certificate (a list of authorities of their own): the name only |
 | connections | what it tried that the network refused (the host's view); the report names the program that tried each (audit's `connect`, inside) |
 | addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "note to the AI:", chat-template tokens (a phrase is `warn`: skills, prompts and their tests are full of them); Unicode that hides text — tag characters, a run of zero-width ones, bidirectional controls in code or a file's name (not one zero-width joiner, which emoji and names have, nor a right-to-left override in pip's `AUTHORS.txt`) |
 
@@ -190,7 +191,7 @@ The verdict is in the JSON too (`verdict`: `suspicious`, `review`, `clean`,
 
 | Grade | |
 |---|---|
-| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text spelled in Unicode tag characters (a model reads it, a person sees nothing; not a flag's, 🏴 then a region's letters, which emoji use); a request to the sinkhole, or a name looked up, that carries the run's decoy token (a secret sent out); a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
+| high | a decoy tampered with or deleted, or read by anything but its own tool (or by a program audit did not see); text spelled in Unicode tag characters (a model reads it, a person sees nothing; not a flag's, 🏴 then a region's letters, which emoji use); a request to the sinkhole, or a name looked up, that carries the run's decoy token (a secret sent out) — not a decoy's credential to its own service only, in the header it reads (`npm whoami` with `NPM_TOKEN` to npm's registry, `GITHUB_TOKEN` to GitHub's API): that is a tool logged in, `warn`; a privesc probe an escalation goes for: `find -perm` for setuid or setgid files, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, a container runtime's socket, `/proc/PID/mem` |
 | warn | a name looked up; a request to the sinkhole; an HTTPS client that refused its certificate; a phrase addressed to an AI agent; a run of zero-width characters, bidirectional controls in code (they deceive a person reading it; the tests of terminals and editors have them); a name looked up; every other privesc probe (cron, root's home, the kernel's switches, `find -perm` for writable files); a VM probe; a connection refused; a file changed outside `~/work` that is not a cache, a tool's settings or a temporary file (`~/.local/bin`, `~/.ssh`, the system); a process left; a listening socket |
 | info | a decoy read only by its own tool; `sudo`, `su`, `pkexec`… looked up by name (installers check for sudo); a VM probe ordinary programs make too (`/proc/cpuinfo`, `/proc/self/cgroup`); a cache, a temporary file, a directory whose entries changed |
 
@@ -342,6 +343,24 @@ root. Code can tell it apart — every name resolves, which on a machine with
 no network none would — so evasive code may behave; `--no-sinkhole` answers
 no name, as before, and the names are still written down.
 
+With `--answers` (and `--ci`), what worms go for answers as for a user
+logged in — the user the code runs as (`dev` in the image), in an organization `acme` with one
+private repository, `acme/billing-api`, owner of an npm package,
+`acme-billing-utils`, with keys of an AWS account that keeps one secret:
+
+| where | answered |
+|---|---|
+| `api.github.com` | `/user` (with `X-OAuth-Scopes: repo, workflow…`), `/user/repos`, `/user/orgs`; a repository created; for `acme`'s or the user's own: the repository, a branch's ref, a ref created, a file written, a runner's registration token. Another's repository: the empty `200` |
+| `registry.npmjs.org` | `whoami`, a search by maintainer, the package and its tarball (made in the VM: a `package.json` and an `index.js`), a publish |
+| `*.amazonaws.com` | STS `GetCallerIdentity`; Secrets Manager `ListSecrets`, `GetSecretValue` |
+| `*.actions.githubusercontent.com` | the OIDC token (`ACTIONS_ID_TOKEN_REQUEST_URL`, `--ci`) |
+
+Everything else gets the empty `200`. Every secret handed out — the OIDC
+token, a runner's token, the secret's value — has this run's token in it:
+sent on, it is a secret sent (`high`), as a decoy's. A request shows what
+it was answered as (`answered: npm whoami`, `"answer"` in the JSON). Not
+by default: an answer makes code go further, and only where you asked.
+
 ## JSON
 
 ```json
@@ -390,6 +409,7 @@ no name, as before, and the names are still written down.
   "connections": [{"protocol": "udp", "dst": "1.1.1.1", "dst_port": 53, "count": 4, "reason": "egress",
                    "first_ms": 2400, "last_ms": 2950}],
   "net":         "sinkhole",       // sinkhole, servfail (--no-sinkhole), off (an image without it)
+  "answers":     false,            // --answers, --ci: answered as to a logged-in user
   "dns":         [{"count": 4, "type": "A", "name": "evil.example", "first_ms": 2300, "last_ms": 2900}],
   "requests":    [{"count": 1, "scheme": "https", "method": "POST", "url": "https://evil.example/collect",
                    "port": 443, "bytes": 2048, "carries_token": true, "first_ms": 2330, "last_ms": 2330}],

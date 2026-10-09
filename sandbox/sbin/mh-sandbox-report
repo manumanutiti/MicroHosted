@@ -137,29 +137,34 @@ records() {
 
 	# The code's network (mh-sandbox-net), in the order first seen, the first
 	# 500 of each:
-	#   net sinkhole|servfail|off   names answered into the sinkhole, none,
-	#                               or not recorded (no resolver here)
+	#   net sinkhole|servfail|off [answers]
+	#                               names answered into the sinkhole, none,
+	#                               or not recorded (no resolver here);
+	#                               answers: as to a logged-in user (--answers)
 	#   dns COUNT TYPE NAME T1 T2   a name looked up
 	#   addr ADDRESS NAME           the sinkhole's address given to NAME
-	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT T1 T2
+	#   http COUNT SCHEME METHOD URL BYTES TOKEN PORT T1 T2 ANSWER
 	#                               a request to the sinkhole; TOKEN 1: this
-	#                               run's decoy token was in it; BYTES summed
+	#                               run's decoy token was in it, 2: only as
+	#                               its own service's credential (1 wins);
+	#                               BYTES summed;
+	#                               ANSWER: the answer given (--answers), - none
 	#   tls COUNT NAME T1 T2        an HTTPS client that refused the
 	#                               sinkhole's certificate: only the name
 	# Each record of $N/log ends in the time it was written.
 	printf 'section\tnet\n'
 	if [ -s "$S/net" ] && [ -e "$N/log" ]; then
-		printf 'net\t%s\n' "$(cat "$S/net")"
+		printf 'net\t%s\n' "$(cat "$S/net")"  # a tab and answers, with --answers
 		awk -F'\t' '
 			function add(kind, k) { if (!((kind, k) in n)) { o[kind, ++m[kind]] = k; t1[kind, k] = $NF } t2[kind, k] = $NF; n[kind, k]++ }
 			function when(kind, k) { return t1[kind, k] "\t" t2[kind, k] }
 			$1 == "dns" && NF == 4 { add("dns", $2 "\t" $3) }
 			$1 == "addr" && NF == 4 { if (++a <= 500) print $1 "\t" $2 "\t" $3 }
-			$1 == "http" && NF == 8 { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; t[k] = t[k] || $6; p[k] = $7 }
+			$1 == "http" && (NF == 8 || NF == 9) { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; if ($6 == 1 || t[k] != 1 && $6 > t[k]) t[k] = $6; p[k] = $7; if (NF == 9) ans[k] = $8 }
 			$1 == "tls" && NF == 4 { add("tls", $2) }
 			END {
 				for (i = 1; i <= m["dns"] && i <= 500; i++) { k = o["dns", i]; printf "dns\t%d\t%s\t%s\n", n["dns", k], k, when("dns", k) }
-				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\t%s\n", n["http", k], k, b[k], t[k], p[k], when("http", k) }
+				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n", n["http", k], k, b[k], t[k], p[k], when("http", k), (k in ans ? ans[k] : "-") }
 				for (i = 1; i <= m["tls"] && i <= 500; i++) { k = o["tls", i]; printf "tls\t%d\t%s\t%s\n", n["tls", k], k, when("tls", k) }
 			}' "$N/log"
 	else

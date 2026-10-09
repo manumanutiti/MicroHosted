@@ -97,8 +97,11 @@ type sandboxOpts struct {
 	// noSinkhole: no name answered, as with no network (mh-sandbox-net)
 	noSinkhole bool
 	// ci: the code's environment a CI runner's, with decoy tokens in it
-	// (mh-sandbox-prepare --ci)
+	// (mh-sandbox-prepare --ci); it answers too
 	ci bool
+	// answers: GitHub, npm's registry, AWS answered as for a logged-in user
+	// (mh-sandbox-net's Answers), not with an empty 200
+	answers bool
 }
 
 // sandboxTarget is what goes into ~/work.
@@ -148,6 +151,7 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.boolVar(&o.output, "output", "o", "print the code's own output too (its last 8 KiB): by default only what it did is reported")
 	fs.boolVar(&o.noSinkhole, "no-sinkhole", "", "answer no name the code looks up, as with no network: by default the sandbox's own network answers HTTP and HTTPS and writes down what was sent")
 	fs.boolVar(&o.ci, "ci", "", "run it as in CI: GitHub Actions' variables, and decoy tokens in its environment (GITHUB_TOKEN, NPM_TOKEN, AWS keys…), as a CI job has them")
+	fs.boolVar(&o.answers, "answers", "", "answer as GitHub, npm's registry, AWS and Actions' OIDC would a logged-in user (a made-up one): code that stops on an empty answer, a worm after whoami, goes on (on with --ci)")
 	fs.listVar(&o.rules, "rules", "", "a `FILE` of rules of your own: detections, findings accepted (repeatable; sandbox/rules/, docs/sandbox.md)")
 	pos, err := fs.parse(args)
 	if err != nil {
@@ -158,6 +162,10 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	}
 	if o.timeout < time.Second || o.timeout > 10*time.Minute {
 		return usagef(p, "--timeout must be between 1s and 10m")
+	}
+	o.answers = o.answers || o.ci
+	if o.answers && o.noSinkhole {
+		return usagef(p, "--no-sinkhole answers nothing: not with --answers or --ci")
 	}
 	if o.cpus < 1 || o.cpus > 32 || o.memory < 256 || o.memory > 32768 {
 		return usagef(p, "--cpus must be 1 to 32, --mem 256M to 32G")
@@ -422,18 +430,27 @@ func (s *sandbox) run() (err error) {
 			return err
 		}
 	}
-	if s.o.ci {
-		// before the fetch: an image without it costs no download
-		if r, _, err := s.exec("grep -q -e --ci /usr/sbin/mh-sandbox-prepare", time.Minute); err != nil {
+	// before the fetch: an image without them costs no download
+	for _, f := range []struct {
+		on   bool
+		flag string
+	}{{s.o.ci, "--ci"}, {s.o.answers, "--answers"}} {
+		if !f.on {
+			continue
+		}
+		if r, _, err := s.exec("grep -q -e "+f.flag+" /usr/sbin/mh-sandbox-prepare", time.Minute); err != nil {
 			return err
 		} else if r.ExitCode != 0 {
-			return fmt.Errorf("image %s predates --ci: rebuild it from sandbox/ (docs/sandbox.md)", s.image)
+			return fmt.Errorf("image %s predates %s: rebuild it from sandbox/ (docs/sandbox.md)", s.image, f.flag)
 		}
 	}
 
 	prepare := "mh-sandbox-prepare"
 	if s.o.noSinkhole {
 		prepare += " --no-sinkhole"
+	}
+	if s.o.answers {
+		prepare += " --answers"
 	}
 	if s.o.ci {
 		prepare += " --ci"
@@ -1408,6 +1425,9 @@ type sandboxReport struct {
 	// holds, HTTP and HTTPS answered and written down), servfail (no name
 	// answered: --no-sinkhole), off (an image without it: not recorded)
 	Net string `json:"net"`
+	// Answers: the sinkhole answered as GitHub, npm, AWS would a logged-in
+	// user (--answers, --ci)
+	Answers bool `json:"answers"`
 	// DNS: the names the code looked up
 	DNS []sandboxDNS `json:"dns"` // untrusted: name
 	// Requests: what it sent the sinkhole; TLSRefused: HTTPS clients that
@@ -1579,6 +1599,14 @@ type sandboxRequest struct {
 	// CarriesToken: this run's decoy token was in it — as is, URL- or
 	// base64-encoded, gzipped: a secret sent out
 	CarriesToken bool `json:"carries_token"`
+	// TokenToItsService: the token was in it, but only where its own
+	// service reads it (npm's registry, GitHub, AWS, PyPI: their
+	// Authorization header) — a decoy's credential used, as a tool logged
+	// in does, not sent out
+	TokenToItsService bool `json:"token_to_its_service,omitempty"`
+	// Answer: what the sinkhole answered as (--answers): "github user",
+	// "npm whoami"…; empty: the empty 200
+	Answer string `json:"answer,omitempty"`
 	sandboxWhen
 }
 
@@ -1643,7 +1671,7 @@ func parseSandboxReport(tsv string) *sandboxReport {
 		case "section":
 			r.netSeen = r.netSeen || at(1) == "net" || at(1) == "dns"
 		case "net":
-			r.Net = at(1)
+			r.Net, r.Answers = at(1), at(2) == "answers"
 			if r.Net == "off" {
 				r.Warnings = append(r.Warnings, "no network of the sandbox in this image: the names the code looked up are not recorded")
 			}
@@ -1660,7 +1688,7 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			}
 			r.sinkAddr[at(1)] = at(2)
 		case "http":
-			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", Port: num(7), sandboxWhen: when(8)})
+			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", TokenToItsService: at(6) == "2", Port: num(7), sandboxWhen: when(8), Answer: strings.TrimPrefix(at(10), "-")})
 		case "tls":
 			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2), sandboxWhen: when(3)})
 		case "rules":
