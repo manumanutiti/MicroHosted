@@ -1,5 +1,6 @@
 """HTTP as the sinkhole speaks it: a request read within bounds, written
 down, and answered."""
+import email.utils
 import re
 import ssl
 import time
@@ -80,12 +81,22 @@ def header(head, name):
     return m.group(1).decode("latin-1").strip() if m else ""
 
 
+SERVER = "nginx"  # what a server says it is, unless its answer says otherwise
+
+
 def respond(conn, req, a):
     hdr = "HTTP/1.1 %s\r\n" % a.status
+    names = {k.lower() for k, _ in a.headers}
+    if "date" not in names:
+        hdr += "Date: %s\r\n" % email.utils.formatdate(usegmt=True)
+    if "server" not in names:
+        hdr += "Server: %s\r\n" % SERVER
     hdr += "".join("%s: %s\r\n" % kv for kv in a.headers)
     if a.ctype:
         hdr += "Content-Type: %s\r\n" % a.ctype
-    hdr += "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(a.body)
+    if not a.status.startswith(("204", "304")):  # no body, and none said
+        hdr += "Content-Length: %d\r\n" % len(a.body)
+    hdr += "Connection: close\r\n\r\n"
     conn.sendall(hdr.encode("latin-1") + (b"" if req.method == "HEAD" else a.body))
 
 

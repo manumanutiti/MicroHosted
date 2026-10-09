@@ -341,9 +341,25 @@ the VM, by the image's `mh-sandbox-net`, and written down:
   looked up and answers an `A` query with an address of its own for each
   name, in `198.18.0.0/15` — a range the VM holds itself (a local route): a
   connection there never reaches the host. Any other type has no answer.
-- **The sinkhole**, on ports 80 and 443 of those addresses, answers HTTP
-  `200`, empty, and writes down the method, the URL, the size and whether
-  this run's decoy token is in it. HTTPS gets a certificate for the name,
+- **The sinkhole**, on ports 80 and 443 of those addresses, answers as a
+  web server would — `Date`, `Server`, a `Content-Type` — and writes down
+  the method, the URL, the size and whether this run's decoy token is in
+  it. What it answers, with nothing ever fetched from outside:
+  - a small valid file of the type the path names: a page for `/`, `{}`
+    for `.json`, a 1×1 PNG, an empty `.zip` or `.tar.gz`, `exit 0` for
+    `.sh`; for a `POST` or `PUT`, `{"status":"ok"}`;
+  - the checks systems make to know they are online (`generate_204`,
+    Apple's, Microsoft's, Firefox's, GNOME's), as online, not as a captive
+    portal;
+  - what is my address (`api.ipify.org`, `ipinfo.io`, `ip-api.com`,
+    `ifconfig.me`, Cloudflare's `/cdn-cgi/trace`…): a home connection's
+    address in Denver, made up for the run;
+  - DNS over HTTPS (`dns.google`, `cloudflare-dns.com`, `1.1.1.1`…), JSON
+    and wire format: answered by the same resolver, and the name written
+    down in `dns`.
+
+  A request shows what it was answered as when it was not the generic file
+  (`answered: ip lookup`). HTTPS gets a certificate for the name,
   signed by a CA made for this run that the VM trusts (Node and pip are
   pointed at the system's list); a client with a list of its own (Python's
   `certifi`, a pinned key) refuses it, and only the name it asked for shows.
@@ -374,7 +390,7 @@ private repository, `acme/billing-api`, owner of an npm package,
 | `*.amazonaws.com` | STS `GetCallerIdentity`; Secrets Manager `ListSecrets`, `GetSecretValue` |
 | `*.actions.githubusercontent.com` | the OIDC token (`ACTIONS_ID_TOKEN_REQUEST_URL`, `--ci`) |
 
-Everything else gets the empty `200`. Every secret handed out — the OIDC
+Everything else gets what it would without `--answers`. Every secret handed out — the OIDC
 token, a runner's token, the secret's value — has this run's token in it:
 sent on, it is a secret sent (`high`), as a decoy's. A request shows what
 it was answered as (`answered: npm whoami`, `"answer"` in the JSON). Not

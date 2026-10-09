@@ -15,7 +15,9 @@ no network at all.
 The sinkhole, on ports 80 and 443 of those addresses, and of any bare
 address the code connects to (mh-sandbox-prepare redirects them here; the
 address it meant is read back, SO_ORIGINAL_DST): an HTTP request is
-answered (services) and written down (log.py). answers: the services worms
+answered as the internet would (services/: connectivity checks, what is my
+address, DNS over HTTPS; content.py: a small valid file of the type asked
+for, with the headers a server sends) and written down (log.py). answers: the services worms
 go for are answered as for USER, logged in (services/identity.py). HTTPS
 is answered with a certificate for the name, signed by DIR's CA (tls.py).
 """
@@ -121,7 +123,7 @@ def main(argv):
     log = Log(os.path.join(d, "log"))
     names = Names(log)
     if mode == "sinkhole":
-        sink = Sinkhole(log, names, token, Certs(d), services.Dispatcher(user, token))
+        sink = Sinkhole(log, names, token, Certs(d), services.Dispatcher(services.Context(token, names, log, user)))
         for t, port in tcp:
             threading.Thread(target=sink.accept, args=(t, port), daemon=True).start()
     dns.serve_udp(udp, log, names, mode == "sinkhole")

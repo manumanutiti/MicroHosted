@@ -18,6 +18,10 @@ from mhnet.names import Names  # noqa: E402
 TOK = b"0123456789abcdef0123"
 
 
+def dispatcher(log, user=None):
+    return services.Dispatcher(services.Context(TOK, Names(log), log, user))
+
+
 class Records:
     def __init__(self):
         self.rows = []
@@ -31,9 +35,10 @@ def query(name, qtype=1, qid=b"\x12\x34"):
     return qid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + q + qtype.to_bytes(2, "big") + b"\x00\x01"
 
 
-def exchange(raw, answer=services.Dispatcher(), scheme="http", host="1.2.3.4", log=None):
+def exchange(raw, answer=None, scheme="http", host="1.2.3.4", log=None):
     """raw sent to the sinkhole's HTTP; what it answered, and the records."""
     log = log or Records()
+    answer = answer or dispatcher(log)
     a, b = socket.socketpair()
     t = threading.Thread(target=http.serve, args=(b, scheme, 80, host, log, TOK, answer))
     t.start()
@@ -101,10 +106,12 @@ class HTTPTest(unittest.TestCase):
     def test_request_written_down(self):
         out, rows = exchange(b"POST /c HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 25\r\n\r\nk=" + TOK + b"xxx")
         self.assertTrue(out.startswith(b"HTTP/1.1 200 OK\r\n"))
+        self.assertIn(b"\r\nDate: ", out)
+        self.assertIn(b"\r\nServer: nginx\r\n", out)
         self.assertEqual(rows[0][:8], ("http", "http", "POST", "http://evil.example/c", "25", "1", "80", "-"))
 
     def test_answers(self):
-        d = services.Dispatcher("dev", TOK)
+        d = dispatcher(Records(), "dev")
         out, rows = exchange(b"GET /-/whoami HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n", d)
         self.assertIn(b'"username": "dev"', out)
         self.assertEqual(rows[0][7], "npm whoami")
@@ -122,7 +129,7 @@ class HTTPTest(unittest.TestCase):
         try:
             a, b = socket.socketpair()
             log = Records()
-            t = threading.Thread(target=http.serve, args=(b, "http", 80, "h", log, TOK, services.Dispatcher()))
+            t = threading.Thread(target=http.serve, args=(b, "http", 80, "h", log, TOK, dispatcher(log)))
             t.start()
             for _ in range(15):
                 try:
