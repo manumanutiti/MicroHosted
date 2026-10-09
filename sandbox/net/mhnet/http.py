@@ -32,11 +32,11 @@ def recv(conn, deadline):
     return conn.recv(65536)
 
 
-def read_request(conn, deadline):
-    """The request's head and as much of its body as is kept, and its size.
-    A connection that drips its bytes is cut at the deadline, whatever it
-    sent: it cannot hold one of the sinkhole's slots for the whole run."""
-    data = b""
+def read_request(conn, deadline, data=b""):
+    """The request's head and as much of its body as is kept, and its size
+    (data: what was read of it already). A connection that drips its bytes
+    is cut at the deadline, whatever it sent: it cannot hold one of the
+    sinkhole's slots for the whole run."""
     while b"\r\n\r\n" not in data and len(data) < MAXHEAD:
         chunk = recv(conn, deadline)
         if not chunk:
@@ -100,10 +100,11 @@ def respond(conn, req, a):
     conn.sendall(hdr.encode("latin-1") + (b"" if req.method == "HEAD" else a.body))
 
 
-def serve(conn, scheme, port, host, log, token, answer):
-    """One request on conn: read, written down, answered by answer(req)."""
+def serve(conn, scheme, port, host, log, token, answer, first=b""):
+    """One request on conn: read, written down, answered by answer(req).
+    first: its first bytes, read already (stream.py)."""
     try:
-        head, body, size = read_request(conn, time.monotonic() + DEADLINE)
+        head, body, size = read_request(conn, time.monotonic() + DEADLINE, first)
         req = parse(head, body, scheme, host)
         a = answer(req)
         log.write("http", scheme, printable(req.method, 16), printable(req.url, 300), size,

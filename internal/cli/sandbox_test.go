@@ -1212,6 +1212,40 @@ func TestSandboxSinkhole(t *testing.T) {
 	}
 }
 
+// Every port: what it said on the ones that are not HTTP's, the decoy's
+// secret in a mail high; the audit's connect to it is that line's "by".
+func TestSandboxTCP(t *testing.T) {
+	r := parseSandboxReport(strings.Join([]string{
+		"user\tdev", "token\tab12cd",
+		"section\tnet", "net\tsinkhole",
+		"addr\t198.18.0.1\tsmtp.gmail.com",
+		"tcp\t1\t587\tsmtp\tsmtp.gmail.com\t2300\t1\t1760000002.600\t1760000002.600\tEHLO x\\x0d\\x0a",
+		"tcp\t3\t4444\ttcp\t45.9.148.3\t0\t0\t1760000003.000\t1760000009.000\t",
+		"alert\tconnect\t1\t198.18.0.1:587\tpython3",
+		"alert\tconnect\t3\t45.9.148.3:4444\tbash",
+	}, "\n"))
+	r.Complete = true
+	r.summarize()
+	if len(r.TCP) != 2 || r.TCP[0].First != `EHLO x\x0d\x0a` || r.Summary.SecretsSent != 1 || r.Summary.Requests != 2 {
+		t.Fatalf("tcp %+v, summary %+v", r.TCP, r.Summary)
+	}
+	c := r.network("x")
+	var lines []string
+	for _, f := range c.items {
+		lines = append(lines, f.sev.String()+" "+strings.Join(f.cols, " ")+" | "+f.tail)
+	}
+	want := []string{
+		`high smtp smtp.gmail.com:587 x1 | carries this run's decoy token: a secret sent out; 2 KiB, first: EHLO x\x0d\x0a; by python3`,
+		"warn tcp 45.9.148.3:4444 x3 | a port reverse shells use; sent nothing; by bash",
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Errorf("network:\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+	if c.phrase != "sent a decoy's secret to smtp.gmail.com over smtp" {
+		t.Errorf("phrase %q", c.phrase)
+	}
+}
+
 // A name under a TLD that does not exist was NXDOMAIN, not answered; a
 // resolver of the code's own was the sandbox's.
 func TestSandboxNXDomain(t *testing.T) {

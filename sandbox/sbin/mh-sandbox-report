@@ -155,6 +155,12 @@ records() {
 	#                               ANSWER: the answer given (--answers), - none
 	#   tls COUNT NAME T1 T2        an HTTPS client that refused the
 	#                               sinkhole's certificate: only the name
+	#   tcp COUNT PORT PROTO HOST BYTES TOKEN T1 T2 FIRST
+	#                               a connection that was not HTTP's: the
+	#                               protocol it spoke (smtp, ftp, ssh, tls,
+	#                               tcp: none known), what it sent, summed
+	#                               (BYTES), TOKEN 1 if any carried it;
+	#                               FIRST: the first one's first bytes
 	# Each record of $N/log ends in the time it was written.
 	printf 'section\tnet\n'
 	if [ -s "$S/net" ] && [ -e "$N/log" ]; then
@@ -167,10 +173,12 @@ records() {
 			$1 == "nx" && NF == 3 && !($2 in nx) { nx[$2]; if (++x <= 500) print $1 "\t" $2 }
 			$1 == "http" && (NF == 8 || NF == 9) { k = $2 "\t" $3 "\t" $4; add("http", k); b[k] += $5; if ($6 == 1 || t[k] != 1 && $6 > t[k]) t[k] = $6; p[k] = $7; if (NF == 9) ans[k] = $8 }
 			$1 == "tls" && NF == 4 { add("tls", $2) }
+			$1 == "tcp" && NF == 8 { k = $2 "\t" $3 "\t" $4; if (!(("tcp", k) in n)) f[k] = $7; add("tcp", k); tb[k] += $5; if ($6 == 1) tt[k] = 1 }
 			END {
 				for (i = 1; i <= m["dns"] && i <= 500; i++) { k = o["dns", i]; printf "dns\t%d\t%s\t%s\n", n["dns", k], k, when("dns", k) }
 				for (i = 1; i <= m["http"] && i <= 500; i++) { k = o["http", i]; printf "http\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n", n["http", k], k, b[k], t[k], p[k], when("http", k), (k in ans ? ans[k] : "-") }
 				for (i = 1; i <= m["tls"] && i <= 500; i++) { k = o["tls", i]; printf "tls\t%d\t%s\t%s\n", n["tls", k], k, when("tls", k) }
+				for (i = 1; i <= m["tcp"] && i <= 500; i++) { k = o["tcp", i]; printf "tcp\t%d\t%s\t%d\t%d\t%s\t%s\n", n["tcp", k], k, tb[k], tt[k] + 0, when("tcp", k), f[k] }
 			}' "$N/log"
 	else
 		printf 'net\toff\n'
@@ -323,10 +331,11 @@ human() {
 		$1 == "listen" { printf "  %-5s %s\n", $2, $3 }
 		$1 == "net" && $2 == "off" { print "  (no network of the sandbox in this image: names not recorded)" }
 		$1 == "net" && $2 == "servfail" { print "  (no name answered)" }
-		$1 == "net" && $2 == "sinkhole" { print "  (names answered into the sinkhole, which answers HTTP and HTTPS)" }
+		$1 == "net" && $2 == "sinkhole" { print "  (names answered into the sinkhole, which answers every TCP port)" }
 		$1 == "dns"  { printf "  %4d× looked up %-5s %s\n", $2, $3, $4 }
 		$1 == "http" { printf "  %4d× %s %s  (%d bytes%s)\n", $2, $4, $5, $6, $7 ? ", WITH THE DECOY TOKEN" : "" }
 		$1 == "tls"  { printf "  %4d× https %s  (refused the sinkhole'"'"'s certificate)\n", $2, $3 }
+		$1 == "tcp"  { printf "  %4d× %s %s:%s  (%d bytes%s) %.80s\n", $2, $4, $5, $3, $6, $7 ? ", WITH THE DECOY TOKEN" : "", $10 }
 		$1 == "agent"  { printf "  %s:%s: %s\n", $3, $4, $5 }'
 }
 

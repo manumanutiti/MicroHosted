@@ -554,6 +554,29 @@ func (r *sandboxReport) network(x string) category {
 		seen[dst] = true
 		c.items = append(c.items, finding{sev: sevWarn, cols: []string{"https", t.Name, x + strconv.Itoa(t.Count)}, tail: join("refused the sinkhole's certificate (its own list of authorities): what it would send is unknown", by(dst)), tailDim: true, short: t.Name})
 	}
+	// what it said on the other ports: mail sent, a file stored, a shell's
+	// beacon — the sinkhole answered each as its server would
+	for _, t := range r.TCP {
+		dst := t.Host + ":" + strconv.Itoa(t.Port)
+		seen[dst] = true
+		sent := "sent nothing"
+		if t.Bytes > 0 {
+			sent = sizeOf(t.Bytes)
+			if t.First != "" {
+				sent += ", first: " + t.First
+			}
+		}
+		f := finding{sev: sevWarn, cols: []string{t.Proto, dst, x + strconv.Itoa(t.Count)}, tail: join(dstNote(t.Host, t.Port), sent, by(dst)), tailDim: true, short: t.Proto + " " + t.Host}
+		if t.CarriesToken {
+			f.sev, f.tailDim = sevHigh, false
+			f.tail = join("carries this run's decoy token: a secret sent out", sent, by(dst))
+			if !secretSent {
+				c.phrase = "sent a decoy's secret to " + t.Host + " over " + t.Proto
+			}
+			secretSent = true
+		}
+		c.items = append(c.items, f)
+	}
 	// the names: what it meant to reach, where an address says little; one
 	// line a name, its types together (A and AAAA are one lookup)
 	var names []string

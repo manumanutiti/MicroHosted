@@ -14,15 +14,19 @@ connection to it never reaches the host; any other type has no answer; a
 name under a TLD that does not exist is NXDOMAIN. servfail: no name is
 answered, as with no network at all.
 
-The sinkhole, on ports 80 and 443 of those addresses, and of any bare
-address the code connects to (mh-sandbox-prepare redirects them here; the
-address it meant is read back, SO_ORIGINAL_DST): an HTTP request is
-answered as the internet would (services/: connectivity checks, what is my
+The sinkhole, on every TCP port of those addresses (a REDIRECT each, to
+CATCH, added here) and of any bare address the code connects to
+(mh-sandbox-prepare redirects them to CATCH; the address and port it meant
+are read back, SO_ORIGINAL_DST), tells what each connection speaks
+(stream.py): an HTTP request, on any port, is answered as the internet would (services/: connectivity checks, what is my
 address, DNS over HTTPS; content.py: a small valid file of the type asked
 for, with the headers a server sends) and written down (log.py). answers: the services worms
 go for are answered as for USER, logged in (services/identity.py). HTTPS
 is answered with a certificate for the name, issued weeks ago by DIR's
-intermediate under the root the VM trusts (tls.py, ca.py).
+intermediate under the root the VM trusts (tls.py, ca.py). SMTP, FTP, POP3,
+IMAP and SSH are greeted as their servers do, and the rest read, unanswered
+(lines.py); each written down. Without the REDIRECTs (no iptables), ports
+80 and 443 of the names' addresses are still served.
 
 mh-sandbox-net DIR ca, as root, before: that root and intermediate (ca.py).
 """
@@ -33,26 +37,28 @@ import subprocess
 import sys
 import threading
 
-from . import dns, http, services
+from . import dns, services
 from .log import Log
 from .names import Names, pick
+from .stream import Stream
 from .tls import Certs
 
 RESOLVER = "127.53.0.1"
 SLOTS = 64            # connections served at once; the rest are closed
 HARD_DEADLINE = 30    # seconds a connection may last, whatever it does
 SO_ORIGINAL_DST = 80  # linux/netfilter_ipv4.h
+CATCH = 1             # the port every redirected connection comes to
 
 
-def original_dst(conn, names):
-    """Where a connection mh-sandbox-prepare's REDIRECT sent here was going:
-    a bare address the code connected to, or None (not redirected)."""
+def original_dst(conn):
+    """Where a connection a REDIRECT sent here was going: (address, port),
+    or None (not redirected: the code connected to the sinkhole itself)."""
     try:
         raw = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
     except OSError:
         return None
     a = ipaddress.ip_address(raw[4:8])
-    return None if a.is_loopback or names.owns(a) else a
+    return None if a.is_loopback else (a, int.from_bytes(raw[2:4], "big"))
 
 
 def route(blocks):
@@ -64,6 +70,14 @@ def route(blocks):
         sys.exit("mh-sandbox-net: the names' addresses could not be routed locally")
 
 
+def redirect(blocks):
+    """Every TCP port of each block to CATCH, as root, in one restore; False
+    when there is no iptables to do it."""
+    restore = next((p for p in ("/usr/sbin/iptables-legacy-restore", "/sbin/iptables-legacy-restore") if os.path.exists(p)), None)
+    rules = "*nat\n" + "".join("-A OUTPUT -d %s -p tcp -j REDIRECT --to-ports %d\n" % (b, CATCH) for b in blocks) + "COMMIT\n"
+    return restore is not None and subprocess.run([restore, "--noflush"], input=rules.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
 def cut(conn):
     try:
         conn.shutdown(socket.SHUT_RDWR)
@@ -72,8 +86,8 @@ def cut(conn):
 
 
 class Sinkhole:
-    def __init__(self, log, names, token, certs, answer):
-        self.log, self.names, self.token, self.certs, self.answer = log, names, token, certs, answer
+    def __init__(self, names, stream):
+        self.names, self.stream = names, stream
         self.slots = threading.BoundedSemaphore(SLOTS)
 
     def accept(self, sock, port):
@@ -82,15 +96,17 @@ class Sinkhole:
                 conn, _ = sock.accept()
             except InterruptedError:
                 continue
-            local = ipaddress.ip_address(conn.getsockname()[0])
-            # a name's address, by its name; a bare address, as itself
-            host = (self.names.name(local) or local) if self.names.owns(local) else original_dst(conn, self.names)
-            if host is None or not self.slots.acquire(blocking=False):
+            # CATCH: where it was going; 80 and 443, without the REDIRECTs:
+            # a name's address, connected to
+            dst = original_dst(conn) if port == CATCH else (ipaddress.ip_address(conn.getsockname()[0]), port)
+            if dst is None or port != CATCH and not self.names.owns(dst[0]) or not self.slots.acquire(blocking=False):
                 conn.close()
                 continue
-            threading.Thread(target=self.handle, args=(conn, port, str(host)), daemon=True).start()
+            # a name's address, by its name; a bare address, as itself
+            host = self.names.name(dst[0]) or dst[0] if self.names.owns(dst[0]) else dst[0]
+            threading.Thread(target=self.handle, args=(conn, dst[1], str(host), dst[0]), daemon=True).start()
 
-    def handle(self, conn, port, host):
+    def handle(self, conn, port, host, addr):
         # a hard end to whatever the code makes of it: a handshake dripped a
         # byte at a time cannot hold a slot for the run
         timer = threading.Timer(HARD_DEADLINE, cut, (conn,))
@@ -98,12 +114,7 @@ class Sinkhole:
         timer.start()
         try:
             conn.settimeout(5)
-            if port != 443:
-                http.serve(conn, "http", port, host, self.log, self.token, self.answer)
-                return
-            w = self.certs.wrap(conn, host, self.log)
-            if w is not None:
-                http.serve(w[0], "https", port, w[1], self.log, self.token, self.answer)
+            self.stream.serve(conn, port, host, addr)
         finally:
             timer.cancel()
             conn.close()
@@ -123,6 +134,8 @@ def main(argv):
     blocks = pick()
     if mode == "sinkhole":
         route(blocks)
+        if not redirect(blocks):
+            print("mh-sandbox-net: the names' addresses' ports other than 80 and 443 refuse", file=sys.stderr)
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind((RESOLVER, 53))
     dns_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -131,10 +144,11 @@ def main(argv):
     dns_tcp.listen(32)
     tcp = []
     if mode == "sinkhole":
-        for port in (80, 443):
+        for port in (CATCH, 80, 443):
             t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            t.bind(("0.0.0.0", port))
+            # CATCH: what the REDIRECTs send, which is to loopback's
+            t.bind(("127.0.0.1" if port == CATCH else "0.0.0.0", port))
             t.listen(128)
             tcp.append((t, port))
     # root no longer: DIR's owner
@@ -149,7 +163,8 @@ def main(argv):
     log = Log(os.path.join(d, "log"))
     names = Names(log, blocks)
     if mode == "sinkhole":
-        sink = Sinkhole(log, names, token, Certs(d), services.Dispatcher(services.Context(token, names, log, user)))
+        answer = services.Dispatcher(services.Context(token, names, log, user))
+        sink = Sinkhole(names, Stream(log, token, Certs(d), answer))
         for t, port in tcp:
             threading.Thread(target=sink.accept, args=(t, port), daemon=True).start()
     threading.Thread(target=dns.serve_tcp, args=(dns_tcp, log, names, mode == "sinkhole"), daemon=True).start()

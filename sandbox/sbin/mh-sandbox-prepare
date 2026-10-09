@@ -222,24 +222,23 @@ if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink
 	echo -1000 > "/proc/$!/oom_score_adj" 2>/dev/null || true
 	rm -f /etc/resolv.conf
 	printf 'nameserver 127.53.0.1\n' > /etc/resolv.conf
-	# A bare address (curl https://83.142.209.194/x, the cloud's metadata
-	# at 169.254.169.254) asks no name: its HTTP and HTTPS go to the
-	# sinkhole too, which reads where they were going (SO_ORIGINAL_DST).
-	# Not the VM's own addresses (the sinkhole's range is local), nor
-	# IPv6. An image without iptables: as before, the host refuses them.
-	# One rule a port: the kernel has no multiport match.
 	# A resolver of the code's own (dig @8.8.8.8, a resolver library given
 	# 1.1.1.1): its queries, UDP and TCP, are answered by ours, as from
-	# the address asked.
+	# the address asked. First: the rule after it would take TCP's.
+	# A bare address (curl https://83.142.209.194/x, the cloud's metadata
+	# at 169.254.169.254, nc 45.9.148.3 4444) asks no name: its TCP, every
+	# port, goes to the sinkhole too (mh-sandbox-net's port 1), which reads
+	# where it was going (SO_ORIGINAL_DST) and tells what it speaks. Not
+	# the VM's own addresses (the names' are local: mh-sandbox-net
+	# redirects those), nor IPv6. An image without iptables: as before, the
+	# host refuses them.
 	if [ $net != servfail ] && command -v iptables-legacy >/dev/null; then
-		for p in 80 443; do
-			iptables-legacy -t nat -A OUTPUT -p tcp --dport $p -m addrtype ! --dst-type LOCAL -j REDIRECT 2>/dev/null ||
-				echo "mh-sandbox-prepare: bare addresses' port $p not sent to the sinkhole: the host refuses them" >&2
-		done
 		for p in udp tcp; do
 			iptables-legacy -t nat -A OUTPUT -p $p --dport 53 -m addrtype ! --dst-type LOCAL -j DNAT --to-destination 127.53.0.1:53 2>/dev/null ||
 				echo "mh-sandbox-prepare: other resolvers' $p not sent to the sandbox's: the host refuses them" >&2
 		done
+		iptables-legacy -t nat -A OUTPUT -p tcp -m addrtype ! --dst-type LOCAL -j REDIRECT --to-ports 1 2>/dev/null ||
+			echo "mh-sandbox-prepare: bare addresses' TCP not sent to the sinkhole: the host refuses it" >&2
 	fi
 	# up before the code can ask
 	i=0
