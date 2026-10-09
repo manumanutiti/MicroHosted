@@ -3,6 +3,7 @@
 # leaves the VM; what the code meant to reach is written down.
 #
 #   mh-sandbox-net DIR sinkhole|answers USER|servfail < TOKEN
+#   mh-sandbox-net DIR ca      (the run's certificate authority, as root)
 #
 # The code is the package mhnet (sandbox/net, in the image under LIB), what
 # it does in mhnet/main.py. -I: no PYTHON* variable, no user's site, no

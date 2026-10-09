@@ -35,6 +35,8 @@ base: ubuntu:24.04
 # --apt (golang…). procps and iproute2 are the
 # report's (ps, ss); iptables the sandbox's network's (legacy: the kernel has
 # no nf_tables), to send a connection to a bare address to the sinkhole;
+# python3-cryptography the sinkhole's certificates (backdated, which
+# Ubuntu's openssl 3.0 cannot);
 # auditd too: which paths the code asked for that tell a
 # VM apart (/sys/class/dmi, /proc/cpuinfo…), found or not, what it ran, and
 # the alerts (a setuid(0) refused, a write to ~/.ssh/authorized_keys, a
@@ -46,6 +48,7 @@ packages:
   - git
   - python3
   - python3-venv
+  - python3-cryptography
   - build-essential
   - unzip
   - xz-utils

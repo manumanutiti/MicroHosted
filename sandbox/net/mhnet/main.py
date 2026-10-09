@@ -21,7 +21,10 @@ answered as the internet would (services/: connectivity checks, what is my
 address, DNS over HTTPS; content.py: a small valid file of the type asked
 for, with the headers a server sends) and written down (log.py). answers: the services worms
 go for are answered as for USER, logged in (services/identity.py). HTTPS
-is answered with a certificate for the name, signed by DIR's CA (tls.py).
+is answered with a certificate for the name, issued weeks ago by DIR's
+intermediate under the root the VM trusts (tls.py, ca.py).
+
+mh-sandbox-net DIR ca, as root, before: that root and intermediate (ca.py).
 """
 import ipaddress
 import os
@@ -109,6 +112,10 @@ class Sinkhole:
 
 def main(argv):
     d, mode = argv[1], argv[2]
+    if mode == "ca":
+        from . import ca
+        ca.make(d)
+        return
     token = sys.stdin.read().strip().lower().encode()
     user = argv[3] if mode == "answers" else None
     if user:

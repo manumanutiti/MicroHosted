@@ -365,9 +365,13 @@ the VM, by the image's `mh-sandbox-net`, and written down:
     down in `dns`.
 
   A request shows what it was answered as when it was not the generic file
-  (`answered: ip lookup`). HTTPS gets a certificate for the name,
-  signed by a CA made for this run that the VM trusts (Node and pip are
-  pointed at the system's list); a client with a list of its own (Python's
+  (`answered: ip lookup`). HTTPS gets a certificate for the name. It is
+  dated like one from a public CA: issued 1 to 60 days ago, valid for 90.
+  It comes from a CA made for this run, set up the way a company's
+  TLS-inspecting proxy sets up its own: a root from years ago that the VM
+  trusts ("Acme Corp Root CA"), and an intermediate that signs, sent with
+  each certificate. Nothing in it is dated at the run. Node and pip are
+  pointed at the system's list. A client with a list of its own (Python's
   `certifi`, a pinned key) refuses it, and only the name it asked for shows.
 - **A bare address** — `curl https://83.142.209.194/x`, the cloud's
   metadata at `169.254.169.254` — asks no name: its ports 80 and 443 go to

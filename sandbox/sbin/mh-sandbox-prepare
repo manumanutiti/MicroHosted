@@ -205,11 +205,11 @@ if command -v python3 >/dev/null && [ -x /usr/sbin/mh-sandbox-net ] && id mhsink
 	rm -rf "$N"
 	install -d -o mhsink -g mhsink -m 700 "$N"
 	if [ $net != servfail ]; then
-		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
-			-keyout "$N/ca.key" -out "$N/ca.crt" -subj "/O=Internal/CN=Internal Root CA" \
-			-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
-		chown mhsink:mhsink "$N/ca.key" "$N/ca.crt"
-		cp "$N/ca.crt" /usr/local/share/ca-certificates/internal-root.crt
+		# a company's TLS-inspecting proxy's: a root made years ago, an
+		# intermediate that signs (mhnet/ca.py)
+		/usr/sbin/mh-sandbox-net "$N" ca </dev/null
+		chown mhsink:mhsink "$N/ca.crt" "$N/inter.crt" "$N/inter.key"
+		cp "$N/ca.crt" /usr/local/share/ca-certificates/acme-corp-root-ca.crt
 		update-ca-certificates >/dev/null 2>&1
 	fi
 	# net: sinkhole or servfail, and answers after a tab (mh-sandbox-report)

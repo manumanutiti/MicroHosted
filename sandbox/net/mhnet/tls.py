@@ -1,30 +1,21 @@
-"""A certificate for each name the code asks for, signed by DIR's CA, which
-the VM trusts (mh-sandbox-prepare)."""
-import ipaddress
+"""A certificate for each name the code asks for, signed by DIR's
+intermediate, under the root the VM trusts (ca.py, mh-sandbox-prepare)."""
 import os
 import re
 import ssl
-import subprocess
 import threading
 
+from .ca import Issuer, write
 from .dns import HOSTNAME
 from .log import printable
 
-MAXCERTS = 1000  # names past it get the default certificate: a loop of made-up names costs no openssl run each
+MAXCERTS = 1000  # names past it get the default certificate: a loop of made-up names costs no key each
 DEFAULT = "sandbox.invalid"
-
-
-def is_ip(s):
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
 
 
 class Certs:
     def __init__(self, d):
-        self.d = d
+        self.issuer = Issuer(d)
         self.dir = os.path.join(d, "certs")
         os.makedirs(self.dir, exist_ok=True)
         self.ctxs = {}
@@ -46,16 +37,9 @@ class Certs:
             return c
 
     def issue(self, name, base):
-        ext = base + ".ext"
-        with open(ext, "w") as f:
-            f.write("subjectAltName=%s:%s\nextendedKeyUsage=serverAuth\n" % ("IP" if is_ip(name) else "DNS", name))
-        subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                        "-nodes", "-keyout", base + ".key", "-subj", "/CN=" + name, "-out", base + ".csr"],
-                       check=True, capture_output=True, timeout=20)
-        subprocess.run(["openssl", "x509", "-req", "-in", base + ".csr", "-CA", os.path.join(self.d, "ca.crt"),
-                        "-CAkey", os.path.join(self.d, "ca.key"), "-set_serial", str(int.from_bytes(os.urandom(8), "big")),
-                        "-days", "30", "-extfile", ext, "-out", base + ".crt"],
-                       check=True, capture_output=True, timeout=20)
+        key, chain = self.issuer.issue(name)
+        write(base + ".key", key)
+        write(base + ".crt", chain)
 
     def wrap(self, conn, host, log):
         """conn as TLS's server, with the certificate for the name it asks
