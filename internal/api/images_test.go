@@ -119,4 +119,32 @@ func TestImageRoutes(t *testing.T) {
 	if code, out := do("GET", "/v1/images/parser:1.0", ""); code != http.StatusOK {
 		t.Errorf("remaining tag = %d %s", code, out)
 	}
+
+	// Deleting an image takes its golden's pre-grown copies with it: every
+	// build run leaves one as big as its disk, and waiting for the daemon's
+	// next start to prune them filled the store.
+	if err := os.WriteFile(filepath.Join(storeDir, "rootfs2.ext4"), []byte("rootfs2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := json.Marshal(types.ImportImageRequest{Name: "other:1",
+		KernelPath: filepath.Join(storeDir, "vmlinux"), RootfsPath: filepath.Join(storeDir, "rootfs2.ext4"), VCPUs: 1, MemMB: 64})
+	code, out = do("POST", "/v1/images", string(other))
+	var otherImg types.ImageResponse
+	if code != http.StatusCreated || json.Unmarshal(out, &otherImg) != nil {
+		t.Fatalf("import other = %d %s", code, out)
+	}
+	sized := filepath.Join(storeDir, "sized")
+	if err := os.MkdirAll(sized, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copyOf := filepath.Join(sized, strings.TrimPrefix(otherImg.Rootfs, "sha256:")+"-4096m-0123456789ab.ext4")
+	if err := os.WriteFile(copyOf, []byte("grown"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := do("DELETE", "/v1/images/other:1", ""); code != http.StatusOK {
+		t.Fatalf("delete other = %d %s", code, out)
+	}
+	if _, err := os.Stat(copyOf); !os.IsNotExist(err) {
+		t.Errorf("pre-grown copy of a deleted image's golden still there (stat: %v)", err)
+	}
 }

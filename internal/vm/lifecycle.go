@@ -448,8 +448,9 @@ func (m *Manager) SweepResidue() {
 // PruneSizedGoldens removes the pre-grown golden copies no template in the
 // catalog needs any more: its template was removed, or its golden rebuilt or
 // deleted (see storage.PruneSizedGoldens). Unlike SweepResidue's targets these
-// are a disposable cache, not VM data. Call before serving, when no create can
-// be in flight.
+// are a disposable cache, not VM data. Called before serving, and after an
+// image is deleted: each image's golden is its own blob, so every build
+// imported and run leaves a copy the size of its disk until then.
 func (m *Manager) PruneSizedGoldens() {
 	var goldens []string
 	for _, tpl := range m.catalog.List() {

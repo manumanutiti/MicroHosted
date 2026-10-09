@@ -217,6 +217,9 @@ func storageReport(mgr *vm.Manager, facts vm.Facts) types.StorageInfo {
 		{What: "snapshots", Path: filepath.Join(facts.StoreDir, "snapshots"), SizeMB: hostinfo.DirSizeMB(filepath.Join(facts.StoreDir, "snapshots"))},
 		{What: "volumes", Path: filepath.Join(facts.StoreDir, "volumes"), SizeMB: hostinfo.DirSizeMB(filepath.Join(facts.StoreDir, "volumes"))},
 		{What: "jailer_chroots", Path: facts.ChrootBase, SizeMB: hostinfo.DirSizeMB(facts.ChrootBase)},
+		{What: "images", Path: filepath.Join(facts.StoreDir, "images"), SizeMB: hostinfo.DirSizeMB(filepath.Join(facts.StoreDir, "images"))},
+		{What: "pregrown_goldens", Path: filepath.Join(facts.StoreDir, "sized"), SizeMB: hostinfo.DirSizeMB(filepath.Join(facts.StoreDir, "sized"))},
+		{What: "build_cache", Path: filepath.Join(facts.StoreDir, "build"), SizeMB: hostinfo.DirSizeMB(filepath.Join(facts.StoreDir, "build"))},
 	}
 	return info
 }

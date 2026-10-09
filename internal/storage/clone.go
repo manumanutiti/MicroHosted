@@ -187,9 +187,13 @@ func goldenBase(golden string) string {
 // PruneSizedGoldens removes the pre-grown copies (see sizedGolden) that match
 // none of goldens as they are now: their template left the catalog, or its
 // golden was rebuilt or deleted. Leftover temporary files from an interrupted
-// build go too. They are a cache, rebuilt by the next create that needs one,
-// so this is safe whenever no create is in flight. Returns what it removed.
+// build go too. They are a cache, rebuilt by the next create that needs one.
+// It holds sizedMu, under which every copy is built, so a running daemon can
+// call it: no .tmp it sees is still being grown, and a create in flight only
+// ever uses a copy of a current golden, which stays. Returns what it removed.
 func PruneSizedGoldens(instancesDir string, goldens []string) ([]string, error) {
+	sizedMu.Lock()
+	defer sizedMu.Unlock()
 	entries, err := os.ReadDir(filepath.Join(instancesDir, sizedDir))
 	if os.IsNotExist(err) {
 		return nil, nil

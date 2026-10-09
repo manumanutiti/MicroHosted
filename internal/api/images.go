@@ -78,6 +78,10 @@ func registerImageRoutes(mux *http.ServeMux, mgr *vm.Manager) {
 			writeError(w, imageErrStatus(err), err)
 			return
 		}
+		if res.Deleted {
+			// its golden's pre-grown copies, as big as the disks it booted
+			mgr.PruneSizedGoldens()
+		}
 		writeJSON(w, http.StatusOK, res)
 	})
 
