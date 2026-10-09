@@ -148,11 +148,12 @@ column.
   its `trin.tar.gz`, and where it sends it, were never seen. Nothing more
   leaves the VM: the network stays the sinkhole's. Detached payloads
   (`nohup`, `setsid`, `&`) in npm too. Part of 2.5.
-- `169.254.170.2` (ECS task credentials) noted as the cloud's metadata,
+- Done: `169.254.170.2` (ECS task credentials) noted as the cloud's metadata,
   as `169.254.169.254` is (`dstNote`).
-- "commands it ran": a multi-line `python -c` shows each of its lines as
-  a command of its own (the hex blob); one command, its lines together.
-- `obfuscated_exec` sees base64 and eval, not a home-made cipher (XOR
+- Done: "commands it ran": a long `python -c` showed as many commands (the
+  hex blob): not its lines, the kernel's pieces of a long argument, one
+  EXECVE record each (`a2[0]`, `a2[1]`…). classify joins them: one command.
+- Done (by the blob of `\xNN` escapes and the running of it): `obfuscated_exec` saw base64 and eval, not a home-made cipher (XOR
   with an md5 keystream, decoded and run by `python -`): the `.pth`
   caught it here; without one it would pass.
 

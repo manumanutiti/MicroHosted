@@ -1326,3 +1326,19 @@ func TestHookDownload(t *testing.T) {
 		t.Errorf("alerts:\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
+
+// The cloud's metadata endpoints, where credentials are handed out.
+func TestDstNoteMetadata(t *testing.T) {
+	for dst, want := range map[string]string{
+		"169.254.169.254": "cloud metadata: an instance's credentials",
+		"[fd00:ec2::254]": "cloud metadata: an instance's credentials",
+		"fd00:ec2::254":   "cloud metadata: an instance's credentials",
+		"169.254.170.2":   "cloud metadata: an ECS task's credentials",
+		"169.254.170.23":  "cloud metadata: an EKS pod's credentials",
+		"169.254.170.3":   "",
+	} {
+		if got := dstNote(dst, 80); got != want {
+			t.Errorf("%s: %q, want %q", dst, got, want)
+		}
+	}
+}

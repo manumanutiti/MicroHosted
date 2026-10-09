@@ -195,6 +195,22 @@ classify() {
 		function built(w) { return w ~ /(^|-)(ld(\.(bfd|gold|lld))?|lld|mold|collect2|cc1(plus)?|gcc[-0-9.]*|g\+\+[-0-9.]*|cc|c\+\+|clang(\+\+)?[-0-9.]*|rustc|go|link|compile|tcc|zig|ghc|javac|nim|as|strip|objcopy)$/ }
 		# what a command line says, by its words: ARGS, its arguments
 		# joined by \001; CWD, where it ran
+		# execd E: an exec'"'"'s command line, all of its EXECVE records read,
+		# counted (exec); 0 for one not the code'"'"'s own (viash).
+		function execd(e,  cmd, t2, sn) {
+			cmd = xcmd[e]; delete xcmd[e]; ev = e
+			# an interpreter running a script is named by the script, as
+			# the kernel names a #! one: #!/usr/bin/env node loses that
+			# (node /usr/local/bin/npm is npm; node -e is node)
+			if (sc[e] == "execve" && ok[e] && exb[e] ~ /^(node|nodejs|python[0-9.]*|perl|ruby|bash|dash|sh)$/ &&
+			    split(pend[e], t2, "\001") > 1 && t2[2] !~ /^-/ && base(t2[2]) != "")
+				pcomm[epid[e]] = base(t2[2])
+			if (e in viash) return 0
+			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
+			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0; xpid[cmd] = epid[e]; xppid[cmd] = ppid[e] }
+			mark(nran, cmd)
+			return 1
+		}
 		function command(e, args, cwd,  cmd, lc, n, t, a0, i, x, rec, wide, tgt, who, dt, sens, pat, sx) {
 			ev = e
 			n = split(args, t, "\001")
@@ -247,6 +263,16 @@ classify() {
 			    lc ~ /(exec|eval)\(.*(b64decode|base64|decompress|fromcharcode|atob\(|unhexlify|codecs\.decode)/ ||
 			    lc ~ /eval +["'"'"']?\$\(.*base64 +(-[a-z]*d|--decode)/)
 				alert("obfuscated_exec", cmd, who)
+			# a cipher of its own: inline code (python -c, node -e, perl -e)
+			# carrying a blob of \xNN escapes and running code — exec, a
+			# subprocess, an interpreter fed on stdin (elementary-data: XOR
+			# with an md5 keystream, decoded and run by python -). Not by
+			# the cipher: by the blob and the running of it.
+			else if (a0 ~ /^(python[0-9.]*|node|nodejs|perl|ruby|php[0-9.]*)$/ && lc ~ / -[a-z]*[ce] / &&
+			    lc ~ /(exec|eval|compile)\(|subprocess|os\.(system|popen|exec)|child_process|function\(|"-"\]|sys\.executable/) {
+				x = lc
+				if (gsub(/\\x[0-9a-f][0-9a-f]/, "", x) >= 64) alert("obfuscated_exec", cmd, who)
+			}
 			if (lc ~ /(curl|wget)[^|;&]*\| *(sudo +)?(\/usr)?(\/bin\/)?(ba|da|z|k)?sh( |$|;)/ ||
 			    lc ~ /(^|[ ;&|(\/])((ba|da|z)?sh +-c +|eval +|source +|\. +)["'"'"']?(\$\(|<\() *(curl|wget) /)
 				alert("pipe_to_shell", cmd, who)
@@ -429,30 +455,30 @@ classify() {
 		/^type=CWD/ {
 			e = ev = id()
 			cwd[e] = arg(field("cwd"))
-			if (e in pend) { command(e, pend[e], cwd[e]); delete pend[e] }
+			if (e in pend) { if (execd(e)) command(e, pend[e], cwd[e]); delete pend[e] }
 			next
 		}
+		# An exec'"'"'s arguments: several EXECVE records of one event when they
+		# are long — the kernel cuts an argument too long for one into
+		# a1_len=N, then a1[0]=… a1[1]=…, record after record (python -c with
+		# a script in it). Joined here; the command counted once they all
+		# are, at the event'"'"'s CWD record (execd).
 		/^type=EXECVE/ {
 			e = ev = id()
-			s = $0; cmd = ""; args = ""
-			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 4000) {
-				v = substr(s, RSTART + 1, RLENGTH - 1); sub(/^[^=]*=/, "", v)
+			s = $0; cmd = xcmd[e]; args = pend[e]
+			while (match(s, / a[0-9]+(\[[0-9]+\])?=("[^"]*"|[0-9A-Fa-f]+)/) && length(cmd) < 32768) {
+				v = substr(s, RSTART + 1, RLENGTH - 1); k = v; sub(/^[^=]*=/, "", v); sub(/=.*/, "", k)
 				v = arg(v); gsub(/[^[:print:]]/, "?", v)
-				cmd = cmd (cmd == "" ? "" : " ") v
-				args = args (args == "" ? "" : "\001") v
+				if (k ~ /\[[1-9][0-9]*\]$/) {
+					# a piece of the argument before it
+					cmd = cmd v; args = args v
+				} else {
+					cmd = cmd (cmd == "" ? "" : " ") v
+					args = args (args == "" ? "" : "\001") v
+				}
 				s = substr(s, RSTART + RLENGTH)
 			}
-			pend[e] = args
-			# an interpreter running a script is named by the script, as
-			# the kernel names a #! one: #!/usr/bin/env node loses that
-			# (node /usr/local/bin/npm is npm; node -e is node)
-			if (sc[e] == "execve" && ok[e] && exb[e] ~ /^(node|nodejs|python[0-9.]*|perl|ruby|bash|dash|sh)$/ &&
-			    split(args, t2, "\001") > 1 && t2[2] !~ /^-/ && base(t2[2]) != "")
-				pcomm[epid[e]] = base(t2[2])
-			if (e in viash) { delete pend[e]; next }
-			if (length(cmd) > 300) cmd = substr(cmd, 1, 300) "..."
-			if (!(cmd in nran)) { split(e, sn, ":"); first[cmd] = sn[2] + 0; xpid[cmd] = epid[e]; xppid[cmd] = ppid[e] }
-			mark(nran, cmd)
+			pend[e] = args; xcmd[e] = cmd
 			# every -perm VALUE of one find: -4000 setuid, -2000 setgid, -o=w writable
 			s = $0
 			while (match(s, /"-perm" a[0-9]+="[^"]*"/)) {
@@ -577,7 +603,7 @@ classify() {
 		}
 		END {
 			parents()
-			for (e in pend) command(e, pend[e], "")
+			for (e in pend) if (execd(e)) command(e, pend[e], "")
 			for (k in nran) printf "exec\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", first[k], nran[k], k, tfirst[k], tlast[k], xpid[k], xppid[k]
 			for (k in seen) {
 				split(k, a, "\t")

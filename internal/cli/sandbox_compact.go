@@ -347,8 +347,12 @@ const sandboxResolver = "127.53.0.1"
 // dstNote says what a destination is, where it is known.
 func dstNote(dst string, port int) string {
 	switch {
-	case dst == "169.254.169.254" || dst == "[fd00:ec2::254]":
+	case dst == "169.254.169.254" || strings.Trim(dst, "[]") == "fd00:ec2::254":
 		return "cloud metadata: an instance's credentials"
+	case dst == "169.254.170.2":
+		return "cloud metadata: an ECS task's credentials"
+	case dst == "169.254.170.23" || strings.Trim(dst, "[]") == "fd00:ec2::23":
+		return "cloud metadata: an EKS pod's credentials"
 	case dst == sandboxResolver && port == 53:
 		return "the sandbox's resolver: the names are above"
 	case port == 53:

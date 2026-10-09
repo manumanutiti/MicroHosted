@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -353,6 +354,17 @@ func TestGuestClassifyTimes(t *testing.T) {
 	log = append(log, ev("1760000000.350", 11, 104, 101, "openat", "cat", `type=PATH {H} item=0 name="/home/dev/.npmrc" nametype=NORMAL`)...)
 	log = append(log, ev("1760000001.500", 12, 102, 101, "execve", "npm", `type=EXECVE {H} argc=2 a0="npm" a1="whoami"`)...)
 	log = append(log, ev("1760000002.000", 13, 103, 101, "execve", "crontab", `type=EXECVE {H} argc=2 a0="crontab" a1="x"`)...)
+	// a script too long for one record: the kernel cuts it (a2_len, then
+	// a2[0], a2[1] in records of their own); one command, one alert
+	script := "import subprocess, sys\nk = b\"" + strings.Repeat(`\x41`, 64) + "\"\nsubprocess.run([sys.executable, \"-\"], input=k)"
+	h := strings.ToUpper(hex.EncodeToString([]byte(script)))
+	log = append(log, ev("1760000003.000", 14, 105, 101, "execve", "python3",
+		fmt.Sprintf(`type=EXECVE {H} argc=3 a0="python3" a1="-c" a2_len=%d`, len(h)),
+		`type=EXECVE {H} a2[0]=`+h[:len(h)/4*2],
+		`type=EXECVE {H} a2[1]=`+h[len(h)/4*2:])...)
+	// the blob alone (nothing run), and running code without one: no alert
+	log = append(log, ev("1760000004.000", 15, 106, 101, "execve", "python3", `type=EXECVE {H} argc=3 a0="python3" a1="-c" a2=`+strings.ToUpper(hex.EncodeToString([]byte("print(b\""+strings.Repeat(`\x41`, 64)+"\")"))))...)
+	log = append(log, ev("1760000005.000", 16, 107, 101, "execve", "node", `type=EXECVE {H} argc=3 a0="node" a1="-e" a2=`+strings.ToUpper(hex.EncodeToString([]byte("require('child_process').execSync('ls \\x41')"))))...)
 	dir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(dir, "decoys"), []byte("/home/dev/.npmrc\tnpm reads it\tnpm\n"), 0o600))
 	must(t, os.WriteFile(filepath.Join(dir, "rules"), nil, 0o600))
@@ -372,6 +384,18 @@ func TestGuestClassifyTimes(t *testing.T) {
 		if !strings.Contains(string(out)+"\n", w+"\n") {
 			t.Errorf("no %q in:\n%s", w, out)
 		}
+	}
+	py := 0
+	for _, l := range strings.Split(string(out), "\n") {
+		if f := strings.Split(l, "\t"); f[0] == "exec" && len(f) > 6 && f[6] == "105" {
+			py++
+			if !strings.HasPrefix(f[3], "python3 -c import subprocess, sys?k = b\"\\x41") {
+				t.Errorf("python -c, its pieces joined: %q", f[3])
+			}
+		}
+	}
+	if py != 1 || strings.Count(string(out), "alert\tobfuscated_exec\t") != 1 || !strings.Contains(string(out), "alert\tobfuscated_exec\t1\tpython3 -c import subprocess") {
+		t.Errorf("python -c: %d commands, obfuscated_exec:\n%s", py, out)
 	}
 }
 

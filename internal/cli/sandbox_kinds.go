@@ -82,7 +82,7 @@ var alertKinds = map[string]alertKind{
 	"hook_pipe_to_shell": {sevHigh, "an install script ran what it downloaded",
 		"curl … | sh run by a package's install script (npm's preinstall, install, postinstall; pip's setup.py, a build backend), not by the command given: a dependency fetching and running code of its own on install, as Shai-Hulud 2.0 brought in Bun"},
 	"obfuscated_exec": {sevHigh, "ran hidden code",
-		"decoded and ran at once (base64 -d | sh, exec(b64decode(…))): code that hides what it runs from whoever reads it"},
+		"decoded and ran at once (base64 -d | sh, exec(b64decode(…)), or inline code carrying a blob of \\xNN escapes that it runs: a cipher of its own): code that hides what it runs from whoever reads it"},
 	"dropper": {sevHigh, "ran a binary it dropped in /tmp",
 		"a program written (not compiled) after the sandbox was prepared, in /tmp, /var/tmp or /dev/shm, then run: a downloaded payload"},
 	"dropped_exec": {sevWarn, "ran a program it wrote",
