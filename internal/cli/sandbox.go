@@ -84,10 +84,13 @@ type sandboxOpts struct {
 	image   string
 	iface   string
 	timeout time.Duration
-	cpus    int64
-	memory  int64 // MiB, --mem
-	keep    bool
-	asJSON  bool
+	// linger: after the command, how long to wait for what it left
+	// running (mh-sandbox-linger)
+	linger time.Duration
+	cpus   int64
+	memory int64 // MiB, --mem
+	keep   bool
+	asJSON bool
 	// jsonOut: the report as JSON to this file too, the view still printed
 	jsonOut string
 	verbose bool
@@ -136,6 +139,8 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	fs.DurationVar(&o.timeout, "timeout", 5*time.Minute, "for the fetch and the run each, a `DURATION` of at most 10m")
 	fs.alias("timeout", "t")
 	fs.defined = append(fs.defined, "timeout")
+	fs.DurationVar(&o.linger, "linger", 30*time.Second, "after the command, wait up to `DURATION` (at most 10m, 0 not at all) for what it left running — nohup, setsid, a hook's background job — still on the sandbox's own network")
+	fs.defined = append(fs.defined, "linger")
 	o.memory = 2048
 	fs.Int64Var(&o.cpus, "cpus", 2, "the VM's `N` vCPUs")
 	fs.alias("cpus", "c")
@@ -162,6 +167,9 @@ func sandboxRun(e *env, cmd *command, p string, args []string) error {
 	}
 	if o.timeout < time.Second || o.timeout > 10*time.Minute {
 		return usagef(p, "--timeout must be between 1s and 10m")
+	}
+	if o.linger < 0 || o.linger > 10*time.Minute {
+		return usagef(p, "--linger must be between 0 and 10m")
 	}
 	o.answers = o.answers || o.ci
 	if o.answers && o.noSinkhole {
@@ -499,16 +507,25 @@ func (s *sandbox) run() (err error) {
 	s.began = time.Now()
 	res, timedOut, err := s.exec("mh-sandbox-run "+shellQuote(s.command), s.o.timeout)
 	took := time.Since(s.began)
-	stopWatch()
 	if err != nil {
+		stopWatch()
 		return err
 	}
 	code := res.ExitCode
 	if timedOut {
 		code = 124
 	}
+	// a run that timed out was still running: what it left is looked at now
+	lingerWarn := ""
+	if !timedOut && s.o.linger > 0 {
+		lingerWarn = s.lingerFor(s.o.linger)
+	}
+	stopWatch()
 
 	rep := s.report()
+	if lingerWarn != "" {
+		rep.Warnings = append(rep.Warnings, lingerWarn)
+	}
 	if !rep.Complete {
 		rep.AddressesAnAgent = append(rep.AddressesAnAgent, scanned...)
 	}
@@ -545,6 +562,24 @@ func (s *sandbox) run() (err error) {
 		return exitError{code: code}
 	}
 	return nil
+}
+
+// lingerFor waits up to d, after the command, for what it left running
+// (mh-sandbox-linger); a warning when it could not.
+func (s *sandbox) lingerFor(d time.Duration) string {
+	secs := int64((d + time.Second - 1) / time.Second)
+	r, timedOut, err := s.exec(fmt.Sprintf("mh-sandbox-linger %d", secs), d+30*time.Second)
+	switch {
+	case err != nil:
+		return "the wait for what the code left running failed (" + err.Error() + ")"
+	case timedOut:
+		return "the wait for what the code left running timed out"
+	case r.ExitCode == 127:
+		return "image " + s.image + " does not wait for what the code leaves running (--linger): rebuild it from sandbox/ (docs/sandbox.md)"
+	case r.ExitCode != 0:
+		return fmt.Sprintf("the wait for what the code left running failed (exit %d)", r.ExitCode)
+	}
+	return ""
 }
 
 // writeJSON writes the report to --json-out's file, if any.
@@ -1406,6 +1441,12 @@ type sandboxReport struct {
 	TimedOut bool `json:"timed_out"`
 	// DurationMS: from the command's start to its end (or the timeout).
 	DurationMS int64 `json:"duration_ms"`
+	// Linger: after the command, the wait for what it left running
+	// (--linger): "" not waited, none (nothing left), ended (all of it in
+	// time), cut (still running at the end: stopped, in processes);
+	// LingerMS how long it was. Not in duration_ms.
+	Linger   string `json:"linger"`
+	LingerMS int64  `json:"linger_ms"`
 	// Complete: the VM's side of the report was read. When false, every
 	// list but connections is unknown, not empty (warnings say why).
 	Complete bool           `json:"complete"`
@@ -1696,6 +1737,10 @@ func parseSandboxReport(tsv string) *sandboxReport {
 			r.TLSRefused = append(r.TLSRefused, sandboxTLS{Count: num(1), Name: at(2), sandboxWhen: when(3)})
 		case "rules":
 			r.rulesApplied = num(1)
+		case "linger":
+			if ms, err := strconv.ParseInt(at(1), 10, 64); err == nil && (at(2) == "none" || at(2) == "ended" || at(2) == "cut") {
+				r.Linger, r.LingerMS = at(2), ms
+			}
 		case "decoy":
 			r.readers = r.readers || len(f) > 4
 			r.Decoys = append(r.Decoys, sandboxDecoy{State: at(1), Path: at(2), Legitimately: at(3), By: []string{}, Opens: []sandboxOpen{}, tools: strings.Fields(at(4))})

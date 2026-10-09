@@ -37,6 +37,9 @@ records() {
 	[ ! -s "$S/start" ] || printf 'start\t%s\n' "$(cat "$S/start")"
 	# rules N: the user's rules this image applied (classify)
 	[ ! -s "$S/rules" ] || printf 'rules\t%s\n' "$(grep -c . "$S/rules")"
+	# linger MS none|ended|cut: how long mh-sandbox-linger waited for what
+	# the command left running, and how that ended
+	[ ! -s "$S/linger" ] || printf 'linger\t%s\n' "$(cat "$S/linger")"
 	audit=
 	if command -v auditctl >/dev/null; then
 		audit=1

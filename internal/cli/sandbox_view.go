@@ -658,6 +658,12 @@ func (r *sandboxReport) render(w io.Writer, st viewStyle, verbose, output bool) 
 	if r.Complete && r.commands >= 0 {
 		meta = append(meta, fmt.Sprintf("%d commands", r.Summary.Commands))
 	}
+	switch waited := runDuration(time.Duration(r.LingerMS) * time.Millisecond); r.Linger {
+	case "ended":
+		meta = append(meta, "then "+waited+" more, until what it left running ended")
+	case "cut":
+		meta = append(meta, st.paint(sevColor[sevWarn], "then "+waited+" more, and it was still running")+" (stopped, then looked at)")
+	}
 	fmt.Fprintln(w, "   "+st.dim(strings.Join(meta, st.sep())))
 	if r.Summary.EvasionSuspected {
 		fmt.Fprintln(w, wrap("   "+st.paint(sevColor[sevWarn], st.pick("⚠", "!!")+" it looked for a VM: what it did not do here proves nothing"), 5, viewWidth))

@@ -664,6 +664,7 @@ func TestSandboxRunsWithoutNetwork(t *testing.T) {
 		"mh-sandbox-scan",
 		"sed 's/^/agent\tinput\t/' /var/lib/mh-sandbox/scan 2>/dev/null",
 		`mh-sandbox-run './'\''install me.sh'\'''`,
+		"mh-sandbox-linger 30",
 		"mh-sandbox-report --tsv",
 		"cat /usr/share/mh-sandbox/agent-patterns",
 	}
@@ -977,6 +978,26 @@ func TestSandboxRenderEmpty(t *testing.T) {
 	r.summarize()
 	if out := renderReport(r, false, false); !strings.Contains(out, "it looked for a VM: what it did not do here proves nothing") {
 		t.Errorf("evasion not said:\n%s", out)
+	}
+}
+
+// The wait for what the command left running: said in the header line,
+// a malformed record ignored.
+func TestSandboxRenderLinger(t *testing.T) {
+	for _, c := range []struct{ rec, linger, says string }{
+		{"linger\t40\tnone\n", "none", ""},
+		{"linger\t12345\tended\n", "ended", "then 12s more, until what it left running ended"},
+		{"linger\t30012\tcut\n", "cut", "then 30s more, and it was still running (stopped, then looked at)"},
+		{"linger\t5\tgone\n", "", ""},
+		{"linger\tx\tcut\n", "", ""},
+	} {
+		r := parseSandboxReport("user\tdev\n" + c.rec)
+		r.Complete, r.Target, r.Image = true, "./x.sh", "sandbox:8"
+		r.summarize()
+		out := renderReport(r, false, false)
+		if r.Linger != c.linger || (c.says != "" && !strings.Contains(out, c.says)) || (c.says == "" && strings.Contains(out, " more, ")) {
+			t.Errorf("%q: linger %q\n%s", c.rec, r.Linger, out)
+		}
 	}
 }
 

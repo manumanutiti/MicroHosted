@@ -1,0 +1,37 @@
+#!/bin/sh
+# After the command has ended, waits for what it left running: code that
+# detaches (nohup, setsid, a .pth hook's background stealer, a `&` the
+# command line does not wait for) goes on after the command line returns.
+# The network stays the sandbox's own all along: nothing gets out by
+# waiting. Run it as root (mh exec), after mh-sandbox-run, before
+# mh-sandbox-report — which stops (SIGSTOP) and lists whatever is still
+# running:
+#
+#   mh exec -t 1m VM mh-sandbox-linger 30
+#
+# It waits SECONDS at most, and writes to $S/linger what it saw
+# (mh-sandbox-report: linger): the milliseconds it waited, and none (the
+# command left nothing running), ended (all of it ended in time), or cut
+# (still running when the time was up).
+. /usr/sbin/mh-sandbox-lib
+
+[ "$(id -u)" = 0 ] || { echo "mh-sandbox-linger: run as root (mh exec)" >&2; exit 1; }
+[ -e "$S/since" ] || { echo "mh-sandbox-linger: not prepared" >&2; exit 1; }
+case "${1:-}" in
+'' | *[!0-9]*) echo "usage: mh-sandbox-linger SECONDS" >&2; exit 2 ;;
+esac
+
+left() { pgrep -u "$U" >/dev/null 2>&1; }
+ms() { awk '{ printf "%d", $1 * 1000 }' /proc/uptime; }
+
+t0=$(ms)
+state=none
+if left; then
+	state=cut
+	end=$((t0 + $1 * 1000))
+	while [ "$(ms)" -lt "$end" ]; do
+		sleep 0.5
+		left || { state=ended; break; }
+	done
+fi
+printf '%s\t%s\n' "$(($(ms) - t0))" "$state" > "$S/linger"

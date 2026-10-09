@@ -63,6 +63,7 @@ mh sandbox npm:@modelcontextprotocol/server-filesystem@2025.8.21 'mcp-server-fil
 | `--image IMAGE` | default: the newest `sandbox:N` |
 | `--iface IFACE` | the fetch network's way out (default: the host's default route) |
 | `--timeout D` | for the fetch and the run each (default 5m, at most 10m) |
+| `--linger D` | after the command, wait up to D for what it left running (default 30s, at most 10m, 0 not at all) |
 | `--cpus N`, `--mem SIZE` | the VM's size (default 2 vCPUs, 2G): a build — `go build`, `cargo`, webpack — outgrows less. Out of memory, the kernel kills the code first, never the agent or audit: a run that outgrows the VM fails as itself, the report intact |
 | `--keep` | keep the VM (and its network) afterwards, to look inside |
 | `--json` | the report as JSON on stdout (schema below), everything in it |
@@ -317,6 +318,16 @@ looks.
 If the code is still running when the timeout comes, it is stopped
 (SIGSTOP) where it is and looked at: what it left running is still listed.
 
+Code that detaches — `nohup`, `setsid`, a `&` nobody waits for, a `.pth`
+hook's background job — goes on after the command line returns. So when
+the command ends with processes of the sandbox's user still running, the
+sandbox waits (`--linger`, 30 s by default) until they end or the time is
+up, and only then stops and looks at them: the header says `then 12s more,
+until what it left running ended`, or `… and it was still running`. The
+network stays the sandbox's own all along: waiting lets nothing out. A
+command that leaves nothing running costs no wait. A run that timed out is
+not waited for: it was still running.
+
 If the report from inside the VM fails, the rest is still printed — the
 output, the exit code, the host's connections — with `"complete": false`
 and a warning: everything from inside is then unknown, not empty.
@@ -381,6 +392,8 @@ by default: an answer makes code go further, and only where you asked.
   "exit_code": 0,                  // the command's; 124 if it timed out
   "timed_out": false,
   "duration_ms": 4810,             // the command's start to its end
+  "linger": "ended",               // "" (not waited), none, ended, cut
+  "linger_ms": 12345,              // the wait after it, not in duration_ms
   "complete": true,                // false: the VM's side could not be read
   "verdict": "suspicious",         // suspicious, review, clean, incomplete, did_not_run
   "summary": {
@@ -508,6 +521,9 @@ accept:                                  # findings you checked: graded info, ne
   `accept` rules, which apply to the report.
 
 ## Out of scope
+
+What could come next, weighed and in order: `docs/sandbox-next.md`.
+
 
 - **Running an agent inside** (to audit a skill by watching an agent use it):
   it needs the model's API reachable and a key inside the VM. Not done.
