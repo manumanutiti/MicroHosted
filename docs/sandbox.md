@@ -333,6 +333,11 @@ the VM, by the image's `mh-sandbox-net`, and written down:
   signed by a CA made for this run that the VM trusts (Node and pip are
   pointed at the system's list); a client with a list of its own (Python's
   `certifi`, a pinned key) refuses it, and only the name it asked for shows.
+- **A bare address** — `curl https://83.142.209.194/x`, the cloud's
+  metadata at `169.254.169.254` — asks no name: its ports 80 and 443 go to
+  the sinkhole too (the image's `iptables`, legacy), which writes the
+  request down under that address. IPv4 only; other ports are refused by
+  the host, as before.
 - **Any other port** of a sinkhole address refuses the connection; audit
   says which program tried it, and the report names it by the name it
   looked up (`evil.example:4444`).

@@ -16,7 +16,9 @@
 # any other type has no answer. servfail: no name is answered, as with no
 # network at all.
 #
-# The sinkhole, on ports 80 and 443 of those addresses: an HTTP request is
+# The sinkhole, on ports 80 and 443 of those addresses, and of any bare
+# address the code connects to (mh-sandbox-prepare redirects them here; the
+# address it meant is read back, SO_ORIGINAL_DST): an HTTP request is
 # answered 200 and empty, and written down — method, URL, size, and whether
 # this run's decoy token is in it (as is, URL- or base64-encoded, gzipped):
 # a secret sent out. answers: the services worms go for — GitHub's API,
@@ -456,6 +458,14 @@ class Answers:
         return self.js("github oidc token", {"value": b64({"alg": "RS256", "typ": "JWT"}) + "." + b64(claims) + "." + self.tok + self.TOK})
 
 
+def is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
 class Certs:
     """A certificate for each name, signed by DIR's CA."""
 
@@ -472,7 +482,7 @@ class Certs:
             base = os.path.join(self.d, "certs", re.sub(r"[^a-z0-9.-]", "_", name))
             ext = base + ".ext"
             with open(ext, "w") as f:
-                f.write("subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n" % name)
+                f.write("subjectAltName=%s:%s\nextendedKeyUsage=serverAuth\n" % ("IP" if is_ip(name) else "DNS", name))
             subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
                             "-nodes", "-keyout", base + ".key", "-subj", "/CN=" + name, "-out", base + ".csr"],
                            check=True, capture_output=True, timeout=20)
@@ -486,21 +496,37 @@ class Certs:
             return c
 
 
+SO_ORIGINAL_DST = 80  # linux/netfilter_ipv4.h
+
+
+def original_dst(conn):
+    """Where a connection mh-sandbox-prepare's REDIRECT sent here was going:
+    a bare address the code connected to, or None (not redirected)."""
+    try:
+        raw = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    except OSError:
+        return None
+    a = ipaddress.ip_address(raw[4:8])
+    return None if a.is_loopback or a in SINK else a
+
+
 def sinkhole(sock, port, tls, log, names, token, certs, slots, answers):
     while True:
         try:
             conn, _ = sock.accept()
         except InterruptedError:
             continue
-        local = conn.getsockname()[0]
-        if ipaddress.ip_address(local) not in SINK or not slots.acquire(blocking=False):
+        local = ipaddress.ip_address(conn.getsockname()[0])
+        # a name's address, by its name; a bare address, as itself
+        host = (names.name(local) or local) if local in SINK else original_dst(conn)
+        if host is None or not slots.acquire(blocking=False):
             conn.close()
             continue
+        host = str(host)
 
-        def handle(conn=conn, local=local):
+        def handle(conn=conn, host=host):
             try:
                 conn.settimeout(5)
-                host = names.name(local) or local
                 if not tls:
                     serve(conn, "http", port, host, log, token, answers)
                     return
