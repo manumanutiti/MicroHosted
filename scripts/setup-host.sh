@@ -113,7 +113,25 @@ fi
 echo "==> Checking the disk store (copy-on-write)..."
 INSTANCES_DIR="${INSTANCES_DIR:-/var/lib/microhosted/store}"
 COW_IMG="${COW_IMG:-/var/lib/microhosted/instances.btrfs}"
+COW_SIZE_ASKED="${COW_SIZE_GB:-}"   # set: the caller chose a size
 COW_SIZE_GB="${COW_SIZE_GB:-20}"
+if ! [[ "$COW_SIZE_GB" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: COW_SIZE_GB must be a whole number of GB, not '$COW_SIZE_GB'" >&2
+  exit 1
+fi
+
+# note_kept_size says so when the caller asked for a size and the store that
+# already exists has another: its size is only chosen when it is created.
+note_kept_size() {
+  [[ -n "$COW_SIZE_ASKED" && -f "$COW_IMG" ]] || return 0
+  local have=$(( $(sudo stat -c %s "$COW_IMG") / 1024 / 1024 / 1024 ))
+  [[ "$have" == "$COW_SIZE_GB" ]] && return 0
+  echo "  NOTE: the store already exists with ${have}GB; COW_SIZE_GB=$COW_SIZE_GB only applies when it is"
+  echo "        created. To grow it in place, with the VMs running:"
+  echo "          sudo truncate -s ${COW_SIZE_GB}G $COW_IMG"
+  echo "          sudo losetup -c \$(findmnt -n -o SOURCE $INSTANCES_DIR)"
+  echo "          sudo btrfs filesystem resize max $INSTANCES_DIR"
+}
 
 # fstab_has IMG DST succeeds when /etc/fstab mounts IMG at exactly DST.
 # Everything here keys on the IMAGE (field 1), never on the target: the
@@ -186,6 +204,7 @@ if probe_reflink "$INSTANCES_DIR"; then
   if [[ "$(findmnt -n -o SOURCE --target "$INSTANCES_DIR" 2>/dev/null || true)" == "$(sudo losetup -j "$COW_IMG" 2>/dev/null | cut -d: -f1 | head -1)" ]] \
      && [[ -f "$COW_IMG" ]]; then
     ensure_fstab
+    note_kept_size
   fi
 elif mountpoint -q "$INSTANCES_DIR"; then
   echo "  WARN: $INSTANCES_DIR is mounted but without reflink; switch it to btrfs/XFS-reflink"
@@ -200,6 +219,8 @@ else
   if [[ ! -f "$COW_IMG" ]]; then
     sudo truncate -s "${COW_SIZE_GB}G" "$COW_IMG"   # sparse: doesn't take GB until used
     sudo mkfs.btrfs -q "$COW_IMG"
+  else
+    note_kept_size
   fi
   sudo mount -o loop,compress=zstd "$COW_IMG" "$INSTANCES_DIR"
   ensure_fstab   # persist it so the mount survives reboots

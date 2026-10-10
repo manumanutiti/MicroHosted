@@ -62,6 +62,18 @@ API on a TCP port instead — with no authentication in front of it — and
 `FC_VERSION=vX.Y.Z` changes Firecracker (a conscious decision: snapshots are
 tied to the version that created them).
 
+**The store's size.** Images and VM disks live in a btrfs copy-on-write store,
+a file of 20 GB by default. It is sparse: it takes on disk only what is
+written. `COW_SIZE_GB=40` picks another size; it applies when the store is
+created, on a first install. An existing store keeps its size (the installer
+says so if you ask for another) and grows in place, with the VMs running:
+
+```bash
+sudo truncate -s 40G /var/lib/microhosted/instances.btrfs
+sudo losetup -c $(findmnt -n -o SOURCE /var/lib/microhosted/store)
+sudo btrfs filesystem resize max /var/lib/microhosted/store
+```
+
 It is **idempotent**: re-running it updates the binaries and the service
 without touching live VMs, and keeps the socket's group as it is. It must run
 **on the target machine** (KVM, cgroups and the store are local); to ship only

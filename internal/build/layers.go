@@ -95,6 +95,13 @@ wait "$child"`
 // files and plain whiteouts, and means the same stacked under any other.
 const overlayOptions = "index=off,redirect_dir=off,metacopy=off"
 
+// overlayMount is mount(8) for the overlays: forced onto mount(2), whose
+// options take a page — maxLayers lower directories. util-linux 2.40+ mounts
+// with fsconfig(2) otherwise, which takes a value of at most 256 bytes: a
+// lowerdir of four layers already fails, as "wrong fs type, bad option"
+// (Debian 13's 2.41, for one).
+const overlayMount = "LIBMOUNT_FORCE_MOUNT2=always mount -t overlay overlay"
+
 // stepScript mounts a step's view of the image in its own namespaces and
 // runs "$@" (env, then the step's shell) chrooted into it. The scaffold,
 // the top lower directory, is the build's own: it holds /etc/resolv.conf
@@ -107,7 +114,7 @@ const stepScript = `set -e
 layers=$1 lower=$2 upper=$3 work=$4 merged=$5 cache=$6
 shift 6
 cd "$layers"
-mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work,` + overlayOptions + `" "$merged"
+` + overlayMount + ` -o "lowerdir=$lower,upperdir=$upper,workdir=$work,` + overlayOptions + `" "$merged"
 cd /
 mount -t proc -o nosuid,nodev,noexec proc "$merged/proc"
 mount -t tmpfs -o nosuid,noexec,mode=0755,size=4m tmpfs "$merged/dev"
@@ -133,7 +140,7 @@ const finalScript = `set -e
 layers=$1 lower=$2 merged=$3
 shift 3
 cd "$layers"
-mount -t overlay overlay -o "lowerdir=$lower,` + overlayOptions + `" "$merged"
+` + overlayMount + ` -o "lowerdir=$lower,` + overlayOptions + `" "$merged"
 cd /
 for d in proc dev sys; do
 	if [ -L "$merged/$d" ] || [ ! -d "$merged/$d" ]; then

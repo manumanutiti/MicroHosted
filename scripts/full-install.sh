@@ -10,7 +10,8 @@
 #   6. health check through the API
 #
 # Supports x86_64 and aarch64 (ARM64 boards with a 64-bit kernel, Jetson, ARM gateways).
-# Normal entry point: `make full-install` (accepts ARCH=, FC_VERSION=, ADDR=).
+# Normal entry point: `make full-install` (accepts ARCH=, FC_VERSION=, ADDR=,
+# COW_SIZE_GB=).
 #
 # Idempotent: re-running it updates the binary/service and doesn't touch live VMs
 # (KillMode=process + reconcile). NOTE: with FC_VERSION=latest it may upgrade
@@ -46,6 +47,8 @@ SOCKET="${SOCKET:-/run/microhosted.sock}"
 SOCKET_GROUP="${SOCKET_GROUP:-}"
 MANAGED_IFACE="${MANAGED_IFACE:-}"
 MANAGED_HOST_ALLOW="${MANAGED_HOST_ALLOW:-}"
+# Empty: setup-host.sh's default store size.
+COW_SIZE_GB="${COW_SIZE_GB:-}"
 if [[ -n "$ADDR" ]]; then
   API_URL="http://${ADDR}"
   [[ "$ADDR" == :* ]] && API_URL="http://localhost${ADDR}"
@@ -99,7 +102,8 @@ sudo -v
 # --- [2/6] Host: cgroups, nftables, CoW store -------------------------------
 echo ""
 echo "==> [2/6] Configuring the host (setup-host.sh)..."
-sudo ./scripts/setup-host.sh
+# sudo resets the environment, so the store size is passed explicitly.
+sudo COW_SIZE_GB="$COW_SIZE_GB" ./scripts/setup-host.sh
 
 # --- [3/6] Firecracker + Jailer ----------------------------------------------
 echo ""

@@ -31,6 +31,10 @@ SOCKET_GROUP ?=
 # reachable from them (default udp/67 for DHCP; "none" denies every one).
 MANAGED_IFACE ?=
 MANAGED_HOST_ALLOW ?=
+# Size in GB of the btrfs copy-on-write store a first install creates (a sparse
+# file: it takes on disk only what is written). Empty: setup-host.sh's default,
+# 20. An existing store keeps its size.
+COW_SIZE_GB ?=
 
 # ---------------------------------------------------------------------------
 # Target architecture. Defaults to this machine's; can be forced with
@@ -104,12 +108,13 @@ install-cli: build
 #   make full-install FC_VERSION=v1.16.1   # pin the Firecracker version
 #   make full-install SOCKET_GROUP=none      # socket root-only (default: group microhosted, you in it)
 #   make full-install ADDR=127.0.0.1:8080      # serve on a port instead
+#   make full-install COW_SIZE_GB=40           # a 40 GB store (default 20; first install only)
 # Afterward: cd orchestrator/examples/hello && mh up
 # (make prepare-image only for catalog templates: mh run base-alpine)
 # ---------------------------------------------------------------------------
 full-install:
 	chmod +x scripts/*.sh
-	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) SOCKET=$(SOCKET) SOCKET_GROUP=$(SOCKET_GROUP) MANAGED_IFACE=$(MANAGED_IFACE) MANAGED_HOST_ALLOW=$(MANAGED_HOST_ALLOW) ./scripts/full-install.sh
+	ARCH=$(ARCH) FC_VERSION=$(FC_VERSION) ADDR=$(ADDR) SOCKET=$(SOCKET) SOCKET_GROUP=$(SOCKET_GROUP) MANAGED_IFACE=$(MANAGED_IFACE) MANAGED_HOST_ALLOW=$(MANAGED_HOST_ALLOW) COW_SIZE_GB=$(COW_SIZE_GB) ./scripts/full-install.sh
 
 # ---------------------------------------------------------------------------
 # Full uninstallation: the inverse of full-install. Kills the live VMs, removes
@@ -148,7 +153,7 @@ install-fc:
 
 setup-host:
 	chmod +x scripts/setup-host.sh
-	sudo ./scripts/setup-host.sh
+	sudo COW_SIZE_GB=$(COW_SIZE_GB) ./scripts/setup-host.sh
 
 kernel:
 	chmod +x scripts/build-kernel.sh
